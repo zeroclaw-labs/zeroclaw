@@ -748,32 +748,36 @@ pub async fn agent_turn(
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(ToolLoop {
-        exec: ResolvedAgentExecution {
-            model_access: ResolvedModelAccess {
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
                 model_provider,
                 provider_name,
                 model,
                 temperature,
             },
-            tools_registry,
-            observer,
-            silent,
-            approval,
-            multimodal_config,
-            max_tool_iterations,
-            hooks: None,
-            excluded_tools,
-            dedup_exempt_tools,
-            activated_tools,
-            model_switch_callback,
-            pacing: &zeroclaw_config::schema::PacingConfig::default(),
-            strict_tool_parsing,
-            parallel_tools,
-            max_tool_result_chars,
-            context_token_budget,
-            receipt_generator: None,
-            knobs: &LoopKnobs::default(),
-        },
+            ResolvedIo {
+                tools_registry,
+                observer,
+                silent,
+                approval,
+                multimodal_config,
+                hooks: None,
+                activated_tools,
+                model_switch_callback,
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations,
+                excluded_tools,
+                dedup_exempt_tools,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing,
+                parallel_tools,
+                max_tool_result_chars,
+                context_token_budget,
+                knobs: &LoopKnobs::default(),
+            },
+        ),
         history,
         channel_name,
         channel_reply_target,
@@ -806,9 +810,9 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedModelAccess, StreamDelta, ToolLoop,
-    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
-    run_tool_call_loop, scrub_credentials,
+    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1876,32 +1880,38 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                exec: ResolvedAgentExecution {
-                                    model_access: ResolvedModelAccess {
+                                exec: ResolvedAgentExecution::resolve(
+                                    ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
                                         model: &model_name,
                                         temperature: effective_temperature,
                                     },
-                                    tools_registry: &tools_registry,
-                                    observer: observer.as_ref(),
-                                    silent: false,
-                                    approval: approval_manager.as_ref(),
-                                    multimodal_config: &config.multimodal,
-                                    max_tool_iterations: agent.resolved.max_tool_iterations,
-                                    hooks: None,
-                                    excluded_tools: &excluded_tools,
-                                    dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
-                                    activated_tools: activated_handle.as_ref(),
-                                    model_switch_callback: Some(model_switch_callback.clone()),
-                                    pacing: &config.pacing,
-                                    strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                    parallel_tools: agent.resolved.parallel_tools,
-                                    max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                    context_token_budget: agent.resolved.effective_context_budget(),
-                                    receipt_generator: None,
-                                    knobs: &LoopKnobs::default(),
-                                },
+                                    ResolvedIo {
+                                        tools_registry: &tools_registry,
+                                        observer: observer.as_ref(),
+                                        silent: false,
+                                        approval: approval_manager.as_ref(),
+                                        multimodal_config: &config.multimodal,
+                                        hooks: None,
+                                        activated_tools: activated_handle.as_ref(),
+                                        model_switch_callback: Some(model_switch_callback.clone()),
+                                        receipt_generator: None,
+                                    },
+                                    ResolvedRuntimeKnobs {
+                                        max_tool_iterations: agent.resolved.max_tool_iterations,
+                                        excluded_tools: &excluded_tools,
+                                        dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
+                                        pacing: &config.pacing,
+                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                        parallel_tools: agent.resolved.parallel_tools,
+                                        max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                        context_token_budget: agent
+                                            .resolved
+                                            .effective_context_budget(),
+                                        knobs: &LoopKnobs::default(),
+                                    },
+                                ),
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
@@ -2381,34 +2391,44 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
-                                    exec: ResolvedAgentExecution {
-                                        model_access: ResolvedModelAccess {
+                                    exec: ResolvedAgentExecution::resolve(
+                                        ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
                                             provider_name: &provider_name,
                                             model: &model_name,
                                             temperature: turn_temperature,
                                         },
-                                        tools_registry: &tools_registry,
-                                        observer: observer.as_ref(),
-                                        silent: true,
-                                        approval: approval_manager.as_ref(),
-                                        multimodal_config: &config.multimodal,
-                                        max_tool_iterations: agent.resolved.max_tool_iterations,
-                                        hooks: None,
-                                        excluded_tools: &excluded_tools,
-                                        dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
-                                        activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: Some(model_switch_callback.clone()),
-                                        pacing: &config.pacing,
-                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                        parallel_tools: agent.resolved.parallel_tools,
-                                        max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent
-                                            .resolved
-                                            .effective_context_budget(),
-                                        receipt_generator: None,
-                                        knobs: &LoopKnobs::default(),
-                                    },
+                                        ResolvedIo {
+                                            tools_registry: &tools_registry,
+                                            observer: observer.as_ref(),
+                                            silent: true,
+                                            approval: approval_manager.as_ref(),
+                                            multimodal_config: &config.multimodal,
+                                            hooks: None,
+                                            activated_tools: activated_handle.as_ref(),
+                                            model_switch_callback: Some(
+                                                model_switch_callback.clone(),
+                                            ),
+                                            receipt_generator: None,
+                                        },
+                                        ResolvedRuntimeKnobs {
+                                            max_tool_iterations: agent.resolved.max_tool_iterations,
+                                            excluded_tools: &excluded_tools,
+                                            dedup_exempt_tools: &agent
+                                                .resolved
+                                                .tool_call_dedup_exempt,
+                                            pacing: &config.pacing,
+                                            strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                            parallel_tools: agent.resolved.parallel_tools,
+                                            max_tool_result_chars: agent
+                                                .resolved
+                                                .max_tool_result_chars,
+                                            context_token_budget: agent
+                                                .resolved
+                                                .effective_context_budget(),
+                                            knobs: &LoopKnobs::default(),
+                                        },
+                                    ),
                                     history: &mut history,
                                     channel_name,
                                     channel_reply_target: None,
@@ -4908,6 +4928,101 @@ mod tests {
         );
         assert!(!requests[0][0].content.contains("[IMAGE:"));
         assert!(!requests[0][0].content.contains(&oversized_payload));
+    }
+
+    /// Regression: a non-vision provider must not be permanently poisoned by an
+    /// image marker left in history from an EARLIER turn. The capability error
+    /// is scoped to the image the user *just* sent (see
+    /// `run_tool_call_loop_returns_structured_error_for_non_vision_provider`);
+    /// a carried-over marker degrades to text-only so the next plain-text turn
+    /// succeeds instead of re-failing forever. Reproduces the reported bug where
+    /// one image to a non-vision provider made every subsequent text turn fail
+    /// (the RPC/streaming path persists the user message into the long-lived
+    /// session history before the loop runs, so a failed image turn leaves its
+    /// marker behind).
+    #[tokio::test]
+    async fn run_tool_call_loop_degrades_carried_over_image_on_non_vision_provider() {
+        let model_provider = RecordingModelProvider::new();
+        let recorded_requests = Arc::clone(&model_provider.requests);
+
+        // An earlier image turn left its marker in history; the latest user
+        // message is plain text.
+        let mut history = vec![
+            ChatMessage::user(
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("a carried-over image must not fail a plain-text turn");
+
+        assert_eq!(result, "done");
+
+        // The provider was actually called (no hard capability error) and the
+        // carried-over marker was stripped before reaching the text-only model.
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1, "exactly one provider call expected");
+        let sent_blob = requests[0]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !sent_blob.contains("[IMAGE:"),
+            "carried-over image marker must be stripped, got: {sent_blob}"
+        );
+        assert!(
+            sent_blob.contains("[media attachment]"),
+            "stripped marker should become the text placeholder, got: {sent_blob}"
+        );
     }
 
     #[tokio::test]

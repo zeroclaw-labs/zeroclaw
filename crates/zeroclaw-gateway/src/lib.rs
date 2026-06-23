@@ -12,6 +12,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
@@ -560,10 +562,11 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-    // Reload sender owned by the daemon. /admin/reload writes `true` here;
-    // the daemon's wait loop reacts via `subscribe()` and tears down to
-    // re-init. Cross-platform replacement for the SIGUSR1 hack.
-    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // Reload controls owned by the daemon for supervised runs. RPC reloads
+    // write to `shutdown_tx` before signalling daemon reload so the listener
+    // releases its socket before the replacement gateway binds. /admin/reload
+    // writes to both controls directly. Standalone gateway passes `None`.
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
@@ -1501,7 +1504,11 @@ pub async fn run_gateway(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, reload_tx) = reload_controls
+        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .unwrap_or((owned_shutdown_tx, None));
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
@@ -1822,6 +1829,9 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes());
+
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
     let inner = inner
@@ -1880,12 +1890,15 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger route lives on its own sub-router so it can opt out
-    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
-    // the route through `merge`, so only this endpoint sees the longer
-    // timeout.
-    let cron_run_router: Router = Router::new()
-        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+    // Manual cron-trigger and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // synchronous agent turn inline. Layers attached here travel with the
+    // route through `merge`, so only these endpoints see the longer timeout.
+    let long_running_router: Router<AppState> =
+        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    #[cfg(feature = "a2a")]
+    let long_running_router = long_running_router.merge(a2a::a2a_task_route());
+    let long_running_router: Router = long_running_router
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1893,7 +1906,7 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(cron_run_router);
+    let inner = inner.merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2371,7 +2384,7 @@ fn needs_quickstart_channel_reply() -> String {
 /// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
 /// already validated against `config.agents` by the handler. `None` keeps the
 /// legacy default pick (migration-synthesized "default", else first enabled).
-async fn run_gateway_chat_with_tools(
+pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
@@ -5028,6 +5041,68 @@ mod tests {
             );
         }
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_uses_external_shutdown_sender() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        shutdown_tx
+            .send(true)
+            .expect("external daemon-owned shutdown sender should stay connected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway should return after external shutdown")
+            .expect("gateway task should not panic")
+            .expect("gateway shutdown should be graceful");
+
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("gateway should release the listener after external shutdown");
     }
 
     #[tokio::test]
