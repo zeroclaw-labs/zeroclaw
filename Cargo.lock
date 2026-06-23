@@ -14530,7 +14530,6 @@ dependencies = [
 name = "zeroclaw-runtime"
 version = "0.8.1"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-trait",
  "axum",
@@ -14570,7 +14569,6 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "ring",
- "rumqttc",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
@@ -14598,6 +14596,7 @@ dependencies = [
  "webpki-roots 1.0.7",
  "which",
  "windows 0.61.3",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
@@ -14690,7 +14689,6 @@ dependencies = [
 name = "zeroclawlabs"
 version = "0.8.1"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-imap",
  "async-trait",

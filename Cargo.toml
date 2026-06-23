@@ -147,9 +147,6 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
-aardvark-sys.workspace = true
-
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 

@@ -39,6 +39,7 @@ pub(crate) fn record_llm_failure(
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
@@ -64,8 +65,8 @@ pub(crate) fn try_recover_context_overflow(
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
             WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_attrs(::serde_json::json!({"iteration": iteration + 1})),
             "Context window exceeded, attempting in-loop recovery"
         );
@@ -75,7 +76,8 @@ pub(crate) fn try_recover_context_overflow(
         if chars_saved > 0 {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
                 "Context recovery: trimmed old tool results, retrying"
             );
@@ -87,7 +89,8 @@ pub(crate) fn try_recover_context_overflow(
         if dropped > 0 {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"dropped": dropped})),
                 "Context recovery: dropped old messages, retrying"
             );
@@ -98,6 +101,7 @@ pub(crate) fn try_recover_context_overflow(
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure),
             "Context overflow unrecoverable: no trimmable messages"
         );

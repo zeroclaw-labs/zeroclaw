@@ -1,6 +1,6 @@
 //! Process-global cache for skill-directory loads.
 //!
-//! [`super::load_skills_from_directory`] and [`super::load_open_skills_from_directory`]
+//! [`super::load_skills_from_directory`] and `super::load_open_skills_from_directory`
 //! are pure functions of `(dir, allow_scripts, filesystem state)`, but each call
 //! does a recursive read *and* a full security audit (content scan + parse) of
 //! every skill subdirectory. They run on every prompt build and every
