@@ -350,40 +350,72 @@ impl SopRunStore for InMemoryRunStore {
     }
 
     fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
-        if policy.max_terminal == 0 {
-            return Ok(0);
-        }
         let mut g = self.lock()?;
-        if g.terminal.len() <= policy.max_terminal {
-            return Ok(0);
-        }
-        // Evict OLDEST terminal runs first (by completion, then start time) —
-        // HashSet order is non-deterministic, so sort before truncating.
-        let mut terminal: Vec<(String, String)> = g
-            .terminal
-            .iter()
-            .map(|id| {
-                let ts = g
-                    .runs
-                    .get(id)
-                    .map(|r| {
-                        r.run
+        let mut dropped = 0usize;
+
+        // Age bound (`keep_secs`): drop terminal runs whose completion (or start,
+        // when completion is unset) time is older than the cutoff, independently
+        // of the count, so it also applies when `max_terminal` is unbounded (0).
+        // The cutoff is formatted to match `now_iso8601()` (trailing "Z") so the stored
+        // ISO-8601 UTC timestamps compare lexically.
+        if let Some(keep) = policy.keep_secs {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(keep as i64))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string();
+            let expired: Vec<String> = g
+                .terminal
+                .iter()
+                .filter(|id| {
+                    g.runs.get(*id).is_some_and(|r| {
+                        let ts = r
+                            .run
                             .completed_at
-                            .clone()
-                            .unwrap_or_else(|| r.run.started_at.clone())
+                            .as_deref()
+                            .unwrap_or(r.run.started_at.as_str());
+                        ts < cutoff.as_str()
                     })
-                    .unwrap_or_default();
-                (id.clone(), ts)
-            })
-            .collect();
-        terminal.sort_by(|a, b| a.1.cmp(&b.1));
-        let drop_n = terminal.len() - policy.max_terminal;
-        for (id, _) in terminal.into_iter().take(drop_n) {
-            g.runs.remove(&id);
-            g.events.remove(&id);
-            g.terminal.remove(&id);
+                })
+                .cloned()
+                .collect();
+            for id in expired {
+                g.runs.remove(&id);
+                g.events.remove(&id);
+                g.terminal.remove(&id);
+                dropped += 1;
+            }
         }
-        Ok(drop_n)
+
+        // Count bound (`max_terminal`, 0 = unbounded): keep at most N terminal
+        // runs, evicting the OLDEST excess (by completion, then start time).
+        // HashSet order is non-deterministic, so sort before truncating.
+        if policy.max_terminal > 0 && g.terminal.len() > policy.max_terminal {
+            let mut terminal: Vec<(String, String)> = g
+                .terminal
+                .iter()
+                .map(|id| {
+                    let ts = g
+                        .runs
+                        .get(id)
+                        .map(|r| {
+                            r.run
+                                .completed_at
+                                .clone()
+                                .unwrap_or_else(|| r.run.started_at.clone())
+                        })
+                        .unwrap_or_default();
+                    (id.clone(), ts)
+                })
+                .collect();
+            terminal.sort_by(|a, b| a.1.cmp(&b.1));
+            let drop_n = terminal.len() - policy.max_terminal;
+            for (id, _) in terminal.into_iter().take(drop_n) {
+                g.runs.remove(&id);
+                g.events.remove(&id);
+                g.terminal.remove(&id);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 
     fn health_check(&self) -> bool {
@@ -663,6 +695,44 @@ mod tests {
             })
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn prune_keep_secs_drops_aged_runs_even_under_max_terminal() {
+        let s = build_run_store();
+        // Two terminal runs; the count (2) stays well under max_terminal, so only
+        // the age bound can evict. One is ancient, one is far-future.
+        s.finish_run("old", &run("old", 1, Some("2000-01-01T00:00:00Z")))
+            .unwrap();
+        s.finish_run("fresh", &run("fresh", 1, Some("2099-01-01T00:00:00Z")))
+            .unwrap();
+        let dropped = s
+            .prune(&RetentionPolicy {
+                max_terminal: 100,
+                keep_secs: Some(1),
+            })
+            .unwrap();
+        assert_eq!(
+            dropped, 1,
+            "aged terminal run must be pruned by keep_secs despite count under cap"
+        );
+        assert!(s.load_run("old").unwrap().is_none(), "ancient run evicted");
+        assert!(
+            s.load_run("fresh").unwrap().is_some(),
+            "future-dated run retained"
+        );
+        // keep_secs also applies when max_terminal is unbounded (0).
+        s.finish_run("old2", &run("old2", 1, Some("2001-01-01T00:00:00Z")))
+            .unwrap();
+        assert_eq!(
+            s.prune(&RetentionPolicy {
+                max_terminal: 0,
+                keep_secs: Some(1),
+            })
+            .unwrap(),
+            1,
+            "keep_secs prunes even with unbounded max_terminal"
         );
     }
 
