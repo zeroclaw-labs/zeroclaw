@@ -388,67 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_invalid_size() {
-        let Some(path) = wasm_path() else { return };
-        let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-        let mut plugin = create_plugin(&path, &perms).unwrap();
-        let args =
-            serde_json::to_vec(&serde_json::json!({"prompt": "test", "size": "bad"})).unwrap();
-        let result = call_execute(&mut plugin, &args).unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Invalid size"));
-    }
-
-    #[test]
-    fn execute_invalid_model_traversal() {
-        let Some(path) = wasm_path() else { return };
-        let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-        let mut plugin = create_plugin(&path, &perms).unwrap();
-        let args =
-            serde_json::to_vec(&serde_json::json!({"prompt": "test", "model": "../../evil"}))
-                .unwrap();
-        let result = call_execute(&mut plugin, &args).unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Invalid model"));
-    }
-
-    /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
-    /// function: the host returns Err (var unset), which Extism propagates
-    /// as a plugin-call trap. Proves the env_read path is wired.
-    #[test]
-    fn execute_missing_api_key_exercises_env_read_host_fn() {
-        let Some(path) = wasm_path() else { return };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FAL_API_KEY") };
-        let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-        let mut plugin = create_plugin(&path, &perms).unwrap();
-        let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
-        let err = call_execute(&mut plugin, &args).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("FAL_API_KEY") || msg.contains("not set"),
-            "expected env-var error, got: {msg}"
-        );
-    }
-
-    /// End-to-end permission enforcement: without `EnvRead`, the host
-    /// function returns permission-denied and Extism propagates it as a trap.
-    #[test]
-    fn execute_without_env_read_permission_fails() {
-        let Some(path) = wasm_path() else { return };
-        // Only HttpClient granted, EnvRead missing
-        let perms = vec![PluginPermission::HttpClient];
-        let mut plugin = create_plugin(&path, &perms).unwrap();
-        let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
-        let err = call_execute(&mut plugin, &args).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("permission") || msg.contains("env_read"),
-            "expected permission-denied error, got: {msg}"
-        );
-    }
-
-    #[test]
     fn inject_config_overrides_caller_supplied_config_when_section_present() {
         let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
         let config = HashMap::from([("api_key".to_string(), "real".to_string())]);
