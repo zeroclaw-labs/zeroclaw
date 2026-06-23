@@ -32,12 +32,16 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Restart classification (advisory) ────────────────────────────
 
-/// Whether a clean process exit will be relaunched by a supervisor.
+/// How a post-upgrade restart is achieved in this environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartMode {
-    /// A supervisor (systemd/launchd) will relaunch us on exit.
+    /// A supervisor (systemd/launchd) relaunches us after a clean exit.
     Supervised,
-    /// No supervisor will relaunch us — the operator must restart manually.
+    /// No supervisor, but we can relaunch ourselves: after teardown the daemon
+    /// detached-spawns the new binary, then exits (bare unix process).
+    SelfRespawn,
+    /// We cannot safely auto-restart (container PID 1, or non-unix bare); the
+    /// operator must restart manually.
     Manual,
 }
 
@@ -45,8 +49,14 @@ impl RestartMode {
     pub fn as_str(self) -> &'static str {
         match self {
             RestartMode::Supervised => "supervised",
+            RestartMode::SelfRespawn => "self_respawn",
             RestartMode::Manual => "manual",
         }
+    }
+
+    /// Whether the dashboard may offer (and the backend honour) auto-restart.
+    pub fn auto_restartable(self) -> bool {
+        matches!(self, RestartMode::Supervised | RestartMode::SelfRespawn)
     }
 }
 
@@ -108,9 +118,18 @@ fn detect_restart_uncached() -> RestartInfo {
             hint: "launchctl kickstart -k <your-zeroclaw-label>".to_string(),
         };
     }
-    RestartInfo {
-        mode: RestartMode::Manual,
-        hint: "restart the `zeroclaw daemon` process".to_string(),
+    // Bare process. On unix we can relaunch ourselves (detached respawn after
+    // teardown); elsewhere there's no safe self-relaunch, so stay manual.
+    if cfg!(unix) {
+        RestartInfo {
+            mode: RestartMode::SelfRespawn,
+            hint: "restart the `zeroclaw daemon` process".to_string(),
+        }
+    } else {
+        RestartInfo {
+            mode: RestartMode::Manual,
+            hint: "restart the `zeroclaw daemon` process".to_string(),
+        }
     }
 }
 
@@ -312,11 +331,10 @@ pub async fn handle_version_upgrade(
     }
 
     let restart = detect_restart();
-    let supervised = restart.mode == RestartMode::Supervised;
-    if req.auto_restart && !supervised {
+    if req.auto_restart && !restart.mode.auto_restartable() {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "auto_restart requires a supervised environment (systemd/launchd); restart manually instead",
+            "auto_restart is not available here (container or non-unix bare process); restart manually instead",
         );
     }
 
@@ -343,11 +361,17 @@ pub async fn handle_version_upgrade(
     *slot = Some(progress.clone());
     drop(slot);
 
-    ::zeroclaw_spawn::spawn!(run_upgrade(
-        progress,
-        req.version,
-        req.auto_restart && supervised,
-    ));
+    let action = if req.auto_restart {
+        match restart.mode {
+            RestartMode::Supervised => RestartAction::Supervised,
+            RestartMode::SelfRespawn => RestartAction::SelfRespawn,
+            // Unreachable: rejected with 400 above.
+            RestartMode::Manual => RestartAction::None,
+        }
+    } else {
+        RestartAction::None
+    };
+    ::zeroclaw_spawn::spawn!(run_upgrade(progress, req.version, action));
 
     (
         StatusCode::ACCEPTED,
@@ -456,11 +480,23 @@ async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<Upgrade
     }
 }
 
-/// Drive `zeroclaw update`, then either mark done or (Phase 3) self-restart.
+/// What to do once the upgrade succeeds.
+#[derive(Debug, Clone, Copy)]
+enum RestartAction {
+    /// Leave the swapped binary on disk; the operator restarts manually.
+    None,
+    /// Exit cleanly; a supervisor (systemd/launchd) relaunches the new binary.
+    Supervised,
+    /// Exit cleanly after asking `main` to detached-spawn the new binary (bare
+    /// unix process with no supervisor).
+    SelfRespawn,
+}
+
+/// Drive `zeroclaw update`, then either mark done or (Phase 3) restart.
 async fn run_upgrade(
     progress: Arc<Mutex<UpgradeProgress>>,
     version: Option<String>,
-    auto_restart_supervised: bool,
+    action: RestartAction,
 ) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -542,22 +578,32 @@ async fn run_upgrade(
         return;
     }
 
-    if auto_restart_supervised {
-        // Phase 3: the binary on disk is new; exit cleanly so the supervisor
-        // relaunches it. We never spawn/exec a replacement ourselves.
-        set_state(&progress, UpgradeState::Restarting);
-        tokio::time::sleep(RESTART_GRACE).await;
-        request_supervised_restart();
-    } else {
-        set_state(&progress, UpgradeState::Done);
+    match action {
+        RestartAction::None => set_state(&progress, UpgradeState::Done),
+        RestartAction::Supervised => {
+            // The binary on disk is new; exit cleanly so the supervisor
+            // relaunches it. We never spawn/exec a replacement ourselves.
+            set_state(&progress, UpgradeState::Restarting);
+            tokio::time::sleep(RESTART_GRACE).await;
+            trigger_graceful_shutdown();
+        }
+        RestartAction::SelfRespawn => {
+            // No supervisor: ask `main` to detached-spawn the new binary once
+            // the daemon has torn down, then exit. The respawn flag is read at
+            // the post-shutdown point, after the listener is released.
+            set_state(&progress, UpgradeState::Restarting);
+            tokio::time::sleep(RESTART_GRACE).await;
+            zeroclaw_runtime::restart::request_respawn();
+            trigger_graceful_shutdown();
+        }
     }
 }
 
 /// Send ourselves SIGTERM so the daemon's signal handler runs its graceful
-/// teardown (`DaemonExit::Shutdown`) and the supervisor relaunches the new
-/// binary. No-op on non-unix (auto_restart is only offered when supervised,
-/// which we only detect on unix).
-fn request_supervised_restart() {
+/// teardown (`DaemonExit::Shutdown`). Whether the process is then relaunched by
+/// a supervisor or self-respawned by `main` is decided by the caller. No-op on
+/// non-unix (auto_restart is only offered on unix).
+fn trigger_graceful_shutdown() {
     #[cfg(unix)]
     // SAFETY: `raise` is async-signal-safe and merely posts SIGTERM to this
     // process, which the daemon already handles for graceful shutdown.
@@ -573,7 +619,11 @@ mod tests {
     #[test]
     fn restart_mode_as_str_is_stable() {
         assert_eq!(RestartMode::Supervised.as_str(), "supervised");
+        assert_eq!(RestartMode::SelfRespawn.as_str(), "self_respawn");
         assert_eq!(RestartMode::Manual.as_str(), "manual");
+        assert!(RestartMode::Supervised.auto_restartable());
+        assert!(RestartMode::SelfRespawn.auto_restartable());
+        assert!(!RestartMode::Manual.auto_restartable());
     }
 
     #[test]

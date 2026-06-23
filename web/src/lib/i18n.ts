@@ -881,6 +881,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'upgrade.cancel': "Cancel",
     'upgrade.confirm_body': "This downloads and swaps the running binary. The previous version is backed up. You'll need to restart the service to apply it (or enable auto-restart under a supervisor).",
     'upgrade.auto_restart': "Restart automatically after upgrade",
+    'upgrade.self_respawn_note': "No supervisor here — the daemon relaunches itself. If the new version fails to start, the service stays down (recover from the .bak backup).",
     'upgrade.manual_note': "After the upgrade, restart the service to apply:",
     'upgrade.upgrading': "Upgrading…",
     'upgrade.restarting': "Restarting the service…",

@@ -19,8 +19,9 @@ export interface UpgradeDialogProps {
   loading: boolean;
   /** `gateway.allow_self_upgrade` — gates the Upgrade button. */
   allowSelfUpgrade: boolean;
-  /** Whether a clean exit is relaunched by a supervisor (enables auto-restart). */
-  restartMode?: 'supervised' | 'manual';
+  /** How a restart is achieved here; `supervised` and `self_respawn` can
+   *  auto-restart, `manual` cannot. */
+  restartMode?: 'supervised' | 'self_respawn' | 'manual';
   /** Manual-restart command to show after a swap. */
   restartHint?: string;
   /** Close the dialog (Esc, backdrop, or Close button). */
@@ -66,7 +67,8 @@ export function UpgradeDialog({
   const [status, setStatus] = useState<UpgradeStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reconciled, setReconciled] = useState(false);
-  const supervised = restartMode === 'supervised';
+  const canAutoRestart =
+    restartMode === 'supervised' || restartMode === 'self_respawn';
   const [autoRestart, setAutoRestart] = useState(true);
 
   // Reset on open, and re-attach to an upgrade that is still running server-side.
@@ -74,7 +76,7 @@ export function UpgradeDialog({
     if (!open) return;
     setError(null);
     setReconciled(false);
-    setAutoRestart(supervised);
+    setAutoRestart(canAutoRestart);
     getUpgradeStatus()
       .then((s) => {
         if (s.state === 'running') {
@@ -90,7 +92,7 @@ export function UpgradeDialog({
         }
       })
       .catch(() => setView('info'));
-  }, [open, supervised]);
+  }, [open, canAutoRestart]);
 
   useEffect(() => {
     if (!open) return;
@@ -183,7 +185,7 @@ export function UpgradeDialog({
     try {
       const res = await startUpgrade({
         version: info?.latest_version ?? undefined,
-        auto_restart: autoRestart && supervised,
+        auto_restart: autoRestart && canAutoRestart,
       });
       setHandoffId(res.handoff_id);
       setStatus(null);
@@ -247,17 +249,24 @@ export function UpgradeDialog({
                 {isNewer && !allowSelfUpgrade && (
                   <div className="text-xs text-pc-text-muted">{t('upgrade.disabled')}</div>
                 )}
-                {isNewer && allowSelfUpgrade && supervised && view === 'info' && (
-                  <label className="flex items-center gap-2 text-xs text-pc-text-muted">
-                    <input
-                      type="checkbox"
-                      checked={autoRestart}
-                      onChange={(e) => setAutoRestart(e.target.checked)}
-                    />
-                    {t('upgrade.auto_restart')}
-                  </label>
+                {isNewer && allowSelfUpgrade && canAutoRestart && view === 'info' && (
+                  <div className="flex flex-col gap-1">
+                    <label className="flex items-center gap-2 text-xs text-pc-text-muted">
+                      <input
+                        type="checkbox"
+                        checked={autoRestart}
+                        onChange={(e) => setAutoRestart(e.target.checked)}
+                      />
+                      {t('upgrade.auto_restart')}
+                    </label>
+                    {autoRestart && restartMode === 'self_respawn' && (
+                      <div className="text-[11px] text-pc-text-muted pl-6">
+                        {t('upgrade.self_respawn_note')}
+                      </div>
+                    )}
+                  </div>
                 )}
-                {isNewer && allowSelfUpgrade && !supervised && view === 'info' && (
+                {isNewer && allowSelfUpgrade && !canAutoRestart && view === 'info' && (
                   <div className="text-xs text-pc-text-muted">
                     {t('upgrade.manual_note')}
                     {restartHint && (

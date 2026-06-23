@@ -3865,6 +3865,11 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Capture the launch command now, before any in-app upgrade can
+            // swap the binary on disk (after which `current_exe()` resolves to a
+            // "(deleted)" path on Linux). Used by the post-loop self-respawn.
+            zeroclaw_runtime::restart::record_launch();
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -4055,6 +4060,11 @@ async fn main() -> Result<()> {
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }
+            // Bare-process auto-restart: the daemon has now torn down (the
+            // gateway listener is released), so launch the upgraded binary as a
+            // detached child before we exit. No-op unless an in-app upgrade
+            // requested a self-respawn.
+            zeroclaw_runtime::restart::respawn_if_requested();
             Ok(())
         }
 
