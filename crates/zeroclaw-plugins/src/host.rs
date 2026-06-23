@@ -76,11 +76,16 @@ impl PluginHost {
     }
 
     /// Parse the signature mode string from config into a `SignatureMode`.
-    pub fn parse_signature_mode(mode: &str) -> SignatureMode {
+    /// Parse a `[plugins.security] signature_mode` config string into a
+    /// [`SignatureMode`]. Returns `None` for any unrecognized value so the
+    /// caller can surface the misconfiguration under its attribution span
+    /// instead of silently degrading to the weakest posture. Case-insensitive.
+    pub fn parse_signature_mode(mode: &str) -> Option<SignatureMode> {
         match mode.to_lowercase().as_str() {
-            "strict" => SignatureMode::Strict,
-            "permissive" => SignatureMode::Permissive,
-            _ => SignatureMode::Disabled,
+            "strict" => Some(SignatureMode::Strict),
+            "permissive" => Some(SignatureMode::Permissive),
+            "disabled" => Some(SignatureMode::Disabled),
+            _ => None,
         }
     }
 
@@ -965,22 +970,46 @@ capabilities = ["tool"]
     }
 
     #[test]
+    fn from_plugins_dir_with_security_permissive_loads_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Permissive,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.list_plugins().len(),
+            1,
+            "permissive mode must load an unsigned plugin (signed-but-invalid is rejected by enforce_signature_policy, covered in signature.rs)"
+        );
+    }
+
+    #[test]
     fn parse_signature_mode_maps_config_strings() {
         assert_eq!(
             PluginHost::parse_signature_mode("strict"),
-            SignatureMode::Strict
+            Some(SignatureMode::Strict)
         );
         assert_eq!(
             PluginHost::parse_signature_mode("permissive"),
-            SignatureMode::Permissive
+            Some(SignatureMode::Permissive)
         );
         assert_eq!(
             PluginHost::parse_signature_mode("disabled"),
-            SignatureMode::Disabled
+            Some(SignatureMode::Disabled)
         );
+        // Case-insensitive: to_lowercase normalizes before matching.
         assert_eq!(
-            PluginHost::parse_signature_mode("nonsense"),
-            SignatureMode::Disabled
+            PluginHost::parse_signature_mode("STRICT"),
+            Some(SignatureMode::Strict)
         );
+        // Unrecognized values return None so the caller fails safe instead of
+        // silently degrading to the weakest posture on a config typo.
+        assert_eq!(PluginHost::parse_signature_mode("nonsense"), None);
+        assert_eq!(PluginHost::parse_signature_mode("sttict"), None);
     }
 }
