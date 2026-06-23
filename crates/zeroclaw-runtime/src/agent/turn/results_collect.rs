@@ -70,6 +70,7 @@ pub(crate) fn collect_tool_results(
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
                                 ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
@@ -81,8 +82,9 @@ pub(crate) fn collect_tool_results(
                 crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(
                                 ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
                             ),
@@ -99,6 +101,7 @@ pub(crate) fn collect_tool_results(
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model": model,
@@ -126,6 +129,7 @@ pub(crate) fn collect_tool_results(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_attrs(::serde_json::json!({"tool": tool_name, "receipt": receipt})),
                 "Tool receipt generated"
             );
@@ -195,6 +199,7 @@ pub(crate) fn check_identical_output_abort(
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": model,

@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
@@ -211,10 +211,42 @@ fn switch_tabs_keys() -> Vec<String> {
         .collect()
 }
 
+/// Display form of a config directory. Replaces the user's home prefix with
+/// "~" so a long path like "/home/alice/.zeroclaw" reads as
+/// "~/.zeroclaw" in the Config header. Falls back to the original path
+/// representation when the path is not under the current home directory or
+/// when the home directory cannot be resolved.
+fn shorten_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    // Canonicalize the home directory so the comparison is symmetric with the
+    // canonicalized config path. This handles symlinked $HOME setups common on
+    // macOS, NixOS, and container images.
+    let home_path = PathBuf::from(&home)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(home));
+    let to_tilde = |p: &Path| -> String {
+        match p.strip_prefix(&home_path) {
+            Ok(rel) => format!("~/{}", rel.to_string_lossy().trim_end_matches('/')),
+            Err(_) => p.display().to_string(),
+        }
+    };
+    if let Ok(canon) = path.canonicalize() {
+        return to_tilde(&canon);
+    }
+    to_tilde(path)
+}
+
 // ── App state ────────────────────────────────────────────────────
 
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
+    /// Cached display string for the active config directory, computed once at
+    /// construction so the tab bar does not re-stat the filesystem on every
+    /// render.
+    config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
@@ -291,6 +323,7 @@ impl App {
     pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
+            config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
             section_tab_area: None,
@@ -513,6 +546,15 @@ impl App {
             spans.push(Span::styled("   ", theme::dim_style()));
             spans.push(Span::styled(msg.to_string(), theme::warn_style()));
         }
+        // Surface the active config directory so the user can tell which
+        // on-disk state the displayed values came from when running with
+        // --config-dir, $ZEROCLAW_CONFIG_DIR, or a daemon backed by a
+        // different config source.
+        spans.push(Span::styled("   ", theme::dim_style()));
+        spans.push(Span::styled(
+            format!("config: {}", self.config_dir_display),
+            theme::dim_style(),
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
