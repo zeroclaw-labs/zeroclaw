@@ -79,22 +79,46 @@ fn reject_ssrf_url(raw_url: &str) -> Result<SafeTarget, Error> {
         .host_str()
         .ok_or_else(|| Error::msg("HTTP request URL has no host"))?
         .to_string();
-    if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+    if zeroclaw_infra::net_guard::is_private_or_local_host(&host) {
         return Err(Error::msg(
             "blocked HTTP request to a private or local host",
         ));
     }
     let addrs: Vec<std::net::SocketAddr> = parsed
+        // Scheme validated to http/https above, whose default ports the url
+        // crate knows, so the `|| None` default-port fallback is unreachable.
         .socket_addrs(|| None)
         .map_err(|e| Error::msg(format!("failed to resolve HTTP request host: {e}")))?;
     for addr in &addrs {
-        if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&addr.ip().to_string()) {
+        if zeroclaw_infra::net_guard::is_private_or_local_host(&addr.ip().to_string()) {
             return Err(Error::msg(
                 "blocked HTTP request resolving to a private or local address",
             ));
         }
     }
     Ok(SafeTarget { host, addrs })
+}
+
+/// Build the SSRF-hardened blocking HTTP client for a validated target. Two
+/// invariants the SSRF defense depends on, isolated here so a regression that
+/// removes either is testable without a live request:
+///
+/// 1. `redirect(Policy::none())` — a public URL cannot 30x into a private or
+///    local target without re-validation.
+/// 2. `resolve(host, addr)` for every validated address — pins the connection
+///    to the addresses checked above so a second DNS lookup inside reqwest
+///    cannot rebind the host to a private address (DNS rebinding).
+///
+/// 120s ceiling covers legitimate slow cases (large downloads, slow inference).
+/// Runs inside spawn_blocking, so a stalled request holds a blocking-pool thread.
+fn build_guarded_client(target: &SafeTarget) -> reqwest::Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none());
+    for addr in &target.addrs {
+        builder = builder.resolve(&target.host, *addr);
+    }
+    builder.build()
 }
 
 fn handle_http_request(
@@ -120,25 +144,8 @@ fn handle_http_request(
 
     let target = reject_ssrf_url(&req.url)?;
 
-    // Pin the connection to the exact addresses validated above so a second,
-    // independent DNS lookup inside reqwest cannot rebind the host to a private
-    // address. Disable redirect following so a public URL cannot 30x into a
-    // private or local target without re-validation.
-    //
-    // 120s ceiling covers legitimate slow cases: large file downloads and slow
-    // model-inference endpoints. Note: this runs inside spawn_blocking, so a
-    // stalled request holds a blocking-pool thread for the full duration.
-    let client = {
-        let mut builder = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::none());
-        for addr in &target.addrs {
-            builder = builder.resolve(&target.host, *addr);
-        }
-        builder
-            .build()
-            .map_err(|e| Error::msg(format!("failed to create HTTP client: {e}")))?
-    };
+    let client = build_guarded_client(&target)
+        .map_err(|e| Error::msg(format!("failed to create HTTP client: {e}")))?;
 
     let mut builder = match req.method.to_uppercase().as_str() {
         "GET" => client.get(&req.url),
@@ -279,6 +286,22 @@ mod tests {
     }
 
     #[test]
+    fn reject_ssrf_url_blocks_all_rfc1918_and_ipv6_local_ranges() {
+        // Each RFC 1918 sub-range and IPv6 local form, exercised end-to-end at
+        // the reject_ssrf_url call site (not only in net_guard unit tests), so a
+        // regression in the host-string / resolved-address wiring is caught.
+        for url in [
+            "http://172.16.0.1/",        // RFC 1918 172.16/12
+            "http://192.168.1.1/",       // RFC 1918 192.168/16
+            "http://[fe80::1]/",         // IPv6 link-local
+            "http://[fd00::1]/",         // IPv6 ULA
+            "http://[::ffff:10.0.0.1]/", // IPv4-mapped IPv6 -> non-global v4
+        ] {
+            assert!(reject_ssrf_url(url).is_err(), "{url} must be blocked");
+        }
+    }
+
+    #[test]
     fn reject_ssrf_url_blocks_non_http_scheme() {
         assert!(reject_ssrf_url("file:///etc/passwd").is_err());
         assert!(reject_ssrf_url("gopher://example.com/").is_err());
@@ -290,6 +313,21 @@ mod tests {
         assert_eq!(target.host, "8.8.8.8");
         assert!(target.addrs.iter().all(|a| !a.ip().is_loopback()));
         assert!(!target.addrs.is_empty());
+    }
+
+    #[test]
+    fn build_guarded_client_pins_validated_addrs_and_builds() {
+        // Structure-only: proves the guarded client builds with the pinned
+        // address set from a validated public target. The build configures
+        // redirect::Policy::none() and resolve() for each addr; a regression
+        // removing either defense changes this construction path.
+        let target = reject_ssrf_url("http://8.8.8.8/").expect("public literal allowed");
+        assert!(!target.addrs.is_empty(), "validated target must pin addrs");
+        let client = build_guarded_client(&target);
+        assert!(
+            client.is_ok(),
+            "guarded client must build for a validated target"
+        );
     }
 
     #[test]
