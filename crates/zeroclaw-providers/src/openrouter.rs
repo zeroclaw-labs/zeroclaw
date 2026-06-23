@@ -1343,6 +1343,7 @@ mod tests {
 
         let request = ChatRequest {
             model: "google/gemini-2.5-pro".into(),
+            models: None,
             messages: messages
                 .iter()
                 .map(|msg| Message {
@@ -2039,6 +2040,7 @@ mod tests {
         let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2055,6 +2057,7 @@ mod tests {
             .with_extra_body(serde_json::json!({}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2071,6 +2074,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2092,6 +2096,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"temperature": 0.9}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2108,6 +2113,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
