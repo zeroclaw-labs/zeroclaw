@@ -2116,7 +2116,6 @@ impl Agent {
                     }),
                 ),
             )
-            )
             .await;
 
         // Feed the accumulated per-call usage into the AgentEnd guard before
@@ -2537,7 +2536,6 @@ impl Agent {
                             turn_id: &turn_id,
                         }),
                     ),
-                )
                 )
                 .await;
 
@@ -6813,18 +6811,73 @@ mod tests {
         expected_alias: Option<&str>,
         expected_channel: Option<&str>,
     ) {
-        let turn_ids: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                ObserverEvent::AgentStart { turn_id, .. }
-                | ObserverEvent::LlmRequest { turn_id, .. }
-                | ObserverEvent::LlmResponse { turn_id, .. }
-                | ObserverEvent::ToolCallStart { turn_id, .. }
-                | ObserverEvent::ToolCall { turn_id, .. }
-                | ObserverEvent::AgentEnd { turn_id, .. } => turn_id.clone(),
-                _ => None,
-            })
-            .collect();
+        // Regression guard for PR #7771: every lifecycle observer event that
+        // carries the `(channel, agent_alias, turn_id)` correlation triple
+        // MUST populate all three. These six variants back OTel parent-child
+        // span linkage and per-agent attribution; a `None` in any field
+        // silently breaks trace correlation. The original `run()` entry point
+        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
+        // `turn_id: None` because it recorded events outside the turn engine.
+        //
+        // This checks each event individually (no skipping
+        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
+        // than only checking consistency among the non-`None` subset — a
+        // single `None` field is a failure, not something to be filtered out.
+        let mut turn_ids: Vec<String> = Vec::new();
+        for event in events {
+            let (variant, channel, agent_alias, turn_id) = match event {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentStart", channel, agent_alias, turn_id),
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentEnd", channel, agent_alias, turn_id),
+                ObserverEvent::LlmRequest {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmRequest", channel, agent_alias, turn_id),
+                ObserverEvent::LlmResponse {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmResponse", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCallStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCallStart", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCall", channel, agent_alias, turn_id),
+                _ => continue,
+            };
+            assert!(
+                channel.is_some(),
+                "{variant} observer event must carry channel, got None: {event:?}"
+            );
+            assert!(
+                agent_alias.is_some(),
+                "{variant} observer event must carry agent_alias, got None: {event:?}"
+            );
+            assert!(
+                turn_id.is_some(),
+                "{variant} observer event must carry turn_id, got None: {event:?}"
+            );
+            turn_ids.push(turn_id.clone().expect("checked Some above"));
+        }
 
         assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
         let first = &turn_ids[0];
@@ -6835,35 +6888,35 @@ mod tests {
 
         if let Some(alias) = expected_alias {
             for e in events {
-                match e {
-                    ObserverEvent::LlmRequest { agent_alias, .. }
+                let agent_alias = match e {
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                    | ObserverEvent::AgentEnd { agent_alias, .. }
+                    | ObserverEvent::LlmRequest { agent_alias, .. }
                     | ObserverEvent::LlmResponse { agent_alias, .. }
                     | ObserverEvent::ToolCallStart { agent_alias, .. }
-                    | ObserverEvent::ToolCall { agent_alias, .. } => {
-                        assert_eq!(
-                            agent_alias.as_deref(),
-                            Some(alias),
-                            "agent_alias should be consistent"
-                        );
-                    }
-                    _ => {}
-                }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    _ => continue,
+                };
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some(alias),
+                    "agent_alias should be consistent"
+                );
             }
         }
 
         if let Some(channel) = expected_channel {
             for e in events {
-                match e {
+                let ch = match e {
                     ObserverEvent::AgentStart { channel: ch, .. }
                     | ObserverEvent::LlmRequest { channel: ch, .. }
                     | ObserverEvent::LlmResponse { channel: ch, .. }
                     | ObserverEvent::ToolCallStart { channel: ch, .. }
                     | ObserverEvent::ToolCall { channel: ch, .. }
-                    | ObserverEvent::AgentEnd { channel: ch, .. } => {
-                        assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
-                    }
-                    _ => {}
-                }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    _ => continue,
+                };
+                assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
             }
         }
     }
@@ -7333,12 +7386,13 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
-        assert_all_events_share_turn_id(&events, None, Some("agent"));
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 }
