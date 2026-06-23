@@ -339,13 +339,20 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+
       - name: Resolve base SHA
         id: base
         run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Docs quality gate (markdown lint + em-dash prose check)
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
+
+      - name: Docs links gate (added links check)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_links_gate.sh
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
