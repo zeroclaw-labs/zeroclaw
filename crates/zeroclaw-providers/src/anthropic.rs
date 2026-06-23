@@ -3,6 +3,7 @@ use crate::traits::{
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
@@ -1613,7 +1614,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let body = match Self::build_streaming_request(&native_request) {
             Ok(body) => body,
-            Err(e) => return stream::once(async move { Err(e.to_string()) }).boxed(),
+            Err(e) => return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) }).boxed(),
         };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
