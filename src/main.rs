@@ -6227,32 +6227,13 @@ fn is_cli_placeholder_name(name: &str) -> bool {
 
 #[must_use]
 fn is_common_html_tag(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "a" | "abbr"
-            | "br"
-            | "code"
-            | "details"
-            | "div"
-            | "em"
-            | "img"
-            | "kbd"
-            | "li"
-            | "ol"
-            | "p"
-            | "samp"
-            | "span"
-            | "strong"
-            | "summary"
-            | "table"
-            | "tbody"
-            | "td"
-            | "th"
-            | "thead"
-            | "tr"
-            | "ul"
-            | "var"
-    )
+    const COMMON_HTML_TAGS: &[&str] = &[
+        "a", "abbr", "br", "code", "details", "div", "em", "img", "kbd", "li", "ol", "p", "samp",
+        "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr", "ul", "var",
+    ];
+
+    let normalized = name.to_ascii_lowercase();
+    COMMON_HTML_TAGS.contains(&normalized.as_str())
 }
 
 // ─── Gateway helper functions ───────────────────────────────────────────────
