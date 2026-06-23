@@ -283,5 +283,5 @@ rmdir /s /q "%USERPROFILE%\.zeroclaw"
 ## Next
 
 - [Service management](./service.md)
-- [Quick start](../getting-started/quick-start.md)
+- [Quick start](../getting-started/quickstart.md)
 - [Operations → Overview](../ops/overview.md)

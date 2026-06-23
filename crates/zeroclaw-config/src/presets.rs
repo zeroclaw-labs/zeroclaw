@@ -70,8 +70,11 @@ pub const RISK_PRESETS: &[RiskPreset] = &[
     RiskPreset {
         preset_name: "balanced",
         label: "Balanced",
-        help: "Sensible day-to-day defaults. Workspace-scoped with approval \
-               gates on risky operations. Recommended for most users.",
+        help: "Trusted daily driver for a personal dev box. Supervised, \
+               workspace-scoped with sensitive paths blocked and the sandbox \
+               on. Any command runs without an allowlist, but high-risk \
+               commands stay blocked unless explicitly allowlisted. \
+               Recommended for most users.",
         values: balanced_risk,
     },
     RiskPreset {
@@ -113,10 +116,32 @@ fn locked_down_risk() -> RiskProfileConfig {
 }
 
 fn balanced_risk() -> RiskProfileConfig {
-    // Schema default is already the Balanced shape (Supervised,
-    // workspace_only=true, medium-risk approval). Use it directly so
-    // the preset can't drift away from the schema default by accident.
-    RiskProfileConfig::default()
+    // Trusted-local daily-driver shape: Supervised autonomy, workspace-scoped
+    // with sensitive paths blocked, sandbox on, and any command permitted with
+    // high-risk commands still gated. `allowed_commands: ["*"]` lifts the
+    // medium-risk allowlist friction, while `block_high_risk_commands: true`
+    // keeps the `*` wildcard from exempting high-risk commands: `*` is not an
+    // explicit allowlist entry, so a high-risk command matched only by `*` is
+    // blocked outright (it never reaches the approval branch), not merely
+    // prompted. Medium-risk approval is off so routine work does not interrupt.
+    RiskProfileConfig {
+        level: AutonomyLevel::Supervised,
+        workspace_only: true,
+        allowed_commands: vec!["*".to_string()],
+        forbidden_paths: default_forbidden_paths(),
+        require_approval_for_medium_risk: false,
+        block_high_risk_commands: true,
+        shell_env_passthrough: vec![],
+        auto_approve: vec![],
+        always_ask: vec![],
+        allowed_roots: vec![],
+        delegation_policy: DelegationPolicy::default(),
+        allowed_tools: vec![],
+        excluded_tools: vec![],
+        sandbox_enabled: Some(true),
+        sandbox_backend: None,
+        firejail_args: vec![],
+    }
 }
 
 fn yolo_risk() -> RiskProfileConfig {
@@ -532,17 +557,59 @@ mod tests {
         }
     }
 
-    /// The `Balanced` preset must equal the schema's `Default::default()` —
-    /// that's the contract that lets us call `RiskProfileConfig::default()`
-    /// / `RuntimeProfileConfig::default()` for the Balanced factory
-    /// instead of duplicating field literals.
     #[test]
-    fn balanced_risk_matches_schema_default() {
+    fn balanced_risk_is_trusted_local_shape() {
         let preset = risk_preset("balanced").unwrap();
-        let preset_values = (preset.values)();
-        let schema_default = RiskProfileConfig::default();
-        // Compare via Debug since RiskProfileConfig doesn't derive PartialEq.
-        assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+        let v = (preset.values)();
+        // Supervised, workspace-scoped, sandbox on: a trusted personal dev box.
+        assert_eq!(v.level, AutonomyLevel::Supervised);
+        assert!(v.workspace_only);
+        assert_eq!(v.sandbox_enabled, Some(true));
+        // Any command runs without an allowlist, but high-risk is blocked, not
+        // prompted: the `*` wildcard is not an explicit exemption, so
+        // block_high_risk_commands rejects high-risk commands outright while
+        // medium-risk friction is off.
+        assert_eq!(v.allowed_commands, vec!["*".to_string()]);
+        assert!(v.block_high_risk_commands);
+        assert!(!v.require_approval_for_medium_risk);
+    }
+
+    #[test]
+    fn balanced_risk_allows_routine_commands_but_blocks_high_risk() {
+        let preset = risk_preset("balanced").unwrap();
+        let values = (preset.values)();
+        let policy = crate::policy::SecurityPolicy {
+            autonomy: values.level,
+            allowed_commands: values.allowed_commands.clone(),
+            block_high_risk_commands: values.block_high_risk_commands,
+            require_approval_for_medium_risk: values.require_approval_for_medium_risk,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        for cmd in ["ls", "cat README.md", "git status"] {
+            assert!(
+                policy.is_command_allowed(cmd),
+                "balanced must allow routine command `{cmd}` without an allowlist",
+            );
+        }
+        // High-risk command passes the allowlist but is blocked outright at
+        // execution: the `*` wildcard is not an explicit allowlist entry, so
+        // block_high_risk_commands rejects it even when approved=true. This is
+        // a hard block, not an approval prompt.
+        assert!(policy.is_command_allowed("rm -rf node_modules"));
+        let err_unapproved = policy
+            .validate_command_execution("rm -rf node_modules", false)
+            .expect_err("balanced must block a wildcard-matched high-risk command");
+        let err_approved = policy
+            .validate_command_execution("rm -rf node_modules", true)
+            .expect_err("blocked even with approved=true: not an approval prompt");
+        assert!(
+            err_approved.contains("high-risk command is disallowed"),
+            "must be the hard-block error, not the approval-required one: {err_approved}",
+        );
+        assert_eq!(
+            err_unapproved, err_approved,
+            "approval state must not change the outcome for a wildcard-matched high-risk command",
+        );
     }
 
     #[test]

@@ -91,9 +91,10 @@ pub struct TaskRecord {
     #[serde(default)]
     pub idem_key: Option<String>,
     /// EPIC D attribution (Principal co-design `COORD-principal-contract.md` §7/R3): the
-    /// authenticated `Principal.id` that originated this run. Additive & deferred — it is
-    /// `Option<String>` only because the field is added before the auth effort lands the
-    /// `zeroclaw_api::PrincipalId` newtype; the type swaps to `Option<PrincipalId>` then.
+    /// authenticated `Principal.id` that originated this run. Additive and unstamped today:
+    /// stored as `Option<String>` (a serialization-friendly primitive) and left `None` until
+    /// EPIC D wires population from the now-landed `zeroclaw_api::principal::PrincipalId`; the
+    /// type swaps to `Option<PrincipalId>` as part of that wiring.
     /// It resolves to the carried `Principal.id` (never a bare principal-`None`).
     #[serde(default)]
     pub principal_id: Option<String>,
@@ -173,6 +174,6 @@ mod tests {
         assert!(!rec.delivered);
         assert!(rec.parent_id.is_none());
         assert!(rec.originator_route.is_none());
-        assert!(rec.principal_id.is_none()); // EPIC-D deferred attribution defaults absent
+        assert!(rec.principal_id.is_none()); // EPIC-D attribution not yet stamped; absent
     }
 }

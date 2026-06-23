@@ -118,6 +118,20 @@ fn sanitize_tool_name(raw: &str) -> String {
     format!("{head}{suffix}")
 }
 
+/// Name of the environment variable that carries the in-flight session key
+/// into skill shell tools.
+const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
+
+/// The session key for the current turn, or `None` when the turn is unscoped
+/// (one-shot / webhook). Empty keys are treated as absent.
+fn get_session_id() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|key| !key.is_empty())
+}
+
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
     tool_name: String,
@@ -262,6 +276,11 @@ impl Tool for SkillShellTool {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
+        }
+
+        // Injected after env_clear so it survives; absent when the turn is unscoped.
+        if let Some(session_id) = get_session_id() {
+            cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
         let result =
@@ -459,6 +478,28 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[tokio::test]
+    async fn get_session_id_returns_scoped_session_key() {
+        let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
+            get_session_id()
+        })
+        .await;
+        assert_eq!(got, Some("gw_abc-123".to_string()));
+    }
+
+    #[test]
+    fn get_session_id_none_outside_a_scoped_turn() {
+        assert_eq!(get_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn get_session_id_none_for_empty_session_key() {
+        let got =
+            crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
+                .await;
+        assert_eq!(got, None);
     }
 
     fn sample_skill_tool() -> SkillTool {

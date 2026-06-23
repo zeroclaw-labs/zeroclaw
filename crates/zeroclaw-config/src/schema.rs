@@ -3337,9 +3337,11 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub knowledge_bundles: Vec<String>,
-    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`,
-    /// itself a named group of MCP servers; agents pick which bundles to
-    /// load.
+    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
+    /// group of MCP servers. Secure by default: an agent is granted only the
+    /// servers named by its bundles. An agent with no `mcp_bundles` receives
+    /// no MCP servers (omission is not a grant). See
+    /// `Config::mcp_servers_for_agent`.
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
@@ -3394,6 +3396,16 @@ pub struct AliasedAgentConfig {
     #[tab(Providers)]
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
+
+    /// Per-agent override for the context-compression summarizer provider, as
+    /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
+    /// the runtime profile's `context_compression.summary_provider`, else the
+    /// agent's own resolved provider+model. Reference only, never a copy;
+    /// resolved by [`Config::effective_summary_provider`]. Validated in
+    /// `Config::validate()`.
+    #[tab(Providers)]
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
 
     /// Auto-allow delegation to every agent sharing this agent's risk
     /// profile. Default `true` preserves the historical reach where any
@@ -3465,6 +3477,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
@@ -3628,6 +3641,29 @@ impl Config {
             return None;
         }
         self.runtime_profiles.get(profile_alias)
+    }
+
+    /// Effective context-compression summarizer provider for an agent:
+    /// agent-level `summary_provider` override → the runtime profile's
+    /// `context_compression.summary_provider` → `None` (the caller then reuses
+    /// the agent's own provider+model, optionally via the deprecated
+    /// `summary_model` swap). Unlike the inert agent-inline tunables below, the
+    /// agent-level override IS consulted — it's an explicit per-agent choice,
+    /// mirroring `classifier_provider`'s "empty = inherit" semantics.
+    #[must_use]
+    pub fn effective_summary_provider(
+        &self,
+        agent_alias: &str,
+    ) -> Option<crate::providers::ModelProviderRef> {
+        if let Some(a) = self.agents.get(agent_alias)
+            && !a.summary_provider.trim().is_empty()
+        {
+            return Some(a.summary_provider.clone());
+        }
+        self.runtime_profile_for_agent(agent_alias)
+            .map(|p| &p.context_compression.summary_provider)
+            .filter(|r| !r.trim().is_empty())
+            .cloned()
     }
 
     // ── Effective per-agent runtime tunables ──────────────────────────
@@ -3902,6 +3938,68 @@ impl Config {
             .join("agents")
             .join(agent_alias)
             .join("workspace")
+    }
+
+    /// Effective MCP servers granted to an agent by its `mcp_bundles`.
+    ///
+    /// Secure by default: omission is not a grant. An agent is reached via
+    /// `resolved_agent_config`; an unknown alias or one with no `mcp_bundles`
+    /// receives NO MCP servers. See [`Self::mcp_servers_for_bundles`] for how
+    /// a non-empty bundle list resolves to servers.
+    #[must_use]
+    pub fn mcp_servers_for_agent(&self, agent_alias: &str) -> Vec<McpServerConfig> {
+        match self.resolved_agent_config(agent_alias) {
+            Some(agent) => self.mcp_servers_for_bundles(&agent.mcp_bundles),
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve a set of `[mcp_bundles.<alias>]` references to the concrete
+    /// `[mcp.servers]` entries they grant.
+    ///
+    /// Secure by default: omission is not a grant.
+    /// - An empty `bundle_aliases` grants NO servers (`Vec::new()`).
+    /// - The grant is the union of each referenced bundle's `servers`, in
+    ///   first-seen order with duplicates dropped.
+    /// - Deny wins: a server name listed in ANY referenced bundle's `exclude`
+    ///   is removed from the grant, regardless of which bundle included it.
+    /// - An unknown bundle alias grants nothing (it is skipped, not an error)
+    ///   and a server name with no matching `[mcp.servers]` entry grants
+    ///   nothing. Both fail closed: a misconfiguration narrows access, never
+    ///   widens it.
+    #[must_use]
+    pub fn mcp_servers_for_bundles(&self, bundle_aliases: &[String]) -> Vec<McpServerConfig> {
+        if bundle_aliases.is_empty() {
+            return Vec::new();
+        }
+        // Deny wins: collect every excluded name across the referenced bundles
+        // first, so an include in one bundle cannot defeat an exclude in another.
+        let mut excluded: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for alias in bundle_aliases {
+            if let Some(bundle) = self.mcp_bundles.get(alias) {
+                for name in &bundle.exclude {
+                    excluded.insert(name.as_str());
+                }
+            }
+        }
+        // Union of granted names in first-seen order, skipping excludes.
+        let mut granted: Vec<&str> = Vec::new();
+        for alias in bundle_aliases {
+            if let Some(bundle) = self.mcp_bundles.get(alias) {
+                for name in &bundle.servers {
+                    let n = name.as_str();
+                    if !excluded.contains(n) && !granted.contains(&n) {
+                        granted.push(n);
+                    }
+                }
+            }
+        }
+        // Resolve names against the configured servers. A name that matches no
+        // `[mcp.servers]` entry is not granted.
+        granted
+            .into_iter()
+            .filter_map(|name| self.mcp.servers.iter().find(|s| s.name == name).cloned())
+            .collect()
     }
 
     /// `<install>/shared/` — directory shared across every agent on this
@@ -5295,6 +5393,44 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
+/// An external, user-configured skill registry ZeroClaw can install from.
+///
+/// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
+/// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ExternalRegistry {
+    /// Short alias used in `registry:<name>/<skill>` install specs.
+    pub name: String,
+    /// Git repository URL of the registry (must expose a top-level `skills/` dir).
+    pub url: String,
+    /// Registry protocol. Only `"git"` is supported today; other protocols
+    /// are reserved for a future additive release.
+    #[serde(default = "default_extra_registry_kind")]
+    pub kind: String,
+    /// Whether this registry is eligible for installs. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl ExternalRegistry {
+    /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
+    ///
+    /// Keep this as the single registry-alias rule used by both config
+    /// validation and runtime install-spec parsing. Lowercase aliases also
+    /// avoid clone-directory collisions on case-insensitive filesystems.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+}
+
+fn default_extra_registry_kind() -> String {
+    "git".to_string()
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5316,6 +5452,11 @@ pub struct SkillsConfig {
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
     pub registry_url: Option<String>,
+    /// Additional user-configured skill registries, installed via
+    /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
+    /// is cloned to its own `extra-registry-<name>/` workspace directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -5820,6 +5961,24 @@ pub struct ProviderCostRates {
     #[serde(default)]
     #[nested]
     pub transcription: crate::providers::TranscriptionCostRatesByProvider,
+}
+
+/// The provider families that carry `[cost.rates.providers.*]` rate sheets, as
+/// the trailing segment shared by their `[providers.<category>]` section. One
+/// entry per `#[nested]` field on `ProviderCostRates`; this list is the registry
+/// the TUI and web surfaces resolve cost tabs from, never a per-surface literal.
+pub const PROVIDER_COST_CATEGORIES: [&str; 3] = ["models", "tts", "transcription"];
+
+/// Cost-rate category for a `providers.<category>` section key, or `None` for
+/// sections that carry no rate sheets. Resolves against
+/// [`PROVIDER_COST_CATEGORIES`] so a new rate-bearing family is added in one
+/// place.
+#[must_use]
+pub fn cost_category_for_provider_section(section_key: &str) -> Option<&'static str> {
+    let suffix = section_key.strip_prefix("providers.")?;
+    PROVIDER_COST_CATEGORIES
+        .into_iter()
+        .find(|category| *category == suffix)
 }
 
 /// Token-cost rates for a single chat / completion model, in USD per
@@ -9558,6 +9717,12 @@ pub struct MemoryConfig {
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_api_key: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -9756,6 +9921,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -10404,15 +10570,21 @@ pub struct KnowledgeBundleConfig {
 
 /// Named MCP server bundle (`[mcp_bundles.<alias>]`).
 ///
-/// A reusable group of MCP servers that can be activated together by alias.
+/// A reusable group of MCP servers granted to an agent that references the
+/// bundle by alias in `agents.<alias>.mcp_bundles`. Server IDs are matched
+/// against `[mcp.servers]` by `name`. Resolution is secure by default (see
+/// `Config::mcp_servers_for_bundles`): an ID with no matching server grants
+/// nothing, and `exclude` wins over `servers` across every bundle an agent
+/// references.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "mcp_bundle"]
 #[serde(default)]
 pub struct McpBundleConfig {
-    /// MCP server IDs to include in this bundle.
+    /// MCP server IDs (`[mcp.servers].name`) granted by this bundle.
     pub servers: Vec<String>,
-    /// MCP server IDs to exclude from this bundle.
+    /// MCP server IDs removed from the grant. Deny wins: a name listed here is
+    /// excluded even if another referenced bundle includes it.
     pub exclude: Vec<String>,
 }
 
@@ -12904,6 +13076,18 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// Allowed group chats by JID (Web mode). An empty list (the default)
+    /// permits all groups; a non-empty list drops every group message whose
+    /// chat JID matches no entry. Each entry matches either the full group
+    /// JID (`123456789012345@g.us`) or the JID user part - the segment before
+    /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
+    /// Direct messages bypass this filter regardless of list contents.
+    /// Modeled on the Matrix channel's `allowed_rooms`; it gates group
+    /// identity, which `dm_policy`/`group_policy` (chat type) and the
+    /// sender allowlist (sender) do not.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -16465,6 +16649,7 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_cross_provider_summary_model_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -16484,6 +16669,108 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the #7964 cross-provider shape on a legacy config that has NOT
+    /// migrated to `summary_provider`. The deprecated
+    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare model
+    /// id dispatched onto each consuming agent's OWN provider; when a single
+    /// profile is shared by agents resolving to MORE THAN ONE distinct provider,
+    /// that one bare id is cross-provider for at least one of them and silently
+    /// fails at runtime. The new `summary_provider` (agent override or profile
+    /// level) supersedes the bare id and is self-contained, so an agent that
+    /// sets it is safe and excluded from the count.
+    ///
+    /// This is the offline, deterministic "startup diagnostic" the #7964 review
+    /// asked for: no schema bump, no network, no model catalog. It names the
+    /// profile, the affected agents, and their differing providers, and
+    /// recommends migrating to `context_compression.summary_provider`.
+    fn collect_cross_provider_summary_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (profile_alias, profile) in &self.runtime_profiles {
+            // Only the deprecated bare summary_model is at risk; a profile-level
+            // summary_provider already supersedes it for every consumer.
+            if !profile
+                .context_compression
+                .summary_provider
+                .trim()
+                .is_empty()
+            {
+                continue;
+            }
+            let Some(summary_model) = profile.context_compression.summary_model.as_deref() else {
+                continue;
+            };
+            if summary_model.trim().is_empty() {
+                continue;
+            }
+
+            // Gather the agents that (a) reference this profile and (b) have no
+            // agent-level summary_provider override (an override supersedes the
+            // bare id, so the agent is safe). For each, resolve the canonical
+            // provider entry its bare summary_model would be dispatched onto.
+            let mut affected: Vec<(String, String)> = Vec::new();
+            for (agent_alias, agent) in &self.agents {
+                if agent.runtime_profile.trim() != profile_alias {
+                    continue;
+                }
+                if !agent.summary_provider.trim().is_empty() {
+                    continue;
+                }
+                let provider_label = self.canonical_provider_label(agent.model_provider.trim());
+                affected.push((agent_alias.clone(), provider_label));
+            }
+
+            // The bug only manifests across distinct providers: a single shared
+            // bare id sent to two or more different providers. Same-provider use
+            // is the deprecated-but-correct case and stays silent here (the
+            // runtime deprecation WARN still nudges migration).
+            let distinct: std::collections::BTreeSet<&str> =
+                affected.iter().map(|(_, p)| p.as_str()).collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+
+            let mut agents_sorted: Vec<&(String, String)> = affected.iter().collect();
+            agents_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let detail = agents_sorted
+                .iter()
+                .map(|(name, provider)| format!("{name} -> {provider}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "cross_provider_summary_model",
+                format!(
+                    "runtime_profiles.{profile_alias}.context_compression.summary_model \
+                     ({summary_model:?}) is a bare model id reused by agents resolving to \
+                     different providers ({detail}); the deprecated summary_model is \
+                     dispatched on each agent's own provider, so it is sent to the wrong \
+                     provider for at least one of them and silently fails at runtime (#7964). \
+                     Migrate to context_compression.summary_provider (or an agent-level \
+                     summary_provider), which is self-contained and runs on its own provider."
+                ),
+                format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
+            ));
+        }
+    }
+
+    /// Canonical label for an agent's resolved model provider, used to decide
+    /// whether two agents sit on distinct providers. A non-empty ref that
+    /// resolves through `[providers.models]` collapses to its canonical
+    /// `<family>.<alias>` so equivalent spellings (bare vs dotted) compare
+    /// equal; an empty or unresolved ref keeps its raw form (empty becomes a
+    /// stable sentinel) so it still participates as a distinct bucket.
+    fn canonical_provider_label(&self, provider_ref: &str) -> String {
+        if provider_ref.is_empty() {
+            return "<agent default provider>".to_string();
+        }
+        match self.providers.models.find_by_name(provider_ref) {
+            Some((family, alias, _)) => format!("{family}.{alias}"),
+            None => provider_ref.to_string(),
+        }
     }
 
     /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
@@ -16817,6 +17104,57 @@ impl Config {
             }
             if let Err(e) = crate::skill_bundles::validate_uniqueness(self, &install_root) {
                 validation_bail!(InvalidFormat, "skill_bundles", "{e}");
+            }
+        }
+
+        // MCP bundles: resolution is secure by default, so a dangling
+        // reference fails closed (the agent is granted fewer servers, never
+        // more). Surface the misconfiguration as a warning so an operator is
+        // not left wondering why an agent's MCP tools vanished, without
+        // turning a typo into a hard startup failure.
+        {
+            let known_servers: std::collections::HashSet<&str> =
+                self.mcp.servers.iter().map(|s| s.name.as_str()).collect();
+            for (bundle_alias, bundle) in &self.mcp_bundles {
+                for server in bundle.servers.iter().chain(bundle.exclude.iter()) {
+                    if !known_servers.contains(server.as_str()) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_bundle": bundle_alias,
+                                "server": server,
+                            })),
+                            "mcp_bundles.<alias> references an MCP server name not in [mcp.servers]; it grants nothing"
+                        );
+                    }
+                }
+            }
+            for agent_alias in self.agents.keys() {
+                let Some(agent) = self.resolved_agent_config(agent_alias) else {
+                    continue;
+                };
+                for bundle_alias in &agent.mcp_bundles {
+                    if !self.mcp_bundles.contains_key(bundle_alias) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "agent": agent_alias,
+                                "mcp_bundle": bundle_alias,
+                            })),
+                            "agents.<alias>.mcp_bundles references an undefined [mcp_bundles.<alias>]; the agent is granted no servers from it"
+                        );
+                    }
+                }
             }
         }
 
@@ -17415,6 +17753,50 @@ impl Config {
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
+        // Skills — extra registries
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (i, reg) in self.skills.extra_registries.iter().enumerate() {
+                if reg.name.trim().is_empty() {
+                    anyhow::bail!("skills.extra_registries[{i}].name must not be empty");
+                }
+                if !ExternalRegistry::is_valid_name(&reg.name) {
+                    anyhow::bail!(
+                        "skills.extra_registries[{i}].name '{}' is invalid; use only lowercase ASCII letters, numbers, '-' or '_' so it can be addressed as registry:<name>/<skill>",
+                        reg.name
+                    );
+                }
+                if !seen.insert(reg.name.as_str()) {
+                    anyhow::bail!("skills.extra_registries has duplicate name '{}'", reg.name);
+                }
+                if reg.url.trim().is_empty() {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].url must not be empty",
+                        reg.name
+                    );
+                }
+                if reg.kind != "git" {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
+                        reg.name,
+                        reg.kind
+                    );
+                }
+                match reqwest::Url::parse(&reg.url) {
+                    Ok(u) if matches!(u.scheme(), "http" | "https" | "file") => {}
+                    Ok(u) => anyhow::bail!(
+                        "skills.extra_registries[{}].url scheme '{}' is unsupported (use http, https, or file)",
+                        reg.name,
+                        u.scheme()
+                    ),
+                    Err(e) => anyhow::bail!(
+                        "skills.extra_registries[{}].url is not a valid URL: {e}",
+                        reg.name
+                    ),
+                }
+            }
+        }
+
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
@@ -17526,6 +17908,43 @@ impl Config {
             );
         }
 
+        // Per-profile validation: the context-compression summarizer provider
+        // ref (#7964) must resolve to a configured `[providers.models.*]` alias.
+        // Empty = inherit (valid). A shared profile fails loud at config time
+        // instead of only when some agent using it compresses.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let value = self.runtime_profiles[palias]
+                .context_compression
+                .summary_provider
+                .trim();
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!(
+                                "runtime_profiles.{palias}.context_compression.summary_provider"
+                            ),
+                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("runtime_profiles.{palias}.context_compression.summary_provider"),
+                    "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
+                ),
+            }
+        }
+
         // Per-agent validation. Mandatory + alias-existence checks live
         // here so the gateway PATCH path returns structured per-field
         // errors and the frontend never owns this rule. Sorted iteration
@@ -17622,6 +18041,12 @@ impl Config {
                     "providers.models",
                     "classifier_provider",
                     agent.classifier_provider.trim(),
+                ),
+                // Agent-level context-compression summarizer override (#7964).
+                (
+                    "providers.models",
+                    "summary_provider",
+                    agent.summary_provider.trim(),
                 ),
             ];
             for (section_prefix, field, value) in typed_provider_refs {
@@ -19084,6 +19509,49 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    #[::core::prelude::v1::test]
+    fn provider_cost_categories_match_rate_struct_fields() {
+        let json = serde_json::to_value(super::ProviderCostRates::default()).unwrap();
+        let mut fields: Vec<String> = json
+            .as_object()
+            .expect("ProviderCostRates serializes to a map")
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        let mut registry: Vec<String> = super::PROVIDER_COST_CATEGORIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        registry.sort();
+        assert_eq!(
+            fields, registry,
+            "PROVIDER_COST_CATEGORIES must list exactly the ProviderCostRates rate-sheet fields"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cost_category_resolves_only_rate_bearing_sections() {
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.models"),
+            Some("models")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.tts"),
+            Some("tts")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.transcription"),
+            Some("transcription")
+        );
+        assert_eq!(super::cost_category_for_provider_section("channels"), None);
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.unknown"),
+            None
+        );
+        assert_eq!(super::cost_category_for_provider_section("models"), None);
+    }
+
     #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
@@ -19324,6 +19792,154 @@ mod tests {
             .any(|line| line == exact || line.starts_with(&nested))
     }
 
+    fn mcp_server(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            ..McpServerConfig::default()
+        }
+    }
+
+    /// A config with three configured servers (`a`, `b`, `c`) plus the given
+    /// `[mcp_bundles.<alias>]` entries. Uses `push`/`insert` (not field
+    /// assignment) to avoid `clippy::field_reassign_with_default`.
+    fn config_with_mcp_bundles(bundles: Vec<(&str, McpBundleConfig)>) -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server("a"));
+        config.mcp.servers.push(mcp_server("b"));
+        config.mcp.servers.push(mcp_server("c"));
+        for (alias, bundle) in bundles {
+            config.mcp_bundles.insert(alias.to_string(), bundle);
+        }
+        config
+    }
+
+    #[test]
+    async fn mcp_bundles_empty_grants_no_servers() {
+        // Secure by default: omission is not a grant.
+        let config = config_with_mcp_bundles(vec![]);
+        assert!(config.mcp_servers_for_bundles(&[]).is_empty());
+    }
+
+    #[test]
+    async fn mcp_bundles_union_resolves_and_dedups() {
+        let config = config_with_mcp_bundles(vec![
+            (
+                "x",
+                McpBundleConfig {
+                    servers: vec!["a".into(), "b".into()],
+                    exclude: vec![],
+                },
+            ),
+            (
+                "y",
+                McpBundleConfig {
+                    servers: vec!["b".into(), "c".into()],
+                    exclude: vec![],
+                },
+            ),
+        ]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "y".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b", "c"],
+            "union across bundles, first-seen order, deduplicated"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundles_exclude_wins_across_bundles() {
+        // `b` is included by bundle `x` but excluded by bundle `y`; deny wins.
+        let config = config_with_mcp_bundles(vec![
+            (
+                "x",
+                McpBundleConfig {
+                    servers: vec!["a".into(), "b".into()],
+                    exclude: vec![],
+                },
+            ),
+            (
+                "y",
+                McpBundleConfig {
+                    servers: vec!["c".into()],
+                    exclude: vec!["b".into()],
+                },
+            ),
+        ]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "y".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "c"],
+            "an excluded server is denied even when another referenced bundle includes it"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundles_unknown_bundle_and_dangling_name_grant_nothing() {
+        // An unknown bundle alias and a server name with no `[mcp.servers]`
+        // entry both fail closed (grant nothing).
+        let config = config_with_mcp_bundles(vec![(
+            "x",
+            McpBundleConfig {
+                servers: vec!["a".into(), "ghost".into()],
+                exclude: vec![],
+            },
+        )]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "missing".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "a dangling server name and an unknown bundle alias grant nothing"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_grants_only_via_agent_bundles() {
+        let mut config = config_with_mcp_bundles(vec![(
+            "aa",
+            McpBundleConfig {
+                servers: vec!["a".into()],
+                exclude: vec![],
+            },
+        )]);
+        config.agents.insert(
+            "aaatools".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["aa".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .agents
+            .insert("defzc".to_string(), AliasedAgentConfig::default());
+
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent("aaatools")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(granted, vec!["a"], "agent is granted its bundle's servers");
+        assert!(
+            config.mcp_servers_for_agent("defzc").is_empty(),
+            "an agent with no mcp_bundles is granted no MCP servers (omission is not a grant)"
+        );
+        assert!(
+            config.mcp_servers_for_agent("ghost").is_empty(),
+            "an unknown agent is granted no MCP servers"
+        );
+    }
+
     fn parse_test_config(raw: &str) -> Config {
         let mut merged = raw.trim().to_string();
         for table in [
@@ -19559,6 +20175,96 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    fn ext_reg(name: &str, url: &str, kind: &str) -> ExternalRegistry {
+        ExternalRegistry {
+            name: name.to_string(),
+            url: url.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_git_extra_registry() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "git")];
+        assert!(config.validate().is_ok(), "valid git registry must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_non_git_kind() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "zip-api")];
+        let err = config
+            .validate()
+            .expect_err("non-git kind must be rejected");
+        assert!(err.to_string().contains("kind must be 'git'"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_duplicate_names() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![
+            ext_reg("team", "https://github.com/acme/a", "git"),
+            ext_reg("team", "https://github.com/acme/b", "git"),
+        ];
+        let err = config
+            .validate()
+            .expect_err("duplicate names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate name 'team'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_unaddressable_names() {
+        for name in [
+            "team.prod",
+            "team prod",
+            "team/prod",
+            "..",
+            " team",
+            "team ",
+            "Team",
+            "teamProd",
+        ] {
+            let mut config = Config::default();
+            config.skills.extra_registries =
+                vec![ext_reg(name, "https://github.com/acme/skills", "git")];
+            let err = config
+                .validate()
+                .expect_err("unaddressable extra-registry name must be rejected");
+            assert!(
+                err.to_string().contains("registry:<name>/<skill>"),
+                "name {name:?} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_empty_name_or_url() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("", "https://github.com/acme/a", "git")];
+        assert!(config.validate().is_err(), "empty name must be rejected");
+
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "   ", "git")];
+        assert!(config.validate().is_err(), "empty url must be rejected");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_bad_url_scheme() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "ftp://example.com/x", "git")];
+        let err = config
+            .validate()
+            .expect_err("non-http(s)/file scheme must be rejected");
+        assert!(err.to_string().contains("scheme"), "got: {err}");
     }
 
     #[test]
@@ -22064,6 +22770,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22097,6 +22804,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22153,6 +22861,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22183,6 +22892,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22260,6 +22970,7 @@ allowed_numbers = ["+1", "+2"]
                     self_chat_mode: false,
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
+                    allowed_groups: vec![],
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
@@ -23932,6 +24643,32 @@ api_token = "tok"
 
         let _ = build_runtime_proxy_client(&service_key);
         assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn proxy_reload_applies_new_config_through_rwlock() {
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://boot.example:3128".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://boot.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://reloaded.example:8080".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://reloaded.example:8080"),
+            "RwLock-backed runtime config must reflect the reloaded value"
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     #[test]
@@ -28840,6 +29577,279 @@ allowed_users = []
         );
     }
 
+    // #7964: agent-level summary_provider validated like classifier_provider.
+    #[tokio::test]
+    async fn config_validate_rejects_agent_summary_provider_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            summary_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!("{:#}", cfg.validate().expect_err("missing alias must fail"));
+        assert!(
+            msg.contains("summary_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for agent summary_provider, got: {msg}"
+        );
+    }
+
+    // #7964: profile-level summary_provider validated by the new profile loop.
+    #[tokio::test]
+    async fn config_validate_rejects_profile_summary_provider_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            summary_provider = "custom.nope"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate().expect_err("missing profile alias must fail")
+        );
+        assert!(
+            msg.contains("runtime_profiles.fast.context_compression.summary_provider")
+                && msg.contains("providers.models.custom.nope is not configured"),
+            "expected DanglingReference for profile summary_provider, got: {msg}"
+        );
+    }
+
+    // #7964: effective_summary_provider precedence — agent → profile → None.
+    #[tokio::test]
+    async fn effective_summary_provider_precedence() {
+        let toml = r#"
+            [providers.models.custom.main]
+            api_key = "k"
+            model = "m-main"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.cheap]
+            api_key = "k"
+            model = "m-cheap"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.profilesum]
+            api_key = "k"
+            model = "m-profile"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            summary_provider = "custom.profilesum"
+
+            [agents.a]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+            runtime_profile = "fast"
+            summary_provider = "custom.cheap"
+
+            [agents.b]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+            runtime_profile = "fast"
+
+            [agents.c]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // agent override wins over the profile
+        assert_eq!(
+            cfg.effective_summary_provider("a").as_deref(),
+            Some("custom.cheap")
+        );
+        // agent empty → profile value
+        assert_eq!(
+            cfg.effective_summary_provider("b").as_deref(),
+            Some("custom.profilesum")
+        );
+        // no agent override + no runtime profile → None (caller uses agent's own)
+        assert_eq!(cfg.effective_summary_provider("c"), None);
+    }
+
+    // #7964: config-time diagnostic for the legacy cross-provider summary_model
+    // shape. A profile sets the deprecated bare summary_model and is shared by
+    // two agents on DIFFERENT providers with no summary_provider override -> the
+    // diagnostic fires and names the profile + the affected agents + providers.
+    #[tokio::test]
+    async fn collect_warnings_flags_cross_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "cross_provider_summary_model")
+            .expect("expected cross_provider_summary_model warning");
+        assert_eq!(
+            w.path,
+            "runtime_profiles.shared.context_compression.summary_model"
+        );
+        assert!(
+            w.message.contains("haiku"),
+            "message names the model: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("alpha -> custom.p1"),
+            "message names alpha + provider: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("beta -> custom.p2"),
+            "message names beta + provider: {}",
+            w.message
+        );
+    }
+
+    // Control: same profile + summary_model but both agents on the SAME provider
+    // -> no diagnostic (deprecated-but-correct; runtime WARN still nudges).
+    #[tokio::test]
+    async fn collect_warnings_silent_for_same_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.collect_warnings()
+                .iter()
+                .any(|w| w.code == "cross_provider_summary_model"),
+            "same-provider use must not warn"
+        );
+    }
+
+    // Control: cross-provider agents but each sets an agent-level
+    // summary_provider override -> the override supersedes the bare id, so no
+    // diagnostic.
+    #[tokio::test]
+    async fn collect_warnings_silent_when_summary_provider_override_present() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.sum]
+            api_key = "k"
+            model = "ms"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+            summary_provider = "custom.sum"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+            summary_provider = "custom.sum"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.collect_warnings()
+                .iter()
+                .any(|w| w.code == "cross_provider_summary_model"),
+            "agent-level summary_provider override must suppress the warning"
+        );
+    }
+
     #[test]
     async fn config_validate_accepts_classifier_provider_pointing_at_existing_alias() {
         let toml = r#"
@@ -29229,6 +30239,117 @@ model_provider = \"ollama.default\"
     // which is #7498.  These tests catch that drift: an empty TOML
     // table (the extreme case of pruning — all fields pruned away)
     // must deserialize to the same value as the struct's `Default`.
+
+    // ── Schema-walked reload round-trip smoke battery ─────────────
+    //
+    // Reload re-reads config.toml and rebuilds the in-memory Config; any
+    // scalar field that does not survive a serialize -> deserialize cycle
+    // is silently lost on reload (the #7498 class). This walks every
+    // scalar prop the derive exposes, mutates it off-default, round-trips
+    // the whole Config through TOML, and asserts the mutated value comes
+    // back. Driven entirely off prop_fields() so it tracks the schema.
+
+    fn values_match(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => (x - y).abs() < f64::EPSILON,
+            _ => false,
+        }
+    }
+
+    fn off_default_value_for(
+        field: &crate::traits::PropFieldInfo,
+        current: &str,
+    ) -> Option<String> {
+        match field.kind {
+            PropKind::Bool => Some(if current == "true" { "false" } else { "true" }.to_string()),
+            PropKind::Integer => {
+                let n: i128 = current.parse().unwrap_or(0);
+                Some((n.wrapping_add(7)).to_string())
+            }
+            PropKind::Float => {
+                let n: f64 = current.parse().unwrap_or(0.0);
+                Some(format!("{:.3}", n + 1.5))
+            }
+            PropKind::String => {
+                let probe = "zc_reload_probe";
+                if current == probe {
+                    Some("zc_reload_probe_alt".to_string())
+                } else {
+                    Some(probe.to_string())
+                }
+            }
+            PropKind::Enum => field.enum_variants.and_then(|variants| {
+                variants()
+                    .into_iter()
+                    .find(|v| v != current)
+                    .or_else(|| variants().into_iter().next())
+            }),
+            PropKind::AliasRef
+            | PropKind::StringArray
+            | PropKind::ObjectArray
+            | PropKind::Object => None,
+        }
+    }
+
+    #[test]
+    async fn every_scalar_field_survives_toml_reload_round_trip() {
+        let mut config = Config::default();
+        let fields = config.prop_fields();
+
+        let mut mutated: Vec<(String, String)> = Vec::new();
+        let mut skipped_non_scalar = 0usize;
+        let mut skipped_unsettable = 0usize;
+
+        for field in &fields {
+            if field.is_secret {
+                continue;
+            }
+            let Ok(current) = config.get_prop(&field.name) else {
+                skipped_unsettable += 1;
+                continue;
+            };
+            let Some(target) = off_default_value_for(field, &current) else {
+                skipped_non_scalar += 1;
+                continue;
+            };
+            if config.set_prop(&field.name, &target).is_err() {
+                skipped_unsettable += 1;
+                continue;
+            }
+            mutated.push((field.name.clone(), target));
+        }
+
+        let serialized = toml::to_string(&config).expect("mutated config must serialize");
+        let reloaded: Config =
+            toml::from_str(&serialized).expect("serialized config must deserialize");
+
+        let mut lost: Vec<String> = Vec::new();
+        for (name, expected) in &mutated {
+            match reloaded.get_prop(name) {
+                Ok(got) if values_match(&got, expected) => {}
+                Ok(got) => lost.push(format!("{name}: set {expected:?}, reloaded {got:?}")),
+                Err(e) => lost.push(format!("{name}: set {expected:?}, reload read failed: {e}")),
+            }
+        }
+
+        assert!(
+            lost.is_empty(),
+            "{} scalar field(s) did not survive a TOML reload round-trip ({} mutated, {} non-scalar skipped, {} unsettable skipped):\n{}",
+            lost.len(),
+            mutated.len(),
+            skipped_non_scalar,
+            skipped_unsettable,
+            lost.join("\n")
+        );
+        assert!(
+            mutated.len() > 100,
+            "smoke battery covered only {} scalar fields; schema walk likely regressed",
+            mutated.len()
+        );
+    }
 
     #[test]
     async fn empty_table_round_trips_to_http_request_config_default() {
