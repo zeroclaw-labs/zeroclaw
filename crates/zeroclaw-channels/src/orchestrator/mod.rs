@@ -19392,9 +19392,9 @@ This is an example JSON object for profile settings."#;
         // The autosave path calls strip_inline_data_image_markers before
         // storing to durable memory, so inline data: bytes never persist while
         // re-loadable path markers and surrounding text survive.
-        let img_open = "[".to_string() + "IMAGE:/tmp/shot.png]";
-        let data_marker =
-            "[".to_string() + "IMAGE:data:image/png;base64," + &"AQIDBAUGBwg".repeat(64) + "]";
+        let img_open = format!("[{}", "IMAGE:/tmp/shot.png]");
+        let payload = "AQIDBAUGBwg".repeat(64);
+        let data_marker = format!("[{}{payload}]", "IMAGE:data:image/png;base64,");
         let content = format!("look at {img_open} and {data_marker} please");
 
         let cleaned = strip_inline_data_image_markers(&content);
