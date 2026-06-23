@@ -253,7 +253,7 @@ type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 type ThinkingOverrideMap = Arc<Mutex<HashMap<String, ThinkingLevel>>>;
 /// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
 /// Keyed by a `scope_override_key` (prefixed `user::`/`agent::`), so both
-/// tiers share one in-memory map. Never persisted — lost on restart by design.
+/// scopes share one in-memory map. Never persisted — lost on restart by design.
 type ScopedRouteMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
