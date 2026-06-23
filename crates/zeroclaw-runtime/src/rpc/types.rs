@@ -1056,6 +1056,8 @@ rpc_type! {
         /// backend picker).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
     }
 }
 

@@ -278,6 +278,27 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Count image markers in the **most recent** genuine user message (the newest
+/// inbound user turn), ignoring tool-result carriers and any earlier user
+/// messages still present in history.
+///
+/// This is the turn-scoped counterpart to [`count_user_image_markers`]. It lets
+/// the vision router distinguish "the user *just* sent an image we cannot see"
+/// (surface a capability error so the attachment is not silently ignored) from
+/// "an earlier user image is merely carried over in history" (degrade to
+/// text-only). Erroring on a carried-over marker would poison every later turn,
+/// since the marker lives in the long-lived session history permanently. That
+/// was the reported bug: a single image to a non-vision provider made every
+/// subsequent text turn fail.
+pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .unwrap_or(0)
+}
+
 /// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
 /// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
 /// `[media attachment]`. Match is case-insensitive to align with the channel
@@ -1784,6 +1805,44 @@ mod tests {
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_latest_user_image_markers_scopes_to_newest_user_message() {
+        // No user messages at all -> zero.
+        assert_eq!(count_latest_user_image_markers(&[]), 0);
+
+        // The newest user message carries the image -> counted (the user just
+        // sent it; the vision router surfaces a capability error).
+        let just_sent = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&just_sent), 1);
+
+        // An earlier user message carried an image, but the newest user message
+        // is plain text -> zero. This is the poison-prevention case: the carried
+        // over marker must NOT keep re-triggering the capability error.
+        let carried_over = vec![
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&carried_over), 0);
+        // The history-wide count still sees the carried-over marker, which is
+        // why the router must distinguish the two.
+        assert_eq!(count_user_image_markers(&carried_over), 1);
+
+        // A trailing tool-result carrier does not mask the real latest user
+        // message (its markers are not user-sent and must not be counted here).
+        let trailing_tool_result = vec![
+            ChatMessage::user("inspect [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
     }
 
     #[tokio::test]
