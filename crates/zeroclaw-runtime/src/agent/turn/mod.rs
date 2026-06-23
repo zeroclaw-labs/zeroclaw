@@ -53,6 +53,7 @@ pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
@@ -76,6 +77,9 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use execution::{
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
@@ -107,10 +111,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 use crate::agent::tool_execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
 };
-use crate::approval::ApprovalManager;
-use crate::observability::Observer;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
-use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -165,40 +166,22 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// destructures it once at entry, so the body reads exactly as it did when
 /// these were positional parameters.
 pub struct ToolLoop<'a> {
-    pub model_provider: &'a dyn ModelProvider,
+    /// The resolved per-agent execution context: model binding, gated tool
+    /// registry, approval, observability, and resolved runtime knobs. Stable
+    /// for every turn to this agent; built once and reused. See
+    /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
+    pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
-    pub tools_registry: &'a [Box<dyn Tool>],
-    pub observer: &'a dyn Observer,
-    pub provider_name: &'a str,
-    pub model: &'a str,
-    pub temperature: Option<f64>,
-    pub silent: bool,
-    pub approval: Option<&'a ApprovalManager>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
-    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
-    pub max_tool_iterations: usize,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub hooks: Option<&'a crate::hooks::HookRunner>,
-    pub excluded_tools: &'a [String],
-    pub dedup_exempt_tools: &'a [String],
-    pub activated_tools:
-        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    pub model_switch_callback: Option<ModelSwitchCallback>,
-    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
-    pub strict_tool_parsing: bool,
-    pub parallel_tools: bool,
-    pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
     pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub channel: Option<&'a dyn Channel>,
-    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
-    pub knobs: &'a LoopKnobs,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
@@ -211,21 +194,35 @@ pub struct ToolLoop<'a> {
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
-        model_provider,
+        exec,
         history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        approval,
         channel_name,
         channel_reply_target,
-        multimodal_config,
-        max_tool_iterations,
         cancellation_token,
         on_delta,
+        shared_budget,
+        channel,
+        collected_receipts,
+        event_tx,
+        mut steering,
+        mut new_messages_out,
+        mut image_cache,
+        ingress,
+    } = p;
+    let ResolvedAgentExecution {
+        model_access:
+            ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+            },
+        tools_registry,
+        observer,
+        silent,
+        approval,
+        multimodal_config,
+        max_tool_iterations,
         hooks,
         excluded_tools,
         dedup_exempt_tools,
@@ -236,17 +233,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
-        shared_budget,
-        channel,
         receipt_generator,
-        collected_receipts,
-        event_tx,
-        mut steering,
-        mut new_messages_out,
         knobs,
-        mut image_cache,
-        ingress,
-    } = p;
+    } = exec;
 
     // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
     // RFC #6971: every inbound turn passes the universal SOP policy layer before
@@ -391,7 +380,75 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        preflight_history_maintenance(history, context_token_budget, iteration);
+        preflight_history_maintenance(history);
+
+        if iteration == 0 && context_token_budget > 0 {
+            let taken = std::mem::take(history);
+            let result =
+                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            if result.trimmed {
+                let mut trimmed = result.history;
+                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
+                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                *history = trimmed;
+                {
+                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        model = %model,
+                        model_provider = %provider_name,
+                    );
+                    let _zc_trim_guard = __zc_trim_span.entered();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "dropped_messages": result.dropped_messages,
+                                "dropped_turns": result.dropped_turns,
+                                "kept_turns": result.kept_turns,
+                                "budget_tokens": context_token_budget,
+                                "tokens_before": result.tokens_before,
+                                "tokens_after": result.tokens_after,
+                                "tokens_reclaimed": result.tokens_before.saturating_sub(result.tokens_after),
+                                "budget_headroom": context_token_budget.saturating_sub(result.tokens_after),
+                            })),
+                        format!(
+                            "History trimmed: dropped {} oldest turn(s) ({} msgs), {} -> {} tok (budget {}), reclaimed {} tok",
+                            result.dropped_turns,
+                            result.dropped_messages,
+                            result.tokens_before,
+                            result.tokens_after,
+                            context_token_budget,
+                            result.tokens_before.saturating_sub(result.tokens_after)
+                        )
+                    );
+                }
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::HistoryTrimmed {
+                            dropped_messages: result.dropped_messages,
+                            kept_turns: result.kept_turns,
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-budget",
+                            ),
+                        })
+                        .await;
+                }
+                observer.record_event(
+                    &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                        dropped_messages: result.dropped_messages,
+                        kept_turns: result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
+                    },
+                );
+            } else {
+                *history = result.history;
+            }
+        }
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -561,7 +618,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &turn_id,
                     &e,
                 );
-                let recovered = try_recover_context_overflow(history, &e, iteration);
+                let recovered = try_recover_context_overflow(
+                    history,
+                    &e,
+                    iteration,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await;
                 if recovered {
                     continue;
                 }

@@ -97,9 +97,9 @@ Body uses the PR template. **The validation-evidence section is required**: past
 
 Risk labels:
 
-- `risk: low`: rollback is a revert; no user action needed
-- `risk: medium`: users may need to update config / env / CLI usage; rollback plan required
-- `risk: high`: security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
+- `risk:low`: rollback is a revert; no user action needed
+- `risk:medium`: users may need to update config / env / CLI usage; rollback plan required
+- `risk:high`: security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
 
 ## After the PR
 

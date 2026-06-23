@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::traits::PRUNED_CONTEXT_SEPARATOR;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -458,28 +456,11 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn should_skip_internal_pruning_marker(messages: &[ChatMessage], index: usize) -> bool {
-        let Some(msg) = messages.get(index) else {
-            return false;
-        };
-        if msg.is_pruned_tool_exchange_summary() {
-            return true;
-        }
-        msg.is_pruned_context_separator()
-            && index
-                .checked_sub(1)
-                .and_then(|previous| messages.get(previous))
-                .is_some_and(ChatMessage::is_pruned_tool_exchange_summary)
-    }
-
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
-        for (index, msg) in messages.iter().enumerate() {
-            if Self::should_skip_internal_pruning_marker(messages, index) {
-                continue;
-            }
+        for msg in messages.iter() {
             match msg.role.as_str() {
                 "system" => {
                     if system_text.is_none() {
@@ -3271,156 +3252,5 @@ data: {\"type\":\"message_stop\"}\n\n";
                 window[0].role
             );
         }
-    }
-
-    #[test]
-    fn convert_messages_does_not_surface_context_separator_as_user_instruction() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: ChatMessage::pruned_tool_exchange_summary(1),
-            },
-            ChatMessage::pruned_context_separator(),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "live_1", "name": "file_read", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "tool".to_string(),
-                content: serde_json::json!({
-                    "tool_call_id": "live_1",
-                    "content": "recent file content"
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Continue from the current state.".to_string(),
-            },
-        ];
-
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-        let roles = native_msgs
-            .iter()
-            .map(|message| message.role.as_str())
-            .collect::<Vec<_>>();
-        let flattened_text = native_msgs
-            .iter()
-            .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                NativeContentOut::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            roles.windows(2).all(|pair| pair[0] != pair[1]),
-            "converted request should preserve Anthropic role alternation: {roles:?}"
-        );
-        assert!(
-            !flattened_text.contains(&PRUNED_CONTEXT_SEPARATOR),
-            "synthetic role separator should not be delivered to Anthropic as user text: \
-             {flattened_text:?}"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(
-                    |block| matches!(block, NativeContentOut::ToolUse { id, .. } if id == "live_1"),
-                )
-            }),
-            "live tool_use must survive pruning-marker filtering"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        NativeContentOut::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } if tool_use_id == "live_1" && content == "recent file content"
-                    )
-                })
-            }),
-            "matching live tool_result must survive pruning-marker filtering"
-        );
-    }
-
-    #[test]
-    fn convert_messages_keeps_real_context_separator_between_assistants() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "protected assistant one".to_string(),
-            },
-            ChatMessage::pruned_context_separator(),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "live_2", "name": "file_read", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "tool".to_string(),
-                content: serde_json::json!({
-                    "tool_call_id": "live_2",
-                    "content": "recent file content"
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Continue from the current state.".to_string(),
-            },
-        ];
-
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-        let roles = native_msgs
-            .iter()
-            .map(|message| message.role.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(
-            roles.windows(2).all(|pair| pair[0] != pair[1]),
-            "context separator should keep Anthropic roles alternating: {roles:?}"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(
-                    |block| matches!(block, NativeContentOut::ToolUse { id, .. } if id == "live_2"),
-                )
-            }),
-            "live tool_use must survive real context separator conversion"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "live_2"
-                    )
-                })
-            }),
-            "matching live tool_result must survive real context separator conversion"
-        );
     }
 }

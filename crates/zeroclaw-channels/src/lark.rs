@@ -2,10 +2,13 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use reqwest::multipart::{Form, Part};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
+use tokio::fs;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
@@ -571,6 +574,188 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkOutgoingMediaKind {
+    Image,
+    File { file_type: &'static str },
+}
+
+impl LarkOutgoingMediaKind {
+    fn from_marker_kind(kind: &str) -> Option<Self> {
+        match kind.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::File {
+                file_type: "stream",
+            }),
+            "VIDEO" => Some(Self::File { file_type: "mp4" }),
+            "AUDIO" | "VOICE" => Some(Self::File { file_type: "opus" }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LarkOutgoingMediaMarker {
+    kind: LarkOutgoingMediaKind,
+    target: String,
+}
+
+#[derive(Debug, Clone)]
+struct LarkResolvedMediaMarker {
+    kind: LarkOutgoingMediaKind,
+    path: PathBuf,
+    file_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct LarkPreparedMediaMessage {
+    msg_type: &'static str,
+    content: serde_json::Value,
+}
+
+fn lark_outgoing_media_from_marker(
+    kind: String,
+    target: String,
+) -> Option<LarkOutgoingMediaMarker> {
+    Some(LarkOutgoingMediaMarker {
+        kind: LarkOutgoingMediaKind::from_marker_kind(&kind)?,
+        target,
+    })
+}
+
+fn validate_lark_marker_target(
+    target: &str,
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Lark/Feishu marker target is empty");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("file:")
+        || lower.contains("://")
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"reason": "disallowed_scheme"})),
+            "lark: marker target uses disallowed scheme"
+        );
+        anyhow::bail!("Lark/Feishu marker target uses a disallowed scheme");
+    }
+
+    let workspace = workspace_dir.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"reason": "no_workspace_dir"})),
+            "lark: local marker target has no workspace_dir"
+        );
+        anyhow::Error::msg("Lark/Feishu channel was started without a workspace_dir")
+    })?;
+
+    let workspace = std::fs::canonicalize(workspace).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "canonicalize Lark/Feishu workspace_dir failed: {err}"
+        ))
+    })?;
+    let candidate = Path::new(trimmed);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace.join(candidate)
+    };
+
+    let candidate = std::fs::canonicalize(&candidate).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"reason": "not_found"})),
+                "lark: marker target not found on disk"
+            );
+            anyhow::Error::msg("Lark/Feishu marker target not found on disk")
+        } else {
+            anyhow::Error::msg(format!(
+                "canonicalize Lark/Feishu marker target failed: {err}"
+            ))
+        }
+    })?;
+
+    if !candidate.starts_with(&workspace) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"reason": "outside_workspace"})),
+            "lark: marker target escapes workspace_dir"
+        );
+        anyhow::bail!("Lark/Feishu marker target resolves outside workspace_dir");
+    }
+
+    Ok(candidate)
+}
+
+fn resolve_lark_media_marker(
+    marker: &LarkOutgoingMediaMarker,
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<LarkResolvedMediaMarker> {
+    let path = validate_lark_marker_target(&marker.target, workspace_dir)?;
+    let metadata = std::fs::metadata(&path).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "read Lark/Feishu marker target metadata failed: {err}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!("Lark/Feishu marker target is not a file");
+    }
+    if metadata.len() == 0 {
+        anyhow::bail!("Lark/Feishu marker target is empty");
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+
+    Ok(LarkResolvedMediaMarker {
+        kind: marker.kind,
+        path,
+        file_name,
+    })
+}
+
+async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyhow::Result<Form> {
+    let bytes = fs::read(&marker.path).await.map_err(|err| {
+        anyhow::Error::msg(format!(
+            "read Lark/Feishu image marker target failed: {err}"
+        ))
+    })?;
+    Ok(Form::new().text("image_type", "message").part(
+        "image",
+        Part::bytes(bytes).file_name(marker.file_name.clone()),
+    ))
+}
+
+async fn build_lark_file_upload_form(
+    marker: &LarkResolvedMediaMarker,
+    file_type: &'static str,
+) -> anyhow::Result<Form> {
+    let bytes = fs::read(&marker.path).await.map_err(|err| {
+        anyhow::Error::msg(format!("read Lark/Feishu file marker target failed: {err}"))
+    })?;
+    Ok(Form::new()
+        .text("file_type", file_type)
+        .text("file_name", marker.file_name.clone())
+        .part(
+            "file",
+            Part::bytes(bytes).file_name(marker.file_name.clone()),
+        ))
+}
+
 /// State carried between sending an approval card and the user's click.
 ///
 /// Used to (a) wake the awaiting future via `sender` and (b) re-render
@@ -616,6 +801,9 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Workspace root that bounds outbound media marker reads. Resolved by
+    /// the orchestrator from `Config::channel_workspace_dir("lark.<alias>")`.
+    workspace_dir: Option<PathBuf>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     /// In-flight approval requests keyed by `approval_id` (UUID v4).
@@ -725,6 +913,7 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
+            workspace_dir: None,
             transcription: None,
             transcription_manager: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -790,6 +979,13 @@ impl LarkChannel {
     /// ✅/⚠️ on completion) are posted to incoming messages.
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
+        self
+    }
+
+    /// Configure the workspace root used to validate local outbound media
+    /// marker targets before upload.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -2098,6 +2294,158 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    async fn send_json_with_token_refresh(
+        &self,
+        url: &str,
+        token: &mut String,
+        body: &serde_json::Value,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        let (status, response) = self.send_text_once(url, token, body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            *token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) = self.send_text_once(url, token, body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "send failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, context)?;
+        } else {
+            ensure_lark_send_success(status, &response, context)?;
+        }
+
+        Ok(())
+    }
+
+    async fn post_multipart_once(
+        &self,
+        url: &str,
+        token: &str,
+        form: Form,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    async fn upload_lark_image(
+        &self,
+        token: &mut String,
+        marker: &LarkResolvedMediaMarker,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/images", self.api_base());
+        let form = build_lark_image_upload_form(marker).await?;
+        let (status, response) = self.post_multipart_once(&url, token, form).await?;
+        let response = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            *token = self.get_tenant_access_token().await?;
+            let retry_form = build_lark_image_upload_form(marker).await?;
+            let (retry_status, retry_response) =
+                self.post_multipart_once(&url, token, retry_form).await?;
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "upload image failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+            ensure_lark_send_success(retry_status, &retry_response, "upload image")?;
+            retry_response
+        } else {
+            ensure_lark_send_success(status, &response, "upload image")?;
+            response
+        };
+
+        response
+            .pointer("/data/image_key")
+            .or_else(|| response.get("image_key"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::Error::msg("Lark/Feishu image upload returned no image_key"))
+    }
+
+    async fn upload_lark_file(
+        &self,
+        token: &mut String,
+        marker: &LarkResolvedMediaMarker,
+        file_type: &'static str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/files", self.api_base());
+        let form = build_lark_file_upload_form(marker, file_type).await?;
+        let (status, response) = self.post_multipart_once(&url, token, form).await?;
+        let response = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            *token = self.get_tenant_access_token().await?;
+            let retry_form = build_lark_file_upload_form(marker, file_type).await?;
+            let (retry_status, retry_response) =
+                self.post_multipart_once(&url, token, retry_form).await?;
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "upload file failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+            ensure_lark_send_success(retry_status, &retry_response, "upload file")?;
+            retry_response
+        } else {
+            ensure_lark_send_success(status, &response, "upload file")?;
+            response
+        };
+
+        response
+            .pointer("/data/file_key")
+            .or_else(|| response.get("file_key"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::Error::msg("Lark/Feishu file upload returned no file_key"))
+    }
+
+    async fn prepare_lark_media_marker(
+        &self,
+        token: &mut String,
+        marker: &LarkResolvedMediaMarker,
+    ) -> anyhow::Result<LarkPreparedMediaMessage> {
+        let (msg_type, content) = match marker.kind {
+            LarkOutgoingMediaKind::Image => {
+                let image_key = self.upload_lark_image(token, marker).await?;
+                ("image", serde_json::json!({ "image_key": image_key }))
+            }
+            LarkOutgoingMediaKind::File { file_type } => {
+                let file_key = self.upload_lark_file(token, marker, file_type).await?;
+                ("file", serde_json::json!({ "file_key": file_key }))
+            }
+        };
+
+        Ok(LarkPreparedMediaMessage { msg_type, content })
+    }
+
+    async fn send_lark_media_message(
+        &self,
+        token: &mut String,
+        recipient: &str,
+        media: &LarkPreparedMediaMessage,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": media.msg_type,
+            "content": media.content.to_string(),
+        });
+        let url = self.send_message_url();
+        self.send_json_with_token_refresh(&url, token, &body, "media send")
+            .await
+    }
+
     /// Parse an event callback payload and extract messages.
     /// Supports text, post, image, and file message types.
     pub async fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
@@ -2362,32 +2710,34 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
+        let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
+        let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
+        let markers = raw_markers
+            .into_iter()
+            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
+            .collect::<Vec<_>>();
+        let resolved_markers = markers
+            .iter()
+            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut prepared_media = Vec::with_capacity(resolved_markers.len());
+        for marker in &resolved_markers {
+            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
+        }
 
-        let chunks = split_markdown_chunks(&message.content, LARK_CARD_MARKDOWN_MAX_BYTES);
-        for chunk in &chunks {
-            let body = build_interactive_card_body(&message.recipient, chunk);
-
-            let (status, response) = self.send_text_once(&url, &token, &body).await?;
-
-            if should_refresh_lark_tenant_token(status, &response) {
-                // Token expired/invalid, invalidate and retry once.
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_response) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-
-                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                    anyhow::bail!(
-                        "send failed after token refresh: status={retry_status}, body={retry_response}"
-                    );
-                }
-
-                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            } else {
-                ensure_lark_send_success(status, &response, "without token refresh")?;
+        if !text_content.is_empty() || markers.is_empty() {
+            let chunks = split_markdown_chunks(&text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
+            for chunk in &chunks {
+                let body = build_interactive_card_body(&message.recipient, chunk);
+                self.send_json_with_token_refresh(&url, &mut token, &body, "text send")
+                    .await?;
             }
+        }
+
+        for media in &prepared_media {
+            self.send_lark_media_message(&mut token, &message.recipient, media)
+                .await?;
         }
 
         Ok(())
@@ -2833,30 +3183,37 @@ impl Channel for LarkChannel {
 
         self.last_draft_edit.lock().await.remove(message_id);
 
-        let chunks = split_markdown_chunks(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        let mut token = self.get_tenant_access_token().await?;
+        let (text_content, raw_markers) = super::util::parse_attachment_markers(text);
+        let markers = raw_markers
+            .into_iter()
+            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
+            .collect::<Vec<_>>();
+        let resolved_markers = markers
+            .iter()
+            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut prepared_media = Vec::with_capacity(resolved_markers.len());
+        for marker in &resolved_markers {
+            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
+        }
+
+        let chunks = split_markdown_chunks(&text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
         let first = chunks.first().copied().unwrap_or("");
         self.patch_card_content(message_id, first).await?;
 
         if chunks.len() > 1 {
-            let token = self.get_tenant_access_token().await?;
             let url = self.send_message_url();
             for chunk in &chunks[1..] {
                 let body = build_interactive_card_body(recipient, chunk);
-                let (status, response) = self.send_text_once(&url, &token, &body).await?;
-                if should_refresh_lark_tenant_token(status, &response) {
-                    self.invalidate_token().await;
-                    let new_token = self.get_tenant_access_token().await?;
-                    let (retry_status, retry_response) =
-                        self.send_text_once(&url, &new_token, &body).await?;
-                    ensure_lark_send_success(
-                        retry_status,
-                        &retry_response,
-                        "after token refresh (finalize_draft)",
-                    )?;
-                } else {
-                    ensure_lark_send_success(status, &response, "finalize_draft chunk")?;
-                }
+                self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
+                    .await?;
             }
+        }
+
+        for media in &prepared_media {
+            self.send_lark_media_message(&mut token, recipient, media)
+                .await?;
         }
 
         Ok(())
@@ -3843,6 +4200,71 @@ mod tests {
     fn lark_ws_non_activity_frames_do_not_refresh_heartbeat_watchdog() {
         assert!(!should_refresh_last_recv(&WsMsg::Text("hello".into())));
         assert!(!should_refresh_last_recv(&WsMsg::Close(None)));
+    }
+
+    #[test]
+    fn lark_outgoing_media_kind_maps_shared_marker_kinds() {
+        assert_eq!(
+            LarkOutgoingMediaKind::from_marker_kind("image"),
+            Some(LarkOutgoingMediaKind::Image)
+        );
+        assert_eq!(
+            LarkOutgoingMediaKind::from_marker_kind("document"),
+            Some(LarkOutgoingMediaKind::File {
+                file_type: "stream"
+            })
+        );
+        assert_eq!(
+            LarkOutgoingMediaKind::from_marker_kind("video"),
+            Some(LarkOutgoingMediaKind::File { file_type: "mp4" })
+        );
+        assert_eq!(
+            LarkOutgoingMediaKind::from_marker_kind("voice"),
+            Some(LarkOutgoingMediaKind::File { file_type: "opus" })
+        );
+        assert_eq!(LarkOutgoingMediaKind::from_marker_kind("embed"), None);
+    }
+
+    #[test]
+    fn lark_marker_target_accepts_workspace_relative_file() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let file = workspace.path().join("image.png");
+        std::fs::write(&file, b"png").expect("write file");
+
+        let resolved =
+            validate_lark_marker_target("image.png", Some(workspace.path())).expect("valid target");
+
+        assert_eq!(resolved, file.canonicalize().expect("canonical file"));
+    }
+
+    #[test]
+    fn lark_marker_target_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let file = outside.path().join("secret.txt");
+        std::fs::write(&file, b"secret").expect("write outside file");
+
+        let err = validate_lark_marker_target(&file.to_string_lossy(), Some(workspace.path()))
+            .expect_err("outside workspace must be refused");
+
+        assert!(
+            err.to_string().contains("outside workspace_dir"),
+            "expected workspace escape error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lark_marker_target_rejects_url_schemes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let err =
+            validate_lark_marker_target("https://example.com/image.png", Some(workspace.path()))
+                .expect_err("url target must be refused");
+
+        assert!(
+            err.to_string().contains("disallowed scheme"),
+            "expected scheme error, got: {err}"
+        );
     }
 
     #[test]
@@ -5693,6 +6115,266 @@ mod tests {
             "hi from cron",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn lark_send_uploads_workspace_image_marker_after_text() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "image_key": "img_test_key" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_test_message_id" }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("photo.png"), b"\x89PNG\r\n\x1a\n")
+            .expect("write image");
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]))
+            .with_workspace_dir(workspace.path().to_path_buf());
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("caption [IMAGE:photo.png]", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should upload and send image marker");
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let send_bodies = requests
+            .iter()
+            .filter(|request| request.url.path() == "/im/v1/messages")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("send body should be valid JSON")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            send_bodies.iter().any(|body| {
+                body["msg_type"].as_str() == Some("interactive")
+                    && body["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("caption"))
+            }),
+            "expected one interactive card send with caption; bodies: {send_bodies:?}"
+        );
+        let image_send = send_bodies
+            .iter()
+            .find(|body| body["msg_type"].as_str() == Some("image"))
+            .expect("expected image send body");
+        assert_eq!(image_send["receive_id"].as_str(), Some("oc_test_chat_id"));
+        let content = image_send["content"]
+            .as_str()
+            .expect("image content should be a JSON string");
+        let content_json: serde_json::Value =
+            serde_json::from_str(content).expect("image content should parse as JSON");
+        assert_eq!(content_json["image_key"].as_str(), Some("img_test_key"));
+    }
+
+    #[tokio::test]
+    async fn lark_send_uploads_workspace_document_marker_as_file_message() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "file_key": "file_test_key" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_test_message_id" }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("brief.txt"), b"brief").expect("write document");
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]))
+            .with_workspace_dir(workspace.path().to_path_buf());
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("see attached [DOCUMENT:brief.txt]", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should upload and send document marker");
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let send_bodies = requests
+            .iter()
+            .filter(|request| request.url.path() == "/im/v1/messages")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("send body should be valid JSON")
+            })
+            .collect::<Vec<_>>();
+
+        let file_send = send_bodies
+            .iter()
+            .find(|body| body["msg_type"].as_str() == Some("file"))
+            .expect("expected file send body");
+        assert_eq!(file_send["receive_id"].as_str(), Some("oc_test_chat_id"));
+        let content = file_send["content"]
+            .as_str()
+            .expect("file content should be a JSON string");
+        let content_json: serde_json::Value =
+            serde_json::from_str(content).expect("file content should parse as JSON");
+        assert_eq!(content_json["file_key"].as_str(), Some("file_test_key"));
+    }
+
+    #[tokio::test]
+    async fn lark_finalize_draft_cleans_marker_text_and_sends_media() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/images"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "image_key": "draft_img_key" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex("/im/v1/messages/om_draft_media"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_test_message_id" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("draft.png"), b"\x89PNG\r\n\x1a\n")
+            .expect("write image");
+        let mut ch = make_channel()
+            .with_streaming(StreamMode::Partial, 500)
+            .with_workspace_dir(workspace.path().to_path_buf());
+        ch.api_base_override = Some(mock_server.uri());
+
+        ch.finalize_draft(
+            "oc_test_chat_id",
+            "om_draft_media",
+            "final caption [IMAGE:draft.png]",
+        )
+        .await
+        .expect("finalize_draft should clean text and send image");
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let patch = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("expected draft PATCH");
+        let patch_body = String::from_utf8_lossy(&patch.body);
+        assert!(patch_body.contains("final caption"));
+        assert!(
+            !patch_body.contains("[IMAGE:"),
+            "final draft body must not leak marker text: {patch_body}"
+        );
+        let image_send = requests
+            .iter()
+            .filter(|request| request.url.path() == "/im/v1/messages")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("send body should be valid JSON")
+            })
+            .find(|body| body["msg_type"].as_str() == Some("image"))
+            .expect("expected image send after draft finalization");
+        let content = image_send["content"]
+            .as_str()
+            .expect("image content should be a JSON string");
+        let content_json: serde_json::Value =
+            serde_json::from_str(content).expect("image content should parse as JSON");
+        assert_eq!(content_json["image_key"].as_str(), Some("draft_img_key"));
     }
 
     #[test]

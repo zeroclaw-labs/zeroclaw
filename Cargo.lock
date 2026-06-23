@@ -14464,6 +14464,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "wasmtime 43.0.2",
  "zeroclaw-api",
+ "zeroclaw-infra",
  "zeroclaw-log",
 ]
 
@@ -14596,6 +14597,7 @@ dependencies = [
  "webpki-roots 1.0.7",
  "which",
  "windows 0.61.3",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
