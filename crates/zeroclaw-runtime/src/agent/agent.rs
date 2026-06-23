@@ -878,6 +878,19 @@ impl Agent {
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
         self.tool_dispatcher = tool_dispatcher;
+        self.refresh_system_prompt();
+    }
+
+    fn refresh_system_prompt(&mut self) {
+        let Some(ConversationMessage::Chat(first)) = self.history.first() else {
+            return;
+        };
+        if first.role != "system" {
+            return;
+        }
+        if let Ok(sys) = self.build_system_prompt() {
+            self.history[0] = ConversationMessage::Chat(ChatMessage::system(sys));
+        }
     }
 
     /// Return the names of all registered tools.  Test-only — avoids
@@ -2010,34 +2023,38 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution {
-                            model_access: crate::agent::loop_::ResolvedModelAccess {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
                                 provider_name: &self.model_provider_name,
                                 model: &effective_model,
                                 temperature: self.temperature,
                             },
-                            tools_registry: &self.tools,
-                            observer: self.observer.as_ref(),
-                            silent: false,
-                            approval: self.approval_manager.as_deref(),
-                            multimodal_config: &self.multimodal_config,
-                            max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            hooks: self.hook_runner.as_deref(),
-                            excluded_tools: &[],
-                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                            activated_tools: self.activated_tools.as_ref(),
-                            model_switch_callback: None,
-                            pacing: &pacing,
-                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                            parallel_tools: self.config.resolved.parallel_tools,
-                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_token_budget: self.config.resolved.max_context_tokens,
-                            receipt_generator: receipt_scope
-                                .as_ref()
-                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            knobs: &knobs,
-                        },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: false,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_token_budget: self.config.resolved.max_context_tokens,
+                                knobs: &knobs,
+                            },
+                        ),
                         history: &mut loop_history,
                         channel_name: "cli",
                         channel_reply_target: None,
@@ -2052,6 +2069,8 @@ impl Agent {
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
+                        // Phase 1: stamp Internal/Trusted. Real per-transport
+                        // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
                     }),
                 ),
@@ -2421,34 +2440,38 @@ impl Agent {
                     crate::agent::tool_receipts::scope_receipts(
                         receipt_scope.clone(),
                         crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                            exec: crate::agent::loop_::ResolvedAgentExecution {
-                                model_access: crate::agent::loop_::ResolvedModelAccess {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
                                     model_provider: self.model_provider.as_ref(),
                                     provider_name: &self.model_provider_name,
                                     model: &effective_model,
                                     temperature: self.temperature,
                                 },
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: true,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                hooks: self.hook_runner.as_deref(),
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: None,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self.config.resolved.max_context_tokens,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                                knobs: &knobs,
-                            },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: true,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                    context_token_budget: self.config.resolved.max_context_tokens,
+                                    knobs: &knobs,
+                                },
+                            ),
                             history: &mut loop_history,
                             channel_name: "cli",
                             channel_reply_target: None,
@@ -2463,6 +2486,8 @@ impl Agent {
                             steering: None,
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
+                            // Phase 1: stamp Internal/Trusted. Real per-transport
+                            // stamping is PR C (RFC #6971 §4).
                             ingress: zeroclaw_api::ingress::IngressContext::internal(),
                         }),
                     ),
@@ -3973,6 +3998,53 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn set_tool_dispatcher_refreshes_existing_system_prompt() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.seed_history(&[ChatMessage::user("hello")]);
+        let before = match agent.history().first() {
+            Some(ConversationMessage::Chat(m)) if m.role == "system" => m.content.clone(),
+            other => panic!("expected a system prompt first, got {other:?}"),
+        };
+        assert!(
+            before.contains("Tool Use Protocol"),
+            "xml dispatcher system prompt should carry the xml tool protocol"
+        );
+
+        agent.set_tool_dispatcher(Box::new(NativeToolDispatcher));
+        let after = match agent.history().first() {
+            Some(ConversationMessage::Chat(m)) if m.role == "system" => m.content.clone(),
+            other => panic!("expected a system prompt first, got {other:?}"),
+        };
+        assert!(
+            !after.contains("Tool Use Protocol"),
+            "native dispatcher system prompt must not carry the xml tool protocol after swap"
+        );
     }
 
     #[test]

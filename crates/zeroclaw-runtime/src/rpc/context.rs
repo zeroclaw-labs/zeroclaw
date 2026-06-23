@@ -130,6 +130,10 @@ pub struct RpcContext {
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
 
+    /// Write `true` to ask the current gateway listener to shut down before
+    /// daemon reload rebinds the same address.
+    pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
 
@@ -162,6 +166,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -185,9 +190,34 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_reload_controls(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+        reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx,
+            gateway_shutdown_tx,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
         })

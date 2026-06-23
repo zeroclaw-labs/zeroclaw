@@ -287,6 +287,14 @@ pub struct Config {
     #[group = "Network"]
     pub gateway: GatewayConfig,
 
+    /// Inbound A2A discovery server (`[a2a.server]`). Default-closed:
+    /// serves the well-known catalog card and per-alias agent cards only
+    /// when `enabled = true`. See `crate::multi_agent::A2aServerConfig`.
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub a2a: crate::multi_agent::A2aServerSection,
+
     /// WebSocket Secure (WSS) transport for remote TUI connections (`[wss]`).
     #[serde(default)]
     #[nested]
@@ -3397,6 +3405,16 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Per-agent override for the context-compression summarizer provider, as
+    /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
+    /// the runtime profile's `context_compression.summary_provider`, else the
+    /// agent's own resolved provider+model. Reference only, never a copy;
+    /// resolved by [`Config::effective_summary_provider`]. Validated in
+    /// `Config::validate()`.
+    #[tab(Providers)]
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
+
     /// Auto-allow delegation to every agent sharing this agent's risk
     /// profile. Default `true` preserves the historical reach where any
     /// same-profile peer is a delegation target. Set `false` to opt this
@@ -3450,6 +3468,16 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
+
+    /// Per-agent A2A publication block (`[agents.<alias>.a2a]`). Gates
+    /// whether this alias is discoverable as a spec-conforming A2A agent
+    /// and which resolved skills appear on its card. Default-closed
+    /// (`published = false`, no exposed skills). See
+    /// `crate::multi_agent::AgentA2aConfig`.
+    #[tab(General)]
+    #[serde(default)]
+    #[nested]
+    pub a2a: crate::multi_agent::AgentA2aConfig,
 }
 
 impl Default for AliasedAgentConfig {
@@ -3467,12 +3495,14 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            a2a: crate::multi_agent::AgentA2aConfig::default(),
         }
     }
 }
@@ -3630,6 +3660,29 @@ impl Config {
             return None;
         }
         self.runtime_profiles.get(profile_alias)
+    }
+
+    /// Effective context-compression summarizer provider for an agent:
+    /// agent-level `summary_provider` override → the runtime profile's
+    /// `context_compression.summary_provider` → `None` (the caller then reuses
+    /// the agent's own provider+model, optionally via the deprecated
+    /// `summary_model` swap). Unlike the inert agent-inline tunables below, the
+    /// agent-level override IS consulted — it's an explicit per-agent choice,
+    /// mirroring `classifier_provider`'s "empty = inherit" semantics.
+    #[must_use]
+    pub fn effective_summary_provider(
+        &self,
+        agent_alias: &str,
+    ) -> Option<crate::providers::ModelProviderRef> {
+        if let Some(a) = self.agents.get(agent_alias)
+            && !a.summary_provider.trim().is_empty()
+        {
+            return Some(a.summary_provider.clone());
+        }
+        self.runtime_profile_for_agent(agent_alias)
+            .map(|p| &p.context_compression.summary_provider)
+            .filter(|r| !r.trim().is_empty())
+            .cloned()
     }
 
     // ── Effective per-agent runtime tunables ──────────────────────────
@@ -5927,6 +5980,24 @@ pub struct ProviderCostRates {
     #[serde(default)]
     #[nested]
     pub transcription: crate::providers::TranscriptionCostRatesByProvider,
+}
+
+/// The provider families that carry `[cost.rates.providers.*]` rate sheets, as
+/// the trailing segment shared by their `[providers.<category>]` section. One
+/// entry per `#[nested]` field on `ProviderCostRates`; this list is the registry
+/// the TUI and web surfaces resolve cost tabs from, never a per-surface literal.
+pub const PROVIDER_COST_CATEGORIES: [&str; 3] = ["models", "tts", "transcription"];
+
+/// Cost-rate category for a `providers.<category>` section key, or `None` for
+/// sections that carry no rate sheets. Resolves against
+/// [`PROVIDER_COST_CATEGORIES`] so a new rate-bearing family is added in one
+/// place.
+#[must_use]
+pub fn cost_category_for_provider_section(section_key: &str) -> Option<&'static str> {
+    let suffix = section_key.strip_prefix("providers.")?;
+    PROVIDER_COST_CATEGORIES
+        .into_iter()
+        .find(|category| *category == suffix)
 }
 
 /// Token-cost rates for a single chat / completion model, in USD per
@@ -10501,6 +10572,17 @@ pub struct SkillBundleConfig {
     pub exclude: Vec<String>,
 }
 
+impl SkillBundleConfig {
+    /// Whether a skill name survives this bundle's include/exclude filter.
+    /// Empty `include` admits every name; `exclude` always wins.
+    pub fn admits_skill(&self, name: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|s| s == name) {
+            return false;
+        }
+        !self.exclude.iter().any(|s| s == name)
+    }
+}
+
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
 ///
 /// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
@@ -13024,6 +13106,18 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// Allowed group chats by JID (Web mode). An empty list (the default)
+    /// permits all groups; a non-empty list drops every group message whose
+    /// chat JID matches no entry. Each entry matches either the full group
+    /// JID (`123456789012345@g.us`) or the JID user part - the segment before
+    /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
+    /// Direct messages bypass this filter regardless of list contents.
+    /// Modeled on the Matrix channel's `allowed_rooms`; it gates group
+    /// identity, which `dm_policy`/`group_policy` (chat type) and the
+    /// sender allowlist (sender) do not.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -15375,6 +15469,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
@@ -16585,6 +16680,7 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_cross_provider_summary_model_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -16604,6 +16700,108 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the #7964 cross-provider shape on a legacy config that has NOT
+    /// migrated to `summary_provider`. The deprecated
+    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare model
+    /// id dispatched onto each consuming agent's OWN provider; when a single
+    /// profile is shared by agents resolving to MORE THAN ONE distinct provider,
+    /// that one bare id is cross-provider for at least one of them and silently
+    /// fails at runtime. The new `summary_provider` (agent override or profile
+    /// level) supersedes the bare id and is self-contained, so an agent that
+    /// sets it is safe and excluded from the count.
+    ///
+    /// This is the offline, deterministic "startup diagnostic" the #7964 review
+    /// asked for: no schema bump, no network, no model catalog. It names the
+    /// profile, the affected agents, and their differing providers, and
+    /// recommends migrating to `context_compression.summary_provider`.
+    fn collect_cross_provider_summary_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (profile_alias, profile) in &self.runtime_profiles {
+            // Only the deprecated bare summary_model is at risk; a profile-level
+            // summary_provider already supersedes it for every consumer.
+            if !profile
+                .context_compression
+                .summary_provider
+                .trim()
+                .is_empty()
+            {
+                continue;
+            }
+            let Some(summary_model) = profile.context_compression.summary_model.as_deref() else {
+                continue;
+            };
+            if summary_model.trim().is_empty() {
+                continue;
+            }
+
+            // Gather the agents that (a) reference this profile and (b) have no
+            // agent-level summary_provider override (an override supersedes the
+            // bare id, so the agent is safe). For each, resolve the canonical
+            // provider entry its bare summary_model would be dispatched onto.
+            let mut affected: Vec<(String, String)> = Vec::new();
+            for (agent_alias, agent) in &self.agents {
+                if agent.runtime_profile.trim() != profile_alias {
+                    continue;
+                }
+                if !agent.summary_provider.trim().is_empty() {
+                    continue;
+                }
+                let provider_label = self.canonical_provider_label(agent.model_provider.trim());
+                affected.push((agent_alias.clone(), provider_label));
+            }
+
+            // The bug only manifests across distinct providers: a single shared
+            // bare id sent to two or more different providers. Same-provider use
+            // is the deprecated-but-correct case and stays silent here (the
+            // runtime deprecation WARN still nudges migration).
+            let distinct: std::collections::BTreeSet<&str> =
+                affected.iter().map(|(_, p)| p.as_str()).collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+
+            let mut agents_sorted: Vec<&(String, String)> = affected.iter().collect();
+            agents_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let detail = agents_sorted
+                .iter()
+                .map(|(name, provider)| format!("{name} -> {provider}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "cross_provider_summary_model",
+                format!(
+                    "runtime_profiles.{profile_alias}.context_compression.summary_model \
+                     ({summary_model:?}) is a bare model id reused by agents resolving to \
+                     different providers ({detail}); the deprecated summary_model is \
+                     dispatched on each agent's own provider, so it is sent to the wrong \
+                     provider for at least one of them and silently fails at runtime (#7964). \
+                     Migrate to context_compression.summary_provider (or an agent-level \
+                     summary_provider), which is self-contained and runs on its own provider."
+                ),
+                format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
+            ));
+        }
+    }
+
+    /// Canonical label for an agent's resolved model provider, used to decide
+    /// whether two agents sit on distinct providers. A non-empty ref that
+    /// resolves through `[providers.models]` collapses to its canonical
+    /// `<family>.<alias>` so equivalent spellings (bare vs dotted) compare
+    /// equal; an empty or unresolved ref keeps its raw form (empty becomes a
+    /// stable sentinel) so it still participates as a distinct bucket.
+    fn canonical_provider_label(&self, provider_ref: &str) -> String {
+        if provider_ref.is_empty() {
+            return "<agent default provider>".to_string();
+        }
+        match self.providers.models.find_by_name(provider_ref) {
+            Some((family, alias, _)) => format!("{family}.{alias}"),
+            None => provider_ref.to_string(),
+        }
     }
 
     /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
@@ -17741,6 +17939,43 @@ impl Config {
             );
         }
 
+        // Per-profile validation: the context-compression summarizer provider
+        // ref (#7964) must resolve to a configured `[providers.models.*]` alias.
+        // Empty = inherit (valid). A shared profile fails loud at config time
+        // instead of only when some agent using it compresses.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let value = self.runtime_profiles[palias]
+                .context_compression
+                .summary_provider
+                .trim();
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!(
+                                "runtime_profiles.{palias}.context_compression.summary_provider"
+                            ),
+                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("runtime_profiles.{palias}.context_compression.summary_provider"),
+                    "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
+                ),
+            }
+        }
+
         // Per-agent validation. Mandatory + alias-existence checks live
         // here so the gateway PATCH path returns structured per-field
         // errors and the frontend never owns this rule. Sorted iteration
@@ -17837,6 +18072,12 @@ impl Config {
                     "providers.models",
                     "classifier_provider",
                     agent.classifier_provider.trim(),
+                ),
+                // Agent-level context-compression summarizer override (#7964).
+                (
+                    "providers.models",
+                    "summary_provider",
+                    agent.summary_provider.trim(),
                 ),
             ];
             for (section_prefix, field, value) in typed_provider_refs {
@@ -19299,6 +19540,62 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    #[::core::prelude::v1::test]
+    fn skill_bundle_admits_skill_honors_include_and_exclude() {
+        let mut bundle = super::SkillBundleConfig::default();
+        assert!(bundle.admits_skill("anything"));
+
+        bundle.include = vec!["widget".into()];
+        assert!(bundle.admits_skill("widget"));
+        assert!(!bundle.admits_skill("gadget"));
+
+        bundle.exclude = vec!["widget".into()];
+        assert!(!bundle.admits_skill("widget"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn provider_cost_categories_match_rate_struct_fields() {
+        let json = serde_json::to_value(super::ProviderCostRates::default()).unwrap();
+        let mut fields: Vec<String> = json
+            .as_object()
+            .expect("ProviderCostRates serializes to a map")
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        let mut registry: Vec<String> = super::PROVIDER_COST_CATEGORIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        registry.sort();
+        assert_eq!(
+            fields, registry,
+            "PROVIDER_COST_CATEGORIES must list exactly the ProviderCostRates rate-sheet fields"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cost_category_resolves_only_rate_bearing_sections() {
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.models"),
+            Some("models")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.tts"),
+            Some("tts")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.transcription"),
+            Some("transcription")
+        );
+        assert_eq!(super::cost_category_for_provider_section("channels"), None);
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.unknown"),
+            None
+        );
+        assert_eq!(super::cost_category_for_provider_section("models"), None);
+    }
+
     #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
@@ -20728,6 +21025,7 @@ auto_save = true
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
@@ -21391,6 +21689,7 @@ default_temperature = 0.7
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
@@ -22517,6 +22816,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22550,6 +22850,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22606,6 +22907,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22636,6 +22938,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22713,6 +23016,7 @@ allowed_numbers = ["+1", "+2"]
                     self_chat_mode: false,
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
+                    allowed_groups: vec![],
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
@@ -29316,6 +29620,279 @@ allowed_users = []
                 && msg.contains("does-not-exist")
                 && msg.contains("providers.models.custom.does-not-exist is not configured"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
+        );
+    }
+
+    // #7964: agent-level summary_provider validated like classifier_provider.
+    #[tokio::test]
+    async fn config_validate_rejects_agent_summary_provider_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            summary_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!("{:#}", cfg.validate().expect_err("missing alias must fail"));
+        assert!(
+            msg.contains("summary_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for agent summary_provider, got: {msg}"
+        );
+    }
+
+    // #7964: profile-level summary_provider validated by the new profile loop.
+    #[tokio::test]
+    async fn config_validate_rejects_profile_summary_provider_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            summary_provider = "custom.nope"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate().expect_err("missing profile alias must fail")
+        );
+        assert!(
+            msg.contains("runtime_profiles.fast.context_compression.summary_provider")
+                && msg.contains("providers.models.custom.nope is not configured"),
+            "expected DanglingReference for profile summary_provider, got: {msg}"
+        );
+    }
+
+    // #7964: effective_summary_provider precedence — agent → profile → None.
+    #[tokio::test]
+    async fn effective_summary_provider_precedence() {
+        let toml = r#"
+            [providers.models.custom.main]
+            api_key = "k"
+            model = "m-main"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.cheap]
+            api_key = "k"
+            model = "m-cheap"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.profilesum]
+            api_key = "k"
+            model = "m-profile"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            summary_provider = "custom.profilesum"
+
+            [agents.a]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+            runtime_profile = "fast"
+            summary_provider = "custom.cheap"
+
+            [agents.b]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+            runtime_profile = "fast"
+
+            [agents.c]
+            enabled = true
+            model_provider = "custom.main"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // agent override wins over the profile
+        assert_eq!(
+            cfg.effective_summary_provider("a").as_deref(),
+            Some("custom.cheap")
+        );
+        // agent empty → profile value
+        assert_eq!(
+            cfg.effective_summary_provider("b").as_deref(),
+            Some("custom.profilesum")
+        );
+        // no agent override + no runtime profile → None (caller uses agent's own)
+        assert_eq!(cfg.effective_summary_provider("c"), None);
+    }
+
+    // #7964: config-time diagnostic for the legacy cross-provider summary_model
+    // shape. A profile sets the deprecated bare summary_model and is shared by
+    // two agents on DIFFERENT providers with no summary_provider override -> the
+    // diagnostic fires and names the profile + the affected agents + providers.
+    #[tokio::test]
+    async fn collect_warnings_flags_cross_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "cross_provider_summary_model")
+            .expect("expected cross_provider_summary_model warning");
+        assert_eq!(
+            w.path,
+            "runtime_profiles.shared.context_compression.summary_model"
+        );
+        assert!(
+            w.message.contains("haiku"),
+            "message names the model: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("alpha -> custom.p1"),
+            "message names alpha + provider: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("beta -> custom.p2"),
+            "message names beta + provider: {}",
+            w.message
+        );
+    }
+
+    // Control: same profile + summary_model but both agents on the SAME provider
+    // -> no diagnostic (deprecated-but-correct; runtime WARN still nudges).
+    #[tokio::test]
+    async fn collect_warnings_silent_for_same_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.collect_warnings()
+                .iter()
+                .any(|w| w.code == "cross_provider_summary_model"),
+            "same-provider use must not warn"
+        );
+    }
+
+    // Control: cross-provider agents but each sets an agent-level
+    // summary_provider override -> the override supersedes the bare id, so no
+    // diagnostic.
+    #[tokio::test]
+    async fn collect_warnings_silent_when_summary_provider_override_present() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.sum]
+            api_key = "k"
+            model = "ms"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+            summary_provider = "custom.sum"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+            summary_provider = "custom.sum"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.collect_warnings()
+                .iter()
+                .any(|w| w.code == "cross_provider_summary_model"),
+            "agent-level summary_provider override must suppress the warning"
         );
     }
 

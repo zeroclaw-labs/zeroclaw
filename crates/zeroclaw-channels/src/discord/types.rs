@@ -117,7 +117,7 @@ impl DiscordOutgoing {
 /// 100-char limit; `options` are the typed command options (empty → the legacy
 /// single free-text `input`).
 ///
-/// `Eq` is not derived: [`OptionSpec`] carries `f64` numeric bounds.
+/// `Eq` is not derived: `OptionSpec` carries `f64` numeric bounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscordSlashCommandSpec {
     pub skill_name: String,
