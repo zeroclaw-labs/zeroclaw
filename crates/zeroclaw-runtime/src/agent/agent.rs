@@ -1641,6 +1641,39 @@ impl Agent {
         self.history.extend(other_messages);
     }
 
+    /// Append the trailing `Tool receipts:` block to a turn's response when
+    /// `[tool_receipts] show_in_response` is set. Reads the per-turn collector
+    /// from the active receipt scope; a `None` scope or empty collector returns
+    /// the response unchanged. Shared by `turn` and `turn_streamed*` so every
+    /// non-channel surface (ACP, gateway WS, CLI) renders the same block the
+    /// channel orchestrator does.
+    fn append_receipts_block(
+        &self,
+        response: String,
+        scope: Option<&crate::agent::tool_receipts::ReceiptScope>,
+    ) -> String {
+        if !self.config.resolved.tool_receipts.show_in_response {
+            return response;
+        }
+        let Some(scope) = scope else {
+            return response;
+        };
+        let block = {
+            let receipts = scope.collector().lock().unwrap_or_else(|e| e.into_inner());
+            crate::agent::tool_receipts::render_receipts_block(&receipts)
+        };
+        match block {
+            Some(block) => {
+                if response.is_empty() {
+                    block
+                } else {
+                    format!("{response}\n\n{block}")
+                }
+            }
+            None => response,
+        }
+    }
+
     fn build_system_prompt(&self) -> Result<String> {
         let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
             || self.tool_dispatcher.should_send_tool_specs();
@@ -1665,7 +1698,12 @@ impl Agent {
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
-        self.prompt_builder.build(&ctx)
+        let mut prompt = self.prompt_builder.build(&ctx)?;
+        let receipts = &self.config.resolved.tool_receipts;
+        if receipts.enabled && receipts.inject_system_prompt {
+            prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        Ok(prompt)
     }
 
     // Superseded by the loop's prepare/approve/execute pipeline (#7415).
@@ -2041,6 +2079,8 @@ impl Agent {
             self.history.push(replayed);
         }
         let response = loop_result?;
+
+        let response = self.append_receipts_block(response, receipt_scope.as_ref());
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -2473,6 +2513,8 @@ impl Agent {
                     }
 
                     self.observer.record_event(&ObserverEvent::TurnComplete);
+                    let committed_response =
+                        self.append_receipts_block(committed_response, receipt_scope.as_ref());
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
@@ -4297,6 +4339,98 @@ mod tests {
         assert!(
             !history_has_receipt(&agent),
             "disabled receipts must not sign tool results"
+        );
+    }
+
+    fn show_in_response_config(show: bool) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                tool_receipts: zeroclaw_config::schema::ToolReceiptsConfig {
+                    enabled: true,
+                    show_in_response: show,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        }
+    }
+
+    fn streamed_agent_with_config(config: zeroclaw_config::schema::AliasedAgentConfig) -> Agent {
+        let model_provider = Box::new(StreamToolCaptureModelProvider {
+            tools_received: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    // RED on the pre-fix branch: `show_in_response` was read only in the channel
+    // orchestrator, so ACP/WS/CLI turns never appended the auditable block.
+    // GREEN once the turn paths route the collector through
+    // `append_receipts_block`.
+    #[tokio::test]
+    async fn turn_streamed_appends_receipts_block_when_show_in_response() {
+        let mut agent = streamed_agent_with_config(show_in_response_config(true));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (response, _msgs) = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
+            "show_in_response must append the Tool receipts block to the reply, got: {response}"
+        );
+    }
+
+    // Control: with show_in_response off the reply carries no receipts block,
+    // even though receipts are still signed into history.
+    #[tokio::test]
+    async fn turn_streamed_omits_receipts_block_when_show_in_response_off() {
+        let mut agent = streamed_agent_with_config(show_in_response_config(false));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (response, _msgs) = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            !response.contains("Tool receipts:"),
+            "no receipts block when show_in_response is off, got: {response}"
+        );
+        assert!(
+            history_has_receipt(&agent),
+            "receipts are still signed into history when only the reply block is off"
+        );
+    }
+
+    // The receipt-echo system-prompt addendum is added on the turn path when
+    // inject_system_prompt is on (default), matching the channel orchestrator.
+    #[test]
+    fn build_system_prompt_injects_receipt_addendum_when_enabled() {
+        let agent = streamed_agent_with_config(show_in_response_config(true));
+        let prompt = agent
+            .build_system_prompt()
+            .expect("system prompt should build");
+        assert!(
+            prompt.contains("## Tool Execution Receipts"),
+            "enabled receipts with inject_system_prompt must add the addendum"
         );
     }
 

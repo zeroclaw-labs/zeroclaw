@@ -5269,16 +5269,7 @@ image_cache: None,
                 let receipts = tool_receipts_collector
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if receipts.is_empty() {
-                    None
-                } else {
-                    use std::fmt::Write as _;
-                    let mut block = String::from("---\nTool receipts:");
-                    for r in receipts.iter() {
-                        write!(block, "\n  {r}").ok();
-                    }
-                    Some(block)
-                }
+                zeroclaw_runtime::agent::tool_receipts::render_receipts_block(&receipts)
             } else {
                 None
             };
@@ -9199,13 +9190,7 @@ pub async fn start_channels(
         }
         if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
         {
-            system_prompt.push_str(
-                "\n## Tool Execution Receipts\n\n\
-                 Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
-                 signature proving the tool actually executed. You must include the receipt \
-                 verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
-                 A missing or invalid receipt indicates a fabricated tool call.\n\n",
-            );
+            system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
 
         // === First iteration only: set up shared channel infrastructure ===
