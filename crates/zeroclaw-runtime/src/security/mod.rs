@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
