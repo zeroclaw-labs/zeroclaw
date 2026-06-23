@@ -288,6 +288,9 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         open={upgradeOpen}
         info={info}
         loading={loading}
+        allowSelfUpgrade={status?.allow_self_upgrade === true}
+        restartMode={status?.restart_mode}
+        restartHint={status?.restart_hint}
         onClose={() => setUpgradeOpen(false)}
       />
     </>

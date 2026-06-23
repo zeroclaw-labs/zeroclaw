@@ -16,12 +16,14 @@ use super::api::require_auth;
 use anyhow::Context;
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 /// How long a successful version check is reused before re-querying GitHub.
 const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -213,6 +215,327 @@ pub async fn handle_version_check(
     }
 }
 
+// ── Upgrade (Phase 2/3) ──────────────────────────────────────────
+
+/// Lifecycle of an in-flight upgrade. `Restarting` is only reached when the
+/// caller opted into auto-restart under a supervisor (Phase 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeState {
+    Running,
+    Done,
+    Restarting,
+    Failed,
+}
+
+impl UpgradeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpgradeState::Running => "running",
+            UpgradeState::Done => "done",
+            UpgradeState::Restarting => "restarting",
+            UpgradeState::Failed => "failed",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, UpgradeState::Done | UpgradeState::Failed)
+    }
+}
+
+/// Shared progress for the current/most-recent upgrade. The spawned task writes
+/// it; `GET /api/version/upgrade/status` reads it.
+struct UpgradeProgress {
+    handoff_id: String,
+    state: UpgradeState,
+    /// 0 before the first `Phase N/6` marker, else 1..=6.
+    phase: u8,
+    /// Last ~50 lines of combined stdout/stderr.
+    log_tail: VecDeque<String>,
+    previous_version: String,
+    target_version: Option<String>,
+    error: Option<String>,
+    restart_mode: &'static str,
+    restart_hint: String,
+}
+
+const LOG_TAIL_MAX: usize = 50;
+/// Grace before the supervised self-restart, so the final status poll flushes.
+const RESTART_GRACE: Duration = Duration::from_millis(1500);
+/// Upper bound on the whole upgrade subprocess (download + verify + swap).
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The single in-flight (or most recent) upgrade. Only one runs at a time.
+static UPGRADE: Mutex<Option<Arc<Mutex<UpgradeProgress>>>> = Mutex::new(None);
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpgradeRequest {
+    /// Target release tag; defaults to latest.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// After a successful swap, exit so a supervisor relaunches the new binary.
+    /// Only honoured under a detected supervisor (systemd/launchd).
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+fn json_error(code: StatusCode, msg: &str) -> axum::response::Response {
+    (code, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
+///
+/// Returns 202 with a `handoff_id`; the work runs on a detached task and the
+/// client polls `GET /api/version/upgrade/status`.
+pub async fn handle_version_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    // Accept an empty body (defaults) or a JSON object.
+    let req: UpgradeRequest = if body.is_empty() {
+        UpgradeRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
+        }
+    };
+
+    if !state.config.read().gateway.allow_self_upgrade {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it",
+        );
+    }
+
+    let restart = detect_restart();
+    let supervised = restart.mode == RestartMode::Supervised;
+    if req.auto_restart && !supervised {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "auto_restart requires a supervised environment (systemd/launchd); restart manually instead",
+        );
+    }
+
+    // One upgrade at a time.
+    let mut slot = UPGRADE.lock().unwrap();
+    if let Some(existing) = slot.as_ref() {
+        if !existing.lock().unwrap().state.is_terminal() {
+            return json_error(StatusCode::CONFLICT, "an upgrade is already in progress");
+        }
+    }
+
+    let handoff_id = uuid::Uuid::new_v4().to_string();
+    let progress = Arc::new(Mutex::new(UpgradeProgress {
+        handoff_id: handoff_id.clone(),
+        state: UpgradeState::Running,
+        phase: 0,
+        log_tail: VecDeque::new(),
+        previous_version: env!("CARGO_PKG_VERSION").to_string(),
+        target_version: req.version.clone(),
+        error: None,
+        restart_mode: restart.mode.as_str(),
+        restart_hint: restart.hint,
+    }));
+    *slot = Some(progress.clone());
+    drop(slot);
+
+    ::zeroclaw_spawn::spawn!(run_upgrade(
+        progress,
+        req.version,
+        req.auto_restart && supervised,
+    ));
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "handoff_id": handoff_id })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpgradeStatusQuery {
+    #[serde(default)]
+    pub handoff_id: Option<String>,
+}
+
+/// GET /api/version/upgrade/status[?handoff_id=X]
+pub async fn handle_version_upgrade_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<UpgradeStatusQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let slot = UPGRADE.lock().unwrap();
+    let Some(progress) = slot.as_ref() else {
+        return Json(serde_json::json!({ "state": "idle" })).into_response();
+    };
+    let p = progress.lock().unwrap();
+    if let Some(id) = q.handoff_id.as_deref() {
+        if id != p.handoff_id {
+            return json_error(StatusCode::NOT_FOUND, "unknown handoff_id");
+        }
+    }
+    Json(serde_json::json!({
+        "handoff_id": p.handoff_id,
+        "state": p.state.as_str(),
+        "phase": p.phase,
+        "log_tail": p.log_tail,
+        "previous_version": p.previous_version,
+        "target_version": p.target_version,
+        "restart_mode": p.restart_mode,
+        "restart_hint": p.restart_hint,
+        "error": p.error,
+    }))
+    .into_response()
+}
+
+fn set_state(progress: &Arc<Mutex<UpgradeProgress>>, state: UpgradeState) {
+    progress.lock().unwrap().state = state;
+}
+
+fn fail(progress: &Arc<Mutex<UpgradeProgress>>, msg: String) {
+    let mut p = progress.lock().unwrap();
+    p.state = UpgradeState::Failed;
+    p.error = Some(msg);
+}
+
+/// Parse a `Phase N/6` marker out of a log line (best-effort).
+fn parse_phase(line: &str) -> Option<u8> {
+    let rest = line.split_once("Phase ")?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|n| (1..=6).contains(n))
+}
+
+/// Stream a child's output into the log ring buffer, advancing `phase`.
+async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<UpgradeProgress>>) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let mut p = progress.lock().unwrap();
+        if let Some(phase) = parse_phase(&line) {
+            p.phase = phase;
+        }
+        p.log_tail.push_back(line);
+        while p.log_tail.len() > LOG_TAIL_MAX {
+            p.log_tail.pop_front();
+        }
+    }
+}
+
+/// Drive `zeroclaw update`, then either mark done or (Phase 3) self-restart.
+async fn run_upgrade(
+    progress: Arc<Mutex<UpgradeProgress>>,
+    version: Option<String>,
+    auto_restart_supervised: bool,
+) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            fail(
+                &progress,
+                format!("cannot determine current executable: {e}"),
+            );
+            return;
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("update");
+    if let Some(v) = &version {
+        cmd.arg("--version").arg(v);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            fail(&progress, format!("failed to start `zeroclaw update`: {e}"));
+            return;
+        }
+    };
+
+    // Clone into locals first: `spawn!` wraps the body in `async move`, so a
+    // `progress.clone()` *inside* the macro would move `progress` itself.
+    let mut pumps = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let p = progress.clone();
+        pumps.push(::zeroclaw_spawn::spawn!(pump_lines(out, p)));
+    }
+    if let Some(err) = child.stderr.take() {
+        let p = progress.clone();
+        pumps.push(::zeroclaw_spawn::spawn!(pump_lines(err, p)));
+    }
+
+    let status = match tokio::time::timeout(UPGRADE_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            fail(&progress, format!("update process error: {e}"));
+            return;
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            fail(
+                &progress,
+                "update timed out after 15 minutes; the old binary is unchanged".to_string(),
+            );
+            return;
+        }
+    };
+    for h in pumps {
+        let _ = h.await;
+    }
+
+    if !status.success() {
+        let tail = {
+            let p = progress.lock().unwrap();
+            p.log_tail
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        fail(
+            &progress,
+            format!("update failed ({status}); the previous binary is preserved. {tail}"),
+        );
+        return;
+    }
+
+    if auto_restart_supervised {
+        // Phase 3: the binary on disk is new; exit cleanly so the supervisor
+        // relaunches it. We never spawn/exec a replacement ourselves.
+        set_state(&progress, UpgradeState::Restarting);
+        tokio::time::sleep(RESTART_GRACE).await;
+        request_supervised_restart();
+    } else {
+        set_state(&progress, UpgradeState::Done);
+    }
+}
+
+/// Send ourselves SIGTERM so the daemon's signal handler runs its graceful
+/// teardown (`DaemonExit::Shutdown`) and the supervisor relaunches the new
+/// binary. No-op on non-unix (auto_restart is only offered when supervised,
+/// which we only detect on unix).
+fn request_supervised_restart() {
+    #[cfg(unix)]
+    // SAFETY: `raise` is async-signal-safe and merely posts SIGTERM to this
+    // process, which the daemon already handles for graceful shutdown.
+    unsafe {
+        libc::raise(libc::SIGTERM);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +568,23 @@ mod tests {
         let out = check_to_json(&parsed);
         assert_eq!(out["latest_version"], "0.7.4");
         assert_eq!(out["is_newer"], true);
+    }
+
+    #[test]
+    fn upgrade_state_strings_and_terminality() {
+        assert_eq!(UpgradeState::Running.as_str(), "running");
+        assert_eq!(UpgradeState::Restarting.as_str(), "restarting");
+        assert!(UpgradeState::Done.is_terminal());
+        assert!(UpgradeState::Failed.is_terminal());
+        assert!(!UpgradeState::Running.is_terminal());
+        assert!(!UpgradeState::Restarting.is_terminal());
+    }
+
+    #[test]
+    fn parse_phase_extracts_marker() {
+        assert_eq!(parse_phase("Phase 1/6: Preflight checks..."), Some(1));
+        assert_eq!(parse_phase("  INFO  Phase 6/6: Cleanup"), Some(6));
+        assert_eq!(parse_phase("no marker here"), None);
+        assert_eq!(parse_phase("Phase 9/6: bogus"), None);
     }
 }

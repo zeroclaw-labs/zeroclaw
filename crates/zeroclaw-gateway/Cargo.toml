@@ -75,6 +75,11 @@ toml_edit = "0.25"
 rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
+# Unix-only: self-signal SIGTERM to trigger the daemon's graceful shutdown for
+# supervised post-upgrade restart (version.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rand = "0.10"
 rcgen = "0.13"

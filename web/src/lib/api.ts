@@ -378,6 +378,50 @@ export function checkVersion(opts?: {
   );
 }
 
+export type UpgradeState =
+  | "idle"
+  | "running"
+  | "done"
+  | "restarting"
+  | "failed";
+
+export interface UpgradeStatusResponse {
+  handoff_id?: string;
+  state: UpgradeState;
+  /** 0 before the first `Phase N/6` marker, else 1..6. */
+  phase?: number;
+  log_tail?: string[];
+  previous_version?: string;
+  target_version?: string | null;
+  restart_mode?: "supervised" | "manual";
+  restart_hint?: string;
+  error?: string;
+}
+
+/**
+ * POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
+ *
+ * Returns a `handoff_id`; poll {@link getUpgradeStatus} for progress. Requires
+ * `gateway.allow_self_upgrade`. `auto_restart` is only honoured under a
+ * supervisor (systemd/launchd).
+ */
+export function startUpgrade(opts?: {
+  version?: string;
+  auto_restart?: boolean;
+}): Promise<{ handoff_id: string }> {
+  return apiFetch<{ handoff_id: string }>("/api/version/upgrade", {
+    method: "POST",
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+export function getUpgradeStatus(
+  handoffId?: string,
+): Promise<UpgradeStatusResponse> {
+  const qs = handoffId ? `?handoff_id=${encodeURIComponent(handoffId)}` : "";
+  return apiFetch<UpgradeStatusResponse>(`/api/version/upgrade/status${qs}`);
+}
+
 // ---------------------------------------------------------------------------
 // TUIs
 // ---------------------------------------------------------------------------

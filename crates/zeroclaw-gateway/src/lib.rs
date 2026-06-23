@@ -1586,6 +1586,11 @@ pub async fn run_gateway(
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/version/check", get(version::handle_version_check))
+        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade/status",
+            get(version::handle_version_upgrade_status),
+        )
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",
