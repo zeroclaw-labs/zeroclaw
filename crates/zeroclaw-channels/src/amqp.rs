@@ -360,6 +360,7 @@ impl Channel for AmqpChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in AMQP.
         Ok(())
     }
 }
