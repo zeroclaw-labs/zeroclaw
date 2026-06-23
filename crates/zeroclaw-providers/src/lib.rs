@@ -628,6 +628,13 @@ pub struct ModelProviderRuntimeOptions {
     pub think: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// When `Some(false)`, the OpenAI-compatible provider will strip stored
+    /// assistant `reasoning_content`/`reasoning` from outbound history.
+    /// `Some(true)` (or `None`) preserves the provider's default replay
+    /// behaviour. Lets operators targeting strict endpoints (e.g. Groq,
+    /// Mistral) via the generic `custom` provider opt out of reasoning
+    /// replay without depending on a family-specific shortcut. See #8219.
+    pub replay_assistant_reasoning: Option<bool>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -649,6 +656,7 @@ impl Default for ModelProviderRuntimeOptions {
             wire_api: None,
             think: None,
             chat_template_kwargs: None,
+            replay_assistant_reasoning: None,
         }
     }
 }
@@ -708,6 +716,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
+        replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
     }
 }
 

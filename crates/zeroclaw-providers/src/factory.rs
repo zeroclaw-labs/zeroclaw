@@ -147,6 +147,13 @@ pub fn apply_compat_options(
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
     }
+    // Generalises the Groq-specific shortcut added in #7616 so any
+    // OpenAI-compatible `custom` endpoint pointed at a strict backend
+    // (Groq, Mistral, ...) can opt out of reasoning replay without
+    // a dedicated family factory. See #8219.
+    if opts.replay_assistant_reasoning == Some(false) {
+        p = p.without_assistant_reasoning_replay();
+    }
     Box::new(p)
 }
 

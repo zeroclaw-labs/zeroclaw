@@ -708,6 +708,16 @@ pub struct ModelProviderConfig {
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Whether stored assistant reasoning should be replayed on outbound
+    /// assistant history messages for OpenAI-compatible providers.
+    /// `Some(false)` strips `reasoning_content`/`reasoning` from outbound
+    /// history - use this when targeting a strict endpoint (e.g. Groq,
+    /// Mistral) that rejects reasoning fields on input. `None` (default)
+    /// preserves the provider's built-in behaviour. Generalises the
+    /// `groq`-factory shortcut added in #7616 to any OpenAI-compatible
+    /// `custom` endpoint pointed at a strict backend. See #8219.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
