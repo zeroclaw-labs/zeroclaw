@@ -2455,7 +2455,7 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
                 })),
             "Unrecognized plugins.security.signature_mode; failing safe to strict"
         );
-        zeroclaw_plugins::host::SignatureMode::Strict
+        zeroclaw_plugins::signature::SignatureMode::Strict
     });
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
 
