@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { Check, Circle, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { t } from '@/lib/i18n';
 import {
@@ -37,7 +38,7 @@ const PHASE_LABELS = [
   'upgrade.phase.cleanup',
 ];
 
-const UPGRADE_POLL_MS = 1500;
+const UPGRADE_POLL_MS = 800;
 const RESTART_POLL_MS = 2000;
 const RESTART_TIMEOUT_MS = 60_000;
 
@@ -275,44 +276,73 @@ export function UpgradeDialog({
           )}
 
           {/* ── Progress ── */}
-          {(view === 'progress' || view === 'restarting') && (
-            <div className="flex flex-col gap-2">
-              <div className="text-xs text-pc-text">
-                {view === 'restarting' ? t('upgrade.restarting') : t('upgrade.upgrading')}
+          {(view === 'progress' || view === 'restarting') && (() => {
+            // `restarting` implies every phase finished.
+            const cur = view === 'restarting' ? 7 : status?.phase ?? 0;
+            const pct = view === 'restarting' ? 100 : Math.round((Math.min(cur, 6) / 6) * 100);
+            const lastLine = status?.log_tail?.[status.log_tail.length - 1];
+            return (
+              <div className="flex flex-col gap-2.5">
+                <div className="text-xs text-pc-text flex items-center gap-2">
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                  {view === 'restarting' ? t('upgrade.restarting') : t('upgrade.upgrading')}
+                </div>
+
+                {/* Progress bar */}
+                <div className="h-1 w-full overflow-hidden rounded-full bg-pc-surface">
+                  <div
+                    className="h-full rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${pct}%`, background: 'var(--pc-accent)' }}
+                  />
+                </div>
+
+                {/* Live last-line ticker */}
+                {lastLine && (
+                  <div className="font-mono text-[11px] text-pc-text-muted truncate" title={lastLine}>
+                    {lastLine}
+                  </div>
+                )}
+
+                {/* Phase checklist */}
+                <ol className="text-xs flex flex-col gap-1.5">
+                  {PHASE_LABELS.map((key, i) => {
+                    const n = i + 1;
+                    const done = cur > n;
+                    const active = cur === n;
+                    return (
+                      <li key={key} className="flex items-center gap-2">
+                        {done ? (
+                          <Check
+                            className="h-3.5 w-3.5 shrink-0"
+                            style={{ color: 'var(--pc-accent)' }}
+                          />
+                        ) : active ? (
+                          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-pc-text" />
+                        ) : (
+                          <Circle className="h-3.5 w-3.5 shrink-0 text-pc-text-muted opacity-40" />
+                        )}
+                        <span className={done || active ? 'text-pc-text' : 'text-pc-text-muted'}>
+                          {t(key)}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ol>
+
+                {/* Full log (collapsed) */}
+                {status?.log_tail && status.log_tail.length > 0 && (
+                  <details className="text-xs">
+                    <summary className="cursor-pointer text-pc-text-muted">
+                      {t('upgrade.log')}
+                    </summary>
+                    <pre className="mt-1 max-h-40 overflow-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-surface px-3 py-2 text-[11px] leading-relaxed text-pc-text-muted whitespace-pre-wrap">
+                      {status.log_tail.join('\n')}
+                    </pre>
+                  </details>
+                )}
               </div>
-              <ol className="text-xs flex flex-col gap-0.5">
-                {PHASE_LABELS.map((key, i) => {
-                  const n = i + 1;
-                  const cur = status?.phase ?? 0;
-                  const mark =
-                    view === 'restarting' || cur > n ? '✓' : cur === n ? '⟳' : '·';
-                  return (
-                    <li
-                      key={key}
-                      className={
-                        cur >= n || view === 'restarting'
-                          ? 'text-pc-text'
-                          : 'text-pc-text-muted'
-                      }
-                    >
-                      <span className="inline-block w-4">{mark}</span>
-                      {n}/6 {t(key)}
-                    </li>
-                  );
-                })}
-              </ol>
-              {status?.log_tail && status.log_tail.length > 0 && (
-                <details className="text-xs">
-                  <summary className="cursor-pointer text-pc-text-muted">
-                    {t('upgrade.log')}
-                  </summary>
-                  <pre className="mt-1 max-h-40 overflow-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-surface px-3 py-2 text-[11px] leading-relaxed text-pc-text-muted whitespace-pre-wrap">
-                    {status.log_tail.join('\n')}
-                  </pre>
-                </details>
-              )}
-            </div>
-          )}
+            );
+          })()}
 
           {/* ── Done ── */}
           {view === 'done' && (

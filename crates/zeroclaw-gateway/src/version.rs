@@ -413,10 +413,38 @@ fn parse_phase(line: &str) -> Option<u8> {
     digits.parse().ok().filter(|n| (1..=6).contains(n))
 }
 
+/// Strip ANSI escape sequences so the dashboard log panel renders clean text.
+/// `--verbose` makes the child's tracing layer emit colour codes (CSI `ESC[…m`),
+/// which show up as garbage in a browser.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC: drop a CSI sequence (`[` … final byte 0x40..=0x7e); for any
+        // other escape, just drop the following byte (best-effort).
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for nc in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&nc) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
+}
+
 /// Stream a child's output into the log ring buffer, advancing `phase`.
 async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<UpgradeProgress>>) {
     let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Ok(Some(raw)) = lines.next_line().await {
+        let line = strip_ansi(&raw);
         let mut p = progress.lock().unwrap();
         if let Some(phase) = parse_phase(&line) {
             p.phase = phase;
@@ -446,7 +474,9 @@ async fn run_upgrade(
     };
 
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("update");
+    // `--verbose` surfaces the `Phase N/6` records (otherwise INFO logs are
+    // muted on the child's stderr), so the dashboard can stream progress.
+    cmd.arg("--verbose").arg("update");
     if let Some(v) = &version {
         cmd.arg("--version").arg(v);
     }
@@ -586,5 +616,16 @@ mod tests {
         assert_eq!(parse_phase("  INFO  Phase 6/6: Cleanup"), Some(6));
         assert_eq!(parse_phase("no marker here"), None);
         assert_eq!(parse_phase("Phase 9/6: bogus"), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes_and_keeps_text() {
+        let raw = "\u{1b}[2m2026-06-23T07:14:41Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+                   Phase 2/6: Downloading...";
+        let clean = strip_ansi(raw);
+        assert!(!clean.contains('\u{1b}'), "ESC remained: {clean:?}");
+        assert!(!clean.contains("[2m") && !clean.contains("[32m"));
+        assert!(clean.contains("Phase 2/6: Downloading..."));
+        assert_eq!(parse_phase(&clean), Some(2));
     }
 }
