@@ -1238,6 +1238,11 @@ export interface SectionInfo {
     | "typed_family_map"
     | "backend_picker"
     | null;
+  /** Backend-owned cost-rate category for this section, emitted from
+   *  `cost_category_for_provider_section`. One of `models` / `tts` /
+   *  `transcription` for rate-bearing provider sections, or `""` otherwise.
+   *  Drives the Costs tab without a frontend section-key table. */
+  cost_category: string;
 }
 
 export interface SectionsResponse {
