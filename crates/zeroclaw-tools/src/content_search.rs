@@ -693,7 +693,10 @@ mod tests {
         create_test_files(&dir);
 
         let tool = ContentSearchTool::new(test_security(dir.path().to_path_buf()));
-        let result = tool.execute(json!({"pattern": "fn main"})).await.unwrap();
+        let result = tool
+            .execute(json!({"pattern": "fn main", "path": dir.path().to_string_lossy()}))
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(result.output.contains("hello.rs"));

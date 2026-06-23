@@ -174,6 +174,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
