@@ -21,6 +21,7 @@ zc-app-quit-prompt = zerocodeを終了しますか？
 zc-app-quit-explainer = TUIが閉じます。デーモンは稼働し続け、いつでも再接続できます。
 zc-app-reload-status-signalled = デーモンの再読み込みを通知しました — 再接続中…
 zc-app-reload-confirm-row = { $confirm_chord } = 再読み込み   { $cancel_chord } = キャンセル
+zc-error-daemon-version-mismatch = バージョンが一致しません: zerocode は { $client_version } ですが、デーモンは { $server_version } です。同じチェックアウトからデーモンを再ビルドして再起動してください。
 zc-zerocode-tab-theme = テーマ
 zc-zerocode-tab-agent-theme = エージェントテーマ
 zc-zerocode-tab-presets = プリセット

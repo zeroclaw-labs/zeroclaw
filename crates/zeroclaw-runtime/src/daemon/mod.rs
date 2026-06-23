@@ -257,6 +257,40 @@ pub async fn run(
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
 
+    // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
+    // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
+    // before channels so a delegating turn finds the plane live. Best-effort and
+    // additive: on failure the plane stays absent and every producer runs as today.
+    //
+    // `daemon::run` is re-entered on every reload. The handle is installed ONCE (an
+    // OnceLock), so producers and the reaper always agree on one `boot_id`. We therefore
+    // only START on first boot; on reload we reuse the installed handle and just respawn
+    // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
+    // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
+    // would then reap the daemon's OWN live tasks as "prior-boot orphans".
+    if crate::control_plane::control_plane().is_none()
+        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+            .await
+            .map(crate::control_plane::init_control_plane)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+            "control-plane failed to start; supervision disabled for this run"
+        );
+    }
+    // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
+    // boot_id matches what producers stamp via `control_plane()`.
+    if let Some(handle) = crate::control_plane::control_plane() {
+        handle.spawn_reaper(
+            crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            channels_cancel.clone(),
+        );
+        crate::health::mark_component_ok("control-plane");
+    }
+
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();

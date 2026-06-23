@@ -21,6 +21,7 @@ zc-app-quit-prompt = ¿Salir de zerocode?
 zc-app-quit-explainer = La TUI se cierra. El daemon sigue ejecutándose; reconéctate cuando quieras.
 zc-app-reload-status-signalled = Recarga del daemon señalizada — reconectando…
 zc-app-reload-confirm-row = { $confirm_chord } = recargar   { $cancel_chord } = cancelar
+zc-error-daemon-version-mismatch = Las versiones no coinciden: zerocode es { $client_version }, pero el daemon es { $server_version }. Vuelve a compilar y reinicia el daemon desde el mismo checkout que zerocode.
 zc-zerocode-tab-theme = Tema
 zc-zerocode-tab-agent-theme = Temas de agente
 zc-zerocode-tab-presets = Preajustes
