@@ -1238,7 +1238,8 @@ mod tests {
 
     #[test]
     fn chat_request_serializes_with_system_and_user() {
-        let request = OpenRouterModelProvider::build_chat_with_system_request(
+        let provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let request = provider.build_chat_with_system_request(
             Some("You are helpful"),
             "Summarize this",
             "anthropic/claude-sonnet-4",
@@ -1279,6 +1280,7 @@ mod tests {
 
         let request = ChatRequest {
             model: "google/gemini-2.5-pro".into(),
+            models: None,
             messages: messages
                 .iter()
                 .map(|msg| Message {
@@ -1975,6 +1977,7 @@ mod tests {
         let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -1991,6 +1994,7 @@ mod tests {
             .with_extra_body(serde_json::json!({}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2007,6 +2011,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2028,6 +2033,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"temperature": 0.9}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2044,6 +2050,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2065,6 +2072,7 @@ mod tests {
         );
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.7),
             tools: None,
