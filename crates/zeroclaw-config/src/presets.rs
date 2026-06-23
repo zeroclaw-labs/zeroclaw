@@ -73,7 +73,8 @@ pub const RISK_PRESETS: &[RiskPreset] = &[
         help: "Trusted daily driver for a personal dev box. Supervised, \
                workspace-scoped with sensitive paths blocked and the sandbox \
                on. Any command runs without an allowlist, but high-risk \
-               commands still ask. Recommended for most users.",
+               commands stay blocked unless explicitly allowlisted. \
+               Recommended for most users.",
         values: balanced_risk,
     },
     RiskPreset {
@@ -119,9 +120,10 @@ fn balanced_risk() -> RiskProfileConfig {
     // with sensitive paths blocked, sandbox on, and any command permitted with
     // high-risk commands still gated. `allowed_commands: ["*"]` lifts the
     // medium-risk allowlist friction, while `block_high_risk_commands: true`
-    // keeps the `*` wildcard from exempting high-risk commands (it is not an
-    // explicit allowlist entry), so they still require approval. Medium-risk
-    // approval is off so routine work does not interrupt.
+    // keeps the `*` wildcard from exempting high-risk commands: `*` is not an
+    // explicit allowlist entry, so a high-risk command matched only by `*` is
+    // blocked outright (it never reaches the approval branch), not merely
+    // prompted. Medium-risk approval is off so routine work does not interrupt.
     RiskProfileConfig {
         level: AutonomyLevel::Supervised,
         workspace_only: true,
@@ -563,16 +565,17 @@ mod tests {
         assert_eq!(v.level, AutonomyLevel::Supervised);
         assert!(v.workspace_only);
         assert_eq!(v.sandbox_enabled, Some(true));
-        // Any command runs without an allowlist, but high-risk still gates:
-        // the `*` wildcard is not an explicit exemption, so block_high_risk
-        // keeps high-risk commands asking while medium-risk friction is off.
+        // Any command runs without an allowlist, but high-risk is blocked, not
+        // prompted: the `*` wildcard is not an explicit exemption, so
+        // block_high_risk_commands rejects high-risk commands outright while
+        // medium-risk friction is off.
         assert_eq!(v.allowed_commands, vec!["*".to_string()]);
         assert!(v.block_high_risk_commands);
         assert!(!v.require_approval_for_medium_risk);
     }
 
     #[test]
-    fn balanced_risk_allows_routine_commands_but_gates_high_risk() {
+    fn balanced_risk_allows_routine_commands_but_blocks_high_risk() {
         let preset = risk_preset("balanced").unwrap();
         let values = (preset.values)();
         let policy = crate::policy::SecurityPolicy {
@@ -588,14 +591,24 @@ mod tests {
                 "balanced must allow routine command `{cmd}` without an allowlist",
             );
         }
-        // High-risk command is allowed past the allowlist but gated at execution
-        // because the `*` wildcard does not exempt it from block_high_risk.
+        // High-risk command passes the allowlist but is blocked outright at
+        // execution: the `*` wildcard is not an explicit allowlist entry, so
+        // block_high_risk_commands rejects it even when approved=true. This is
+        // a hard block, not an approval prompt.
         assert!(policy.is_command_allowed("rm -rf node_modules"));
+        let err_unapproved = policy
+            .validate_command_execution("rm -rf node_modules", false)
+            .expect_err("balanced must block a wildcard-matched high-risk command");
+        let err_approved = policy
+            .validate_command_execution("rm -rf node_modules", true)
+            .expect_err("blocked even with approved=true: not an approval prompt");
         assert!(
-            policy
-                .validate_command_execution("rm -rf node_modules", false)
-                .is_err(),
-            "balanced must still gate a high-risk command pending approval",
+            err_approved.contains("high-risk command is disallowed"),
+            "must be the hard-block error, not the approval-required one: {err_approved}",
+        );
+        assert_eq!(
+            err_unapproved, err_approved,
+            "approval state must not change the outcome for a wildcard-matched high-risk command",
         );
     }
 
