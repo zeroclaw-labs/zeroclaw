@@ -119,42 +119,57 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 `delegate` enforces two gates in `crates/zeroclaw-runtime/src/tools/delegate.rs` before a target agent runs, in this order:
 
 1. **`delegation_policy.mode`**: the caller's risk profile must permit delegation. `[risk_profiles.<alias>].delegation_policy` is `{ mode = "forbidden" }` by default; set `mode = "allow"` to permit delegation at all. When forbidden, the refusal is:
-   `delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"`
+   ```text
+   delegation is forbidden for caller "<caller>" by risk profile "<caller_profile>" delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"
+   ```
    This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select).
 
-2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_targets`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
+2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_target_configs`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
 
    - **same-profile peers**: every other agent sharing the caller's risk profile, included while `delegate_same_risk_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
-   - **explicit roster**: `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
+   - **explicit roster**: `delegates`, a possibly-empty list of targets the caller may delegate to even across risk profiles. String entries are convenient for manual editing and stand for bounded targets. Object entries make the mode explicit:
+     ```toml
+     delegates = [
+       "reviewer",
+       { agent = "sysadmin", mode = "independent" },
+     ]
+     ```
+     When config is saved, every entry is written in object form with `mode = "bounded"` or `mode = "independent"`.
+     Do not roll this config shape out before the daemon and UI binaries have been upgraded to a build that supports delegate modes. Older binaries expect `delegates` to contain only strings; an object entry makes the `agents` section invalid for that binary and the resilient loader drops the section so the repair surfaces can still start.
 
-   When the target is outside that set the refusal is:
-
-   ```plaintext
-   delegate target "<target>" is not reachable from "<caller>"; add it to [agents.<caller>].delegates or share a risk profile with delegate_same_risk_profile enabled
+   When the target is outside that set, the refusal names the cause. For example:
+   ```text
+   delegate target "<target>" is not reachable from "<caller>": different risk profile (caller uses "<caller_profile>", target uses "<target_profile>"). delegate_same_risk_profile only reaches agents with the same risk profile; add an explicit [agents.<caller>].delegates entry with the intended mode, or change one agent's risk_profile.
+   ```
+   ```text
+   delegate target "<target>" is not reachable from "<caller>": delegate_same_risk_profile is disabled and the target is not listed in [agents.<caller>].delegates
+   ```
+   ```text
+   delegate target "<target>" is not reachable from "<caller>": the target agent is disabled
    ```
 
-   A same-profile target inherits the caller's session workspace boundary and shares its action/cost tracker. An explicit **cross-profile** target runs under its own resolved policy and must pass `ensure_no_escalation_beyond` the caller: a listed delegate that would widen privilege (broader autonomy, extra roots, higher budgets, etc.) is refused with:
+   A bounded target inherits the caller's action/cost tracker. When the bounded target shares the caller's risk profile, it also inherits the caller's session workspace boundary. A bounded **cross-profile** target is allowed when it is reachable through the caller's delegate roster and `delegation_policy`; it runs under the target's resolved policy, while agentic tool availability is capped by the caller's tool registry.
 
-   ```plaintext
-   delegate target "<target>" (risk profile "<target_profile>") would escalate beyond the caller (risk profile "<caller_profile>"): <violation>
-   ```
+   An independent target is available only when explicitly listed with `mode = "independent"`. It still requires `delegation_policy.mode = "allow"` and reachability through `delegates`, but once selected it resolves the target agent's own policy without the caller's non-escalation ceiling, session workspace override, or action/cost tracker.
 
 The advertised roster (the `agent` parameter's enum in the tool schema) lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
 
-In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller's tool surface.
+In bounded agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full `SecurityPolicy::ensure_no_escalation_beyond` check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.
+
+In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is still removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
 
 Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
 
 #### Agentic target tool policy
 
-If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` builds the target sub-loop's tool registry from the parent's available tools. The target risk profile then filters that inherited registry:
+If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` builds the target sub-loop's tool registry from either the parent's available tools (`mode = "bounded"`) or the target's own runtime registry (`mode = "independent"`). The target risk profile then filters that registry:
 
-1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the inherited parent registry unrestricted.
+1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the selected registry unrestricted.
 2. A non-empty `allowed_tools` list keeps only exact matching tool names.
 3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
 4. `delegate` is always removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
 
-This policy lives on the target, not the caller. Same-profile peers use the shared risk profile, while explicit cross-profile delegates use the target's risk profile after the non-escalation check. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.
+This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 
 ### `delegate`: output strings the model sees
 
@@ -176,11 +191,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 8. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 9. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task.`
 10. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
-11. Agentic target with no executable child tools: error begins with `Agent '<target>' has no executable tools`, then names the filtering case:
-    - `available from parent registry` when no allowlist or denylist applies but no non-`delegate` parent tools are available.
-    - `after filtering allowlist (<comma-separated names>)` when a non-empty `allowed_tools` list leaves no executable tools.
-    - `after filtering denylist (<comma-separated names>)` when `excluded_tools` removes every inherited executable tool.
-    - `after filtering allowlist (<comma-separated names>) and denylist (<comma-separated names>)` when both gates combine to leave no executable tools.
+11. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
 ### `delegate`: how to verify it actually fired
 

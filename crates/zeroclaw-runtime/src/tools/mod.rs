@@ -530,7 +530,7 @@ pub fn all_tools_with_runtime(
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
                     .with_timeout_secs(if security.shell_timeout_secs > 0 {
                         security.shell_timeout_secs
                     } else {
@@ -1349,6 +1349,7 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
+        .with_runtime(runtime.clone())
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
