@@ -53,6 +53,7 @@ pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
@@ -76,6 +77,9 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use execution::{
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
@@ -107,10 +111,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 use crate::agent::tool_execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
 };
-use crate::approval::ApprovalManager;
-use crate::observability::Observer;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
-use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -165,40 +166,22 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// destructures it once at entry, so the body reads exactly as it did when
 /// these were positional parameters.
 pub struct ToolLoop<'a> {
-    pub model_provider: &'a dyn ModelProvider,
+    /// The resolved per-agent execution context: model binding, gated tool
+    /// registry, approval, observability, and resolved runtime knobs. Stable
+    /// for every turn to this agent; built once and reused. See
+    /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
+    pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
-    pub tools_registry: &'a [Box<dyn Tool>],
-    pub observer: &'a dyn Observer,
-    pub provider_name: &'a str,
-    pub model: &'a str,
-    pub temperature: Option<f64>,
-    pub silent: bool,
-    pub approval: Option<&'a ApprovalManager>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
-    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
-    pub max_tool_iterations: usize,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub hooks: Option<&'a crate::hooks::HookRunner>,
-    pub excluded_tools: &'a [String],
-    pub dedup_exempt_tools: &'a [String],
-    pub activated_tools:
-        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    pub model_switch_callback: Option<ModelSwitchCallback>,
-    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
-    pub strict_tool_parsing: bool,
-    pub parallel_tools: bool,
-    pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
     pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub channel: Option<&'a dyn Channel>,
-    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
-    pub knobs: &'a LoopKnobs,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
@@ -211,21 +194,35 @@ pub struct ToolLoop<'a> {
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
-        model_provider,
+        exec,
         history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        approval,
         channel_name,
         channel_reply_target,
-        multimodal_config,
-        max_tool_iterations,
         cancellation_token,
         on_delta,
+        shared_budget,
+        channel,
+        collected_receipts,
+        event_tx,
+        mut steering,
+        mut new_messages_out,
+        mut image_cache,
+        ingress,
+    } = p;
+    let ResolvedAgentExecution {
+        model_access:
+            ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+            },
+        tools_registry,
+        observer,
+        silent,
+        approval,
+        multimodal_config,
+        max_tool_iterations,
         hooks,
         excluded_tools,
         dedup_exempt_tools,
@@ -236,17 +233,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
-        shared_budget,
-        channel,
         receipt_generator,
-        collected_receipts,
-        event_tx,
-        mut steering,
-        mut new_messages_out,
         knobs,
-        mut image_cache,
-        ingress,
-    } = p;
+    } = exec;
 
     // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
     // RFC #6971: every inbound turn passes the universal SOP policy layer before
