@@ -511,3 +511,7 @@ zc-config-footer-action-back-to-files = back to files
 zc-config-footer-action-back-to-skills = back to skills
 zc-config-footer-action-help = help
 zc-config-footer-action-new-line = new line
+
+## Inline hint shown on the selected config field row. The { $keys } placeholder
+## is resolved from the current keybinding for ConfigTabAction::Enter.
+zc-config-field-edit-hint = { $keys } → press to edit

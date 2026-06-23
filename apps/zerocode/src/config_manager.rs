@@ -3299,11 +3299,18 @@ impl App {
                 // affordance no longer mimics an active text input. The press
                 // hint is derived from the same row used for ListState
                 // selection, so it stays aligned with the highlight even when
-                // a field-list filter is active.
+                // a field-list filter is active. The key name is resolved from
+                // the current keymap so rebinding ConfigTabAction::Enter is
+                // reflected here, and the prose is rendered through Fluent for
+                // localization.
                 let press_hint = if Some(i) == selected_field {
-                    "  \u{2500}\u{2192} press Enter to edit"
+                    let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
+                    format!(
+                        "  \u{2500}\u{2192} {}",
+                        crate::i18n::t_args("zc-config-field-edit-hint", &[("keys", &enter_key)])
+                    )
                 } else {
-                    ""
+                    String::new()
                 };
                 let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
 
