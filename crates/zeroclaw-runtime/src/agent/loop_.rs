@@ -988,6 +988,142 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Resolve the agent's effective context-compression summary provider to a
+/// freshly-built `(provider, model)` pair (the cross-provider fix for #7964).
+///
+/// Mirrors the channel orchestrator's `resolve_classifier_route` fail-open
+/// contract exactly: `effective_summary_provider` is `None`, OR the ref is
+/// unparseable, OR the alias is missing from `[providers.models]`, OR it has no
+/// `.model`, OR the provider build fails ⇒ WARN once and return `None`. The
+/// caller then falls back to the agent's own provider + model (with the
+/// deprecated `summary_model` swap still honored for un-migrated configs), so
+/// compression never becomes a turn-killing hard error.
+fn resolve_summary_provider(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<(Box<dyn ModelProvider>, String)> {
+    let provider_ref = config.effective_summary_provider(agent_alias)?;
+    let provider_str = provider_ref.as_str().trim();
+    if provider_str.is_empty() {
+        return None;
+    }
+
+    let (type_key, alias_key) = match provider_str.split_once('.') {
+        Some(parts) => parts,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider must be dotted `<type>.<alias>`; falling back to agent provider"
+            );
+            return None;
+        }
+    };
+
+    let model_cfg = match config.providers.models.find(type_key, alias_key) {
+        Some(cfg) => cfg,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to agent provider"
+            );
+            return None;
+        }
+    };
+
+    let model = model_cfg.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "summary_provider points to a [providers.models] entry without a `model` field; falling back to agent provider"
+        );
+        return None;
+    }
+
+    let options = zeroclaw_providers::options_for_provider_ref(
+        config,
+        provider_str,
+        &zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias),
+    );
+    match zeroclaw_providers::create_resilient_model_provider_from_ref(
+        config,
+        provider_str,
+        model_cfg.api_key.as_deref(),
+        model_cfg.uri.as_deref(),
+        &config.reliability,
+        &options,
+    ) {
+        Ok(provider) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"provider": provider_str, "model": model.as_str()})
+                    ),
+                "summary_provider override active"
+            );
+            Some((provider, model))
+        }
+        Err(e) => {
+            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                "Failed to initialize summary_provider; falling back to agent provider"
+            );
+            None
+        }
+    }
+}
+
+/// Runtime deprecation nudge for the legacy `context_compression.summary_model`
+/// fallback path (#7964). When no `summary_provider` is resolved and the
+/// deprecated bare `summary_model` is dispatched on the agent's OWN provider,
+/// WARN once per agent per process that this can silently mismatch for a
+/// runtime profile shared across providers, and recommend migrating to
+/// `summary_provider`. The config-time `cross_provider_summary_model`
+/// diagnostic carries the precise cross-provider detection; this is the
+/// belt-and-suspenders signal on the hot path, deduped so it does not spam
+/// every turn. Mirrors the warn-once pattern in `agent::cost`.
+///
+/// `pub` so the channel orchestrator's proactive-compression fallback (the third
+/// dispatch site, in `zeroclaw-channels`) shares this same process-global
+/// warn-once set, keeping the signal one-per-agent across every fallback path.
+pub fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first = {
+        let mut seen = SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.insert(agent_alias.to_string())
+    };
+    if !first {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(
+                ::serde_json::json!({"agent": agent_alias, "summary_model": summary_model})
+            ),
+        "Deprecated context_compression.summary_model is being dispatched on this agent's own \
+         provider. A bare summary_model shared by a runtime profile across providers can \
+         silently summarize on the wrong provider (#7964). Migrate to summary_provider. \
+         This warning fires once per agent per process."
+    );
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -2508,6 +2644,47 @@ pub async fn run(
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
+                                // Resolve the agent's effective summary provider
+                                // (#7964). On any failure we fall back to the
+                                // agent's own provider + model (with the
+                                // deprecated `summary_model` swap), and only the
+                                // agent-provider path may preserve media markers.
+                                let resolved_summary =
+                                    resolve_summary_provider(&config, agent_alias);
+                                let summary_target = match resolved_summary {
+                                    Some((ref provider, ref model)) => {
+                                        crate::agent::context_compressor::SummaryTarget {
+                                            provider: provider.as_ref(),
+                                            model: model.as_str(),
+                                            preserve_media_markers: false,
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(legacy) = agent
+                                            .resolved
+                                            .context_compression
+                                            .summary_model
+                                            .as_deref()
+                                            .filter(|m| !m.trim().is_empty())
+                                        {
+                                            warn_deprecated_summary_model_fallback(
+                                                agent_alias,
+                                                legacy,
+                                            );
+                                        }
+                                        crate::agent::context_compressor::SummaryTarget {
+                                            provider: model_provider.as_ref(),
+                                            model: agent
+                                                .resolved
+                                                .context_compression
+                                                .summary_model
+                                                .as_deref()
+                                                .unwrap_or(&model_name),
+                                            preserve_media_markers: model_provider
+                                                .supports_vision(),
+                                        }
+                                    }
+                                };
                                 match compressor
                                     .compress_on_error(
                                         &mut history,
@@ -2515,6 +2692,7 @@ pub async fn run(
                                         &model_name,
                                         temperature,
                                         &error_msg,
+                                        summary_target,
                                     )
                                     .await
                                 {
@@ -2580,12 +2758,47 @@ pub async fn run(
                         eff_max_context_tokens,
                     )
                     .with_memory(mem.clone());
+                    // Resolve the agent's effective summary provider (#7964);
+                    // fall back to the agent's own provider + model on any
+                    // failure, preserving media markers only on that path.
+                    let resolved_summary = resolve_summary_provider(&config, agent_alias);
+                    let summary_target = match resolved_summary {
+                        Some((ref provider, ref model)) => {
+                            crate::agent::context_compressor::SummaryTarget {
+                                provider: provider.as_ref(),
+                                model: model.as_str(),
+                                preserve_media_markers: false,
+                            }
+                        }
+                        None => {
+                            if let Some(legacy) = agent
+                                .resolved
+                                .context_compression
+                                .summary_model
+                                .as_deref()
+                                .filter(|m| !m.trim().is_empty())
+                            {
+                                warn_deprecated_summary_model_fallback(agent_alias, legacy);
+                            }
+                            crate::agent::context_compressor::SummaryTarget {
+                                provider: model_provider.as_ref(),
+                                model: agent
+                                    .resolved
+                                    .context_compression
+                                    .summary_model
+                                    .as_deref()
+                                    .unwrap_or(&model_name),
+                                preserve_media_markers: model_provider.supports_vision(),
+                            }
+                        }
+                    };
                     match compressor
                         .compress_if_needed(
                             &mut history,
                             model_provider.as_ref(),
                             &model_name,
                             temperature,
+                            summary_target,
                         )
                         .await
                     {
@@ -5026,6 +5239,101 @@ mod tests {
         );
         assert!(!requests[0][0].content.contains("[IMAGE:"));
         assert!(!requests[0][0].content.contains(&oversized_payload));
+    }
+
+    /// Regression: a non-vision provider must not be permanently poisoned by an
+    /// image marker left in history from an EARLIER turn. The capability error
+    /// is scoped to the image the user *just* sent (see
+    /// `run_tool_call_loop_returns_structured_error_for_non_vision_provider`);
+    /// a carried-over marker degrades to text-only so the next plain-text turn
+    /// succeeds instead of re-failing forever. Reproduces the reported bug where
+    /// one image to a non-vision provider made every subsequent text turn fail
+    /// (the RPC/streaming path persists the user message into the long-lived
+    /// session history before the loop runs, so a failed image turn leaves its
+    /// marker behind).
+    #[tokio::test]
+    async fn run_tool_call_loop_degrades_carried_over_image_on_non_vision_provider() {
+        let model_provider = RecordingModelProvider::new();
+        let recorded_requests = Arc::clone(&model_provider.requests);
+
+        // An earlier image turn left its marker in history; the latest user
+        // message is plain text.
+        let mut history = vec![
+            ChatMessage::user(
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("a carried-over image must not fail a plain-text turn");
+
+        assert_eq!(result, "done");
+
+        // The provider was actually called (no hard capability error) and the
+        // carried-over marker was stripped before reaching the text-only model.
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1, "exactly one provider call expected");
+        let sent_blob = requests[0]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !sent_blob.contains("[IMAGE:"),
+            "carried-over image marker must be stripped, got: {sent_blob}"
+        );
+        assert!(
+            sent_blob.contains("[media attachment]"),
+            "stripped marker should become the text placeholder, got: {sent_blob}"
+        );
     }
 
     #[tokio::test]

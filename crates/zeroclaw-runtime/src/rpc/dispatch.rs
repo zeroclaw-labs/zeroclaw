@@ -3201,6 +3201,11 @@ impl RpcDispatcher {
                         .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
+                    cost_category: zeroclaw_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
                     label,
                     key,
                 }
