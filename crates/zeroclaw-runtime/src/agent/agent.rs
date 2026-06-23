@@ -1731,7 +1731,7 @@ impl Agent {
             .route_model_by_hint(route_model_by_hint)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
-            .skills_prompt_mode(config.skills.prompt_injection_mode)
+            .skills_prompt_mode(config.skills_prompt_mode_for_agent(agent_alias))
             .auto_save(config.memory.auto_save)
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))

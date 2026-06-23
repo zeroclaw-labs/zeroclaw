@@ -1691,7 +1691,7 @@ pub async fn run(
             ),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            config.skills_prompt_mode_for_agent(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -1812,7 +1812,7 @@ pub async fn run(
             &prompt_excluded_tools,
             activated_handle.as_ref(),
             agent.resolved.strict_tool_parsing,
-            config.skills.prompt_injection_mode,
+            config.skills_prompt_mode_for_agent(agent_alias),
             eff_compact_context,
             eff_max_system_prompt_chars,
             true,
@@ -1907,7 +1907,7 @@ pub async fn run(
                 &excluded_tools,
                 activated_handle.as_ref(),
                 agent.resolved.strict_tool_parsing,
-                config.skills.prompt_injection_mode,
+                config.skills_prompt_mode_for_agent(agent_alias),
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
@@ -2020,7 +2020,7 @@ pub async fn run(
                         &excluded_tools,
                         activated_handle.as_ref(),
                         agent.resolved.strict_tool_parsing,
-                        config.skills.prompt_injection_mode,
+                        config.skills_prompt_mode_for_agent(agent_alias),
                         eff_compact_context,
                         eff_max_system_prompt_chars,
                         true,
@@ -2535,7 +2535,7 @@ pub async fn run(
                             &excluded_tools,
                             activated_handle.as_ref(),
                             agent.resolved.strict_tool_parsing,
-                            config.skills.prompt_injection_mode,
+                            config.skills_prompt_mode_for_agent(agent_alias),
                             eff_compact_context,
                             eff_max_system_prompt_chars,
                             true,
@@ -3237,7 +3237,7 @@ pub async fn process_message(
             ("image_info", "Read image metadata."),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            config.skills_prompt_mode_for_agent(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -3352,7 +3352,7 @@ pub async fn process_message(
                 bootstrap_max_chars,
                 Some(&risk_profile),
                 native_tool_specs_present,
-                config.skills.prompt_injection_mode,
+                config.skills_prompt_mode_for_agent(agent_alias),
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
