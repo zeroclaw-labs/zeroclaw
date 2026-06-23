@@ -83,7 +83,7 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    the operator left unconfigured can be filled from the live-pricing
    fallback (see below) before billing. Only when *both* config and the
    live fallback leave input and output at `0.0` does the one-shot
-   `missing_pricing` warn fire — so genuine "we couldn't price this"
+   `missing_pricing` warn fire, so genuine "we couldn't price this"
    records still surface in logs.
 
 4. **CostTracker is a process-global singleton** (`OnceLock` in
@@ -97,25 +97,23 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
 ## Live pricing from gateways
 
 Operators don't have to hand-maintain a rate for every model. A provider can
-opt into pulling token prices straight from its own gateway:
-
-```toml
-[providers.models.openrouter.default]
-api_key      = "..."
-live_pricing = true   # fetch prices from this gateway's /models listing
-```
+opt into pulling token prices straight from its own gateway by setting
+`live_pricing = true` on that provider block (alongside its existing `api_key`
+and model settings); the prices come from the gateway's own `/models` listing.
 
 Behavior:
 
 - **Gateway is the primary source.** The provider's existing `/models` endpoint
-  (the same one onboarding uses to list models) is parsed for per-model pricing
-  — OpenRouter's per-token `pricing{prompt,completion,...}` strings, or an
-  OpenAI-compatible gateway's per-1M-token `pricing` object (e.g. opencode
-  zen). No second copy of the endpoint URL or credentials: they're read from
-  the provider's existing config.
-- **models.dev fallback.** A model the gateway doesn't price — or a provider
+  (the same one onboarding uses to list models) is parsed for per-model pricing.
+  Gateways that publish prices there report them as per-token decimal strings
+  (OpenRouter's and Kilo's `pricing{prompt,completion,...}`), which are scaled
+  to USD per 1M tokens. A gateway whose `/models` listing carries no pricing at
+  all (such as opencode zen, which lists model ids only) is covered by the
+  models.dev fallback below. No second copy of the endpoint URL or credentials:
+  they are read from the provider's existing config.
+- **models.dev fallback.** A model the gateway doesn't price (or a provider
   with no HTTP `/models` listing at all, such as a subprocess gateway like
-  `kilocli` — falls back to the public [models.dev](https://models.dev)
+  `kilocli`) falls back to the public [models.dev](https://models.dev)
   catalog (`api.json`), keyed by the family's models.dev name (see
   `catalog_source_for` in `crates/zeroclaw-providers/src/catalog.rs`). The
   fallback catalog is fetched fresh on each refresh cycle, so both sources
@@ -125,14 +123,14 @@ Behavior:
   deliberate `0.0`) is never overridden. This is a gap-filler, not a
   replacement.
 - **One call per gateway, only flagged models.** Aliases sharing a gateway are
-  deduped to a single `/models` fetch; only the models you flagged are filled
-  from the response.
+  deduped to a single `/models` fetch; from that response only each opted-in
+  alias's own configured `model` is filled, not every model the gateway lists.
 - **Background refresh, never blocks.** A single task refreshes a process-wide
   price snapshot hourly. The cost-recording path reads the cached snapshot
   synchronously and never makes a network call inline, so a slow gateway can't
   stall request accounting.
 - **Default off.** With no provider setting `live_pricing = true` there is no
-  refresher task and no network traffic — behavior is identical to a build
+  refresher task and no network traffic; behavior is identical to a build
   without the feature. Turning the last flagged provider off at runtime
   (config reload) clears the snapshot on the next refresh cycle, so live
   prices stop filling without a restart. The snapshot lives only in
