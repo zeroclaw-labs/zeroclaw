@@ -509,15 +509,8 @@ pub fn load_skills_for_agent(
                 continue;
             }
         };
-        let include: std::collections::HashSet<&str> =
-            bundle.include.iter().map(String::as_str).collect();
-        let exclude: std::collections::HashSet<&str> =
-            bundle.exclude.iter().map(String::as_str).collect();
         for skill in load_skills_from_directory(&dir, allow_scripts) {
-            if !include.is_empty() && !include.contains(skill.name.as_str()) {
-                continue;
-            }
-            if exclude.contains(skill.name.as_str()) {
+            if !bundle.admits_skill(&skill.name) {
                 continue;
             }
             // First-write wins so workspace skills override bundle skills
@@ -2393,7 +2386,7 @@ pub fn install_extra_registry_skill_source(
             }
         })?;
 
-    if registry.kind != "git" {
+    if registry.kind != zeroclaw_config::schema::ExternalRegistryKind::Git {
         anyhow::bail!(
             "registry '{registry_name}' uses unsupported kind '{}'; only 'git' is supported",
             registry.kind

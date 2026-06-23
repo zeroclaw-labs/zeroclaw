@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
@@ -79,6 +80,17 @@ pub use nevis::{NevisAuthProvider, NevisIdentity};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
+
+/// Scrub credential leaks from arbitrary text before it crosses into a log
+/// record or any other sink. Routes through the global [`LeakDetector`] so
+/// every known credential shape is redacted in one place rather than via
+/// per-callsite regexes. Clean input is returned unchanged.
+pub fn scrub(text: &str) -> String {
+    match LeakDetector::new().scan(text) {
+        LeakResult::Clean => text.to_string(),
+        LeakResult::Detected { redacted, .. } => redacted,
+    }
+}
 
 /// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
