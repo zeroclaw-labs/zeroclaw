@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
-use super::store::{InMemoryRunStore, PersistedRun, SopRunStore};
+use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
     SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
@@ -434,21 +434,26 @@ impl SopEngine {
 
     /// Approve a step that is waiting for approval, transitioning back to Running.
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
-        let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"run_id": run_id})),
-                "SOP engine: active run not found"
-            );
-            anyhow::Error::msg(format!("Active run not found: {run_id}"))
-        })?;
+        let status = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?
+            .status;
 
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
         // completed and its output (or the previous step's) is piped forward.
-        if run.status == SopRunStatus::PausedCheckpoint {
+        if status == SopRunStatus::PausedCheckpoint {
+            let run = self.active_runs.get_mut(run_id).unwrap();
             let piped = run
                 .step_results
                 .last()
@@ -459,13 +464,26 @@ impl SopEngine {
             return self.advance_deterministic_step(run_id, piped, None);
         }
 
-        if run.status != SopRunStatus::WaitingApproval {
+        if status != SopRunStatus::WaitingApproval {
             bail!(
-                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {})",
-                run.status
+                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {status})"
             );
         }
 
+        // The WaitingApproval -> ExecuteStep transition is shared with the
+        // out-of-band `resolve_gate` path (EPIC C) via `clear_waiting_gate`.
+        self.clear_waiting_gate(run_id)
+    }
+
+    /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
+    /// action for the current step, and persist. Shared by `approve_step` (the
+    /// agent path) and `resolve_gate` (the out-of-band path) so the transition
+    /// lives in exactly one place. Caller guarantees the run is `WaitingApproval`.
+    pub(crate) fn clear_waiting_gate(&mut self, run_id: &str) -> Result<SopRunAction> {
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
 
@@ -972,6 +990,77 @@ impl SopEngine {
             },
         }
     }
+
+    // ── EPIC C: out-of-band approval plane ──────────────────────────
+
+    /// Read-only config access for the approval resolver.
+    pub(crate) fn config(&self) -> &SopConfig {
+        &self.config
+    }
+
+    /// Classify a run's approval gate for `resolve_gate` (idempotency + typed
+    /// not-found). `Running` (already approved) and terminal runs are
+    /// `AlreadyResolved`; an unknown run or a non-`WaitingApproval` active status
+    /// (e.g. a deterministic `PausedCheckpoint`, which `approve_step` owns) is
+    /// `NotApplicable`.
+    pub(crate) fn gate_state(&self, run_id: &str) -> GateState {
+        if let Some(run) = self.active_runs.get(run_id) {
+            match run.status {
+                SopRunStatus::WaitingApproval => GateState::Waiting {
+                    step: run.current_step,
+                },
+                SopRunStatus::Running => GateState::AlreadyResolved,
+                _ => GateState::NotApplicable,
+            }
+        } else if self.finished_runs.iter().any(|r| r.run_id == run_id) {
+            GateState::AlreadyResolved
+        } else {
+            GateState::NotApplicable
+        }
+    }
+
+    /// Append an approval-ledger row via EPIC B's append-only event log
+    /// (best-effort; logs on failure). The store assigns the monotonic seq.
+    pub(crate) fn record_gate_event(&self, entry: super::approval::GateLedgerEntry) {
+        if let Err(e) = self.store.append_event(&entry.into_event_record()) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "SOP engine: failed to append approval ledger event"
+            );
+        }
+    }
+
+    /// Ordered event/ledger history for a run (from the durable store).
+    pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+        self.store.list_events(run_id)
+    }
+
+    /// The single out-of-band gate-clearing entry point (EPIC C). All four
+    /// principals (agent tool, CLI, gateway, timeout tick) funnel through here.
+    /// Sibling of `approve_step` (which keeps the deterministic-checkpoint resume
+    /// path); the shared `WaitingApproval -> ExecuteStep` body is `clear_waiting_gate`.
+    pub fn resolve_gate(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::ResolveOutcome> {
+        super::approval::resolve::resolve_gate(self, run_id, decision, principal)
+    }
+}
+
+/// Classification of a run's approval-gate state (EPIC C `resolve_gate`).
+pub(crate) enum GateState {
+    /// Waiting on approval at this step number (resolvable).
+    Waiting { step: u32 },
+    /// Already resolved (running after approve, or terminal) - idempotent no-op.
+    AlreadyResolved,
+    /// Not a waiting-approval gate (unknown run, or a non-WaitingApproval status
+    /// such as a deterministic `PausedCheckpoint`, which `approve_step` owns).
+    NotApplicable,
 }
 
 // ── Trigger matching ────────────────────────────────────────────
