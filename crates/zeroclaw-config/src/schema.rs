@@ -3517,6 +3517,15 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub skill_bundles: Vec<String>,
+    /// Per-agent override for how skills are injected into the system prompt.
+    /// `None` (the default) inherits the global `[skills] prompt_injection_mode`;
+    /// `full` or `compact` overrides it for this agent only. Resolved through
+    /// [`Config::skills_prompt_mode_for_agent`], the single point both the
+    /// system-prompt builder and the `read_skill` tool-registration gate
+    /// consult so they always agree on the effective mode.
+    #[tab(Bundles)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
     /// Knowledge bundle aliases. Additive: the agent loads every listed
     /// bundle.
     #[tab(Bundles)]
@@ -3680,6 +3689,7 @@ impl Default for AliasedAgentConfig {
             risk_profile: crate::providers::RiskProfileRef::default(),
             runtime_profile: crate::providers::RuntimeProfileRef::default(),
             skill_bundles: Vec::new(),
+            prompt_injection_mode: None,
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
             acp_enable_mcp: false,
@@ -4072,6 +4082,23 @@ impl Config {
         }
         out.resolved = resolved;
         Some(out)
+    }
+
+    /// Resolve the effective skills prompt-injection mode for an agent: the
+    /// per-agent `[agents.<alias>] prompt_injection_mode` override when set,
+    /// otherwise the global `[skills] prompt_injection_mode`. Unknown aliases
+    /// also fall back to the global value.
+    ///
+    /// Centralizing the fallback here keeps the system-prompt builder and the
+    /// `read_skill` tool-registration gate in lockstep on one effective mode,
+    /// so a compact prompt is never paired with a missing `read_skill` tool
+    /// (or a full prompt with a spurious one).
+    #[must_use]
+    pub fn skills_prompt_mode_for_agent(&self, agent_alias: &str) -> SkillsPromptInjectionMode {
+        self.agents
+            .get(agent_alias)
+            .and_then(|agent| agent.prompt_injection_mode)
+            .unwrap_or(self.skills.prompt_injection_mode)
     }
 
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
@@ -22105,6 +22132,75 @@ api_token = "Bearer test-token"
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn skills_prompt_mode_for_agent_resolves_override_then_global() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+        config.agents.insert(
+            "override".to_string(),
+            AliasedAgentConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .agents
+            .insert("inherit".to_string(), AliasedAgentConfig::default());
+
+        // Per-agent override beats the global value.
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+        // No override → inherit the global value.
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("inherit"),
+            SkillsPromptInjectionMode::Full
+        );
+        // Unknown alias also falls back to the global value.
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("missing"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global moves only the inheriting/unknown agents; the
+        // explicit override is unaffected.
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("inherit"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("missing"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.skills_prompt_mode_for_agent("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+    }
+
+    #[test]
+    async fn aliased_agent_prompt_injection_mode_deserializes() {
+        // Absent → None, so existing global-only configs keep inheriting the
+        // global mode (no migration).
+        let inherited: AliasedAgentConfig = toml::from_str("").unwrap();
+        assert_eq!(inherited.prompt_injection_mode, None);
+
+        // Explicit wire spellings parse to their variants.
+        let compact: AliasedAgentConfig =
+            toml::from_str("prompt_injection_mode = \"compact\"").unwrap();
+        assert_eq!(
+            compact.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
+        let full: AliasedAgentConfig = toml::from_str("prompt_injection_mode = \"full\"").unwrap();
+        assert_eq!(
+            full.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Full)
+        );
     }
 
     #[test]
