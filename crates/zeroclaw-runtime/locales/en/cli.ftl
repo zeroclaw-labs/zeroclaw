@@ -765,6 +765,9 @@ cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
 cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.
+cli-update-available = Update available: v{$current} -> v{$latest}
+cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
+cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
@@ -791,6 +794,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Breadcrumb injected into history where older turns were dropped to fit the
+# context budget; user-visible across channels, WS, RPC, ACP.
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+# Reason carried on every history_trimmed event (WS, SSE, ACP).
+history-trim-reason-budget = context token budget exceeded
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).

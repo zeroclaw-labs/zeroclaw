@@ -77,7 +77,9 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
-pub use execution::{ResolvedAgentExecution, ResolvedModelAccess};
+pub use execution::{
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
@@ -378,7 +380,75 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        preflight_history_maintenance(history, context_token_budget, iteration);
+        preflight_history_maintenance(history);
+
+        if iteration == 0 && context_token_budget > 0 {
+            let taken = std::mem::take(history);
+            let result =
+                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            if result.trimmed {
+                let mut trimmed = result.history;
+                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
+                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                *history = trimmed;
+                {
+                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        model = %model,
+                        model_provider = %provider_name,
+                    );
+                    let _zc_trim_guard = __zc_trim_span.entered();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "dropped_messages": result.dropped_messages,
+                                "dropped_turns": result.dropped_turns,
+                                "kept_turns": result.kept_turns,
+                                "budget_tokens": context_token_budget,
+                                "tokens_before": result.tokens_before,
+                                "tokens_after": result.tokens_after,
+                                "tokens_reclaimed": result.tokens_before.saturating_sub(result.tokens_after),
+                                "budget_headroom": context_token_budget.saturating_sub(result.tokens_after),
+                            })),
+                        format!(
+                            "History trimmed: dropped {} oldest turn(s) ({} msgs), {} -> {} tok (budget {}), reclaimed {} tok",
+                            result.dropped_turns,
+                            result.dropped_messages,
+                            result.tokens_before,
+                            result.tokens_after,
+                            context_token_budget,
+                            result.tokens_before.saturating_sub(result.tokens_after)
+                        )
+                    );
+                }
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::HistoryTrimmed {
+                            dropped_messages: result.dropped_messages,
+                            kept_turns: result.kept_turns,
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-budget",
+                            ),
+                        })
+                        .await;
+                }
+                observer.record_event(
+                    &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                        dropped_messages: result.dropped_messages,
+                        kept_turns: result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
+                    },
+                );
+            } else {
+                *history = result.history;
+            }
+        }
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -548,7 +618,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &turn_id,
                     &e,
                 );
-                let recovered = try_recover_context_overflow(history, &e, iteration);
+                let recovered = try_recover_context_overflow(
+                    history,
+                    &e,
+                    iteration,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await;
                 if recovered {
                     continue;
                 }

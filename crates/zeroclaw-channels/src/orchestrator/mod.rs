@@ -122,13 +122,13 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
-use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
-    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
-    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
-    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
+    scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -245,20 +245,14 @@ const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
-/// When the total character count of conversation history exceeds this limit,
-/// older turns are dropped before the request is sent to the model_provider,
-/// preventing context-window-exceeded errors.  Set conservatively below
-/// common context windows (128 k tokens ≈ 512 k chars) to leave room for
-/// system prompt, memory context, and model output.
-const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 /// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
-/// Keyed by a `scope_override_key` (prefixed `user::`/`guild::`/`agent::`), so all
-/// three tiers share one in-memory map. Never persisted — lost on restart by design.
+/// Keyed by a `scope_override_key` (prefixed `user::`/`agent::`), so both
+/// tiers share one in-memory map. Never persisted — lost on restart by design.
 type ScopedRouteMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
@@ -467,7 +461,7 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
-    /// Session-only `/model` overrides scoped by user/guild/agent (see
+    /// Session-only `/model` overrides scoped by user/agent (see
     /// [`ScopedRouteMap`]). Consulted above `route_overrides` in
     /// [`get_route_selection`]; never persisted.
     scope_overrides: ScopedRouteMap,
@@ -865,6 +859,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "telegram" => Some(
@@ -1836,50 +1838,6 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// Number of most-recent turns whose tool-result payloads are kept at full size
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
-const PROACTIVE_TRIM_PROTECT_LAST_N: usize = 4;
-
-/// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].
-///
-/// Tool-result content is the bulk of an overflowing channel history, so before
-/// dropping any whole turns this first shrinks older `tool`-role payloads to a
-/// bounded head-extract in place (via [`fast_trim_tool_results`]). A trimmed
-/// tool result still tells the model what the tool returned; a *dropped* turn is
-/// gone entirely, which is what makes the bot "respond as if previous messages
-/// don't exist" (#6517). Only if the in-place extracts are still over budget are
-/// the oldest whole turns dropped, and the most recent turn (the current user
-/// message) is always preserved. Returns the number of whole turns dropped.
-fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
-    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-    if total_chars <= budget || turns.len() <= 1 {
-        return 0;
-    }
-
-    // Content-preserving pre-pass: shrink old tool-result payloads in place,
-    // keeping the messages and their tool-call pairing intact.
-    fast_trim_tool_results(turns, PROACTIVE_TRIM_PROTECT_LAST_N);
-
-    // Recompute after the in-place shrink — we may now fit with no turns dropped.
-    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-    if total_chars <= budget {
-        return 0;
-    }
-
-    let mut excess = total_chars.saturating_sub(budget);
-    let mut drop_count = 0;
-
-    // Walk from the oldest turn forward, but never drop the very last turn.
-    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
-        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
-        drop_count += 1;
-    }
-
-    if drop_count > 0 {
-        turns.drain(..drop_count);
-    }
-    drop_count
-}
-
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
@@ -1943,102 +1901,6 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .filter(|m| m.role == "assistant" || m.role == "tool")
         .cloned()
         .collect()
-}
-
-/// Remove tool-role and intermediate assistant tool-call messages from
-/// conversation turns older than the most recent `keep_turns` user→assistant
-/// exchanges.  This prevents unbounded history growth while preserving
-/// tool context for the N most recent turns.
-fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return;
-    };
-
-    // Walk backwards to find the oldest user message that still belongs to the
-    // most recent `keep_turns` exchanges. Everything before that boundary is
-    // old enough to strip. If the session has fewer than `keep_turns` user
-    // turns, preserve every message.
-    let mut user_count = 0;
-    let mut strip_before = 0;
-    for (i, turn) in turns.iter().enumerate().rev() {
-        if turn.role == "user" {
-            user_count += 1;
-            if user_count == keep_turns {
-                strip_before = i;
-                break;
-            }
-        }
-    }
-
-    if user_count < keep_turns {
-        return;
-    }
-
-    // Remove tool and intermediate assistant messages before the boundary.
-    // An "intermediate assistant" is one whose content looks like a tool
-    // call, either in legacy XML / JSON forms or in native `tool_calls` JSON.
-    let mut i = 0;
-    while i < strip_before && i < turns.len() {
-        let dominated = turns[i].role == "tool"
-            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
-        if dominated {
-            turns.remove(i);
-            // Adjust boundary since we removed an element.
-            strip_before = strip_before.saturating_sub(1);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Heuristic: does this assistant message content represent a tool call
-/// rather than a final text response?
-fn is_tool_call_content(content: &str) -> bool {
-    let trimmed = content.trim();
-    trimmed.contains("<tool_call>")
-        || trimmed.starts_with("{\"tool_call\"")
-        || is_named_tool_call_json(trimmed)
-        || is_native_tool_call_json(trimmed)
-}
-
-fn is_named_tool_call_json(content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-
-    value
-        .get("name")
-        .and_then(|name| name.as_str())
-        .is_some_and(|name| {
-            !name.is_empty()
-                && (value.get("args").is_some()
-                    || value.get("arguments").is_some()
-                    || value.get("parameters").is_some())
-        })
-}
-
-fn is_native_tool_call_json(content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-
-    let Some(tool_calls) = value.get("tool_calls").and_then(|calls| calls.as_array()) else {
-        return false;
-    };
-
-    !tool_calls.is_empty()
-        && tool_calls.iter().all(|call| {
-            call.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(|name| name.as_str())
-                .or_else(|| call.get("name").and_then(|name| name.as_str()))
-                .is_some()
-        })
 }
 
 fn rollback_orphan_user_turn(
@@ -4364,13 +4226,6 @@ async fn process_channel_message_body(
     // works for the active turn; historical turns keep compact annotations.
     strip_historical_image_payloads(&mut prior_turns);
 
-    // Proactively trim conversation history before sending to the model_provider
-    // to prevent context-window-exceeded errors (bug #3460).
-    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
-    if dropped > 0 {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sender": msg.sender, "dropped_turns": dropped, "remaining_turns": prior_turns.len()})), "Proactively trimmed conversation history to fit context budget");
-    }
-
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
     // For group chats: merge sender-scope + group-scope memories.
@@ -4442,42 +4297,6 @@ async fn process_channel_message_body(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
-
-    // ── Proactive context compression ────────────────────────────
-    // Use the existing ContextCompressor to summarize older history
-    // before the LLM call, preventing context-window-exceeded errors
-    // and preserving key decisions through LLM-driven summarization.
-    {
-        let cc_config = ctx.agent_cfg.resolved.context_compression.clone();
-        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
-            cc_config,
-            ctx.context_token_budget,
-        )
-        .with_memory(Arc::clone(&ctx.memory));
-        match compressor
-            .compress_if_needed(
-                &mut history,
-                active_model_provider.as_ref(),
-                route.model.as_str(),
-                runtime_defaults.defaults.temperature,
-            )
-            .await
-        {
-            Ok(result) if result.compressed => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sender": msg.sender, "tokens_before": result.tokens_before, "tokens_after": result.tokens_after, "passes": result.passes_used})), "Proactive context compression applied before LLM call");
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Context compression failed, proceeding without"
-                );
-            }
-            _ => {}
-        }
-    }
 
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
@@ -4841,20 +4660,26 @@ async fn process_channel_message_body(
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
                         run_tool_call_loop(ToolLoop {
-exec: ResolvedAgentExecution {
-model_access: ResolvedModelAccess {
+exec: ResolvedAgentExecution::resolve(
+ResolvedModelAccess {
 model_provider: active_model_provider.as_ref(),
 provider_name: route.model_provider.as_str(),
 model: route.model.as_str(),
 temperature: runtime_defaults.defaults.temperature,
 },
+ResolvedIo {
 tools_registry: ctx.tools_registry.as_ref(),
 observer: notify_observer.as_ref() as &dyn Observer,
 silent: true,
 approval: Some(&*ctx.approval_manager),
 multimodal_config: &ctx.multimodal,
-max_tool_iterations: ctx.max_tool_iterations,
 hooks: ctx.hooks.as_deref(),
+activated_tools: ctx.activated_tools.as_ref(),
+model_switch_callback: Some(model_switch_callback.clone()),
+receipt_generator: ctx.receipt_generator.as_ref(),
+},
+ResolvedRuntimeKnobs {
+max_tool_iterations: ctx.max_tool_iterations,
 excluded_tools: if msg.channel == "cli"
                             || ctx.autonomy_level == AutonomyLevel::Full
                         {
@@ -4863,8 +4688,6 @@ excluded_tools: if msg.channel == "cli"
                             ctx.non_cli_excluded_tools.as_ref()
                         },
 dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-activated_tools: ctx.activated_tools.as_ref(),
-model_switch_callback: Some(model_switch_callback.clone()),
 pacing: &ctx.pacing,
 strict_tool_parsing: ctx
                             .prompt_config
@@ -4876,9 +4699,9 @@ parallel_tools: ctx
                             .is_some_and(|agent| agent.resolved.parallel_tools),
 max_tool_result_chars: ctx.max_tool_result_chars,
 context_token_budget: ctx.context_token_budget,
-receipt_generator: ctx.receipt_generator.as_ref(),
 knobs: &loop_knobs,
 },
+),
 history: &mut history,
 channel_name: msg.channel.as_str(),
 channel_reply_target: Some(msg.reply_target.as_str()),
@@ -5203,12 +5026,6 @@ image_cache: None,
                 ChatMessage::assistant(&history_response),
             );
 
-            // Strip tool-call messages from turns older than
-            // keep_tool_context_turns to prevent unbounded growth.
-            if keep_tool_turns > 0 {
-                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
-            }
-
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
             // means the provider sends no `temperature` field (necessary
@@ -5269,16 +5086,7 @@ image_cache: None,
                 let receipts = tool_receipts_collector
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if receipts.is_empty() {
-                    None
-                } else {
-                    use std::fmt::Write as _;
-                    let mut block = String::from("---\nTool receipts:");
-                    for r in receipts.iter() {
-                        write!(block, "\n  {r}").ok();
-                    }
-                    Some(block)
-                }
+                zeroclaw_runtime::agent::tool_receipts::render_receipts_block(&receipts)
             } else {
                 None
             };
@@ -5973,6 +5781,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 #[cfg(any(
     test,
     feature = "channel-discord",
+    feature = "channel-lark",
     feature = "channel-matrix",
     feature = "channel-slack",
     feature = "channel-telegram",
@@ -6227,9 +6036,22 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
+                let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .whatsapp
+                            .get(&alias)
+                            .map(|wa| wa.allowed_groups.clone())
+                            .unwrap_or_default()
+                    })
+                };
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
-                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -6278,6 +6100,9 @@ fn build_channel_by_id(
                 };
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
+                        .with_workspace_dir(one_shot_channel_workspace_dir(
+                            &config, "lark", "default",
+                        ))
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
                         .with_ack_reactions(
@@ -6902,15 +6727,54 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
 /// An empty set means no enabled agent declared channel bindings, so
 /// collection falls back to legacy behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
-    /// Set of `<type>.<alias>` channel references from enabled agents.
-    aliases: HashSet<String>,
+    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
+    /// explicit-binding mode: only enabled owners' bindings count.
+    enabled_bindings: HashSet<String>,
+    /// `<type>.<alias>` declared by ALL agents (enabled or disabled).
+    /// Distinguishes "true legacy fallback" (no bindings anywhere) from
+    /// "bindings exist but every owner is disabled" — the #8013 bug path.
+    /// When non-empty and `enabled_bindings` is empty, legacy mode must
+    /// NOT fire; otherwise disabled owners would still bring their bound
+    /// channels online.
+    all_known_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
     /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    /// no explicit bindings anywhere and legacy "accept all enabled channels"
+    /// mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// True when bindings exist somewhere in the config but every owner is
+    /// `enabled = false`. The #8013 bug fires when this returns true.
+    fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+    }
+
+    /// Build an `ActiveChannelAliases` from a config snapshot.
+    ///
+    /// Single source of truth for the "is this channel reference currently
+    /// active under the agent binding state?" decision. Used by
+    /// `collect_configured_channels` (Discord/Telegram/Mattermost/etc.) and
+    /// by the Nostr startup / health-check paths so the #8013 invariant
+    /// ("a disabled agent must not bring its bound channel online") is
+    /// enforced uniformly across the orchestrator.
+    fn compute(config: &Config) -> Self {
+        Self {
+            enabled_bindings: config
+                .agents
+                .values()
+                .filter(|a| a.enabled)
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+            all_known_bindings: config
+                .agents
+                .values()
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+        }
     }
 }
 
@@ -6994,14 +6858,21 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases = ActiveChannelAliases {
-        aliases: config
-            .agents
-            .values()
-            .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-            .collect(),
-    };
+    let active_channel_aliases = ActiveChannelAliases::compute(&config);
+
+    if active_channel_aliases.disabled_owners_exist() {
+        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "skipped_bindings": skipped.len(),
+                    "bindings": skipped,
+                })),
+            "channel binding(s) skipped: all owning agent(s) are disabled (#8013)"
+        );
+    }
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -7498,17 +7369,35 @@ fn collect_configured_channels(
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
                     let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
+                    let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || {
+                            cfg_arc
+                                .read()
+                                .channels
+                                .whatsapp
+                                .get(&alias)
+                                .map(|wa| wa.allowed_groups.clone())
+                                .unwrap_or_default()
+                        })
+                    };
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
-                                WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
-                                    .with_transcription(config.transcription.clone())
-                                    .with_tts(&config)
-                                    .with_workspace_dir(workspace_dir)
-                                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                    .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                WhatsAppWebChannel::new(
+                                    wa,
+                                    alias.clone(),
+                                    peer_resolver,
+                                    allowed_groups_resolver,
+                                )
+                                .with_transcription(config.transcription.clone())
+                                .with_tts(&config)
+                                .with_workspace_dir(workspace_dir)
+                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
                             wa,
                         ),
@@ -7874,6 +7763,7 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("lark.{alias}")))
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
                     .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
@@ -8460,6 +8350,17 @@ fn collect_configured_channels(
         );
     }
 
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
+                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+            })),
+        "channel binding(s) activated from enabled agents"
+    );
+
     channels
 }
 
@@ -8480,17 +8381,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         // runs (parking_lot guards are not Send).
         let nostr_jobs: Vec<(String, String, Vec<String>)> = {
             let config = config_arc.read();
-            let active_nostr: std::collections::HashSet<String> = config
-                .agents
-                .values()
-                .filter(|a| a.enabled)
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect();
+            // Share the same gate as the Discord/shared-collector path so
+            // the #8013 invariant ("a disabled agent must not bring its
+            // bound channel online") is enforced uniformly — see the
+            // `ActiveChannelAliases::compute` constructor for details.
+            let active = ActiveChannelAliases::compute(&config);
             config
                 .channels
                 .nostr
                 .iter()
-                .filter(|(alias, _)| active_nostr.contains(&format!("nostr.{alias}")))
+                .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                .filter(|(_, ns)| ns.enabled)
                 .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
                 .collect()
         };
@@ -8599,16 +8500,32 @@ fn build_owner_by_channel_key(
         }
     }
 
-    // Legacy fallback mode: when no enabled agent declares channel bindings,
-    // channel collection accepts all enabled channels. Those channels must
-    // also be routable, so bind collected channel keys to the runtime-active
-    // agent selection (explicit `"default"` alias when present, else
-    // lexicographically-smallest enabled alias).
-    // `owner_by_channel_key.is_empty()` means every enabled agent had an
-    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
-    // signal used by `collect_configured_channels` to accept all enabled
-    // channel blocks.
-    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+    // Distinguish "no enabled agent declared bindings" (true legacy mode)
+    // from "bindings exist but every owner is disabled" (active skip — see
+    // #8013). In the second case, we deliberately leave `owner_by_channel_key`
+    // empty so `AgentRouter::resolve` falls through and the inbound message
+    // is dropped at line 5667, instead of being silently routed to a
+    // now-disabled agent.
+    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
+
+    if any_binding_declared_anywhere {
+        if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel bindings exist but no owning agent is enabled; \
+                 affected channels will be unbound and inbound messages dropped (#8013)"
+            );
+        }
+        return owner_by_channel_key;
+    }
+
+    // True legacy mode: no agent anywhere declares a binding. Preserve the
+    // existing deterministic fallback so on-disk session hydration and the
+    // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
+    // continue to work.
+    if !collected_channel_keys.is_empty() {
         let fallback_owner = config
             .resolved_runtime_agent_alias()
             .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
@@ -9199,13 +9116,7 @@ pub async fn start_channels(
         }
         if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
         {
-            system_prompt.push_str(
-                "\n## Tool Execution Receipts\n\n\
-                 Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
-                 signature proving the tool actually executed. You must include the receipt \
-                 verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
-                 A missing or invalid receipt indicates a fabricated tool call.\n\n",
-            );
+            system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
 
         // === First iteration only: set up shared channel infrastructure ===
@@ -9235,25 +9146,42 @@ pub async fn start_channels(
                 collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
 
             #[cfg(feature = "channel-nostr")]
-            if let Some((alias, ns)) = config.channels.nostr.iter().next() {
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
-                };
-                configured_channels.push(ConfiguredChannel {
-                    display_name: "Nostr",
-                    alias: Some(alias.clone()),
-                    channel: Arc::new(
-                        NostrChannel::new(
-                            &ns.private_key,
-                            ns.relays.clone(),
-                            alias.clone(),
-                            peer_resolver,
-                        )
-                        .await?,
-                    ),
-                });
+            {
+                // Share the same gate as the Discord/shared-collector path
+                // and as `doctor_channels` so the #8013 invariant
+                // ("a disabled agent must not bring its bound channel
+                // online") is enforced uniformly — see
+                // `ActiveChannelAliases::compute` for details. The
+                // previous `config.channels.nostr.iter().next()` started
+                // the FIRST Nostr block regardless of agent binding
+                // state, which was a literal copy of the #8013 bug.
+                let active = ActiveChannelAliases::compute(&config);
+                // Materialize the work list into owned values BEFORE any
+                // `.await` so we don't hold any lock across the async
+                // constructor (parking_lot guards are not Send). Mirrors
+                // the same pattern in `doctor_channels`.
+                let nostr_jobs: Vec<(String, String, Vec<String>)> = config
+                    .channels
+                    .nostr
+                    .iter()
+                    .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                    .filter(|(_, ns)| ns.enabled)
+                    .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
+                    .collect();
+                for (alias, private_key, relays) in nostr_jobs {
+                    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
+                    };
+                    configured_channels.push(ConfiguredChannel {
+                        display_name: "Nostr",
+                        alias: Some(alias.clone()),
+                        channel: Arc::new(
+                            NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                        ),
+                    });
+                }
             }
             #[cfg(not(feature = "channel-nostr"))]
             if !config.channels.nostr.is_empty() {
@@ -9836,6 +9764,7 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch = LarkChannel::from_config(lk, alias, peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("lark.{alias}")))
                 .with_approval_timeout_secs(lk.approval_timeout_secs)
                 .with_per_user_session(lk.per_user_session)
                 .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
@@ -9911,8 +9840,16 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
+            let allowed_groups = wa.allowed_groups.clone();
+            let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || allowed_groups.clone());
+            let ch = WhatsAppWebChannel::new(
+                wa,
+                alias.to_string(),
+                peer_resolver,
+                allowed_groups_resolver,
+            )
+            .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -10397,29 +10334,6 @@ temperature = 0.3
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
-    }
-
-    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
-        let mut histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.push(sender.to_string(), turns);
-    }
-
-    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
-        let histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.peek(sender).cloned().unwrap_or_default()
-    }
-
-    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
-        turns
-            .iter()
-            .map(|turn| (turn.role.clone(), turn.content.clone()))
-            .collect()
     }
 
     #[test]
@@ -11437,97 +11351,6 @@ api_key = "anthropic-key"
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
-    }
-
-    #[test]
-    fn proactive_trim_drops_oldest_turns_when_over_budget() {
-        // Each message is 100 chars; 10 messages = 1000 chars total.
-        let mut turns: Vec<ChatMessage> = (0..10)
-            .map(|i| {
-                let content = format!("m{i}-{}", "a".repeat(96));
-                if i % 2 == 0 {
-                    ChatMessage::user(content)
-                } else {
-                    ChatMessage::assistant(content)
-                }
-            })
-            .collect();
-
-        // Budget of 500 should drop roughly half (oldest turns).
-        let dropped = proactive_trim_turns(&mut turns, 500);
-        assert!(dropped > 0, "should have dropped some turns");
-        assert!(turns.len() < 10, "should have fewer turns after trimming");
-        // Last turn should always be preserved.
-        assert!(
-            turns.last().unwrap().content.starts_with("m9-"),
-            "most recent turn must be preserved"
-        );
-        // Total chars should now be within budget.
-        let total: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        assert!(total <= 500, "total chars {total} should be within budget");
-    }
-
-    #[test]
-    fn proactive_trim_noop_when_within_budget() {
-        let mut turns = vec![
-            ChatMessage::user("hello".to_string()),
-            ChatMessage::assistant("hi there".to_string()),
-        ];
-        let dropped = proactive_trim_turns(&mut turns, 10_000);
-        assert_eq!(dropped, 0);
-        assert_eq!(turns.len(), 2);
-    }
-
-    #[test]
-    fn proactive_trim_preserves_last_turn_even_when_over_budget() {
-        let mut turns = vec![ChatMessage::user("x".repeat(2000))];
-        let dropped = proactive_trim_turns(&mut turns, 100);
-        assert_eq!(dropped, 0, "single turn must never be dropped");
-        assert_eq!(turns.len(), 1);
-    }
-
-    // #6517: large tool-result content is shrunk to a bounded extract in place
-    // before any whole turn is dropped, so the model keeps a record of what each
-    // tool returned instead of losing entire old turns ("responding as if
-    // previous messages don't exist").
-    #[test]
-    fn proactive_trim_shrinks_tool_results_before_dropping_turns() {
-        let mut turns: Vec<ChatMessage> = Vec::new();
-        for _ in 0..4 {
-            turns.push(ChatMessage::tool("x".repeat(5000)));
-        }
-        // Recent (protected) text turns; no tool payloads here.
-        turns.push(ChatMessage::user("u1".to_string()));
-        turns.push(ChatMessage::assistant("a1".to_string()));
-        turns.push(ChatMessage::user("u2".to_string()));
-        turns.push(ChatMessage::assistant("a2".to_string()));
-
-        let len_before = turns.len();
-        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        let budget = 12_000;
-        assert!(total_before > budget, "test setup must start over budget");
-
-        let dropped = proactive_trim_turns(&mut turns, budget);
-
-        assert_eq!(
-            dropped, 0,
-            "in-place tool-result shrink should bring it under budget with no whole-turn drops"
-        );
-        assert_eq!(turns.len(), len_before, "no whole turn should be removed");
-        assert_eq!(
-            turns.iter().filter(|t| t.role == "tool").count(),
-            4,
-            "every tool turn must survive (shrunk, not dropped)"
-        );
-        assert!(
-            turns[0].content.chars().count() < 5000,
-            "an old tool result must be shrunk in place"
-        );
-        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        assert!(
-            total_after <= budget,
-            "must be within budget after the in-place shrink: {total_after}"
-        );
     }
 
     #[test]
@@ -18562,6 +18385,303 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    // ----------------------------------------------------------
+    // Pinned regression for issue #8013: disabling an agent must
+    // stop its bound Discord channel from staying online. The
+    // legacy fallback in `ActiveChannelAliases::contains` used to
+    // collapse "no bindings anywhere" with "all explicit owners are
+    // disabled" — these tests pin both states.
+    // ----------------------------------------------------------
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_skips_channel_when_only_owner_is_disabled() {
+        // T1 — the bug path: an explicit binding exists, but the
+        // owner agent is `enabled = false`. Legacy fallback must NOT
+        // bring the channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disco".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Discord"),
+            "disabled-owner channel must not be collected (#8013)"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_legacy_accepts_all_when_no_bindings_declared() {
+        // T2 — the legacy fallback: an enabled agent with no `channels`
+        // list (empty bindings). All enabled channels still load. Pins
+        // the same contract as
+        // `collect_configured_channels_falls_back_when_agent_bindings_missing`
+        // but mirrors it onto Discord so the surface stays obvious.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Discord"),
+            "no-bindings-anywhere must still trigger the legacy fallback"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_respects_mixed_enabled_and_disabled_owners() {
+        // T3 — two bound channels, one owner enabled (keeper) and one
+        // owner disabled (loser). Only the enabled owner's channel
+        // comes online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "a".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-a".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-b".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        let discord_channels: Vec<_> = channels
+            .iter()
+            .filter(|entry| entry.display_name == "Discord")
+            .collect();
+        assert_eq!(
+            discord_channels.len(),
+            1,
+            "exactly one Discord channel should be active when only one owner is enabled"
+        );
+        assert_eq!(
+            discord_channels[0].alias.as_deref(),
+            Some("a"),
+            "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_skips_disabled_owners() {
+        // T4 — reload contract: when an admin flips an agent to
+        // `enabled = false` and the daemon re-runs `start_channels`,
+        // the resulting owner map must NOT bind the now-disabled
+        // owner's channel to any agent (legacy fallback must not fire
+        // because at least one binding exists in the config). Pairs
+        // with `build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default`
+        // to pin both branches of the discriminator.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+
+        // Reload passes an empty enabled_agents slice because the only
+        // owner is disabled.
+        let owners = build_owner_by_channel_key(&config, &[], &["discord.b".to_string()]);
+
+        assert!(
+            owners.is_empty(),
+            "disabled-owner channels must not be rebound to any fallback agent (#8013)"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #8013 — Nostr startup / health-check gate
+    //
+    // The Nostr blocks in `doctor_channels` and `start_channels` were
+    // originally outside the `collect_configured_channels` gate. After
+    // the Phase 2 follow-up (Audacity88 review, 2026-06-21), both Nostr
+    // blocks now share `ActiveChannelAliases::compute` as their single
+    // source of truth. These tests pin that gate directly so the
+    // invariant cannot regress.
+    // ----------------------------------------------------------
+
+    /// Helper: returns the set of `nostr.<alias>` references that pass
+    /// the unified `ActiveChannelAliases` gate AND the channel-level
+    /// `enabled = true` check, in the same way `doctor_channels` and
+    /// `start_channels` use it after Phase 2.
+    #[cfg(feature = "channel-nostr")]
+    fn resolve_nostr_active(config: &Config) -> Vec<String> {
+        let active = ActiveChannelAliases::compute(config);
+        config
+            .channels
+            .nostr
+            .iter()
+            .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+            .filter(|(_, ns)| ns.enabled)
+            .map(|(alias, _)| format!("nostr.{alias}"))
+            .collect()
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn doctor_channels_skips_nostr_when_only_owner_is_disabled() {
+        // T5 — the #8013 bug path on the Nostr side. An explicit
+        // `nostr.default` binding exists, but the owner agent is
+        // `enabled = false`. Both the doctor and startup Nostr blocks
+        // must NOT bring this channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disabled_owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["nostr.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with only a disabled owner must not pass the gate (#8013): got {:?}",
+            active
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_legacy_includes_nostr_when_no_bindings_declared() {
+        // T6 — the legacy fallback on the Nostr side. No agent declares
+        // any channel binding, so the `all_known_bindings.is_empty()`
+        // branch fires and every enabled Nostr alias is accepted. This
+        // pins parity with the Discord T2 behavior.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "legacy_alias".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert_eq!(
+            active,
+            vec!["nostr.legacy_alias".to_string()],
+            "Legacy fallback must keep Nostr active when no agent declares bindings"
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_nostr_skips_channel_level_disabled() {
+        // T7 — channel-level `enabled = false` still skips even when
+        // the agent binding path is satisfied. Pins the channel-level
+        // half of the gate that was previously missing in the
+        // `start_channels` Nostr block.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["nostr.muted".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "muted".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: false, // channel-level off
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with `enabled = false` must not start regardless of agent binding"
+        );
+    }
+
     #[cfg(feature = "channel-email")]
     #[test]
     fn collect_configured_channels_skips_unreferenced_email() {
@@ -21002,126 +21122,6 @@ Done."#;
 
         let tool_msgs = extract_current_turn_tool_messages(&history);
         assert_eq!(tool_msgs.len(), 4);
-    }
-
-    #[test]
-    fn is_tool_call_content_detects_tool_calls() {
-        assert!(is_tool_call_content("{\"tool_call\": \"shell\"}"));
-        assert!(is_tool_call_content("<tool_call>shell</tool_call>"));
-        assert!(is_tool_call_content(
-            "{\"name\": \"read_file\", \"args\": {}}"
-        ));
-        assert!(!is_tool_call_content("The iPad has been blocked."));
-        assert!(!is_tool_call_content(""));
-    }
-
-    #[test]
-    fn is_tool_call_content_does_not_misclassify_regular_name_json() {
-        assert!(!is_tool_call_content(
-            "{\"name\":\"Alice\",\"role\":\"admin\"}"
-        ));
-    }
-
-    #[test]
-    fn strip_old_tool_context_preserves_recent_tool_context_when_history_within_keep_window() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-short";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("block the iPad"),
-                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
-                ChatMessage::assistant("Done, iPad is blocked."),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            turns.len(),
-            4,
-            "tool context in protected turns must not be stripped"
-        );
-        assert_eq!(turns[1].role, "assistant");
-        assert!(turns[1].content.contains("tool_call"));
-        assert_eq!(turns[2].role, "tool");
-    }
-
-    #[test]
-    fn strip_old_tool_context_strips_tool_context_before_keep_window_boundary() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-boundary";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("first task"),
-                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-                ChatMessage::tool("ok"),
-                ChatMessage::assistant("first task done"),
-                ChatMessage::user("second task"),
-                ChatMessage::assistant("second task done"),
-                ChatMessage::user("third task"),
-                ChatMessage::assistant("third task done"),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            history_signature(&turns),
-            vec![
-                ("user".to_string(), "first task".to_string()),
-                ("assistant".to_string(), "first task done".to_string()),
-                ("user".to_string(), "second task".to_string()),
-                ("assistant".to_string(), "second task done".to_string()),
-                ("user".to_string(), "third task".to_string()),
-                ("assistant".to_string(), "third task done".to_string()),
-            ],
-            "tool context older than the protected keep window should be stripped"
-        );
-    }
-
-    #[test]
-    fn strip_old_tool_context_removes_native_tool_call_assistant_messages() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-native";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("first task"),
-                ChatMessage::assistant(
-                    r#"{"content":"Need to call tool","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
-                ),
-                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
-                ChatMessage::assistant("first task done"),
-                ChatMessage::user("second task"),
-                ChatMessage::assistant("second task done"),
-                ChatMessage::user("third task"),
-                ChatMessage::assistant("third task done"),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 1);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            history_signature(&turns),
-            vec![
-                ("user".to_string(), "first task".to_string()),
-                ("assistant".to_string(), "first task done".to_string()),
-                ("user".to_string(), "second task".to_string()),
-                ("assistant".to_string(), "second task done".to_string()),
-                ("user".to_string(), "third task".to_string()),
-                ("assistant".to_string(), "third task done".to_string()),
-            ],
-            "native assistant tool-call JSON should be stripped together with old tool results"
-        );
     }
 
     #[test]

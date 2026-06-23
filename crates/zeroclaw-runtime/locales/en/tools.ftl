@@ -86,7 +86,7 @@ tool-image-info = Read image file metadata (format, dimensions, size) and option
 
 tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 
-tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
+tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and relationship links.
 
 tool-linkedin = Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file.
 

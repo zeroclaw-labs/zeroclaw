@@ -89,3 +89,70 @@ pub struct ResolvedAgentExecution<'a> {
     /// Fine-grained loop behavior flags.
     pub knobs: &'a LoopKnobs,
 }
+
+/// The per-turn I/O wiring half of [`ResolvedAgentExecution::resolve`]'s input:
+/// the borrowed sinks, channels, and policy handles a path holds for the turn.
+/// A grouped input layer (not stored state); `resolve` spreads it into the bundle.
+pub struct ResolvedIo<'a> {
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub observer: &'a dyn Observer,
+    pub silent: bool,
+    pub approval: Option<&'a ApprovalManager>,
+    pub multimodal_config: &'a MultimodalConfig,
+    pub hooks: Option<&'a HookRunner>,
+    pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
+    pub model_switch_callback: Option<ModelSwitchCallback>,
+    pub receipt_generator: Option<&'a ReceiptGenerator>,
+}
+
+/// The resolved per-agent runtime knobs half of [`ResolvedAgentExecution::resolve`]'s
+/// input: the values derived from the agent's resolved config. A grouped input layer
+/// (not stored state); `resolve` spreads it into the bundle.
+pub struct ResolvedRuntimeKnobs<'a> {
+    pub max_tool_iterations: usize,
+    pub excluded_tools: &'a [String],
+    pub dedup_exempt_tools: &'a [String],
+    pub pacing: &'a PacingConfig,
+    pub strict_tool_parsing: bool,
+    pub parallel_tools: bool,
+    pub max_tool_result_chars: usize,
+    pub context_token_budget: usize,
+    pub knobs: &'a LoopKnobs,
+}
+
+impl<'a> ResolvedAgentExecution<'a> {
+    /// The single seam every turn-construction path produces the bundle through,
+    /// so a turn's per-agent policy is assembled in one place rather than re-derived
+    /// inline at each call site. Today it spreads already-resolved inputs into the
+    /// bundle (behavior-neutral); later surface PRs move the per-field resolution
+    /// (tools via a scoped registry, approval, the runtime knobs) into this
+    /// constructor and seal the inputs, at which point the flat fields collapse into
+    /// the [`ResolvedIo`] / [`ResolvedRuntimeKnobs`] layers passed here.
+    pub fn resolve(
+        model_access: ResolvedModelAccess<'a>,
+        io: ResolvedIo<'a>,
+        runtime: ResolvedRuntimeKnobs<'a>,
+    ) -> Self {
+        Self {
+            model_access,
+            tools_registry: io.tools_registry,
+            observer: io.observer,
+            silent: io.silent,
+            approval: io.approval,
+            multimodal_config: io.multimodal_config,
+            max_tool_iterations: runtime.max_tool_iterations,
+            hooks: io.hooks,
+            excluded_tools: runtime.excluded_tools,
+            dedup_exempt_tools: runtime.dedup_exempt_tools,
+            activated_tools: io.activated_tools,
+            model_switch_callback: io.model_switch_callback,
+            pacing: runtime.pacing,
+            strict_tool_parsing: runtime.strict_tool_parsing,
+            parallel_tools: runtime.parallel_tools,
+            max_tool_result_chars: runtime.max_tool_result_chars,
+            context_token_budget: runtime.context_token_budget,
+            receipt_generator: io.receipt_generator,
+            knobs: runtime.knobs,
+        }
+    }
+}

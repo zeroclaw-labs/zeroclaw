@@ -878,6 +878,19 @@ impl Agent {
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
         self.tool_dispatcher = tool_dispatcher;
+        self.refresh_system_prompt();
+    }
+
+    fn refresh_system_prompt(&mut self) {
+        let Some(ConversationMessage::Chat(first)) = self.history.first() else {
+            return;
+        };
+        if first.role != "system" {
+            return;
+        }
+        if let Ok(sys) = self.build_system_prompt() {
+            self.history[0] = ConversationMessage::Chat(ChatMessage::system(sys));
+        }
     }
 
     /// Return the names of all registered tools.  Test-only — avoids
@@ -1641,6 +1654,39 @@ impl Agent {
         self.history.extend(other_messages);
     }
 
+    /// Append the trailing `Tool receipts:` block to a turn's response when
+    /// `[tool_receipts] show_in_response` is set. Reads the per-turn collector
+    /// from the active receipt scope; a `None` scope or empty collector returns
+    /// the response unchanged. Shared by `turn` and `turn_streamed*` so every
+    /// non-channel surface (ACP, gateway WS, CLI) renders the same block the
+    /// channel orchestrator does.
+    fn append_receipts_block(
+        &self,
+        response: String,
+        scope: Option<&crate::agent::tool_receipts::ReceiptScope>,
+    ) -> String {
+        if !self.config.resolved.tool_receipts.show_in_response {
+            return response;
+        }
+        let Some(scope) = scope else {
+            return response;
+        };
+        let block = {
+            let receipts = scope.collector().lock().unwrap_or_else(|e| e.into_inner());
+            crate::agent::tool_receipts::render_receipts_block(&receipts)
+        };
+        match block {
+            Some(block) => {
+                if response.is_empty() {
+                    block
+                } else {
+                    format!("{response}\n\n{block}")
+                }
+            }
+            None => response,
+        }
+    }
+
     fn build_system_prompt(&self) -> Result<String> {
         let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
             || self.tool_dispatcher.should_send_tool_specs();
@@ -1665,7 +1711,12 @@ impl Agent {
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
-        self.prompt_builder.build(&ctx)
+        let mut prompt = self.prompt_builder.build(&ctx)?;
+        let receipts = &self.config.resolved.tool_receipts;
+        if receipts.enabled && receipts.inject_system_prompt {
+            prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        Ok(prompt)
     }
 
     // Superseded by the loop's prepare/approve/execute pipeline (#7415).
@@ -1776,6 +1827,10 @@ impl Agent {
                                     .and_then(|c| c.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
+                                // Provider-wire tool messages do not carry the
+                                // producing tool name; replayed results fall back
+                                // to blind canonicalization (PR #6183, #7345).
+                                tool_name: String::new(),
                             })
                         })
                         .collect();
@@ -1796,6 +1851,9 @@ impl Agent {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        // No provenance on the provider-wire shape; blind canon
+                        // applies as before (PR #6183, #7345).
+                        tool_name: String::new(),
                     };
                     push_tool_results(&mut replayed, vec![result]);
                     continue;
@@ -1963,52 +2021,69 @@ impl Agent {
         // task — caller-scoped task-locals (thread id, session key, tool
         // choice / thinking overrides) silently vanish across a spawn.
         let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
-                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    exec: crate::agent::loop_::ResolvedAgentExecution {
-                        model_access: crate::agent::loop_::ResolvedModelAccess {
-                            model_provider: self.model_provider.as_ref(),
-                            provider_name: &self.model_provider_name,
-                            model: &effective_model,
-                            temperature: self.temperature,
-                        },
-                        tools_registry: &self.tools,
-                        observer: self.observer.as_ref(),
-                        silent: false,
-                        approval: self.approval_manager.as_deref(),
-                        multimodal_config: &self.multimodal_config,
-                        max_tool_iterations: self.config.resolved.max_tool_iterations,
-                        hooks: self.hook_runner.as_deref(),
-                        excluded_tools: &[],
-                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                        activated_tools: self.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        pacing: &pacing,
-                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                        parallel_tools: self.config.resolved.parallel_tools,
-                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                        context_token_budget: self.config.resolved.max_context_tokens,
-                        receipt_generator: None,
-                        knobs: &knobs,
-                    },
-                    history: &mut loop_history,
-                    channel_name: "cli",
-                    channel_reply_target: None,
-                    cancellation_token: None,
-                    on_delta: None,
-                    shared_budget: None,
-                    channel: None,
-                    collected_receipts: None,
-                    event_tx: None,
-                    steering: None,
-                    new_messages_out: Some(&mut loop_new_messages),
-                    image_cache: Some(&mut self.image_cache),
-                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                    // stamping is PR C (RFC #6971 §4).
-                    ingress: zeroclaw_api::ingress::IngressContext::internal(),
-                }),
+                crate::agent::tool_receipts::scope_receipts(
+                    receipt_scope.clone(),
+                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &self.model_provider_name,
+                                model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: false,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_token_budget: self
+                                    .config
+                                    .resolved
+                                    .effective_context_budget(),
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut loop_history,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: Some(&mut loop_new_messages),
+                        image_cache: Some(&mut self.image_cache),
+                        // Phase 1: stamp Internal/Trusted. Real per-transport
+                        // stamping is PR C (RFC #6971 §4).
+                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                    }),
+                ),
             )
             .await;
 
@@ -2033,6 +2108,8 @@ impl Agent {
             self.history.push(replayed);
         }
         let response = loop_result?;
+
+        let response = self.append_receipts_block(response, receipt_scope.as_ref());
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -2325,6 +2402,13 @@ impl Agent {
             .flatten()
             .unwrap_or_else(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only);
 
+        // Built once per turn so the HMAC key is stable across steering rounds
+        // and the same collector accumulates every round's receipts. `None`
+        // when receipts are disabled, gated by the one shared seam.
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
+
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
@@ -2363,49 +2447,69 @@ impl Agent {
             let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     Some(cost_context.clone()),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution {
-                            model_access: crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            tools_registry: &self.tools,
-                            observer: self.observer.as_ref(),
-                            silent: true,
-                            approval: self.approval_manager.as_deref(),
-                            multimodal_config: &self.multimodal_config,
-                            max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            hooks: self.hook_runner.as_deref(),
-                            excluded_tools: &[],
-                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                            activated_tools: self.activated_tools.as_ref(),
-                            model_switch_callback: None,
-                            pacing: &pacing,
-                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                            parallel_tools: self.config.resolved.parallel_tools,
-                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_token_budget: self.config.resolved.max_context_tokens,
-                            receipt_generator: None,
-                            knobs: &knobs,
-                        },
-                        history: &mut loop_history,
-                        channel_name: "cli",
-                        channel_reply_target: None,
-                        cancellation_token: cancel_token.clone(),
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: approval_bridge.as_deref(),
-                        collected_receipts: None,
-                        event_tx: Some(event_tx.clone()),
-                        steering: None,
-                        new_messages_out: Some(&mut round_added),
-                        image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
-                    }),
+                    crate::agent::tool_receipts::scope_receipts(
+                        receipt_scope.clone(),
+                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &self.model_provider_name,
+                                    model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: true,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    context_token_budget: self
+                                        .config
+                                        .resolved
+                                        .effective_context_budget(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            channel_name: "cli",
+                            channel_reply_target: None,
+                            cancellation_token: cancel_token.clone(),
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: approval_bridge.as_deref(),
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: Some(event_tx.clone()),
+                            steering: None,
+                            new_messages_out: Some(&mut round_added),
+                            image_cache: Some(&mut self.image_cache),
+                            // Phase 1: stamp Internal/Trusted. Real per-transport
+                            // stamping is PR C (RFC #6971 §4).
+                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        }),
+                    ),
                 )
                 .await;
 
@@ -2453,6 +2557,8 @@ impl Agent {
                     }
 
                     self.observer.record_event(&ObserverEvent::TurnComplete);
+                    let committed_response =
+                        self.append_receipts_block(committed_response, receipt_scope.as_ref());
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
@@ -3914,6 +4020,53 @@ mod tests {
     }
 
     #[test]
+    fn set_tool_dispatcher_refreshes_existing_system_prompt() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.seed_history(&[ChatMessage::user("hello")]);
+        let before = match agent.history().first() {
+            Some(ConversationMessage::Chat(m)) if m.role == "system" => m.content.clone(),
+            other => panic!("expected a system prompt first, got {other:?}"),
+        };
+        assert!(
+            before.contains("Tool Use Protocol"),
+            "xml dispatcher system prompt should carry the xml tool protocol"
+        );
+
+        agent.set_tool_dispatcher(Box::new(NativeToolDispatcher));
+        let after = match agent.history().first() {
+            Some(ConversationMessage::Chat(m)) if m.role == "system" => m.content.clone(),
+            other => panic!("expected a system prompt first, got {other:?}"),
+        };
+        assert!(
+            !after.contains("Tool Use Protocol"),
+            "native dispatcher system prompt must not carry the xml tool protocol after swap"
+        );
+    }
+
+    #[test]
     fn seed_conversation_history_preserves_tool_call_variants() {
         use zeroclaw_api::model_provider::{
             ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
@@ -3958,6 +4111,7 @@ mod tests {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc-1".into(),
                 content: "ok".into(),
+                tool_name: String::new(),
             }]),
             ConversationMessage::Chat(ChatMessage::assistant("done")),
         ];
@@ -4199,7 +4353,179 @@ mod tests {
         );
     }
 
-    /// Provider that emits TWO native tool calls in a single assistant turn,
+    fn tool_receipts_enabled_config(enabled: bool) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                tool_receipts: zeroclaw_config::schema::ToolReceiptsConfig {
+                    enabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        }
+    }
+
+    fn streamed_agent_with_receipts(enabled: bool) -> Agent {
+        let model_provider = Box::new(StreamToolCaptureModelProvider {
+            tools_received: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(tool_receipts_enabled_config(enabled))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn history_has_receipt(agent: &Agent) -> bool {
+        agent.history().iter().any(|m| match m {
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .any(|r| r.content.contains("[receipt: zc-receipt-")),
+            _ => false,
+        })
+    }
+
+    // RED on upstream/master: the streamed turn path (ACP, gateway WS) hardcoded
+    // `receipt_generator: None`, so an enabled config produced zero receipts.
+    // GREEN once `turn_streamed` derives the scope from its own config through
+    // the shared `ReceiptScope::from_config` seam.
+    #[tokio::test]
+    async fn turn_streamed_signs_tool_results_when_receipts_enabled() {
+        let mut agent = streamed_agent_with_receipts(true);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            history_has_receipt(&agent),
+            "enabled receipts must sign tool results on the streamed path"
+        );
+    }
+
+    // GREEN control: disabled config produces no receipts on the same path.
+    #[tokio::test]
+    async fn turn_streamed_omits_receipts_when_disabled() {
+        let mut agent = streamed_agent_with_receipts(false);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            !history_has_receipt(&agent),
+            "disabled receipts must not sign tool results"
+        );
+    }
+
+    fn show_in_response_config(show: bool) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                tool_receipts: zeroclaw_config::schema::ToolReceiptsConfig {
+                    enabled: true,
+                    show_in_response: show,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        }
+    }
+
+    fn streamed_agent_with_config(config: zeroclaw_config::schema::AliasedAgentConfig) -> Agent {
+        let model_provider = Box::new(StreamToolCaptureModelProvider {
+            tools_received: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    // RED on the pre-fix branch: `show_in_response` was read only in the channel
+    // orchestrator, so ACP/WS/CLI turns never appended the auditable block.
+    // GREEN once the turn paths route the collector through
+    // `append_receipts_block`.
+    #[tokio::test]
+    async fn turn_streamed_appends_receipts_block_when_show_in_response() {
+        let mut agent = streamed_agent_with_config(show_in_response_config(true));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (response, _msgs) = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
+            "show_in_response must append the Tool receipts block to the reply, got: {response}"
+        );
+    }
+
+    // Control: with show_in_response off the reply carries no receipts block,
+    // even though receipts are still signed into history.
+    #[tokio::test]
+    async fn turn_streamed_omits_receipts_block_when_show_in_response_off() {
+        let mut agent = streamed_agent_with_config(show_in_response_config(false));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (response, _msgs) = agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            !response.contains("Tool receipts:"),
+            "no receipts block when show_in_response is off, got: {response}"
+        );
+        assert!(
+            history_has_receipt(&agent),
+            "receipts are still signed into history when only the reply block is off"
+        );
+    }
+
+    // The receipt-echo system-prompt addendum is added on the turn path when
+    // inject_system_prompt is on (default), matching the channel orchestrator.
+    #[test]
+    fn build_system_prompt_injects_receipt_addendum_when_enabled() {
+        let agent = streamed_agent_with_config(show_in_response_config(true));
+        let prompt = agent
+            .build_system_prompt()
+            .expect("system prompt should build");
+        assert!(
+            prompt.contains("## Tool Execution Receipts"),
+            "enabled receipts with inject_system_prompt must add the addendum"
+        );
+    }
+
     /// then finishes. Used to verify serial dispatch ordering.
     struct TwoToolCallStreamModelProvider {
         call_count: Arc<Mutex<usize>>,
@@ -4700,6 +5026,7 @@ mod tests {
                     .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: format!("tc{i}"),
                         content: format!("result{i}"),
+                        tool_name: String::new(),
                     }]));
             }
         }
@@ -4805,6 +5132,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4822,6 +5150,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
         // AC3, TR3
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4839,6 +5168,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc3".into(),
                 content: "result3".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 7);
@@ -4957,6 +5287,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4974,6 +5305,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 5);
@@ -5089,6 +5421,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -5106,6 +5439,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 6);
