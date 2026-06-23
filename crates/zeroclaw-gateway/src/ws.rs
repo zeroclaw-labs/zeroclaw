@@ -1168,6 +1168,16 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         }),
+                        TurnEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns,
+                            reason,
+                        } => serde_json::json!({
+                            "type": "history_trimmed",
+                            "dropped_messages": dropped_messages,
+                            "kept_turns": kept_turns,
+                            "reason": reason,
+                        }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
