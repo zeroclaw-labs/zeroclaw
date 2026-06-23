@@ -415,8 +415,9 @@ sections! {
         key:   "mcp_bundles",
         shape: OneTierAliasMap,
         group: Tools,
-        help:  "Named bundles of MCP servers. Agents reference a bundle to pull in \
-                a set of MCP tools as one unit.",
+        help:  "Named bundles of MCP servers, granted to agents that list the bundle \
+                in their `mcp_bundles`. Secure by default: an agent gets only the \
+                servers its bundles grant; with no bundle it gets no MCP servers.",
     },
     KnowledgeBundles => {
         key:   "knowledge_bundles",
@@ -450,7 +451,7 @@ sections! {
         shape: TypedFamilyMap,
         group: Foundation,
         help:  "Pick which chat platforms ZeroClaw should listen on. Global \
-                channel settings live on [channels]; each configured platform \
+                channel settings live on `[channels]`; each configured platform \
                 still gets its own alias.",
     },
     Hardware => {

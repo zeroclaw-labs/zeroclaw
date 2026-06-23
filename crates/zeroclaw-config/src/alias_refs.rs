@@ -379,6 +379,16 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
         if agent.classifier_provider.trim() == target {
             agent.classifier_provider = crate::providers::ModelProviderRef::default();
         }
+        if agent.summary_provider.trim() == target {
+            agent.summary_provider = crate::providers::ModelProviderRef::default();
+        }
+    }
+    // Profile-level context-compression summarizer ref (#7964).
+    for profile in cfg.runtime_profiles.values_mut() {
+        if profile.context_compression.summary_provider.trim() == target {
+            profile.context_compression.summary_provider =
+                crate::providers::ModelProviderRef::default();
+        }
     }
     for (_ty, _al, profile) in cfg.providers.models.iter_entries_mut() {
         profile.fallback.retain(|fb| fb.trim() != target);
@@ -836,8 +846,21 @@ fn rewrite_model_provider_refs(
             agent.classifier_provider = new_target.as_str().into();
             touched = true;
         }
+        if agent.summary_provider.trim() == old_target {
+            agent.summary_provider = new_target.as_str().into();
+            touched = true;
+        }
         if touched {
             dirty.push(format!("agents.{name}"));
+        }
+    }
+    // Profile-level context-compression summarizer ref (#7964).
+    for (pname, profile) in cfg.runtime_profiles.iter_mut() {
+        if profile.context_compression.summary_provider.trim() == old_target {
+            profile.context_compression.summary_provider = new_target.as_str().into();
+            dirty.push(format!(
+                "runtime_profiles.{pname}.context_compression.summary_provider"
+            ));
         }
     }
     for (ty, al, profile) in cfg.providers.models.iter_entries_mut() {
@@ -1059,6 +1082,32 @@ fn collect_provider_refs(
                         ScrubAction::ClearOptional,
                         agent.classifier_provider.as_str(),
                     ));
+                }
+                if agent.summary_provider.trim() == target {
+                    sites.push(RefSite::soft(
+                        format!("agents.{name}.summary_provider"),
+                        ScrubAction::ClearOptional,
+                        agent.summary_provider.as_str(),
+                    ));
+                }
+            }
+            // Profile-level context-compression summarizer ref (#7964).
+            {
+                let mut pnames: Vec<&String> = cfg.runtime_profiles.keys().collect();
+                pnames.sort();
+                for pname in pnames {
+                    let sp = &cfg.runtime_profiles[pname]
+                        .context_compression
+                        .summary_provider;
+                    if sp.trim() == target {
+                        sites.push(RefSite::soft(
+                            format!(
+                                "runtime_profiles.{pname}.context_compression.summary_provider"
+                            ),
+                            ScrubAction::ClearOptional,
+                            sp.as_str(),
+                        ));
+                    }
                 }
             }
             for (ty, al, profile) in cfg.providers.models.iter_entries() {

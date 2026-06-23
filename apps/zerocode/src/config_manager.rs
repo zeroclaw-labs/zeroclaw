@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
@@ -211,10 +211,42 @@ fn switch_tabs_keys() -> Vec<String> {
         .collect()
 }
 
+/// Display form of a config directory. Replaces the user's home prefix with
+/// "~" so a long path like "/home/alice/.zeroclaw" reads as
+/// "~/.zeroclaw" in the Config header. Falls back to the original path
+/// representation when the path is not under the current home directory or
+/// when the home directory cannot be resolved.
+fn shorten_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    // Canonicalize the home directory so the comparison is symmetric with the
+    // canonicalized config path. This handles symlinked $HOME setups common on
+    // macOS, NixOS, and container images.
+    let home_path = PathBuf::from(&home)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(home));
+    let to_tilde = |p: &Path| -> String {
+        match p.strip_prefix(&home_path) {
+            Ok(rel) => format!("~/{}", rel.to_string_lossy().trim_end_matches('/')),
+            Err(_) => p.display().to_string(),
+        }
+    };
+    if let Ok(canon) = path.canonicalize() {
+        return to_tilde(&canon);
+    }
+    to_tilde(path)
+}
+
 // ── App state ────────────────────────────────────────────────────
 
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
+    /// Cached display string for the active config directory, computed once at
+    /// construction so the tab bar does not re-stat the filesystem on every
+    /// render.
+    config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
@@ -237,6 +269,10 @@ pub(crate) struct App {
     aliases: Vec<String>,
     alias_enabled: Vec<Option<bool>>,
     alias_cursor: usize,
+    // Aliases/Costs tab on cost-bearing provider alias lists.
+    alias_tab: usize,
+    cost_resources: Vec<String>,
+    cost_cursor: usize,
     // Field list
     fields: Vec<ConfigFieldEntry>,
     field_cursor: usize,
@@ -291,6 +327,7 @@ impl App {
     pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
+            config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
             section_tab_area: None,
@@ -307,6 +344,9 @@ impl App {
             aliases: Vec::new(),
             alias_enabled: Vec::new(),
             alias_cursor: 0,
+            alias_tab: 0,
+            cost_resources: Vec::new(),
+            cost_cursor: 0,
             fields: Vec::new(),
             field_cursor: 0,
             edit_buf: String::new(),
@@ -513,6 +553,15 @@ impl App {
             spans.push(Span::styled("   ", theme::dim_style()));
             spans.push(Span::styled(msg.to_string(), theme::warn_style()));
         }
+        // Surface the active config directory so the user can tell which
+        // on-disk state the displayed values came from when running with
+        // --config-dir, $ZEROCLAW_CONFIG_DIR, or a daemon backed by a
+        // different config source.
+        spans.push(Span::styled("   ", theme::dim_style()));
+        spans.push(Span::styled(
+            format!("config: {}", self.config_dir_display),
+            theme::dim_style(),
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -626,6 +675,38 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Aliases/Costs tab bar click on a cost-bearing provider list.
+                if self.alias_list_has_tabs()
+                    && let Some(tab_rect) = self.last_tab_area
+                    && mouse::in_rect(mouse.column, mouse.row, tab_rect)
+                {
+                    let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+                    let display: Vec<String> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            if i == self.alias_tab {
+                                format!("▸ {l}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect();
+                    let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
+                    if let Some(idx) =
+                        mouse::tab_click_index(mouse.column, mouse.row, tab_rect, &display_refs, 3)
+                        && idx != self.alias_tab
+                        && idx < labels.len()
+                    {
+                        self.alias_tab = idx;
+                        self.deactivate_filter();
+                        if idx == 1 {
+                            self.load_cost_resources().await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 // Tab bar click (FieldList only).
                 if let Some(tab_rect) = self.last_tab_area
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
@@ -761,12 +842,16 @@ impl App {
                 self.filtered_indices(&names).len()
             }
             Screen::AliasList { .. } => {
-                let vis = self.filtered_indices(&self.aliases);
-                // +1 for [+ Add] when not filtering
-                if self.filter.is_none() {
-                    vis.len() + 1
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_resources.len() + 1 // +1 for [+ Add]
                 } else {
-                    vis.len()
+                    let vis = self.filtered_indices(&self.aliases);
+                    // +1 for [+ Add] when not filtering
+                    if self.filter.is_none() {
+                        vis.len() + 1
+                    } else {
+                        vis.len()
+                    }
                 }
             }
             Screen::AliasCreate { .. } => 0,
@@ -870,7 +955,9 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_cursor
+                } else if self.filter.is_some() {
                     self.filter_cursor
                 } else {
                     self.alias_cursor
@@ -939,7 +1026,10 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    let total = self.cost_resources.len() + 1; // +1 for [+ Add]
+                    self.cost_cursor = pos.min(total.saturating_sub(1));
+                } else if self.filter.is_some() {
                     let visible = self.filtered_indices(&self.aliases);
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else {
@@ -1006,7 +1096,12 @@ impl App {
                 self.enter_type(idx).await?;
             }
             Screen::AliasList { .. } => {
-                if self.alias_cursor < self.aliases.len() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    if self.cost_cursor < self.cost_resources.len() {
+                        let idx = self.cost_cursor;
+                        self.enter_cost_resource(idx).await?;
+                    }
+                } else if self.alias_cursor < self.aliases.len() {
                     let idx = self.alias_cursor;
                     self.enter_alias(idx).await?;
                 }
@@ -1125,7 +1220,85 @@ impl App {
             self.alias_enabled.push(status);
         }
         self.alias_cursor = 0;
+        self.alias_tab = 0;
+        self.cost_resources.clear();
+        self.cost_cursor = 0;
         Ok(())
+    }
+
+    fn alias_list_cost_target(&self) -> Option<(String, String)> {
+        if let Screen::AliasList {
+            section_idx,
+            breadcrumb,
+            ..
+        } = &self.screen
+            && breadcrumb.len() >= 2
+        {
+            let category = &self.sections[*section_idx].cost_category;
+            if !category.is_empty() {
+                return Some((category.clone(), breadcrumb[1].clone()));
+            }
+        }
+        None
+    }
+
+    /// Base map path for the cost-rates resource list on the active provider
+    /// AliasList: `cost.rates.providers.<category>.<type>`.
+    fn cost_base_path(&self) -> Option<String> {
+        self.alias_list_cost_target()
+            .map(|(category, provider_type)| {
+                format!("cost.rates.providers.{category}.{provider_type}")
+            })
+    }
+
+    /// Whether the active AliasList carries the Aliases/Costs tab pair.
+    fn alias_list_has_tabs(&self) -> bool {
+        self.alias_list_cost_target().is_some()
+    }
+
+    async fn load_cost_resources(&mut self) -> Result<()> {
+        if let Some(base) = self.cost_base_path() {
+            self.cost_resources = self.rpc.config_map_keys(&base).await.unwrap_or_default();
+        } else {
+            self.cost_resources.clear();
+        }
+        self.cost_cursor = 0;
+        Ok(())
+    }
+
+    /// Pre-fill a freshly created cost-rate resource from the live provider
+    /// catalog, matching the web Costs editor. Reuses the existing
+    /// `catalog_models` RPC (same payload the gateway serves the dashboard);
+    /// only the `models` category carries token pricing, so other categories
+    /// are left for manual entry. Best-effort: any miss leaves the sheet
+    /// empty rather than surfacing an error.
+    async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
+        let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
+            return;
+        };
+        let Ok(catalog) = self.rpc.catalog_models(provider_type).await else {
+            return;
+        };
+        let Some(pricing) = catalog.pricing.as_ref().and_then(|p| p.get(resource)) else {
+            return;
+        };
+        // Catalog rates are USD per token; cost sheets store USD per million.
+        let per_mtok = |s: &Option<String>| -> Option<f64> {
+            s.as_ref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v * 1_000_000.0)
+        };
+        let fields = [
+            ("input_per_mtok", per_mtok(&pricing.prompt)),
+            ("output_per_mtok", per_mtok(&pricing.completion)),
+            ("cached_input_per_mtok", per_mtok(&pricing.input_cache_read)),
+        ];
+        for (field, value) in fields {
+            if let Some(v) = value {
+                let prop = format!("{base_path}.{resource}.{field}");
+                let _ = self.rpc.config_set(&prop, serde_json::json!(v)).await;
+            }
+        }
     }
 
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
@@ -1533,6 +1706,37 @@ impl App {
     // ── Alias list ───────────────────────────────────────────────
 
     async fn handle_alias_list(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigTabAction;
+        let has_tabs = self.alias_list_has_tabs();
+
+        // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
+        // the FieldList tab bar uses. On these screens those chords no longer
+        // mean back/into; Back is the only way out to the type list.
+        if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
+            match action {
+                ConfigTabAction::TabLeft => {
+                    if self.alias_tab > 0 {
+                        self.alias_tab -= 1;
+                        self.deactivate_filter();
+                    }
+                    return Ok(());
+                }
+                ConfigTabAction::TabRight => {
+                    if self.alias_tab == 0 {
+                        self.alias_tab = 1;
+                        self.deactivate_filter();
+                        self.load_cost_resources().await?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if has_tabs && self.alias_tab == 1 {
+            return self.handle_cost_tab(key).await;
+        }
+
         let visible = self.filtered_indices(&self.aliases);
         // +1 for [+ Add] (only when not filtering)
         let has_add = self.filter.is_none();
@@ -1555,10 +1759,26 @@ impl App {
         }
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
-        use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
+        // With tabs present, TabLeft no longer doubles as Back.
+        let back = if has_tabs {
+            matches!(action, Some(ConfigTabAction::Back))
+        } else {
+            matches!(
+                action,
+                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+            )
+        };
+        let into = if has_tabs {
+            matches!(action, Some(ConfigTabAction::Enter))
+        } else {
+            matches!(
+                action,
+                Some(ConfigTabAction::Enter | ConfigTabAction::TabRight)
+            )
+        };
         match action {
-            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
+            _ if back => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::AliasList {
                     section_idx,
@@ -1578,7 +1798,7 @@ impl App {
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
+            _ if into => {
                 if has_add && self.alias_cursor == add_pos {
                     if let Screen::AliasList {
                         section_idx,
@@ -1627,6 +1847,190 @@ impl App {
         Ok(())
     }
 
+    /// Costs-tab key handling on a cost-bearing provider AliasList. Mirrors
+    /// the Aliases tab: a resource list with [+ Add], Enter to open the rate
+    /// sheet, delete-row to remove a resource. The map path is the
+    /// `cost.rates.providers.<category>.<type>` subtree.
+    async fn handle_cost_tab(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigTabAction;
+        let Some(base) = self.cost_base_path() else {
+            return Ok(());
+        };
+        let add_pos = self.cost_resources.len();
+        let total = add_pos + 1; // [+ Add] always present on this tab
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::AliasList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    self.types = self.types_for_section(&self.sections[section_idx].key);
+                    self.screen = Screen::TypeList { section_idx };
+                }
+                self.status_msg = None;
+            }
+            Some(ConfigTabAction::Up) => {
+                self.cost_cursor = self.cost_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.cost_cursor + 1 < total => {
+                self.cost_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if self.cost_cursor == add_pos {
+                    if let Screen::AliasList {
+                        section_idx,
+                        breadcrumb,
+                        ..
+                    } = &self.screen
+                    {
+                        self.edit_buf.clear();
+                        let mut bc = breadcrumb.clone();
+                        bc.push(ConfigTab::Costs.label().to_string());
+                        self.screen = Screen::AliasCreate {
+                            section_idx: *section_idx,
+                            map_path: base,
+                            breadcrumb: bc,
+                        };
+                    }
+                } else if self.cost_cursor < self.cost_resources.len() {
+                    self.enter_cost_resource(self.cost_cursor).await?;
+                }
+            }
+            Some(ConfigTabAction::DeleteRow | ConfigTabAction::ToggleSecret)
+                if self.cost_cursor < self.cost_resources.len() =>
+            {
+                let resource = self.cost_resources[self.cost_cursor].clone();
+                match self.rpc.config_map_key_delete(&base, &resource).await {
+                    Ok(()) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-alias-deleted",
+                            &[("alias", &resource)],
+                        ));
+                        self.load_cost_resources().await?;
+                        if self.cost_cursor > 0 && self.cost_cursor >= self.cost_resources.len() {
+                            self.cost_cursor = self.cost_resources.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-delete-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn enter_cost_resource(&mut self, idx: usize) -> Result<()> {
+        let Some(base) = self.cost_base_path() else {
+            return Ok(());
+        };
+        if let Some(resource) = self.cost_resources.get(idx).cloned()
+            && let Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            } = &self.screen
+        {
+            let prefix = format!("{base}.{resource}");
+            let mut bc = breadcrumb.clone();
+            bc.push(ConfigTab::Costs.label().to_string());
+            bc.push(resource);
+            let si = *section_idx;
+            self.load_fields(&prefix).await?;
+            self.screen = Screen::FieldList {
+                section_idx: si,
+                prefix,
+                breadcrumb: bc,
+            };
+            self.status_msg = None;
+        }
+        Ok(())
+    }
+
+    /// Restore the provider AliasList when backing out of a FieldList. Pops
+    /// the trailing segment; if a `Costs` sentinel remains it strips that too
+    /// and reopens the AliasList on the Costs tab with its resource list
+    /// loaded. Otherwise it falls back to the alias-tier list as before.
+    async fn restore_alias_list_from_field_back(
+        &mut self,
+        section_idx: usize,
+        breadcrumb: Vec<String>,
+    ) -> Result<()> {
+        let mut bc = breadcrumb;
+        bc.pop();
+        let costs_label = ConfigTab::Costs.label();
+        let on_costs = bc.last().map(|s| s.as_str()) == Some(costs_label);
+        if on_costs {
+            bc.pop();
+        }
+        let section_key = &self.sections[section_idx].key;
+        let map_path = if bc.len() == 1 {
+            section_key.clone()
+        } else {
+            format!("{}.{}", section_key, bc[1..].join("."))
+        };
+        self.load_aliases(&map_path).await?;
+        self.screen = Screen::AliasList {
+            section_idx,
+            map_path,
+            breadcrumb: bc,
+        };
+        if on_costs {
+            self.alias_tab = 1;
+            self.load_cost_resources().await?;
+        }
+        Ok(())
+    }
+
+    /// Restore the provider AliasList when cancelling or failing a create.
+    /// A `cost.rates.` map path means the create targeted the Costs tab; the
+    /// breadcrumb ends in the `Costs` sentinel, so strip it and reopen on the
+    /// Costs tab. Otherwise reopen the alias-tier list at the map path.
+    async fn restore_alias_list_from_create_back(
+        &mut self,
+        section_idx: usize,
+        map_path: String,
+        breadcrumb: Vec<String>,
+    ) -> Result<()> {
+        let costs_label = ConfigTab::Costs.label();
+        let on_costs = breadcrumb.last().map(|s| s.as_str()) == Some(costs_label);
+        if on_costs {
+            let mut bc = breadcrumb;
+            bc.pop();
+            let section_key = &self.sections[section_idx].key;
+            let provider_path = if bc.len() == 1 {
+                section_key.clone()
+            } else {
+                format!("{}.{}", section_key, bc[1..].join("."))
+            };
+            self.load_aliases(&provider_path).await?;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path: provider_path,
+                breadcrumb: bc,
+            };
+            self.alias_tab = 1;
+            self.load_cost_resources().await?;
+        } else {
+            self.load_aliases(&map_path).await?;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            };
+        }
+        Ok(())
+    }
+
     async fn enter_alias(&mut self, orig_idx: usize) -> Result<()> {
         if let Some(alias) = self.aliases.get(orig_idx)
             && let Screen::AliasList {
@@ -1665,12 +2069,8 @@ impl App {
                     ..
                 } = std::mem::replace(&mut self.screen, Screen::SectionList)
                 {
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb,
-                    };
+                    self.restore_alias_list_from_create_back(section_idx, map_path, breadcrumb)
+                        .await?;
                 }
             }
             Some(ConfigEditorAction::Confirm) => {
@@ -1688,6 +2088,7 @@ impl App {
                 {
                     match self.rpc.config_map_key_create(&map_path, &name).await {
                         Ok(()) => {
+                            self.prefill_cost_rates_from_catalog(&map_path, &name).await;
                             let prefix = format!("{}.{}", map_path, name);
                             let mut bc = breadcrumb;
                             bc.push(name);
@@ -1704,12 +2105,12 @@ impl App {
                                 "zc-config-status-alias-create-failed",
                                 &[("err", &e.to_string())],
                             ));
-                            self.load_aliases(&map_path).await?;
-                            self.screen = Screen::AliasList {
+                            self.restore_alias_list_from_create_back(
                                 section_idx,
                                 map_path,
                                 breadcrumb,
-                            };
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1793,20 +2194,8 @@ impl App {
                 } = screen
                     && breadcrumb.len() >= 2
                 {
-                    let mut bc = breadcrumb;
-                    bc.pop();
-                    let section_key = &self.sections[section_idx].key;
-                    let map_path = if bc.len() == 1 {
-                        section_key.clone()
-                    } else {
-                        format!("{}.{}", section_key, bc[1..].join("."))
-                    };
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb: bc,
-                    };
+                    self.restore_alias_list_from_field_back(section_idx, breadcrumb)
+                        .await?;
                 }
                 self.status_msg = None;
             }
@@ -3060,12 +3449,50 @@ impl App {
         section_idx: usize,
         breadcrumb: &[String],
     ) {
-        let r = regions(area);
+        let mut r = regions(area);
         let section = &self.sections[section_idx];
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        // Aliases/Costs tab bar on cost-bearing provider types. Reuses the
+        // same two-row help split the FieldList tab bar uses.
+        let has_tabs = self.alias_list_has_tabs();
+        let tab_area = if has_tabs {
+            use ratatui::layout::{Constraint, Direction, Layout};
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(r.help);
+            r.help = split[1];
+            Some(split[0])
+        } else {
+            None
+        };
+        if let Some(tab_rect) = tab_area {
+            let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+            let mut spans = Vec::new();
+            for (i, label) in labels.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" │ ", theme::dim_style()));
+                }
+                if i == self.alias_tab {
+                    spans.push(Span::styled(
+                        format!("▸ {label}"),
+                        theme::accent_style().add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(*label, theme::dim_style()));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), tab_rect);
+        }
+
+        if has_tabs && self.alias_tab == 1 {
+            self.draw_cost_resource_list(frame, r, tab_area);
+            return;
+        }
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
@@ -3123,7 +3550,7 @@ impl App {
         );
         self.last_main_area = r.main;
         self.last_list_offset = state.offset();
-        self.last_tab_area = None;
+        self.last_tab_area = tab_area;
 
         let hints = if self.filter.is_some() {
             format!(
@@ -3136,6 +3563,51 @@ impl App {
             "?=help".to_string()
         };
         self.draw_footer(frame, r, &hints);
+    }
+
+    /// Costs-tab body: the resource rate sheets under
+    /// `cost.rates.providers.<category>.<type>`, with an [+ Add] affordance.
+    fn draw_cost_resource_list(&mut self, frame: &mut Frame, r: Regions, tab_area: Option<Rect>) {
+        let base = self.cost_base_path().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{base}.<resource>"),
+                theme::dim_style(),
+            )),
+            r.help,
+        );
+
+        let mut items: Vec<ListItem> = self
+            .cost_resources
+            .iter()
+            .map(|res| ListItem::new(Line::from(Span::styled(res.clone(), theme::body_style()))))
+            .collect();
+        items.push(ListItem::new(Line::from(Span::styled(
+            "[+ Add]",
+            theme::accent_style(),
+        ))));
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(self.cost_cursor.min(items.len().saturating_sub(1))));
+        }
+
+        let (dstyle, dsym) = self.detail_highlight();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    ConfigTab::Costs.label()
+                )))
+                .highlight_style(dstyle)
+                .highlight_symbol(dsym),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = tab_area;
+        self.draw_footer(frame, r, "?=help");
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -3861,6 +4333,20 @@ impl App {
                         k(A::Enter, "zc-config-help-open-alias"),
                         clear_filter(),
                         help(),
+                    ])
+                } else if self.alias_list_has_tabs() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        E::new(
+                            switch_tabs_keys(),
+                            crate::i18n::t("zc-config-help-switch-tabs"),
+                        ),
+                        k(A::Enter, "zc-config-help-open-alias"),
+                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        back(),
+                        help(),
+                        E::spacer(),
+                        mouse_open(),
                     ])
                 } else {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
