@@ -981,7 +981,7 @@ fn timestamp_channel_user_content(content: &str) -> String {
 }
 
 fn channel_history_content_for_user_turn(content: &str) -> String {
-    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+    let (_cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
     if image_refs.is_empty() {
         return content.to_string();
     }
@@ -1005,7 +1005,7 @@ fn channel_history_content_for_user_turn(content: &str) -> String {
     }
 
     if result.is_empty() {
-        "[Image attachment available for re-loading]".to_string()
+        "[Image attachment processed by vision model]".to_string()
     } else {
         result
     }
