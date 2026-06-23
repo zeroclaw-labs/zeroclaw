@@ -7,10 +7,21 @@
 # from the CI runner. Idempotent: safe to run repeatedly (it auto-applies
 # rustfmt, everything else is read-only).
 #
+# When a container runtime + act are present it also runs the release-runbook
+# pre-release gate (Step 3: dry-run the release workflows locally with act) via
+# scripts/dev/act-local.sh, so the same release-stable-manual / cross-platform
+# build jobs that run at tag time are exercised before merge — not just at
+# release. See: maintainers/release-runbook "Dry-run the release workflows".
+#
 #   scripts/agent-preflight.sh ["<proposed PR title>"]
 #
 # Exit 0 = local CI-parity gates passed. Non-zero = fix the reported failures first.
 # Honors CARGO_BUILD_JOBS / RUSTFLAGS from the environment.
+# Env toggles for the pre-release gate:
+#   PREFLIGHT_SKIP_RELEASE_GATE=1     force-skip the act dry-run (fast path)
+#   PREFLIGHT_REQUIRE_RELEASE_GATE=1  treat missing act/runtime as a hard failure
+#                                     (set this on CI / build hosts such as the
+#                                     Ultra and Cerberus battery runners)
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 2
 fail=0
@@ -49,6 +60,39 @@ else
   printf '\n\033[33m(note) pass your proposed PR title as $1 to validate it: scripts/agent-preflight.sh "fix(scope): ..."\033[0m\n'
 fi
 
+# 6. Pre-release gate — dry-run the release/CI workflows locally with act.
+#    The runbook "pre-release PR gate" (release-runbook Step 3): exercises the
+#    release-stable-manual + cross-platform-build jobs that only fire at tag
+#    time, catching workflow_dispatch-only breakage before merge. Heavy
+#    (container builds), so it runs only when a container runtime + act are
+#    available; absence is a loud note locally and a hard failure on hosts that
+#    set PREFLIGHT_REQUIRE_RELEASE_GATE=1.
+release_gate() {
+  if [ "${PREFLIGHT_SKIP_RELEASE_GATE:-0}" = "1" ]; then
+    printf '\n\033[33m(skip) pre-release gate disabled via PREFLIGHT_SKIP_RELEASE_GATE=1\033[0m\n'
+    return 0
+  fi
+  local have_act=0 runtime_up=0
+  if command -v act >/dev/null 2>&1 || gh extension list 2>/dev/null | grep -q 'gh act'; then
+    have_act=1
+  fi
+  if docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then
+    runtime_up=1
+  fi
+  if [ "$have_act" -ne 1 ] || [ "$runtime_up" -ne 1 ] || [ ! -x scripts/dev/act-local.sh ]; then
+    local why="pre-release gate skipped: needs act (gh extension install nektos/gh-act) + a running container runtime (docker/podman) + scripts/dev/act-local.sh. Run it on a capable host: ./scripts/dev/act-local.sh --all"
+    if [ "${PREFLIGHT_REQUIRE_RELEASE_GATE:-0}" = "1" ]; then
+      echo "::error::$why"
+      fail=1
+    else
+      printf '\n\033[33m(note) %s\033[0m\n' "$why"
+    fi
+    return 0
+  fi
+  run ./scripts/dev/act-local.sh --all
+}
+release_gate
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "================================================================"
@@ -57,4 +101,4 @@ if [ "$fail" -ne 0 ]; then
   echo "================================================================"
   exit 1
 fi
-echo "PREFLIGHT PASSED — local CI-parity gates passed; ready to open a PR."
+echo "PREFLIGHT PASSED — local CI-parity + pre-release gates passed; ready to open a PR."
