@@ -141,7 +141,7 @@ def added_lines_for_file(base_sha: str, path: str) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Collect HTTP(S) links added in changed docs lines")
+    parser = argparse.ArgumentParser(description="Collect added documentation links (HTTP(S), relative Markdown links, etc.")
     parser.add_argument("--base", default="", help="Base commit SHA")
     parser.add_argument(
         "--docs-files",
