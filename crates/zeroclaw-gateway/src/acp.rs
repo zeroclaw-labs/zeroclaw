@@ -63,6 +63,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let acp_config = AcpServerConfig {
         max_sessions: config.acp.max_sessions,
         session_timeout_secs: config.acp.session_timeout_secs,
+        enable_mcp: config.acp.enable_mcp,
     };
     let store = AcpSessionStore::new(&config.data_dir)
         .map(Arc::new)

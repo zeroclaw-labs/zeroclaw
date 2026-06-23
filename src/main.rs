@@ -572,7 +572,8 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
-  zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
+  zeroclaw acp --max-sessions 5       # limit concurrent sessions
+  zeroclaw acp --enable-mcp           # load each agent's mcp_bundles tools")]
     Acp {
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
@@ -581,6 +582,12 @@ Examples:
         /// Session inactivity timeout in seconds (default: 3600)
         #[arg(long)]
         session_timeout: Option<u64>,
+
+        /// Initialize MCP tools (from each agent's mcp_bundles) for ACP
+        /// sessions. Off by default to keep session/new prompt; overrides
+        /// the `[acp].enable_mcp` config when set.
+        #[arg(long)]
+        enable_mcp: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -3509,18 +3516,26 @@ async fn main() -> Result<()> {
         Commands::Acp {
             max_sessions,
             session_timeout,
+            enable_mcp,
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
                 let mut acp_config = channels::acp_server::AcpServerConfig {
                     max_sessions: config.acp.max_sessions,
                     session_timeout_secs: config.acp.session_timeout_secs,
+                    enable_mcp: config.acp.enable_mcp,
                 };
                 if let Some(max) = max_sessions {
                     acp_config.max_sessions = max;
                 }
                 if let Some(timeout) = session_timeout {
                     acp_config.session_timeout_secs = timeout;
+                }
+                // CLI flag is a one-way override: `--enable-mcp` turns MCP on
+                // even if the config leaves it off. Absence keeps the config
+                // value (no implicit disable).
+                if enable_mcp {
+                    acp_config.enable_mcp = true;
                 }
                 let store =
                     zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
@@ -3549,7 +3564,7 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (max_sessions, session_timeout, enable_mcp);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }

@@ -11347,6 +11347,16 @@ pub struct AcpConfig {
     /// duration are eligible for eviction. Default: `3600` (1 hour).
     #[serde(default = "default_acp_session_timeout_secs")]
     pub session_timeout_secs: u64,
+    /// Initialize MCP tools for ACP sessions, loading the servers granted by
+    /// each agent's `mcp_bundles` (same wiring as gateway/daemon sessions).
+    ///
+    /// Off by default: MCP servers are external processes/services that can
+    /// block startup while they connect, and ACP `session/new` is expected to
+    /// return promptly. Enable it (here or via `zeroclaw acp --enable-mcp`)
+    /// when an ACP agent must call its `mcp_bundles` tools; `session/new` then
+    /// pays the one-time MCP connection cost (bounded and non-fatal per server).
+    #[serde(default = "default_acp_enable_mcp")]
+    pub enable_mcp: bool,
 }
 
 fn default_acp_max_sessions() -> usize {
@@ -11357,12 +11367,17 @@ fn default_acp_session_timeout_secs() -> u64 {
     3600
 }
 
+fn default_acp_enable_mcp() -> bool {
+    false
+}
+
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             default_agent: None,
             max_sessions: default_acp_max_sessions(),
             session_timeout_secs: default_acp_session_timeout_secs(),
+            enable_mcp: default_acp_enable_mcp(),
         }
     }
 }

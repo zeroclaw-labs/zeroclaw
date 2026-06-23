@@ -50,6 +50,11 @@ pub struct AcpServerConfig {
     pub max_sessions: usize,
     /// Session inactivity timeout in seconds. Default: 3600 (1 hour).
     pub session_timeout_secs: u64,
+    /// Initialize MCP tools (from each agent's `mcp_bundles`) for ACP sessions.
+    /// Default: false — keeps `session/new` prompt by skipping MCP connection
+    /// at session creation. When true, sessions load MCP exactly like the
+    /// gateway/daemon paths do.
+    pub enable_mcp: bool,
 }
 
 impl Default for AcpServerConfig {
@@ -57,6 +62,7 @@ impl Default for AcpServerConfig {
         Self {
             max_sessions: 10,
             session_timeout_secs: 3600,
+            enable_mcp: false,
         }
     }
 }
@@ -573,11 +579,14 @@ impl AcpServer {
         // (identity, scheduled tasks) still lives under `config.data_dir`.
         // ACP sessions exclude persistent memory — context comes from the
         // persisted session history, not the agent's long-term memory store.
+        // MCP init is opt-in (`[acp].enable_mcp` / `--enable-mcp`): off by
+        // default to keep `session/new` prompt; on to load the agent's
+        // `mcp_bundles` tools.
         let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
-            false,
+            self.acp_config.enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -790,7 +799,7 @@ impl AcpServer {
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            false,
+            self.acp_config.enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -992,7 +1001,7 @@ impl AcpServer {
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            false,
+            self.acp_config.enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -2388,6 +2397,164 @@ mod tests {
         .expect("session/new should create a session");
 
         assert!(result["sessionId"].as_str().is_some());
+    }
+
+    /// Spin up a wiremock server speaking the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) advertising a
+    /// single tool. HTTP transport keeps the test cross-platform (no stdio
+    /// scripts). Mirrors the runtime crate's #8193 helper.
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "tools/list"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List finance records",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_test_config` plus an MCP server (`remote`, HTTP transport at
+    /// `mock_uri`) granted to `test-agent` through the `b1` mcp_bundle.
+    fn make_mcp_granting_test_config(cwd: &std::path::Path, mock_uri: String) -> Config {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut cfg = make_test_config(cwd);
+        cfg.mcp.enabled = true;
+        cfg.mcp.deferred_loading = false;
+        cfg.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        cfg.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        cfg
+    }
+
+    #[test]
+    fn acp_server_config_default_disables_mcp() {
+        assert!(
+            !AcpServerConfig::default().enable_mcp,
+            "MCP must stay opt-in so session/new is prompt by default (#8193)"
+        );
+    }
+
+    /// By default (`enable_mcp = false`) an ACP session must NOT touch the
+    /// servers granted by the agent's mcp_bundles — preserving the
+    /// prompt-`session/new` contract (#8193). The granted MCP server records
+    /// zero requests.
+    #[tokio::test]
+    async fn session_new_skips_mcp_by_default() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = start_mock_mcp_http_server("records.list").await;
+        let config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        let acp = AcpServer::new(config, AcpServerConfig::default());
+
+        acp.handle_session_new(&serde_json::json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "agentAlias": "test-agent"
+        }))
+        .await
+        .expect("session/new must succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.is_empty(),
+            "default ACP session must not connect to granted MCP servers; got {} request(s)",
+            requests.len()
+        );
+    }
+
+    /// With `enable_mcp = true` an ACP session connects to the servers granted
+    /// by the agent's mcp_bundles (the same eager wiring used by gateway/daemon
+    /// sessions), so the agent can call those tools. The granted MCP server
+    /// receives the `tools/list` handshake during `session/new`.
+    #[tokio::test]
+    async fn session_new_loads_mcp_bundles_when_enabled() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = start_mock_mcp_http_server("records.list").await;
+        let config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        let acp = AcpServer::new(
+            config,
+            AcpServerConfig {
+                enable_mcp: true,
+                ..AcpServerConfig::default()
+            },
+        );
+
+        acp.handle_session_new(&serde_json::json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "agentAlias": "test-agent"
+        }))
+        .await
+        .expect("session/new must succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| {
+                std::str::from_utf8(&r.body)
+                    .map(|b| b.contains("tools/list"))
+                    .unwrap_or(false)
+            }),
+            "enable_mcp ACP session must list tools from granted MCP servers; \
+             got {} request(s)",
+            requests.len()
+        );
     }
 
     #[tokio::test]
