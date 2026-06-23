@@ -4259,16 +4259,21 @@ async fn process_channel_message_body(
         }
     };
     let history_user_content = msg.content.clone();
+    // Autosave must not persist heavy/private inline `data:` image bytes into
+    // durable memory. Strip them here (path/markers are preserved) before the
+    // store; the channel-history cache still keeps the re-loadable markers via
+    // collapse_inline_image_payloads downstream.
+    let autosave_content = strip_inline_data_image_markers(&history_user_content);
     if ctx.auto_save_memory
-        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
+        && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &history_user_content,
+                &autosave_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -19093,7 +19098,28 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    // ── E2E: photo [IMAGE:] marker rejected by non-vision model_provider ───
+    #[test]
+    fn strip_inline_data_image_markers_drops_bytes_keeps_path_marker_for_autosave() {
+        // The autosave path calls strip_inline_data_image_markers before
+        // storing to durable memory, so inline data: bytes never persist while
+        // re-loadable path markers and surrounding text survive.
+        let img_open = "[".to_string() + "IMAGE:/tmp/shot.png]";
+        let data_marker =
+            "[".to_string() + "IMAGE:data:image/png;base64," + &"AQIDBAUGBwg".repeat(64) + "]";
+        let content = format!("look at {img_open} and {data_marker} please");
+
+        let cleaned = strip_inline_data_image_markers(&content);
+
+        assert!(
+            !cleaned.contains("base64"),
+            "inline data bytes must be stripped before autosave: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("/tmp/shot.png"),
+            "re-loadable path marker must survive: {cleaned}"
+        );
+        assert!(cleaned.contains("look at") && cleaned.contains("please"));
+    }
 
     /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
     /// marker) sent through `process_channel_message` with a non-vision
