@@ -90,7 +90,19 @@ pub(crate) async fn try_recover_context_overflow(
         let dropped_messages = result.dropped_messages;
         let kept_turns = result.kept_turns;
         let tokens_after = result.tokens_after;
-        *history = result.history;
+        let mut recovered_history = result.history;
+        if trimmed {
+            // Insert the same model-visible breadcrumb the turn-boundary path
+            // uses, after the leading system messages, so the retried provider
+            // call tells the model earlier turns were dropped (never silent to
+            // the model, not just to clients).
+            let system_count = recovered_history
+                .iter()
+                .take_while(|m| m.role == "system")
+                .count();
+            recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+        }
+        *history = recovered_history;
         if trimmed {
             ::zeroclaw_log::record!(
                 INFO,
@@ -164,6 +176,13 @@ mod tests {
             try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
 
         assert!(recovered, "an overflowing history must trim and recover");
+        // The retried history must carry the model-visible breadcrumb after the
+        // leading system messages, matching the turn-boundary contract.
+        let breadcrumb_text = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        assert!(
+            history.iter().any(|m| m.content == breadcrumb_text),
+            "recovery must insert the breadcrumb so the model sees the trim"
+        );
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
