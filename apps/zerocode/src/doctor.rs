@@ -283,11 +283,9 @@ impl Doctor {
             KeyCode::PageUp => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(10);
             }
-            KeyCode::Home | KeyCode::Char('g') => {
-                if !self.visible_indices().is_empty() {
-                    self.list_state.select(Some(0));
-                    self.detail_scroll = 0;
-                }
+            KeyCode::Home | KeyCode::Char('g') if !self.visible_indices().is_empty() => {
+                self.list_state.select(Some(0));
+                self.detail_scroll = 0;
             }
             KeyCode::End | KeyCode::Char('G') => {
                 let len = self.visible_indices().len();
