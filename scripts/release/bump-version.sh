@@ -148,8 +148,9 @@ done
 #   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
 #   - /health response example `"version": "X.Y.Z"`
 # Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
-# with the release; `docs/book/po/*.po` mirrors the same swap into the
-# translation catalogs that the i18n pipeline reads.
+# with the release. The translation catalogues (`docs/book/po`) live in the
+# zeroclaw-docs-translations submodule and own their own version-literal swaps,
+# so they are not touched here; refresh-translations.sh tags and pins them.
 echo "Docs book examples..."
 docs_files=()
 while IFS= read -r -d '' f; do
@@ -164,36 +165,6 @@ for f in "${docs_files[@]}"; do
     '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
     "\"version\": \"${VERSION}\""
 done
-
-# ── Docs translation submodule pin ─────────────────────────────────
-# The translated docs catalogues (.po) live in the zeroclaw-docs-translations
-# submodule mounted at docs/book/po, tagged v{version} to mirror each release.
-# Pin the gitlink to the matching tag so a release ships the catalogues cut for
-# that version. Fail closed when the tag is not yet published: a release must
-# never pin to a moving ref. Cut the tag first with refresh-translations.sh.
-# The submodule's own release owns the in-catalogue version-literal swaps, so
-# the main-tree sweep above no longer touches .po files.
-echo "Docs translation submodule pin..."
-SUBMODULE_PATH="$REPO_ROOT/docs/book/po"
-if [[ -f "$REPO_ROOT/.gitmodules" ]] && [[ -d "$SUBMODULE_PATH/.git" || -f "$SUBMODULE_PATH/.git" ]]; then
-  before="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
-  git -C "$SUBMODULE_PATH" fetch --tags origin
-  if ! git -C "$SUBMODULE_PATH" rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
-    echo "error: tag v${VERSION} not found in zeroclaw-docs-translations." >&2
-    echo "       cut the catalogue tag first: ./scripts/release/refresh-translations.sh ${VERSION}" >&2
-    exit 1
-  fi
-  git -C "$SUBMODULE_PATH" checkout --quiet "v${VERSION}"
-  echo "  pinned docs/book/po to tag v${VERSION}"
-  ( cd "$REPO_ROOT" && git add docs/book/po )
-  after="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
-  current="$(git -C "$SUBMODULE_PATH" rev-parse HEAD)"
-  if [[ "$before" != "$current" ]]; then
-    changed=$((changed + 1))
-  fi
-else
-  echo "  skip: docs/book/po submodule not initialised (git submodule update --init)"
-fi
 
 # ── Docs stable-version pointer ────────────────────────────────────
 # Single source of truth for "which deployed docs version is Stable". The

@@ -191,21 +191,19 @@ Per release, the submodule is tagged `v{version}` to mirror the main repo, and `
 
 ## Release translation workflow
 
-Before tagging a release, refresh the catalogues and cut the matching submodule tag. This is one command: it derives the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and pins the main-repo gitlink to that tag. No `git -C` by hand, no version typed into git commands.
+During a release, after `./scripts/release/bump-version.sh` has set the version in `Cargo.toml`, refresh the catalogues and cut the matching submodule tag. This is one command: it reads the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and stages the main-repo gitlink pinned to that tag. No `git -C` by hand, no version typed into git commands. It initialises the submodule if needed.
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-git submodule update --init docs/book/po     # ensure the submodule is present (once)
-
 ./scripts/release/refresh-translations.sh    # version from Cargo.toml
 ```
 
 </div>
 
-The script fetches the submodule tag and `bump-version.sh` pins the gitlink to it; if the tag is missing the bump fails closed rather than pinning to a moving `main`. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` to skip the sync pass when the catalogues are already current, or an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default.
+Run it after `bump-version.sh` so the version it reads is the release version. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` to skip the sync pass when the catalogues are already current, or an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
 
 The model used is whatever is configured under `providers.models.<name>`.
 
