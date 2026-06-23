@@ -6227,9 +6227,22 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
+                let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .whatsapp
+                            .get(&alias)
+                            .map(|wa| wa.allowed_groups.clone())
+                            .unwrap_or_default()
+                    })
+                };
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
-                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -6902,15 +6915,54 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
 /// An empty set means no enabled agent declared channel bindings, so
 /// collection falls back to legacy behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
-    /// Set of `<type>.<alias>` channel references from enabled agents.
-    aliases: HashSet<String>,
+    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
+    /// explicit-binding mode: only enabled owners' bindings count.
+    enabled_bindings: HashSet<String>,
+    /// `<type>.<alias>` declared by ALL agents (enabled or disabled).
+    /// Distinguishes "true legacy fallback" (no bindings anywhere) from
+    /// "bindings exist but every owner is disabled" — the #8013 bug path.
+    /// When non-empty and `enabled_bindings` is empty, legacy mode must
+    /// NOT fire; otherwise disabled owners would still bring their bound
+    /// channels online.
+    all_known_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
     /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    /// no explicit bindings anywhere and legacy "accept all enabled channels"
+    /// mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// True when bindings exist somewhere in the config but every owner is
+    /// `enabled = false`. The #8013 bug fires when this returns true.
+    fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+    }
+
+    /// Build an `ActiveChannelAliases` from a config snapshot.
+    ///
+    /// Single source of truth for the "is this channel reference currently
+    /// active under the agent binding state?" decision. Used by
+    /// `collect_configured_channels` (Discord/Telegram/Mattermost/etc.) and
+    /// by the Nostr startup / health-check paths so the #8013 invariant
+    /// ("a disabled agent must not bring its bound channel online") is
+    /// enforced uniformly across the orchestrator.
+    fn compute(config: &Config) -> Self {
+        Self {
+            enabled_bindings: config
+                .agents
+                .values()
+                .filter(|a| a.enabled)
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+            all_known_bindings: config
+                .agents
+                .values()
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+        }
     }
 }
 
@@ -6994,14 +7046,21 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases = ActiveChannelAliases {
-        aliases: config
-            .agents
-            .values()
-            .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-            .collect(),
-    };
+    let active_channel_aliases = ActiveChannelAliases::compute(&config);
+
+    if active_channel_aliases.disabled_owners_exist() {
+        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "skipped_bindings": skipped.len(),
+                    "bindings": skipped,
+                })),
+            "channel binding(s) skipped: all owning agent(s) are disabled (#8013)"
+        );
+    }
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -7498,17 +7557,35 @@ fn collect_configured_channels(
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
                     let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
+                    let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || {
+                            cfg_arc
+                                .read()
+                                .channels
+                                .whatsapp
+                                .get(&alias)
+                                .map(|wa| wa.allowed_groups.clone())
+                                .unwrap_or_default()
+                        })
+                    };
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
-                                WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
-                                    .with_transcription(config.transcription.clone())
-                                    .with_tts(&config)
-                                    .with_workspace_dir(workspace_dir)
-                                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                    .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                WhatsAppWebChannel::new(
+                                    wa,
+                                    alias.clone(),
+                                    peer_resolver,
+                                    allowed_groups_resolver,
+                                )
+                                .with_transcription(config.transcription.clone())
+                                .with_tts(&config)
+                                .with_workspace_dir(workspace_dir)
+                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
                             wa,
                         ),
@@ -8460,6 +8537,17 @@ fn collect_configured_channels(
         );
     }
 
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
+                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+            })),
+        "channel binding(s) activated from enabled agents"
+    );
+
     channels
 }
 
@@ -8480,17 +8568,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         // runs (parking_lot guards are not Send).
         let nostr_jobs: Vec<(String, String, Vec<String>)> = {
             let config = config_arc.read();
-            let active_nostr: std::collections::HashSet<String> = config
-                .agents
-                .values()
-                .filter(|a| a.enabled)
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect();
+            // Share the same gate as the Discord/shared-collector path so
+            // the #8013 invariant ("a disabled agent must not bring its
+            // bound channel online") is enforced uniformly — see the
+            // `ActiveChannelAliases::compute` constructor for details.
+            let active = ActiveChannelAliases::compute(&config);
             config
                 .channels
                 .nostr
                 .iter()
-                .filter(|(alias, _)| active_nostr.contains(&format!("nostr.{alias}")))
+                .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                .filter(|(_, ns)| ns.enabled)
                 .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
                 .collect()
         };
@@ -8599,16 +8687,32 @@ fn build_owner_by_channel_key(
         }
     }
 
-    // Legacy fallback mode: when no enabled agent declares channel bindings,
-    // channel collection accepts all enabled channels. Those channels must
-    // also be routable, so bind collected channel keys to the runtime-active
-    // agent selection (explicit `"default"` alias when present, else
-    // lexicographically-smallest enabled alias).
-    // `owner_by_channel_key.is_empty()` means every enabled agent had an
-    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
-    // signal used by `collect_configured_channels` to accept all enabled
-    // channel blocks.
-    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+    // Distinguish "no enabled agent declared bindings" (true legacy mode)
+    // from "bindings exist but every owner is disabled" (active skip — see
+    // #8013). In the second case, we deliberately leave `owner_by_channel_key`
+    // empty so `AgentRouter::resolve` falls through and the inbound message
+    // is dropped at line 5667, instead of being silently routed to a
+    // now-disabled agent.
+    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
+
+    if any_binding_declared_anywhere {
+        if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel bindings exist but no owning agent is enabled; \
+                 affected channels will be unbound and inbound messages dropped (#8013)"
+            );
+        }
+        return owner_by_channel_key;
+    }
+
+    // True legacy mode: no agent anywhere declares a binding. Preserve the
+    // existing deterministic fallback so on-disk session hydration and the
+    // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
+    // continue to work.
+    if !collected_channel_keys.is_empty() {
         let fallback_owner = config
             .resolved_runtime_agent_alias()
             .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
@@ -9235,25 +9339,42 @@ pub async fn start_channels(
                 collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
 
             #[cfg(feature = "channel-nostr")]
-            if let Some((alias, ns)) = config.channels.nostr.iter().next() {
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
-                };
-                configured_channels.push(ConfiguredChannel {
-                    display_name: "Nostr",
-                    alias: Some(alias.clone()),
-                    channel: Arc::new(
-                        NostrChannel::new(
-                            &ns.private_key,
-                            ns.relays.clone(),
-                            alias.clone(),
-                            peer_resolver,
-                        )
-                        .await?,
-                    ),
-                });
+            {
+                // Share the same gate as the Discord/shared-collector path
+                // and as `doctor_channels` so the #8013 invariant
+                // ("a disabled agent must not bring its bound channel
+                // online") is enforced uniformly — see
+                // `ActiveChannelAliases::compute` for details. The
+                // previous `config.channels.nostr.iter().next()` started
+                // the FIRST Nostr block regardless of agent binding
+                // state, which was a literal copy of the #8013 bug.
+                let active = ActiveChannelAliases::compute(&config);
+                // Materialize the work list into owned values BEFORE any
+                // `.await` so we don't hold any lock across the async
+                // constructor (parking_lot guards are not Send). Mirrors
+                // the same pattern in `doctor_channels`.
+                let nostr_jobs: Vec<(String, String, Vec<String>)> = config
+                    .channels
+                    .nostr
+                    .iter()
+                    .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                    .filter(|(_, ns)| ns.enabled)
+                    .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
+                    .collect();
+                for (alias, private_key, relays) in nostr_jobs {
+                    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
+                    };
+                    configured_channels.push(ConfiguredChannel {
+                        display_name: "Nostr",
+                        alias: Some(alias.clone()),
+                        channel: Arc::new(
+                            NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                        ),
+                    });
+                }
             }
             #[cfg(not(feature = "channel-nostr"))]
             if !config.channels.nostr.is_empty() {
@@ -9911,8 +10032,16 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
+            let allowed_groups = wa.allowed_groups.clone();
+            let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || allowed_groups.clone());
+            let ch = WhatsAppWebChannel::new(
+                wa,
+                alias.to_string(),
+                peer_resolver,
+                allowed_groups_resolver,
+            )
+            .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -18559,6 +18688,303 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Mattermost"),
             "enabled channels should still load when no enabled agent declares channel bindings"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Pinned regression for issue #8013: disabling an agent must
+    // stop its bound Discord channel from staying online. The
+    // legacy fallback in `ActiveChannelAliases::contains` used to
+    // collapse "no bindings anywhere" with "all explicit owners are
+    // disabled" — these tests pin both states.
+    // ----------------------------------------------------------
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_skips_channel_when_only_owner_is_disabled() {
+        // T1 — the bug path: an explicit binding exists, but the
+        // owner agent is `enabled = false`. Legacy fallback must NOT
+        // bring the channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disco".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Discord"),
+            "disabled-owner channel must not be collected (#8013)"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_legacy_accepts_all_when_no_bindings_declared() {
+        // T2 — the legacy fallback: an enabled agent with no `channels`
+        // list (empty bindings). All enabled channels still load. Pins
+        // the same contract as
+        // `collect_configured_channels_falls_back_when_agent_bindings_missing`
+        // but mirrors it onto Discord so the surface stays obvious.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Discord"),
+            "no-bindings-anywhere must still trigger the legacy fallback"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_respects_mixed_enabled_and_disabled_owners() {
+        // T3 — two bound channels, one owner enabled (keeper) and one
+        // owner disabled (loser). Only the enabled owner's channel
+        // comes online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "a".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-a".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-b".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        let discord_channels: Vec<_> = channels
+            .iter()
+            .filter(|entry| entry.display_name == "Discord")
+            .collect();
+        assert_eq!(
+            discord_channels.len(),
+            1,
+            "exactly one Discord channel should be active when only one owner is enabled"
+        );
+        assert_eq!(
+            discord_channels[0].alias.as_deref(),
+            Some("a"),
+            "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_skips_disabled_owners() {
+        // T4 — reload contract: when an admin flips an agent to
+        // `enabled = false` and the daemon re-runs `start_channels`,
+        // the resulting owner map must NOT bind the now-disabled
+        // owner's channel to any agent (legacy fallback must not fire
+        // because at least one binding exists in the config). Pairs
+        // with `build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default`
+        // to pin both branches of the discriminator.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+
+        // Reload passes an empty enabled_agents slice because the only
+        // owner is disabled.
+        let owners = build_owner_by_channel_key(&config, &[], &["discord.b".to_string()]);
+
+        assert!(
+            owners.is_empty(),
+            "disabled-owner channels must not be rebound to any fallback agent (#8013)"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #8013 — Nostr startup / health-check gate
+    //
+    // The Nostr blocks in `doctor_channels` and `start_channels` were
+    // originally outside the `collect_configured_channels` gate. After
+    // the Phase 2 follow-up (Audacity88 review, 2026-06-21), both Nostr
+    // blocks now share `ActiveChannelAliases::compute` as their single
+    // source of truth. These tests pin that gate directly so the
+    // invariant cannot regress.
+    // ----------------------------------------------------------
+
+    /// Helper: returns the set of `nostr.<alias>` references that pass
+    /// the unified `ActiveChannelAliases` gate AND the channel-level
+    /// `enabled = true` check, in the same way `doctor_channels` and
+    /// `start_channels` use it after Phase 2.
+    #[cfg(feature = "channel-nostr")]
+    fn resolve_nostr_active(config: &Config) -> Vec<String> {
+        let active = ActiveChannelAliases::compute(config);
+        config
+            .channels
+            .nostr
+            .iter()
+            .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+            .filter(|(_, ns)| ns.enabled)
+            .map(|(alias, _)| format!("nostr.{alias}"))
+            .collect()
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn doctor_channels_skips_nostr_when_only_owner_is_disabled() {
+        // T5 — the #8013 bug path on the Nostr side. An explicit
+        // `nostr.default` binding exists, but the owner agent is
+        // `enabled = false`. Both the doctor and startup Nostr blocks
+        // must NOT bring this channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disabled_owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["nostr.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with only a disabled owner must not pass the gate (#8013): got {:?}",
+            active
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_legacy_includes_nostr_when_no_bindings_declared() {
+        // T6 — the legacy fallback on the Nostr side. No agent declares
+        // any channel binding, so the `all_known_bindings.is_empty()`
+        // branch fires and every enabled Nostr alias is accepted. This
+        // pins parity with the Discord T2 behavior.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "legacy_alias".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert_eq!(
+            active,
+            vec!["nostr.legacy_alias".to_string()],
+            "Legacy fallback must keep Nostr active when no agent declares bindings"
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_nostr_skips_channel_level_disabled() {
+        // T7 — channel-level `enabled = false` still skips even when
+        // the agent binding path is satisfied. Pins the channel-level
+        // half of the gate that was previously missing in the
+        // `start_channels` Nostr block.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["nostr.muted".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "muted".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: false, // channel-level off
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with `enabled = false` must not start regardless of agent binding"
         );
     }
 

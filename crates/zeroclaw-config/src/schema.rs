@@ -13024,6 +13024,18 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// Allowed group chats by JID (Web mode). An empty list (the default)
+    /// permits all groups; a non-empty list drops every group message whose
+    /// chat JID matches no entry. Each entry matches either the full group
+    /// JID (`123456789012345@g.us`) or the JID user part - the segment before
+    /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
+    /// Direct messages bypass this filter regardless of list contents.
+    /// Modeled on the Matrix channel's `allowed_rooms`; it gates group
+    /// identity, which `dm_policy`/`group_policy` (chat type) and the
+    /// sender allowlist (sender) do not.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -22517,6 +22529,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22550,6 +22563,7 @@ bot_token = "xoxb-tok"
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22606,6 +22620,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22636,6 +22651,7 @@ allowed_numbers = ["+1", "+2"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
@@ -22713,6 +22729,7 @@ allowed_numbers = ["+1", "+2"]
                     self_chat_mode: false,
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
+                    allowed_groups: vec![],
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
