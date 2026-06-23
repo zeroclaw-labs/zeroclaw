@@ -351,7 +351,7 @@ impl KnowledgeGraph {
         )?;
 
         let mut results = Vec::new();
-        let mut rows = stmt.query(params![sanitized, limit as i64])?;
+        let mut rows = stmt.query(params![sanitized, limit])?;
         while let Some(row) = rows.next()? {
             let node = row_to_node(row)?;
             let rank: f64 = row.get(8)?;
@@ -467,7 +467,7 @@ impl KnowledgeGraph {
         )?;
 
         let mut results = Vec::new();
-        let mut rows = stmt.query(params![node_type.as_str(), limit as i64])?;
+        let mut rows = stmt.query(params![node_type.as_str(), limit])?;
         while let Some(row) = rows.next()? {
             results.push(row_to_node(row)?);
         }
