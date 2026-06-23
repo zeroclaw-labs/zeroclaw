@@ -125,6 +125,7 @@
   - [Communication](./contributing/communication.md)
   - [Privacy & PII discipline](./contributing/privacy.md)
   - [Testing](./contributing/testing.md)
+  - [Agent-policy parity](./contributing/agent-policy-parity-harness.md)
   - [PR review protocol](./contributing/pr-review-protocol.md)
   - [Multi-agent setup](./contributing/multi-agent-setup.md)
   - [Contributor License Agreement](./contributing/cla.md)

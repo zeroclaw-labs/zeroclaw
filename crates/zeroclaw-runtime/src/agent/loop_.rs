@@ -749,32 +749,36 @@ pub async fn agent_turn(
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(ToolLoop {
-        exec: ResolvedAgentExecution {
-            model_access: ResolvedModelAccess {
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
                 model_provider,
                 provider_name,
                 model,
                 temperature,
             },
-            tools_registry,
-            observer,
-            silent,
-            approval,
-            multimodal_config,
-            max_tool_iterations,
-            hooks: None,
-            excluded_tools,
-            dedup_exempt_tools,
-            activated_tools,
-            model_switch_callback,
-            pacing: &zeroclaw_config::schema::PacingConfig::default(),
-            strict_tool_parsing,
-            parallel_tools,
-            max_tool_result_chars,
-            context_token_budget,
-            receipt_generator: None,
-            knobs: &LoopKnobs::default(),
-        },
+            ResolvedIo {
+                tools_registry,
+                observer,
+                silent,
+                approval,
+                multimodal_config,
+                hooks: None,
+                activated_tools,
+                model_switch_callback,
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations,
+                excluded_tools,
+                dedup_exempt_tools,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing,
+                parallel_tools,
+                max_tool_result_chars,
+                context_token_budget,
+                knobs: &LoopKnobs::default(),
+            },
+        ),
         history,
         channel_name,
         channel_reply_target,
@@ -807,9 +811,9 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedModelAccess, StreamDelta, ToolLoop,
-    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
-    run_tool_call_loop, scrub_credentials,
+    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -2014,32 +2018,36 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                exec: ResolvedAgentExecution {
-                                    model_access: ResolvedModelAccess {
+                                exec: ResolvedAgentExecution::resolve(
+                                    ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
                                         model: &model_name,
                                         temperature: effective_temperature,
                                     },
-                                    tools_registry: &tools_registry,
-                                    observer: observer.as_ref(),
-                                    silent: false,
-                                    approval: approval_manager.as_ref(),
-                                    multimodal_config: &config.multimodal,
-                                    max_tool_iterations: agent.resolved.max_tool_iterations,
-                                    hooks: None,
-                                    excluded_tools: &excluded_tools,
-                                    dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
-                                    activated_tools: activated_handle.as_ref(),
-                                    model_switch_callback: Some(model_switch_callback.clone()),
-                                    pacing: &config.pacing,
-                                    strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                    parallel_tools: agent.resolved.parallel_tools,
-                                    max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                    context_token_budget: agent.resolved.max_context_tokens,
-                                    receipt_generator: None,
-                                    knobs: &LoopKnobs::default(),
-                                },
+                                    ResolvedIo {
+                                        tools_registry: &tools_registry,
+                                        observer: observer.as_ref(),
+                                        silent: false,
+                                        approval: approval_manager.as_ref(),
+                                        multimodal_config: &config.multimodal,
+                                        hooks: None,
+                                        activated_tools: activated_handle.as_ref(),
+                                        model_switch_callback: Some(model_switch_callback.clone()),
+                                        receipt_generator: None,
+                                    },
+                                    ResolvedRuntimeKnobs {
+                                        max_tool_iterations: agent.resolved.max_tool_iterations,
+                                        excluded_tools: &excluded_tools,
+                                        dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
+                                        pacing: &config.pacing,
+                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                        parallel_tools: agent.resolved.parallel_tools,
+                                        max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                        context_token_budget: agent.resolved.max_context_tokens,
+                                        knobs: &LoopKnobs::default(),
+                                    },
+                                ),
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
@@ -2519,32 +2527,42 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
-                                    exec: ResolvedAgentExecution {
-                                        model_access: ResolvedModelAccess {
+                                    exec: ResolvedAgentExecution::resolve(
+                                        ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
                                             provider_name: &provider_name,
                                             model: &model_name,
                                             temperature: turn_temperature,
                                         },
-                                        tools_registry: &tools_registry,
-                                        observer: observer.as_ref(),
-                                        silent: true,
-                                        approval: approval_manager.as_ref(),
-                                        multimodal_config: &config.multimodal,
-                                        max_tool_iterations: agent.resolved.max_tool_iterations,
-                                        hooks: None,
-                                        excluded_tools: &excluded_tools,
-                                        dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
-                                        activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: Some(model_switch_callback.clone()),
-                                        pacing: &config.pacing,
-                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                        parallel_tools: agent.resolved.parallel_tools,
-                                        max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent.resolved.max_context_tokens,
-                                        receipt_generator: None,
-                                        knobs: &LoopKnobs::default(),
-                                    },
+                                        ResolvedIo {
+                                            tools_registry: &tools_registry,
+                                            observer: observer.as_ref(),
+                                            silent: true,
+                                            approval: approval_manager.as_ref(),
+                                            multimodal_config: &config.multimodal,
+                                            hooks: None,
+                                            activated_tools: activated_handle.as_ref(),
+                                            model_switch_callback: Some(
+                                                model_switch_callback.clone(),
+                                            ),
+                                            receipt_generator: None,
+                                        },
+                                        ResolvedRuntimeKnobs {
+                                            max_tool_iterations: agent.resolved.max_tool_iterations,
+                                            excluded_tools: &excluded_tools,
+                                            dedup_exempt_tools: &agent
+                                                .resolved
+                                                .tool_call_dedup_exempt,
+                                            pacing: &config.pacing,
+                                            strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                            parallel_tools: agent.resolved.parallel_tools,
+                                            max_tool_result_chars: agent
+                                                .resolved
+                                                .max_tool_result_chars,
+                                            context_token_budget: agent.resolved.max_context_tokens,
+                                            knobs: &LoopKnobs::default(),
+                                        },
+                                    ),
                                     history: &mut history,
                                     channel_name,
                                     channel_reply_target: None,

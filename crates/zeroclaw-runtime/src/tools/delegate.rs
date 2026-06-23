@@ -1,6 +1,6 @@
 use crate::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, TOOL_LOOP_SESSION_KEY, ToolLoop,
-    run_tool_call_loop,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -2079,35 +2079,39 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
-                exec: ResolvedAgentExecution {
-                    model_access: ResolvedModelAccess {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
                         model_provider,
                         provider_name: provider_type,
                         model,
                         temperature,
                     },
-                    tools_registry: &sub_tools,
-                    observer: &noop_observer,
-                    silent: true,
-                    approval: None,
-                    multimodal_config: &self.multimodal_config,
-                    max_tool_iterations: loop_runtime.max_tool_iterations,
-                    hooks: None,
-                    excluded_tools: &[],
-                    dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                    activated_tools: None,
-                    model_switch_callback: None,
-                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                    parallel_tools: loop_runtime.parallel_tools,
-                    max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                    // Keep delegate subagent context pruning aligned with top-level
-                    // agents instead of preserving the old disabled-by-zero path.
-                    context_token_budget: loop_runtime.max_context_tokens,
-                    // delegate subagents don't support approval
-                    receipt_generator,
-                    knobs: &LoopKnobs::default(),
-                },
+                    ResolvedIo {
+                        tools_registry: &sub_tools,
+                        observer: &noop_observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &self.multimodal_config,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        // delegate subagents don't support approval
+                        receipt_generator,
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: loop_runtime.max_tool_iterations,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                        parallel_tools: loop_runtime.parallel_tools,
+                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                        // Keep delegate subagent context pruning aligned with top-level
+                        // agents instead of preserving the old disabled-by-zero path.
+                        context_token_budget: loop_runtime.max_context_tokens,
+                        knobs: &LoopKnobs::default(),
+                    },
+                ),
                 history: &mut history,
                 channel_name: "delegate",
                 channel_reply_target: None,
