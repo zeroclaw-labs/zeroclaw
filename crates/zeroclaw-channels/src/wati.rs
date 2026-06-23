@@ -527,6 +527,7 @@ impl Channel for WatiChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 }

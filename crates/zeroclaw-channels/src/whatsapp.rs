@@ -492,6 +492,7 @@ impl Channel for WhatsAppChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing indicator not wired for the WhatsApp Cloud API path.
         Ok(())
     }
 }
