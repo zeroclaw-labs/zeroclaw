@@ -294,7 +294,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory, agent_alias
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC
              LIMIT ?2",
         )?;
@@ -335,7 +335,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory, agent_alias
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
         )?;
 
@@ -565,6 +565,61 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
             Ok(())
         })
     }
+}
+
+/// Atomically claim a due job for execution.
+///
+/// Sets `locked_at` to `now` only if the row is currently unlocked. The
+/// conditional `WHERE … AND locked_at IS NULL` makes the claim a single atomic
+/// step: at most one caller can transition a job from idle to in-flight. Returns
+/// `true` when this caller won the claim, `false` when the job was already locked
+/// (in flight from an earlier poll, the startup catch-up, or a concurrent
+/// trigger). Combined with the `locked_at IS NULL` filter in `due_jobs` /
+/// `all_overdue_jobs`, this prevents a job that runs longer than the scheduler
+/// poll interval from being launched repeatedly (issue #6037).
+pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
+                params![now.to_rfc3339(), job_id],
+            )
+            .context("Failed to claim cron job for execution")?;
+        Ok(claimed == 1)
+    })
+}
+
+/// Release a job's in-flight lock once its run has completed.
+///
+/// Best-effort: a row that is missing (deleted one-shot) or already unlocked
+/// simply affects zero rows. `next_run` advancement happens separately in the
+/// reschedule path; this only clears the lock so the job is eligible again.
+pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            params![job_id],
+        )
+        .context("Failed to release cron job lock")?;
+        Ok(())
+    })
+}
+
+/// Clear every in-flight lock, returning the number of rows cleared.
+///
+/// Called once at scheduler startup: any lock present at boot is stale because its
+/// owning run died with the previous process. Clearing it lets the job be
+/// scheduled again instead of staying wedged until manual intervention. Uses the
+/// non-creating read helper so an empty workspace (no cron DB yet) stays untouched.
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    let cleared = with_read_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
+            [],
+        )
+        .context("Failed to clear stale cron job locks")
+    })?;
+    Ok(cleared.unwrap_or(0))
 }
 
 pub fn record_run(
@@ -1388,6 +1443,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // scheduler treats those as orphans (skip with warning) rather than
     // coercing them to a magic alias.
     add_column_if_missing(conn, "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
+    // In-flight execution lock: RFC3339 timestamp of when a run claimed this job,
+    // or NULL when idle. `due_jobs`/`all_overdue_jobs` skip locked rows so a job that
+    // runs longer than the poll interval cannot be launched again while still in
+    // flight (see `claim_job`/`release_job` and issue #6037).
+    add_column_if_missing(conn, "locked_at", "TEXT")?;
 
     Ok(())
 }
@@ -1475,6 +1535,119 @@ mod tests {
         assert!(cron_db(&config).exists());
         assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
         assert_eq!(list_jobs(&config).unwrap().len(), 1);
+    }
+
+    /// Force a job's `next_run` into the past so it is selected by `due_jobs`
+    /// without waiting for its real schedule.
+    fn force_due(config: &Config, job_id: &str) {
+        let past = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![past, job_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_job_is_atomic_and_blocks_second_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        assert!(
+            claim_job(&config, &job.id, now).unwrap(),
+            "first claim should win"
+        );
+        assert!(
+            !claim_job(&config, &job.id, now).unwrap(),
+            "second claim must fail while the job is locked"
+        );
+
+        release_job(&config, &job.id).unwrap();
+        assert!(
+            claim_job(&config, &job.id, now).unwrap(),
+            "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_claimed_jobs() {
+        // Regression for #6037: a job that is in flight must not be selected
+        // again by the scheduler while its previous run is still running.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let now = Utc::now();
+
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "job is due before being claimed"
+        );
+        assert_eq!(all_overdue_jobs(&config, now).unwrap().len(), 1);
+
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        assert!(
+            due_jobs(&config, now).unwrap().is_empty(),
+            "a claimed (in-flight) job must not be re-selected by due_jobs"
+        );
+        assert!(
+            all_overdue_jobs(&config, now).unwrap().is_empty(),
+            "a claimed (in-flight) job must not be re-selected by the catch-up path"
+        );
+
+        release_job(&config, &job.id).unwrap();
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "after release the job is due again until it is rescheduled"
+        );
+    }
+
+    #[test]
+    fn clear_stale_locks_releases_in_flight_locks() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let now = Utc::now();
+
+        assert!(claim_job(&config, &job.id, now).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+
+        assert_eq!(
+            clear_stale_locks(&config).unwrap(),
+            1,
+            "the one in-flight lock should be cleared"
+        );
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "after clearing the stale lock the job is eligible again"
+        );
+        assert_eq!(
+            clear_stale_locks(&config).unwrap(),
+            0,
+            "clearing again when idle releases nothing"
+        );
+    }
+
+    #[test]
+    fn clear_stale_locks_on_empty_workspace_does_not_create_db() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(
+            !cron_db(&config).exists(),
+            "clear_stale_locks must not create the cron DB on an empty workspace"
+        );
     }
 
     #[test]

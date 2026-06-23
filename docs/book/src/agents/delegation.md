@@ -119,9 +119,7 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 `delegate` enforces two gates in `crates/zeroclaw-runtime/src/tools/delegate.rs` before a target agent runs, in this order:
 
 1. **`delegation_policy.mode`**: the caller's risk profile must permit delegation. `[risk_profiles.<alias>].delegation_policy` is `{ mode = "forbidden" }` by default; set `mode = "allow"` to permit delegation at all. When forbidden, the refusal is:
-   ```text
-   delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"
-   ```
+   `delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"`
    This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select).
 
 2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_targets`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
@@ -130,12 +128,14 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
    - **explicit roster**: `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
 
    When the target is outside that set the refusal is:
-   ```text
+
+   ```plaintext
    delegate target "<target>" is not reachable from "<caller>"; add it to [agents.<caller>].delegates or share a risk profile with delegate_same_risk_profile enabled
    ```
 
    A same-profile target inherits the caller's session workspace boundary and shares its action/cost tracker. An explicit **cross-profile** target runs under its own resolved policy and must pass `ensure_no_escalation_beyond` the caller: a listed delegate that would widen privilege (broader autonomy, extra roots, higher budgets, etc.) is refused with:
-   ```text
+
+   ```plaintext
    delegate target "<target>" (risk profile "<target_profile>") would escalate beyond the caller (risk profile "<caller_profile>"): <violation>
    ```
 

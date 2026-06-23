@@ -399,6 +399,7 @@ mod tests {
             prompts: vec![],
             slash_options: vec![],
             location: loc.map(PathBuf::from),
+            description_localizations: Default::default(),
         };
         assert_eq!(
             SkillsService::derive_origin(&mk("s", &["open-skills"], None), &bundles),

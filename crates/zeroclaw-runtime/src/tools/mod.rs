@@ -712,11 +712,11 @@ pub fn all_tools_with_runtime(
         root_config.skills.prompt_injection_mode,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
+        // ReadSkillTool now holds full config to support all skill sources:
+        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
-            root_config.data_dir.clone(),
-            root_config.skills.open_skills_enabled,
-            root_config.skills.open_skills_dir.clone(),
-            root_config.skills.allow_scripts,
+            config.clone(),
+            agent_alias.to_string(),
         )));
     }
 
@@ -1168,14 +1168,22 @@ pub fn all_tools_with_runtime(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
             tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_collector(crate::sop::SopMetricsCollector::shared()),
             ));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_collector(crate::sop::SopMetricsCollector::shared()),
+            ));
         }
-        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopStatusTool::new(Arc::clone(sop_engine))
+                .with_collector(crate::sop::SopMetricsCollector::shared()),
+        ));
     }
 
     if let Some(key) = composio_key
@@ -1399,11 +1407,25 @@ pub fn all_tools_with_runtime(
                     let details = host.tool_plugin_details();
                     let count = details.len();
                     for (manifest, wasm_path) in details {
+                        // SSOT: `config` is the snapshot the whole tool set is
+                        // built from, identical to every other tool here. A
+                        // config reload tears down and rebuilds the daemon
+                        // iteration (rpc ConfigReload -> reload_tx), so the
+                        // agent and its tools are reconstructed from the new
+                        // Config; plugin config is never hot-swapped into a live
+                        // WasmTool. The owned map below is that fresh snapshot,
+                        // not a second source of truth.
+                        let plugin_config = config
+                            .plugins
+                            .entry_config(&manifest.name)
+                            .cloned()
+                            .unwrap_or_default();
                         tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
+                            plugin_config,
                         )));
                     }
                     ::zeroclaw_log::record!(

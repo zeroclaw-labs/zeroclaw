@@ -130,6 +130,10 @@ pub struct RpcContext {
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
 
+    /// Write `true` to ask the current gateway listener to shut down before
+    /// daemon reload rebinds the same address.
+    pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
 
@@ -152,6 +156,33 @@ pub struct RpcContext {
 impl RpcContext {
     /// Minimal context for tests — only config and sessions, everything
     /// else `None`.
+    /// Lightweight context for external live integration tests — only config
+    /// and sessions are wired; everything else is `None`. Not `#[cfg(test)]`
+    /// because integration tests compile against the public surface.
+    pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let tui_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.data_dir.clone());
+        let data_dir = config.data_dir.clone();
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
+            acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         Arc::new(Self {
@@ -162,6 +193,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -185,9 +217,34 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_reload_controls(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+        reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx,
+            gateway_shutdown_tx,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
         })
