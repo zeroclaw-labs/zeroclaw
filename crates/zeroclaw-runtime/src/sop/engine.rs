@@ -1160,7 +1160,9 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
         }
         SopExecutionMode::StepByStep => true,
         SopExecutionMode::PriorityBased => match sop.priority {
-            SopPriority::Critical | SopPriority::High => false,
+            // [SEC-FLIP] Critical/High are the MOST dangerous runs, so they MUST
+            // gate (was `=> false`, an inversion that auto-ran the riskiest SOPs).
+            SopPriority::Critical | SopPriority::High => true,
             SopPriority::Normal | SopPriority::Low => {
                 // Supervised behavior for normal/low
                 step.number == 1
@@ -1946,14 +1948,18 @@ mod tests {
     }
 
     #[test]
-    fn priority_based_critical_auto() {
+    fn priority_based_critical_gates() {
+        // [SEC-FLIP] Critical/High under PriorityBased now GATE (was auto-execute).
         let mut engine = engine_with_sops(vec![test_sop(
             "s1",
             SopExecutionMode::PriorityBased,
             SopPriority::Critical,
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
-        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "critical PriorityBased SOPs must gate, not auto-run"
+        );
     }
 
     #[test]
