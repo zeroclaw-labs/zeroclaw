@@ -431,6 +431,16 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         })
                         .await;
                 }
+                observer.record_event(
+                    &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                        dropped_messages: result.dropped_messages,
+                        kept_turns: result.kept_turns,
+                        reason: "context token budget exceeded".to_string(),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
+                    },
+                );
             } else {
                 *history = result.history;
             }
