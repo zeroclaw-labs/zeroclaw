@@ -990,24 +990,24 @@ fn channel_history_content_for_user_turn(content: &str) -> String {
     // references so they can be re-loaded on later turns. This fixes the issue
     // where deferred image attachments lose their re-loadable reference.
     // See issue #8151.
-    let mut result = content.to_string();
+    let mut cleaned = content.to_string();
     for ref_path in &image_refs {
         if ref_path.starts_with("data:") {
             // Strip inline base64 payload (too large to keep in history)
-            result = result.replace(&format!("[IMAGE:{}]", ref_path), "");
+            cleaned = cleaned.replace(&format!("[IMAGE:{}]", ref_path), "");
         }
         // Filesystem paths and URLs are kept as-is for re-loading
     }
 
-    let mut result = result.trim().to_string();
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
+    let mut cleaned = cleaned.trim().to_string();
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
     }
 
-    if result.is_empty() {
-        "[Image attachment available for re-loading]".to_string()
+    if cleaned.is_empty() {
+        "[Image attachment processed by vision model]".to_string()
     } else {
-        result
+        cleaned
     }
 }
 
