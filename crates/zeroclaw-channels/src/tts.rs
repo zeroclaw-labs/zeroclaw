@@ -800,13 +800,28 @@ impl TtsManager {
             bail!(
                 "Agent has no tts_provider configured. Set \
                  `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
-                 [tts_providers.<type>.<alias>] entry."
+                 [providers.tts.<type>.<alias>] entry."
             );
         }
         let voice = self
             .voice_by_alias
             .get(provider_alias)
             .map_or(self.default_voice.as_str(), String::as_str);
+        self.synthesize_with_provider(text, provider_alias, voice)
+            .await
+    }
+
+    /// Synthesize text using the runtime-active agent's resolved
+    /// `tts_provider` reference and an explicit voice.
+    pub async fn synthesize_with_voice(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+        let provider_alias = self.agent_tts_provider.as_str();
+        if provider_alias.is_empty() {
+            bail!(
+                "Agent has no tts_provider configured. Set \
+                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
+                 [providers.tts.<type>.<alias>] entry."
+            );
+        }
         self.synthesize_with_provider(text, provider_alias, voice)
             .await
     }

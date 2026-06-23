@@ -318,6 +318,35 @@ impl OpenRouterModelProvider {
             .collect()
     }
 
+    fn build_chat_with_system_request(
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> ChatRequest {
+        let mut messages = Vec::new();
+
+        if let Some(sys) = system_prompt {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: Self::to_message_content("system", sys),
+            });
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Self::to_message_content("user", message),
+        });
+
+        ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            max_tokens,
+        }
+    }
+
     fn to_message_content(role: &str, content: &str) -> MessageContent {
         if role == "system" {
             // Serialize system messages as a single-text-part array so we can
@@ -557,26 +586,13 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(sys.to_string()),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Self::to_message_content("user", message),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
+        let request = Self::build_chat_with_system_request(
+            system_prompt,
+            message,
+            model,
             temperature,
-            max_tokens: self.max_tokens,
-        };
+            self.max_tokens,
+        );
 
         let body = self.merge_extra_body(&request)?;
         let response = self
@@ -1222,28 +1238,30 @@ mod tests {
 
     #[test]
     fn chat_request_serializes_with_system_and_user() {
-        let request = ChatRequest {
-            model: "anthropic/claude-sonnet-4".into(),
-            messages: vec![
-                Message {
-                    role: "system".into(),
-                    content: MessageContent::Text("You are helpful".into()),
-                },
-                Message {
-                    role: "user".into(),
-                    content: MessageContent::Text("Summarize this".into()),
-                },
-            ],
-            temperature: Some(0.5),
-            max_tokens: None,
-        };
+        let request = OpenRouterModelProvider::build_chat_with_system_request(
+            Some("You are helpful"),
+            "Summarize this",
+            "anthropic/claude-sonnet-4",
+            Some(0.5),
+            None,
+        );
 
-        let json = serde_json::to_string(&request).unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let messages = json["messages"]
+            .as_array()
+            .expect("messages should serialize as an array");
+        let system_parts = messages[0]["content"]
+            .as_array()
+            .expect("system content should use content parts");
 
-        assert!(json.contains("anthropic/claude-sonnet-4"));
-        assert!(json.contains("\"role\":\"system\""));
-        assert!(json.contains("\"role\":\"user\""));
-        assert!(json.contains("\"temperature\":0.5"));
+        assert_eq!(json["model"], "anthropic/claude-sonnet-4");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(system_parts[0]["type"], "text");
+        assert_eq!(system_parts[0]["text"], "You are helpful");
+        assert_eq!(system_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Summarize this");
+        assert_eq!(json["temperature"], 0.5);
     }
 
     #[test]

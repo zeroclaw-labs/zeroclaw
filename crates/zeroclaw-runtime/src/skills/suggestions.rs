@@ -1,5 +1,6 @@
 use super::Skill;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -42,6 +43,7 @@ impl InstallSuggestion {
 pub(crate) fn render_missing_skill_install_suggestion(
     prompt: &str,
     installed_skills: &[Skill],
+    installed_runtime_capabilities: &[&str],
     workspace_dir: &Path,
     enabled: bool,
 ) -> Option<String> {
@@ -50,13 +52,19 @@ pub(crate) fn render_missing_skill_install_suggestion(
     }
 
     let catalog = load_cached_installable_skill_capabilities(workspace_dir);
-    suggest_missing_skill_install(prompt, installed_skills, &catalog)
-        .map(|suggestion| suggestion.render_user_message())
+    suggest_missing_skill_install(
+        prompt,
+        installed_skills,
+        installed_runtime_capabilities,
+        &catalog,
+    )
+    .map(|suggestion| suggestion.render_user_message())
 }
 
 fn suggest_missing_skill_install(
     prompt: &str,
     installed_skills: &[Skill],
+    installed_runtime_capabilities: &[&str],
     catalog: &[InstallableSkillCapability],
 ) -> Option<InstallSuggestion> {
     if prompt.trim().is_empty() {
@@ -64,8 +72,12 @@ fn suggest_missing_skill_install(
     }
 
     let normalized_prompt = normalize(prompt);
+    let installed_runtime_capabilities =
+        normalized_runtime_capabilities(installed_runtime_capabilities);
     for capability in catalog {
-        if is_installed_skill(capability, installed_skills) {
+        if is_installed_skill(capability, installed_skills)
+            || is_installed_runtime_capability(capability, &installed_runtime_capabilities)
+        {
             continue;
         }
         if let Some(matched) = matched_metadata_phrase(&normalized_prompt, capability) {
@@ -227,6 +239,26 @@ fn is_installed_skill(capability: &InstallableSkillCapability, installed_skills:
     })
 }
 
+fn normalized_runtime_capabilities(installed_runtime_capabilities: &[&str]) -> HashSet<String> {
+    installed_runtime_capabilities
+        .iter()
+        .map(|capability| normalize(capability))
+        .filter(|capability| !capability.is_empty())
+        .collect()
+}
+
+fn is_installed_runtime_capability(
+    capability: &InstallableSkillCapability,
+    installed_runtime_capabilities: &HashSet<String>,
+) -> bool {
+    std::iter::once(&capability.name)
+        .chain(std::iter::once(&capability.source))
+        .chain(capability.aliases.iter())
+        .map(|name| normalize(name))
+        .filter(|name| !name.is_empty())
+        .any(|name| installed_runtime_capabilities.contains(&name))
+}
+
 fn matched_metadata_phrase(
     prompt: &str,
     capability: &InstallableSkillCapability,
@@ -272,11 +304,13 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: "Installed capability".to_string(),
+            description_localizations: Default::default(),
             version: "0.1.0".to_string(),
             author: None,
             tags: vec![],
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -298,6 +332,7 @@ mod tests {
         let suggestion = suggest_missing_skill_install(
             "please use calendar to schedule this",
             &installed,
+            &[],
             &catalog,
         );
 
@@ -312,10 +347,61 @@ mod tests {
         let suggestion = suggest_missing_skill_install(
             "please use calendar to schedule this",
             &installed,
+            &[],
             &catalog,
         );
 
         assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn installed_runtime_capability_proceeds_without_suggestion() {
+        let catalog = vec![catalog_entry("calendar", &["google calendar"])];
+
+        let suggestion = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["google calendar"],
+            &catalog,
+        );
+
+        assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn installed_runtime_capability_matches_normalized_tool_names() {
+        let catalog = vec![catalog_entry("calendar", &["google calendar"])];
+
+        for runtime_capability in ["google_calendar", "google-calendar"] {
+            let suggestion = suggest_missing_skill_install(
+                "please use google calendar to schedule this meeting",
+                &[],
+                &[runtime_capability],
+                &catalog,
+            );
+
+            assert!(
+                suggestion.is_none(),
+                "{runtime_capability} should suppress the install suggestion"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_runtime_capability_does_not_suppress_suggestion() {
+        let catalog = vec![catalog_entry("calendar", &["google calendar"])];
+
+        let suggestion = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["google_workspace"],
+            &catalog,
+        );
+
+        assert!(
+            suggestion.is_some(),
+            "unrelated runtime capabilities must not suppress missing-skill suggestions"
+        );
     }
 
     #[test]
@@ -324,6 +410,7 @@ mod tests {
 
         let suggestion = suggest_missing_skill_install(
             "please use google calendar to schedule this meeting",
+            &[],
             &[],
             &catalog,
         )
@@ -343,7 +430,8 @@ mod tests {
     fn low_confidence_prompt_proceeds_normally() {
         let catalog = vec![catalog_entry("calendar", &["calendar"])];
 
-        let suggestion = suggest_missing_skill_install("summarize the design notes", &[], &catalog);
+        let suggestion =
+            suggest_missing_skill_install("summarize the design notes", &[], &[], &catalog);
 
         assert!(suggestion.is_none());
     }
@@ -354,6 +442,7 @@ mod tests {
 
         let suggestion = render_missing_skill_install_suggestion(
             "use calendar to schedule this",
+            &[],
             &[],
             dir.path(),
             false,
@@ -395,12 +484,14 @@ tags = ["scheduling"]
         let body_only_match = suggest_missing_skill_install(
             "please use body only secret phrase for this",
             &[],
+            &[],
             &catalog,
         );
         assert!(body_only_match.is_none());
 
         let suggestion = render_missing_skill_install_suggestion(
             "please use google calendar to schedule this meeting",
+            &[],
             &[],
             dir.path(),
             true,
@@ -432,6 +523,7 @@ aliases = ["release check"]
         let suggestion = suggest_missing_skill_install(
             "please run a release check before tagging",
             &[],
+            &[],
             &catalog,
         );
 
@@ -460,9 +552,10 @@ This body-only browser automation phrase must not be used for matching.
 
         let catalog = load_cached_installable_skill_capabilities(dir.path());
         let suggestion =
-            suggest_missing_skill_install("please use screenshot helper here", &[], &catalog);
+            suggest_missing_skill_install("please use screenshot helper here", &[], &[], &catalog);
         let body_only_match = suggest_missing_skill_install(
             "please use browser automation phrase here",
+            &[],
             &[],
             &catalog,
         );
@@ -471,5 +564,54 @@ This body-only browser automation phrase must not be used for matching.
         assert_eq!(catalog[0].name, "screenshot-helper");
         assert!(suggestion.is_some());
         assert!(body_only_match.is_none());
+    }
+
+    /// Regression: a capability in the raw registry but absent from the
+    /// effective tool set must not suppress install suggestions.
+    ///
+    /// Before the fix, `process_message` built `runtime_capability_names`
+    /// from the raw `tools_registry` (all registered tools regardless of
+    /// exclusion). A tool excluded for the current turn was still treated
+    /// as "installed", causing `suggest_missing_skill_install` to skip the
+    /// suggestion. Using `effective_tool_names` instead ensures that only
+    /// tools available for this turn suppress suggestions.
+    ///
+    /// This test demonstrates the two outcomes:
+    /// - passing the raw name suppresses the suggestion (old behavior);
+    /// - omitting it (as the effective set does) returns the suggestion.
+    #[test]
+    fn excluded_tool_does_not_suppress_missing_skill_suggestion() {
+        let catalog = vec![catalog_entry("calendar", &["calendar", "google calendar"])];
+
+        // With the excluded tool in runtime capabilities (old behavior: raw
+        // registry), the suggestion is suppressed because "calendar" is
+        // treated as already installed.
+        let suppressed = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["calendar"],
+            &catalog,
+        );
+        assert!(
+            suppressed.is_none(),
+            "raw registry including excluded tool should suppress suggestion — this is the old bug"
+        );
+
+        // Without the excluded tool in runtime capabilities (new behavior:
+        // effective tool set), the suggestion is returned because "calendar"
+        // is not considered available for this turn.
+        let suggestion = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["shell", "file_read"],
+            &catalog,
+        );
+        assert!(
+            suggestion.is_some(),
+            "effective tool set excluding the capability must return the suggestion"
+        );
+        let suggestion = suggestion.expect("suggestion should be present");
+        assert_eq!(suggestion.name, "calendar");
+        assert!(suggestion.render_user_message().contains("calendar"));
     }
 }

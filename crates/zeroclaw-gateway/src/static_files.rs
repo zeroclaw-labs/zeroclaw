@@ -50,11 +50,11 @@ pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Res
     let Some(bytes) = load_index_html_bytes(state.web_dist_dir.as_ref()).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Web dashboard not available. Build the frontend with `cargo web build` \
-             (the supported entry point — it generates the TS API client and runs \
-             the Vite production build) and point gateway.web_dist_dir at the \
-             resulting web/dist. The daemon's API endpoints remain reachable \
-             independently of the dashboard.",
+            "Web dashboard not available. Reinstall with the supported installer \
+             so the dashboard is built and placed where the gateway looks for it: \
+             `./install.sh --source` on Linux/macOS, or `setup.bat` on Windows. \
+             The daemon's API endpoints remain reachable independently of the \
+             dashboard.",
         )
             .into_response();
     };

@@ -8,6 +8,10 @@ use super::context::RpcContext;
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
+
+const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -42,6 +46,7 @@ pub enum Method {
     Initialize,
     Status,
     Health,
+    DoctorRun,
 
     // Sessions (agent chat lives here — session/prompt + session/update
     // notifications is the RPC equivalent of the gateway's ws/chat)
@@ -84,6 +89,7 @@ pub enum Method {
     ConfigList,
     ConfigDelete,
     ConfigMapKeys,
+    ConfigResolveAliasSource,
     ConfigMapKeyCreate,
     ConfigMapKeyDelete,
     ConfigMapKeyRename,
@@ -145,6 +151,7 @@ impl Method {
         (Method::Initialize, "initialize"),
         (Method::Status, "status"),
         (Method::Health, "health"),
+        (Method::DoctorRun, "doctor/run"),
         // Sessions
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
@@ -182,6 +189,10 @@ impl Method {
         (Method::ConfigList, "config/list"),
         (Method::ConfigDelete, "config/delete"),
         (Method::ConfigMapKeys, "config/map-keys"),
+        (
+            Method::ConfigResolveAliasSource,
+            "config/resolve-alias-source",
+        ),
         (Method::ConfigMapKeyCreate, "config/map-key-create"),
         (Method::ConfigMapKeyDelete, "config/map-key-delete"),
         (Method::ConfigMapKeyRename, "config/map-key-rename"),
@@ -263,6 +274,23 @@ fn not_yet_implemented(method: Method) -> RpcResult {
     ))
 }
 
+fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
+    DoctorSummary {
+        ok: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Ok)
+            .count(),
+        warnings: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Warn)
+            .count(),
+        errors: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Error)
+            .count(),
+    }
+}
+
 fn personality_template_context(
     config: &zeroclaw_config::schema::Config,
     req: &PersonalityTemplatesParams,
@@ -300,6 +328,19 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     } else {
         Some(format!("{provider_type}.{provider_alias}"))
     }
+}
+
+/// Whether a TUI session should eagerly initialize the agent's MCP servers when
+/// the agent is built for `session/new`.
+///
+/// ACP (Code) sessions skip MCP initialization so `session/new` returns
+/// promptly: user-configured MCP servers are external processes/services that
+/// can block startup while they connect or time out. Chat sessions initialize
+/// MCP so the Zerocode TUI exposes the same MCP tools — and, under deferred
+/// loading, the `tool_search` built-in — that the gateway already exposes for
+/// the same agent (#8193).
+fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
+    !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
 
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
@@ -425,6 +466,7 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(&req.params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
+            Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
@@ -485,6 +527,9 @@ impl RpcDispatcher {
             Method::ConfigList => self.handle_config_list(&req.params),
             Method::ConfigDelete => self.handle_config_delete(&req.params).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigResolveAliasSource => {
+                self.handle_config_resolve_alias_source(&req.params)
+            }
             Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
             Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
@@ -653,6 +698,13 @@ impl RpcDispatcher {
         Ok(val)
     }
 
+    async fn handle_doctor_run(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let results = crate::doctor::run_structured(&config).await;
+        let summary = doctor_summary(&results);
+        to_result(DoctorRunResult { results, summary })
+    }
+
     // ── TUI handlers ─────────────────────────────────────────────
 
     fn handle_tui_list(&self) -> RpcResult {
@@ -679,6 +731,11 @@ impl RpcDispatcher {
     #[cfg(test)]
     pub async fn handle_session_new_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_new(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_messages(params).await
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
@@ -742,13 +799,19 @@ impl RpcDispatcher {
         // session. A non-ACP caller may still opt in explicitly.
         let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             || req.exclude_memory == Some(true);
+        // Chat sessions initialize MCP so the TUI sees the same MCP tools the
+        // gateway exposes for this agent; ACP (Code) sessions skip it to keep
+        // `session/new` prompt (#8193).
+        let initialize_mcp = session_should_initialize_mcp(&chat_mode);
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &req.agent_alias,
             cwd_path,
-            false,
+            initialize_mcp,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -1139,6 +1202,8 @@ impl RpcDispatcher {
         // session — otherwise session recovery silently restores the
         // long-term-memory backend and tools the ACP invariant forbids.
         let exclude_memory = true;
+        // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
+        // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &data.agent_alias,
@@ -1146,6 +1211,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .ok()?;
@@ -1359,6 +1426,19 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
+        // Cost-tracking context for this turn. Built from the daemon-scoped
+        // tracker + the live pricing map and stamped with the agent alias so
+        // `execute_turn` can persist token usage and attribute spend. `None`
+        // when cost tracking is disabled (no tracker wired). See #5221.
+        let cost_context = self.ctx.cost_tracker.as_ref().map(|tracker| {
+            let cfg_guard = self.ctx.config.read();
+            let pricing = crate::agent::cost::build_model_provider_pricing(&cfg_guard);
+            crate::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(pricing),
+            )
+            .with_agent_alias(&attribution_agent_alias)
+        });
         let outcome = execute_turn(
             agent,
             prompt.clone(),
@@ -1370,6 +1450,7 @@ impl RpcDispatcher {
                 model,
                 channel: "rpc",
             },
+            cost_context,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -1549,13 +1630,19 @@ impl RpcDispatcher {
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
                 let cancel_message = match cancel_cause {
-                    Some(crate::rpc::session::CancelCause::ClientRpc) => {
-                        format!("turn cancelled by user in RPC_SESSION {}", req.session_id)
-                    }
                     Some(cause) => {
-                        format!("turn cancelled by daemon: {}", cause.as_str())
+                        format!(
+                            "turn cancelled via {} in RPC_SESSION {}",
+                            cause.as_str(),
+                            req.session_id
+                        )
                     }
-                    None => "turn cancelled by daemon: unattributed".to_string(),
+                    None => {
+                        format!(
+                            "turn cancelled (cause unattributed) in RPC_SESSION {}",
+                            req.session_id
+                        )
+                    }
                 };
                 ::zeroclaw_log::record!(
                     INFO,
@@ -1639,35 +1726,81 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .set_overrides(&req.session_id, req.overrides)
+            .preview_overrides(&req.session_id, &req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         // A model_provider override needs a live provider-box rebuild, which
         // requires Config — held here, not in the session store. Resolve the
-        // model from the (already-merged) model override or the configured
-        // entry, build the box, and swap it onto the session's agent.
-        if let Some(ref model_provider_ref) = merged.model_provider {
+        // model from the prospective merged override or the configured entry,
+        // build the box, and only then commit the override to the session.
+        let built_model_provider = if let Some(ref model_provider_ref) = merged.model_provider {
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(&req.session_id)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             let built = {
                 let config = self.ctx.config.read();
-                crate::agent::agent::build_session_model_provider(
-                    &config,
-                    model_provider_ref,
-                    merged.model.as_deref(),
+                let agent_cfg = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                    .ok_or_else(|| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!("Agent `{agent_alias}` is not configured"),
+                        )
+                    })?;
+                let (model_provider, model_provider_name, model_name) =
+                    crate::agent::agent::build_session_model_provider(
+                        &config,
+                        model_provider_ref,
+                        merged.model.as_deref(),
+                    )
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                    &agent_cfg,
+                    model_provider.as_ref(),
+                );
+                (
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
                 )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
             };
-            let (model_provider, model_provider_name, model_name) = built;
+            Some(built)
+        } else {
+            None
+        };
+
+        let merged = self
+            .ctx
+            .sessions
+            .set_overrides(&req.session_id, req.overrides)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
+            built_model_provider
+        {
             self.ctx
                 .sessions
-                .apply_model_provider(&req.session_id, model_provider, model_provider_name)
+                .apply_model_provider(
+                    &req.session_id,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                )
                 .await
                 .then_some(())
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            // Keep the agent's model name aligned with the model_provider it now holds.
-            if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
-                agent.lock().await.set_model_name(model_name);
-            }
+        } else if let Some(ref model_name) = merged.model
+            && let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await
+        {
+            agent.lock().await.set_model_name(model_name.clone());
         }
 
         to_result(SessionConfigureResult {
@@ -1867,6 +2000,72 @@ impl RpcDispatcher {
             if !loaded.is_empty() {
                 raw = loaded;
                 break;
+            }
+        }
+
+        // Fallback: ACP sessions live in a dedicated store (`acp-sessions.db`)
+        // and are keyed by their raw UUID — they will never be found in the
+        // unified `session_backend` above. Without this branch the Code
+        // (ACP) pane in the TUI resumes a persisted session and renders a
+        // blank transcript even though the picker (which reads from the ACP
+        // store) reports a non-zero `message_count`. See issue #7799.
+        //
+        // Flatten `ConversationMessage` → `ChatMessage` for the
+        // `{ role, content }` wire schema:
+        //   * `Chat(...)`               → pass through.
+        //   * `AssistantToolCalls { text: Some(t), .. }`
+        //                               → assistant `ChatMessage` carrying
+        //                                 just the visible narration `t`.
+        //                                 The agent's duplicate-narration
+        //                                 guard means this text is stored
+        //                                 ONLY on the `AssistantToolCalls`
+        //                                 entry — there is no paired
+        //                                 `Chat(assistant)` row — so dropping
+        //                                 it would lose visible turns from
+        //                                 the replayed transcript on resume.
+        //   * `AssistantToolCalls { text: None | Some("") , .. }`
+        //                               → drop: nothing to render and the
+        //                                 wire shape can't carry tool-call
+        //                                 metadata.
+        //   * `ToolResults(_)`          → drop: the wire shape can't carry
+        //                                 tool results and the TUI's
+        //                                 `load_history` ignores them.
+        // Surfacing tool-call metadata and tool results in replay is a
+        // separate wire-schema change.
+        if raw.is_empty()
+            && let Some(store) = self.ctx.acp_session_store.as_ref()
+        {
+            match store.load_session(&req.session_id) {
+                Ok(Some(data)) => {
+                    raw = data
+                        .messages
+                        .into_iter()
+                        .filter_map(|m| {
+                            match m {
+                            zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
+                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                                text: Some(t),
+                                ..
+                            } if !t.is_empty() => {
+                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
+                            }
+                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                                ..
+                            }
+                            | zeroclaw_api::model_provider::ConversationMessage::ToolResults(_) => {
+                                None
+                            }
+                        }
+                        })
+                        .collect();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session messages: {e}"),
+                    ));
+                }
             }
         }
 
@@ -2296,7 +2495,7 @@ impl RpcDispatcher {
                 continue;
             }
 
-            let (model_provider, model_provider_name, model_name, temperature) = {
+            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
@@ -2307,17 +2506,41 @@ impl RpcDispatcher {
                             .and_then(|entry| entry.temperature)
                     },
                 );
+                let Some(agent_cfg) = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": session_id,
+                                "agent_alias": agent_alias,
+                                "model_provider": model_provider_ref,
+                            })),
+                        "config/set saved provider profile but live session refresh could not resolve agent config"
+                    );
+                    continue;
+                };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
                     model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
-                    Ok((model_provider, model_provider_name, model_name)) => (
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        overrides.temperature.or(provider_temperature),
-                    ),
+                    Ok((model_provider, model_provider_name, model_name)) => {
+                        let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                            &agent_cfg,
+                            model_provider.as_ref(),
+                        );
+                        (
+                            model_provider,
+                            model_provider_name,
+                            model_name,
+                            tool_dispatcher,
+                            overrides.temperature.or(provider_temperature),
+                        )
+                    }
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -2340,12 +2563,17 @@ impl RpcDispatcher {
             };
             if ctx
                 .sessions
-                .apply_model_provider(&session_id, model_provider, model_provider_name)
+                .apply_model_provider(
+                    &session_id,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                )
                 .await
                 && let Some(agent) = ctx.sessions.get_agent(&session_id).await
             {
                 let mut agent = agent.lock().await;
-                agent.set_model_name(model_name);
                 agent.set_temperature(temperature);
             }
         }
@@ -2366,15 +2594,33 @@ impl RpcDispatcher {
     }
 
     fn handle_config_reload(&self) -> RpcResult {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if !self.schedule_daemon_reload("config") {
             return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
-        };
-        // Delay so the RPC reply flushes before the daemon tears down.
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-        });
+        }
         to_result(ConfigReloadResult { reloading: true })
+    }
+
+    fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            return false;
+        };
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+                let _ = gateway_shutdown_tx.send(true);
+                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+            }
+            let _ = reload_tx.send(true);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({ "surface": surface })),
+                "daemon reload dispatched"
+            );
+        });
+        true
     }
 
     fn handle_config_list(&self, params: &Value) -> RpcResult {
@@ -2416,6 +2662,16 @@ impl RpcDispatcher {
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
+        })
+    }
+
+    fn handle_config_resolve_alias_source(&self, params: &Value) -> RpcResult {
+        let req: ConfigResolveAliasSourceParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let values = config.resolve_alias_source(req.source);
+        to_result(ConfigResolveAliasSourceResult {
+            source: req.source,
+            values,
         })
     }
 
@@ -2940,9 +3196,16 @@ impl RpcDispatcher {
                     has_picker,
                     completed,
                     ready: false,
-                    group: String::new(),
+                    group: zeroclaw_config::sections::section_group_for_key(&key)
+                        .label()
+                        .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
+                    cost_category: zeroclaw_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
                     label,
                     key,
                 }
@@ -3245,7 +3508,7 @@ impl RpcDispatcher {
     /// use. Returns `true` when the supervisor was notified, `false`
     /// when no supervisor is attached (e.g. test harness).
     fn signal_daemon_reload(&self) -> bool {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if self.ctx.reload_tx.is_none() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3267,22 +3530,7 @@ impl RpcDispatcher {
             ),
             "quickstart: daemon reload signalled"
         );
-        let started = std::time::Instant::now();
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "surface": crate::quickstart::Surface::Tui.as_str(),
-                    })),
-                "quickstart: daemon reload dispatched"
-            );
-        });
-        true
+        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
 }
 
@@ -3395,6 +3643,225 @@ mod tests {
     }
 
     #[test]
+    fn session_initializes_mcp_for_chat_but_not_acp() {
+        use crate::rpc::types::ChatMode;
+        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // MCP tools (and the deferred-loading `tool_search`) the gateway
+        // already exposes for the agent (#8193).
+        assert!(
+            session_should_initialize_mcp(&ChatMode::Chat),
+            "Chat sessions must eagerly initialize MCP"
+        );
+        // ACP (Code) sessions intentionally skip eager MCP init to keep
+        // `session/new` prompt.
+        assert!(
+            !session_should_initialize_mcp(&ChatMode::Acp),
+            "ACP sessions must skip eager MCP init"
+        );
+    }
+
+    // ── #8193: behavioral `session/new` MCP coverage ─────────────────────────
+    //
+    // These drive the real `handle_session_new` path against a mock MCP server
+    // (HTTP transport, so the harness stays cross-platform — no stdio scripts)
+    // and assert on the resulting agent's tool list. They guard the call-site
+    // wiring, not just the `session_should_initialize_mcp` seam: reverting the
+    // `session/new` argument back to a hard-coded `false` makes the two Chat
+    // tests fail.
+
+    /// Spin up a wiremock server that speaks the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) and advertises
+    /// a single tool. The dotted `tool_name` exercises spec-valid names that
+    /// must survive `<server>__<tool>` prefixing (#8193).
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List domains",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_acp_test_config` plus an MCP server granted to `test-agent` via an
+    /// `mcp_bundles` grant, pointed at `mock_uri`. `deferred` selects
+    /// deferred-loading (`tool_search`) vs eager registration.
+    fn make_mcp_granting_config(
+        tmp: &tempfile::TempDir,
+        mock_uri: String,
+        deferred: bool,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut config = make_acp_test_config(tmp);
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = deferred;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_tool_search_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            names.contains(&"tool_search"),
+            "Chat session with deferred MCP must expose `tool_search`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), false);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        // Eager mode registers the MCP tool directly; the dotted suffix keeps
+        // its `<server>__<tool>` prefix.
+        assert!(
+            names.contains(&"remote__domains.list"),
+            "Chat session with eager MCP must expose `remote__domains.list`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_skips_mcp_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        // Deferred mode would register `tool_search` for a Chat session; an ACP
+        // session must skip MCP init entirely regardless. ACP `session/new`
+        // requires the persistence dispatcher (it touches the ACP store).
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-mcp-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-mcp-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
+            "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
+    #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
             assert_eq!(
@@ -3412,11 +3879,219 @@ mod tests {
     }
 
     #[test]
+    fn doctor_run_method_is_registered() {
+        assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
+        assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn config_reload_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
+
+        let result = dispatcher.handle_config_reload();
+        assert!(
+            result.is_ok(),
+            "config/reload should accept reload-capable contexts"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("gateway shutdown must be signalled before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            config,
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+
+        let result = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .await
+            .expect("quickstart/apply should accept reload-capable contexts");
+        assert_eq!(
+            result["kind"], "applied",
+            "quickstart/apply result: {result:#?}"
+        );
+        assert_eq!(result["daemon_restarted"], true);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("quickstart/apply must signal gateway shutdown before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "quickstart/apply daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("quickstart/apply daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[test]
+    fn doctor_summary_counts_each_severity_bucket() {
+        let results = vec![
+            DiagResult {
+                severity: crate::doctor::Severity::Ok,
+                category: "config".to_string(),
+                message: "ok".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "config".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "runtime".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Error,
+                category: "workspace".to_string(),
+                message: "error".to_string(),
+            },
+        ];
+
+        let summary = doctor_summary(&results);
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
     fn method_all_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
     #[test]
@@ -3654,7 +4329,7 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );
@@ -3859,6 +4534,132 @@ mod tests {
             chat_backend.load(&format!("rpc_{sid}")).is_empty(),
             "ACP session must NOT touch chat session_backend"
         );
+    }
+
+    /// Regression for #7799: `session/messages` must fall back to the dedicated
+    /// ACP session store when the requested session is an ACP session whose
+    /// messages live there (and NOT in the unified `session_backend`). Without
+    /// this, the Code (ACP) pane resumes a saved session and renders a blank
+    /// transcript even though the picker (which reads `session/list-acp`)
+    /// reports a non-zero `message_count`.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Seed an ACP session directly in the dedicated store, exactly the way
+        // a real Code pane would after a turn: a user message, an assistant
+        // turn that narrates while issuing a tool call (the agent stores the
+        // narration ONLY on the `AssistantToolCalls` row — the
+        // duplicate-narration guard suppresses a paired `Chat(assistant)`
+        // row), the tool result, a second tool-call round with no narration,
+        // and a final plain assistant reply. Nothing is written to the
+        // unified `session_backend`, mirroring the production split.
+        let sid = "acp-resume-7799";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .expect("ACP session row");
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "user".into(),
+                        content: "hello from prior turn".into(),
+                    }),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("let me check the logs".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"tail log"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "log contents".into(),
+                    }]),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tc-2".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"grep err"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-2".into(),
+                        content: "no errors".into(),
+                    }]),
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "assistant".into(),
+                        content: "ack from prior turn".into(),
+                    }),
+                ],
+            )
+            .expect("append turn");
+
+        // Sanity: the unified backend really is empty for this id under any
+        // candidate key. If this ever changes the test below stops being a
+        // regression for the ACP-store fallback.
+        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
+            assert!(
+                chat_backend.load(&key).is_empty(),
+                "precondition: unified backend has no rows for {key}"
+            );
+        }
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("session/messages should succeed");
+        let parsed: SessionMessagesResult =
+            from_value(result).expect("SessionMessagesResult shape");
+
+        // Expected replayed transcript (after flattening for the
+        // `{ role, content }` wire shape):
+        //   0: user      "hello from prior turn"
+        //   1: assistant "let me check the logs"   (narration recovered
+        //                                            from AssistantToolCalls.text;
+        //                                            losing this is the
+        //                                            regression #7903 review
+        //                                            was raised against)
+        //   2: assistant "ack from prior turn"
+        // The text-less AssistantToolCalls and both ToolResults rows are
+        // dropped because the current wire schema can't carry them.
+        assert_eq!(parsed.session_id, sid);
+        assert_eq!(
+            parsed.total, 3,
+            "ACP-backed sessions must report their full replayable message count"
+        );
+        assert_eq!(
+            parsed.messages.len(),
+            3,
+            "ACP-backed sessions must replay their persisted messages, not a blank transcript"
+        );
+        assert_eq!(parsed.messages[0].role, "user");
+        assert_eq!(parsed.messages[0].content, "hello from prior turn");
+        assert_eq!(parsed.messages[1].role, "assistant");
+        assert_eq!(
+            parsed.messages[1].content, "let me check the logs",
+            "assistant narration on an AssistantToolCalls row must be preserved \
+             when flattening for session/messages — the agent stores it ONLY \
+             on that row, so dropping it would lose visible turns from the \
+             replayed transcript"
+        );
+        assert_eq!(parsed.messages[2].role, "assistant");
+        assert_eq!(parsed.messages[2].content, "ack from prior turn");
     }
 
     /// A reaped ACP session (gone from memory, durable row intact) must
@@ -4543,6 +5344,46 @@ mod tests {
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model",
             "failed live refresh must leave the existing session provider intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_invalid_provider_does_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.missing"
+                }
+            }))
+            .await;
+        assert!(
+            res.is_err(),
+            "invalid provider switch must fail before mutating session overrides"
+        );
+
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(
+            overrides.model_provider, None,
+            "failed provider switch must not leave a stale override behind"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "failed provider switch must leave the live agent unchanged"
         );
     }
 

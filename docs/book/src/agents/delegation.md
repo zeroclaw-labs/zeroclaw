@@ -36,7 +36,7 @@ Synchronous, in-process, single tokio runtime. Nothing crosses the process bound
 1. Parent's tool loop dispatches `spawn_subagent`. The tool reads its `prompt` argument, refuses if empty.
 2. The tool checks two guards in order:
    - **Depth-1 cap.** If the calling run was itself a SubAgent (`AgentRunOverrides.is_subagent == true`), refuse with `"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"`. SubAgents cannot recurse.
-   - **`risk_profile.allowed_tools` gate.** If the parent's `[risk_profiles.<alias>].allowed_tools` does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias.
+   - **Risk-profile tool gate.** If the parent's `[risk_profiles.<alias>].allowed_tools` is non-empty and does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias.
 3. The tool calls `SubAgentSpawn::for_agent` + `build`. Failures (unknown parent alias, escalating override) surface as `ToolResult { success: false, error: "subagent spawn failed: ..." }`.
 4. The tool constructs `AgentRunOverrides { security, memory: None, is_subagent: true }` and awaits `crate::agent::run` (`crates/zeroclaw-runtime/src/agent/loop_.rs`, `pub async fn run`) inside a tracing scope keyed `subagent-<uuid>`. The parent's `tool` execution **blocks** until the child returns.
 5. The child agent loop runs to completion. Its tool registry is built fresh, with `is_subagent_caller: true` flowing into its own `SpawnSubagentTool` so any attempt to recurse is rejected at the same depth-1 gate.
@@ -81,7 +81,7 @@ Inheritance axis by axis:
 
 You don't call these tools yourself; the bot does, from inside its turn. As a user, you influence the bot's choice with how you phrase the request. There is no special command, no slash-syntax, and no JSON the user types. Whether the model picks `spawn_subagent` or `delegate` depends on its system prompt, the tool's `description` text (visible to the model), and the user's wording. **Phrasing influences; it does not force.**
 
-What CAN be made deterministic is **availability**: tools that aren't in the parent agent's registry can't be picked. That gate lives in `[risk_profiles.<alias>].allowed_tools`. If the alias listed for the parent agent's `risk_profile` doesn't include `spawn_subagent`, the model never sees it. Same for `delegate`. Restart the daemon after editing the config.
+What CAN be made deterministic is **availability**: tools that aren't in the parent agent's registry can't be picked. The risk-profile gate lives in `[risk_profiles.<alias>].allowed_tools` and `[risk_profiles.<alias>].excluded_tools`. A non-empty `allowed_tools` list must include `spawn_subagent` or `delegate` for the model to see that tool; an empty `allowed_tools` list leaves tool availability unrestricted unless `excluded_tools` names the tool. Restart the daemon after editing the config.
 
 What's verifiable end-to-end:
 
@@ -100,7 +100,7 @@ These are exact, sourced from `crates/zeroclaw-runtime/src/tools/spawn_subagent.
 
 1. Empty/missing `prompt` argument: `Missing or empty 'prompt' parameter`
 2. Caller is itself a SubAgent (depth-1 cap): `spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)`
-3. Parent's `risk_profile.allowed_tools` excludes `spawn_subagent`: `spawn_subagent: refused — agent '<parent_alias>' risk_profile does not list spawn_subagent in allowed_tools`
+3. Parent's risk-profile tool gate excludes `spawn_subagent`: `spawn_subagent: refused — agent '<parent_alias>' risk_profile does not list spawn_subagent in allowed_tools`
 4. Unknown parent alias / spawn build error: `subagent spawn failed: <wrapped error>`
 5. Child run returned an error: `subagent run failed: <wrapped error>`
 
@@ -124,12 +124,37 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
    ```
    This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select).
 
-2. **Shared risk profile**: the target agent must use the **same** risk profile as the caller. Delegation does not cross trust tiers: an agent on `hardened` cannot delegate to an agent on `permissive`. When they differ, the refusal is:
+2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_targets`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
+
+   - **same-profile peers**: every other agent sharing the caller's risk profile, included while `delegate_same_risk_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
+   - **explicit roster**: `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
+
+   When the target is outside that set the refusal is:
    ```text
-   delegate target "<target>" uses risk profile "<target_profile>", but delegation requires the same risk profile as the caller ("<caller_profile>")
+   delegate target "<target>" is not reachable from "<caller>"; add it to [agents.<caller>].delegates or share a risk profile with delegate_same_risk_profile enabled
    ```
 
-Because reachability is gated by the shared risk profile, the advertised roster (the `agent` parameter's enum in the tool schema) lists only the configured agents that share the caller's risk profile, minus the caller itself, and only when `delegation_policy.mode = "allow"`. There is no separate per-agent allow-list: the shared profile *is* the allow-list.
+   A same-profile target inherits the caller's session workspace boundary and shares its action/cost tracker. An explicit **cross-profile** target runs under its own resolved policy and must pass `ensure_no_escalation_beyond` the caller: a listed delegate that would widen privilege (broader autonomy, extra roots, higher budgets, etc.) is refused with:
+   ```text
+   delegate target "<target>" (risk profile "<target_profile>") would escalate beyond the caller (risk profile "<caller_profile>"): <violation>
+   ```
+
+The advertised roster (the `agent` parameter's enum in the tool schema) lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
+
+In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller's tool surface.
+
+Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
+
+#### Agentic target tool policy
+
+If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` builds the target sub-loop's tool registry from the parent's available tools. The target risk profile then filters that inherited registry:
+
+1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the inherited parent registry unrestricted.
+2. A non-empty `allowed_tools` list keeps only exact matching tool names.
+3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
+4. `delegate` is always removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
+
+This policy lives on the target, not the caller. Same-profile peers use the shared risk profile, while explicit cross-profile delegates use the target's risk profile after the non-escalation check. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.
 
 ### `delegate`: output strings the model sees
 
@@ -150,6 +175,12 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 7. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 8. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 9. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task.`
+10. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
+11. Agentic target with no executable child tools: error begins with `Agent '<target>' has no executable tools`, then names the filtering case:
+    - `available from parent registry` when no allowlist or denylist applies but no non-`delegate` parent tools are available.
+    - `after filtering allowlist (<comma-separated names>)` when a non-empty `allowed_tools` list leaves no executable tools.
+    - `after filtering denylist (<comma-separated names>)` when `excluded_tools` removes every inherited executable tool.
+    - `after filtering allowlist (<comma-separated names>) and denylist (<comma-separated names>)` when both gates combine to leave no executable tools.
 
 ### `delegate`: how to verify it actually fired
 
@@ -166,14 +197,14 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 
 | | `spawn_subagent` | `delegate` |
 |---|---|---|
-| **Identity** | Same as parent (same UUID, same risk profile) | Target agent's identity (different alias, **same** same risk profile, delegation requires it) |
-| **Permission model** | Parent's policy verbatim (or narrowed subset) | Target agent's own policy (within the shared risk profile) |
+| **Identity** | Same as parent (same UUID, same risk profile) | Target agent's identity (different alias; same-profile peer or an explicit cross-profile delegate) |
+| **Permission model** | Parent's policy verbatim (or narrowed subset) | Target agent's own policy (same-profile, or a cross-profile delegate validated non-escalating) |
 | **Model provider** | Parent's | Target agent's configured provider |
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
-| **Gating** | `risk_profile.allowed_tools` must list `spawn_subagent` | `allowed_tools` must list `delegate`, caller's `delegation_policy mode = "allow"`, and target shares the caller's risk profile |
-| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) on the **same trust tier** to handle the task |
+| **Gating** | Non-empty `risk_profile.allowed_tools` must list `spawn_subagent`; `excluded_tools` must not list it | The caller's non-empty `risk_profile.allowed_tools` must list `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
+| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one |
 
 ## What's not supported
 

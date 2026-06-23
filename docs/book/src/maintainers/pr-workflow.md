@@ -25,7 +25,7 @@ Automation handles path/scope labels and CI gating. Risk, size, type, and contri
 
 The Project board is an automated planning board, not the authoritative PR review queue.
 
-Use the board for issue readiness, active ownership, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
+Use the board for issue readiness, routing evidence, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
 
 A draft JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as design input for future board refresh automation, not as an active GitHub Project integration yet.
 
@@ -33,37 +33,38 @@ Do not mirror native PR review state into manual board lanes. GitHub PR state ow
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
 
-### Issue ownership path
+### Issue routing evidence
 
-Issues need an ownership path before they can safely stay accepted, in progress, or stale-exempt for long periods. PRs have CODEOWNERS and requested reviewers; issues need an equivalent routing contract for the next triage decision.
+Issue triage stays a shared maintainer responsibility. Accepted issues do not need a standing owner map before they can remain open, and CODEOWNERS does not make code owners responsible for every issue in a matching area.
+
+Issues need contributor-visible routing evidence when a special state would otherwise hide them from routine review or stale sweeps: `status:no-stale`, active release/RFC/design tracker status, or a deferred maintainer decision. `status:blocked` keeps its simpler rule: record the unresolved blocker and revisit stale protection when the blocker clears.
 
 Use these meanings consistently:
 
 | Signal | Means | Does not mean |
 |---|---|---|
 | Assignee | Someone is actively implementing, investigating, or shepherding the immediate work. | Permanent area ownership or passive responsibility for every related issue. |
-| Area steward | A maintainer or documented steward surface owns the next routing decision: clarify, accept, close, defer, or identify the next implementation path. | Automatic implementation ownership. |
-| Project active owner | The board-visible person or steward source currently responsible for the next movement. | A replacement for live PR review state. |
-| Labels | Durable classification and likely area routing. | Ownership by themselves. |
+| Routing evidence | A visible issue comment, body section, public field, board field, or linked tracker records the reason for special handling and the next decision surface. | Automatic implementation ownership or permanent area ownership. |
+| Tracker/RFC surface | An active release tracker, RFC, or design tracker can be the coordination surface while it remains current. | Permanent stale protection after the tracker closes, drifts, or stops representing an active decision. |
+| Project board field | Optional planning signal for readiness, routing evidence, blocker state, or stale-exemption rationale when it is visible and maintained. | A private stale-policy source or replacement for native PR review state. |
+| Labels and CODEOWNERS | Durable classification, likely area routing, and PR-review consultation hints. | Ownership or stale protection by themselves. |
 
-Area stewardship is the issue-side analogue to CODEOWNERS, but it is not implemented through CODEOWNERS. If GitHub issue fields are enabled and visible to the public on the issue page, prefer a Public issue field for `Area steward` or `Owner path`. Organization-only or private issue and Project fields do not satisfy contributor-visible ownership. Otherwise, the contributor-visible source can be a maintained steward table, a public Project field, an issue-visible maintainer comment, or a public tracker entry linked from the issue.
+CODEOWNERS is a PR-review routing mechanism. It can identify people to consult when an issue clearly touches a path, but it does not create issue ownership and should not be mirrored into stale policy as a private routing map.
 
-Identifying the next implementation path does not mean the steward must personally implement the issue or guarantee staffing. It means they make the next step explicit: assign an active owner, make the issue contributor-ready, route it to a tracker or milestone, schedule it for maintainer triage, or close/defer it with a recorded rationale.
+Routing evidence is about the next decision, not delivery ownership. A routed issue should not sit in "owned" limbo; the next visible update should make one of these outcomes explicit: assign an active implementer, make the issue contributor-ready, route it to a tracker or milestone, record the blocker, schedule a concrete maintainer decision point, or close/defer it with rationale.
 
-Stewardship is decision ownership, not indefinite delivery ownership. A stewarded issue should not sit in an "owned" limbo; the next visible update should record one of the outcomes above or name the decision needed.
+Scheduling an issue for maintainer triage is valid only when the issue records what decision is needed, where that decision will be tracked, and when it will be revisited. After that triage pass, replace the triage routing with an active implementer, contributor-ready scope, tracker or milestone route, blocked/deferred state, or closure rationale.
 
-Scheduling an issue for maintainer triage is valid only when the issue records what decision is needed, where that decision will be tracked, and when it will be revisited. After that triage pass, replace the triage routing with an active owner, contributor-ready scope, tracker or milestone route, blocked/deferred state, or closure rationale.
+For protected issues, record both the stale-exemption reason and the next decision surface before adding or keeping `status:no-stale`. Useful visible evidence sources include:
 
-For accepted or protected issues, prefer one of these visible owner sources before adding or keeping `status:no-stale`:
+- an assignee doing active work plus an issue-visible note, body section, or tracker entry explaining why stale handling should not apply;
+- an issue comment, issue body section, or public issue field recording the stale-exemption reason and next decision surface;
+- a public Project field that is visible to normal issue readers and actively maintained;
+- a linked public tracker, milestone, RFC, or design issue that records why the issue stays open and when it should be revisited.
 
-- an assignee doing active work;
-- a Public issue field, issue comment, or body section naming the steward path;
-- a public Project active-owner or area-steward field;
-- a linked public tracker entry that names the steward or owner source.
+Active release trackers and active RFC or design trackers are durable coordination surfaces. When the issue title, body, labels, or milestone clearly identify an active tracker or RFC, the tracker itself supplies the stale-exemption reason and contributor-visible routing surface; it does not need repetitive per-issue comments. Revisit the exemption when the milestone closes, the tracker drifts from live release state, the RFC reaches a decision, is superseded, or closes, or the issue no longer represents an active project decision surface.
 
-Active release trackers and active RFC or design trackers are durable coordination surfaces. When the issue title, body, labels, or milestone clearly identify an active tracker or RFC, the tracker itself supplies the stale-exemption reason and contributor-visible steward surface; it does not need repetitive per-issue owner comments. Revisit the exemption when the milestone closes, the tracker drifts from live release state, the RFC reaches a decision, is superseded, or closes, or the issue no longer represents an active project decision surface.
-
-If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or routing evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
 ## PR lanes
 
@@ -156,7 +157,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - First maintainer triage target: **within 48 hours**.
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
-- `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible active owner or steward path when the issue is not already protected by another stale exclusion. Active release trackers and active RFC or design trackers may use the tracker itself as that visible reason and steward surface while they remain active. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
+- `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible routing evidence when the issue is not already protected by another stale exclusion. Active release trackers and active RFC or design trackers may use the tracker itself as that visible reason and routing surface while they remain active. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 

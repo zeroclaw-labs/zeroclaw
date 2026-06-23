@@ -17,53 +17,7 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-#[cfg(test)]
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
-    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "OK",
-    "JIAYI",
-    "APPLAUSE",
-    "THUMBSUP",
-    "FINGERHEART",
-    "SMILE",
-    "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkAckLocale {
-    ZhCn,
-    ZhTw,
-    En,
-    Ja,
-}
 
 /// Map a unicode emoji used by generic callers of [`Channel::add_reaction`]
 /// (e.g. Reply-Intent Precheck, no-reply ack heuristics) to a Lark/Feishu
@@ -681,6 +635,11 @@ pub struct LarkChannel {
     /// [`Self::with_per_user_session`] from
     /// `[channels.lark.<alias>].per_user_session`.
     per_user_session: bool,
+    /// Whether to add acknowledgement reactions (👀, ✅, ⚠️) to incoming
+    /// messages. Set by the orchestrator from the per-channel
+    /// `[channels.lark.<alias>].ack_reactions` override, falling back to
+    /// `[channels].ack_reactions`. Default `true`.
+    ack_reactions: bool,
     /// Cache of `(message_id, unicode_emoji) -> reaction_id` populated by
     /// `add_reaction` so a subsequent `remove_reaction` call can issue
     /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`
@@ -771,6 +730,7 @@ impl LarkChannel {
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             per_user_session: false,
+            ack_reactions: true,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
@@ -820,6 +780,16 @@ impl LarkChannel {
     /// Set by the orchestrator from `[channels.lark.<alias>].per_user_session`.
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
+        self
+    }
+
+    /// Override the resolved `ack_reactions` value for this Lark/Feishu
+    /// instance. The orchestrator computes
+    /// `lk.ack_reactions.unwrap_or(config.channels.ack_reactions)` and passes
+    /// the result here. When `false`, no emoji reactions (👀 on receipt,
+    /// ✅/⚠️ on completion) are posted to incoming messages.
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
         self
     }
 
@@ -1364,6 +1334,11 @@ impl LarkChannel {
                     // pipeline (which can take several seconds before the generic
                     // Channel::add_reaction call would otherwise fire).
                     //
+                    // Gated by `self.ack_reactions` — when the per-channel or
+                    // global `[channels].ack_reactions` is `false`, this fast-ack
+                    // is skipped. The later generic orchestrator call also checks
+                    // `ctx.ack_reactions` and will be a no-op when disabled.
+                    //
                     // CRITICAL: this spawn MUST go through the trait
                     // `Channel::add_reaction` so that Feishu's returned
                     // reaction_id is written into the shared `reaction_ids`
@@ -1377,17 +1352,18 @@ impl LarkChannel {
                     // beside the completion marker. See lifecycle regression
                     // tests `lark_inbound_ack_lifecycle_*` and
                     // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit`.
-                    let reaction_channel = self.clone();
-                    let reaction_message_id = lark_msg.message_id.clone();
-                    let reaction_reply_target = lark_msg.chat_id.clone();
-                    zeroclaw_spawn::spawn!(async move {
-                        if let Err(e) = <LarkChannel as Channel>::add_reaction(
-                            &reaction_channel,
-                            &reaction_reply_target,
-                            &reaction_message_id,
-                            "\u{1F440}",
-                        )
-                        .await
+                    if self.ack_reactions {
+                        let reaction_channel = self.clone();
+                        let reaction_message_id = lark_msg.message_id.clone();
+                        let reaction_reply_target = lark_msg.chat_id.clone();
+                        zeroclaw_spawn::spawn!(async move {
+                            if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                                &reaction_channel,
+                                &reaction_reply_target,
+                                &reaction_message_id,
+                                "\u{1F440}",
+                            )
+                            .await
                         {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -1404,6 +1380,7 @@ impl LarkChannel {
                             );
                         }
                     });
+                    } // if self.ack_reactions
 
                     let channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
@@ -2434,6 +2411,14 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths (Lark-local fast-ack spawns in
+        // `listen_ws` / `listen_http` and the generic orchestrator
+        // add_reaction / remove_reaction calls) become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -2555,6 +2540,12 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -3387,7 +3378,9 @@ impl LarkChannel {
 
             // Parse event messages first; then issue an inbound fast-ack via
             // the same trait-level Channel::add_reaction path that the generic
-            // orchestrator uses. The trait impl writes Feishu's returned
+            // orchestrator uses. The trait impl checks `self.ack_reactions`
+            // first — when disabled this spawn is skipped entirely to avoid
+            // unnecessary work. The trait impl writes Feishu's returned
             // reaction_id into the shared reaction_ids cache and dedupes
             // subsequent duplicate POSTs via a cache-hit fast-path, so the
             // later generic orchestrator add_reaction("👀") call becomes a
@@ -3396,6 +3389,7 @@ impl LarkChannel {
             // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` test.
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
+                && state.channel.ack_reactions
                 && let Some(message_id) = payload
                     .pointer("/event/message/message_id")
                     .and_then(|m| m.as_str())
@@ -3500,213 +3494,6 @@ fn inferred_audio_filename(file_key: &str) -> String {
     }
 }
 
-#[cfg(test)]
-fn pick_uniform_index(len: usize) -> usize {
-    debug_assert!(len > 0);
-    let upper = len as u64;
-    let reject_threshold = (u64::MAX / upper) * upper;
-
-    loop {
-        let value = rand::random::<u64>();
-        if value < reject_threshold {
-            #[allow(clippy::cast_possible_truncation)]
-            return (value % upper) as usize;
-        }
-    }
-}
-
-#[cfg(test)]
-fn random_from_pool(pool: &'static [&'static str]) -> &'static str {
-    pool[pick_uniform_index(pool.len())]
-}
-
-#[cfg(test)]
-fn lark_ack_pool(locale: LarkAckLocale) -> &'static [&'static str] {
-    match locale {
-        LarkAckLocale::ZhCn => LARK_ACK_REACTIONS_ZH_CN,
-        LarkAckLocale::ZhTw => LARK_ACK_REACTIONS_ZH_TW,
-        LarkAckLocale::En => LARK_ACK_REACTIONS_EN,
-        LarkAckLocale::Ja => LARK_ACK_REACTIONS_JA,
-    }
-}
-
-#[cfg(test)]
-fn map_locale_tag(tag: &str) -> Option<LarkAckLocale> {
-    let normalized = tag.trim().to_ascii_lowercase().replace('-', "_");
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if normalized.starts_with("ja") {
-        return Some(LarkAckLocale::Ja);
-    }
-    if normalized.starts_with("en") {
-        return Some(LarkAckLocale::En);
-    }
-    if normalized.contains("hant")
-        || normalized.starts_with("zh_tw")
-        || normalized.starts_with("zh_hk")
-        || normalized.starts_with("zh_mo")
-    {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if normalized.starts_with("zh") {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-#[cfg(test)]
-fn find_locale_hint(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "locale",
-                "language",
-                "lang",
-                "i18n_locale",
-                "user_locale",
-                "locale_id",
-            ] {
-                if let Some(locale) = map.get(key).and_then(serde_json::Value::as_str) {
-                    return Some(locale.to_string());
-                }
-            }
-
-            for child in map.values() {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn detect_locale_from_post_content(content: &str) -> Option<LarkAckLocale> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let obj = parsed.as_object()?;
-    for key in obj.keys() {
-        if let Some(locale) = map_locale_tag(key) {
-            return Some(locale);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-fn is_japanese_kana(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3040..=0x309F | // Hiragana
-        0x30A0..=0x30FF | // Katakana
-        0x31F0..=0x31FF // Katakana Phonetic Extensions
-    )
-}
-
-#[cfg(test)]
-fn is_cjk_han(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3400..=0x4DBF | // CJK Extension A
-        0x4E00..=0x9FFF // CJK Unified Ideographs
-    )
-}
-
-#[cfg(test)]
-fn is_traditional_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奮' | '鬥'
-            | '強'
-            | '體'
-            | '國'
-            | '臺'
-            | '萬'
-            | '與'
-            | '為'
-            | '這'
-            | '學'
-            | '機'
-            | '開'
-            | '裡'
-    )
-}
-
-#[cfg(test)]
-fn is_simplified_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奋' | '斗'
-            | '强'
-            | '体'
-            | '国'
-            | '台'
-            | '万'
-            | '与'
-            | '为'
-            | '这'
-            | '学'
-            | '机'
-            | '开'
-            | '里'
-    )
-}
-
-#[cfg(test)]
-fn detect_locale_from_text(text: &str) -> Option<LarkAckLocale> {
-    if text.chars().any(is_japanese_kana) {
-        return Some(LarkAckLocale::Ja);
-    }
-    if text.chars().any(is_traditional_only_han) {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if text.chars().any(is_simplified_only_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    if text.chars().any(is_cjk_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-#[cfg(test)]
-fn detect_lark_ack_locale(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> LarkAckLocale {
-    if let Some(payload) = payload {
-        if let Some(locale) = find_locale_hint(payload).and_then(|hint| map_locale_tag(&hint)) {
-            return locale;
-        }
-
-        let message_content = payload
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/message/content")
-                    .and_then(serde_json::Value::as_str)
-            });
-
-        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
-            return locale;
-        }
-    }
-
-    detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
-}
-
 /// Detect image MIME type from magic bytes, falling back to Content-Type header.
 fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
@@ -3780,15 +3567,6 @@ fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     } else {
         text.into_owned()
     }
-}
-
-#[cfg(test)]
-fn random_lark_ack_reaction(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> &'static str {
-    let locale = detect_lark_ack_locale(payload, fallback_text);
-    random_from_pool(lark_ack_pool(locale))
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.
@@ -4562,6 +4340,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4589,6 +4368,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4627,6 +4407,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4657,6 +4438,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4687,6 +4469,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 456,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -5006,6 +4789,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -5086,103 +4870,6 @@ mod tests {
         let preview = lark_inline_text_file_preview(Cow::Borrowed(&text));
 
         assert_eq!(preview, format!("{prefix}...\n[truncated]"));
-    }
-
-    #[test]
-    fn lark_reaction_locale_explicit_language_tags() {
-        assert_eq!(map_locale_tag("zh-CN"), Some(LarkAckLocale::ZhCn));
-        assert_eq!(map_locale_tag("zh_TW"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("zh-Hant"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("en-US"), Some(LarkAckLocale::En));
-        assert_eq!(map_locale_tag("ja-JP"), Some(LarkAckLocale::Ja));
-        assert_eq!(map_locale_tag("fr-FR"), None);
-    }
-
-    #[test]
-    fn lark_reaction_locale_prefers_explicit_payload_locale() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            },
-            "message": {
-                "content": "{\"text\":\"hello\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "你好，世界"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_unsupported_payload_falls_back_to_text_script() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "fr-FR"
-            },
-            "message": {
-                "content": "{\"text\":\"頑張れ\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "頑張ってください"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_detects_simplified_and_traditional_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "继续奋斗，今天很强"),
-            LarkAckLocale::ZhCn
-        );
-        assert_eq!(
-            detect_lark_ack_locale(None, "繼續奮鬥，今天很強"),
-            LarkAckLocale::ZhTw
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_defaults_to_english_for_unsupported_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "Bonjour tout le monde"),
-            LarkAckLocale::En
-        );
-    }
-
-    #[test]
-    fn random_lark_ack_reaction_respects_detected_locale_pool() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-CN"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-TW"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_TW.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "en-US"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_EN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
     }
 
     #[test]

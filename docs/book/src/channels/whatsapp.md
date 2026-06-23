@@ -19,6 +19,14 @@ Cloud API mode is the Meta Business Platform integration. It requires a Meta Bus
 
 The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel under the top-level `[tunnel]` section (`tunnel_provider` and the related provider blocks, see the [config reference](../reference/config.md#tunnel)), or front the gateway with your own reverse proxy when developing locally.
 
+Point Meta's Callback URL at the alias of the `[channels.whatsapp.<alias>]`
+instance that should receive it: `GET`/`POST https://<your-public-url>/whatsapp/<alias>`
+(e.g. `[channels.whatsapp.work]` → `/whatsapp/work`). This per-alias routing
+(#6312) lets multiple WhatsApp numbers run side by side. The bare `/whatsapp`
+path still works but is **deprecated**: it resolves to the lexicographically-first
+alias (deterministic across restarts) and sets an `X-Zeroclaw-Deprecation` response
+header. An unknown alias returns `404`. Single-instance deployments need no change.
+
 ## Web mode
 
 WhatsApp Web mode links a regular WhatsApp account through the optional Web backend. It does not need a Meta Business account. It does need a ZeroClaw build with the `whatsapp-web` feature enabled and a persistent session database path.
@@ -39,6 +47,20 @@ For Web mode, `mode = "personal"` applies separate DM, group, and self-chat poli
 | `mention_only` | `true`, `false` | Requires group messages to mention the bot |
 
 The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+
+## Restricting which groups (`allowed_groups`)
+
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+
+Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
+
+```toml
+[channels.whatsapp.myaccount]
+enabled = true
+session_path = "/var/lib/zeroclaw/wa.db"
+# Only operate in these two groups; all other groups are dropped.
+allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
+```
 
 ## Configuration surfaces
 

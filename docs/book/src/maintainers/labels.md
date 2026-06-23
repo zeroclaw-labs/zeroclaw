@@ -14,21 +14,21 @@ Labels are portable metadata. They should answer what kind of work this is, what
 
 When Project board automation is added, use it as an automated planning board,
 not as a second PR review queue. The board should answer slower-moving planning
-questions: what is ready to pick up, who owns it, what tracker or milestone it
-belongs to, and what is blocked. Native GitHub PR state should continue to
-answer fast-moving review and merge questions.
+questions: what is ready to pick up, what routing evidence keeps it active,
+what tracker or milestone it belongs to, and what is blocked. Native GitHub PR
+state should continue to answer fast-moving review and merge questions.
 
 Keep the split based on update frequency:
 
 - Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
-- Project board fields are appropriate for issue planning stage, active owner or steward path, dependency state, stale-exemption reason, and roadmap grouping when those fields are actively maintained.
+- Project board fields are appropriate for issue planning stage, visible routing evidence, dependency state, stale-exemption reason, and roadmap grouping when those fields are actively maintained.
 - Native GitHub PR state owns fast-changing review state: review decision, required checks, mergeability, conflicts, and stale approvals.
 
 The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
 
-Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
+Labels can suggest likely routing, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security`, or `docs` label identifies the surface that probably needs attention. Contributor-visible routing-evidence rules live in the [Project board contract](./pr-workflow.md#issue-routing-evidence).
 
-Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes.
+Use assignees for active work. Use issue comments, issue body sections, public fields, or linked trackers for routing evidence when a special stale, tracker, or deferred-decision state needs explanation. `status:blocked` uses the recorded-blocker rule. The [Project board contract](./pr-workflow.md#issue-routing-evidence) defines the accepted evidence sources and routing outcomes.
 
 ## Canonical spelling
 
@@ -229,7 +229,7 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
 | `status:stale` | No author activity for the stale window; may close if not refreshed |
-| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-ownership-path) has a contributor-visible stale-exemption reason and owner path. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-routing-evidence) has a contributor-visible stale-exemption reason and routing evidence. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
 
 ## Resolution labels
 

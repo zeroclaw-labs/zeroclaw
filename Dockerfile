@@ -1,15 +1,29 @@
 # syntax=docker/dockerfile:1.7-labs
 
-# ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:22-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e AS web-node
+# >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_NODE=node:26-bookworm-slim@sha256:4e2e85a824f938e41a61e9e819f0c7c11432f7d60f470b96214d3ead2f0dd63e
+# >>> end generated:base-arg-node <<<
+# >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.94-slim@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a
+# >>> end generated:base-arg-rust-slim <<<
+# >>> generated:base-arg-debian from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
+# >>> end generated:base-arg-debian <<<
+# >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73d292ef245ab032da7851907798024cefba
+# >>> end generated:base-arg-distroless <<<
 
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS web-builder
+# ── Stage 0: Frontend build ─────────────────────────────────────
+FROM ${ZEROCLAW_BASE_NODE} AS web-node
+
+FROM ${ZEROCLAW_BASE_RUST_SLIM} AS web-builder
 WORKDIR /app
 COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
 COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
+        g++ \
         pkg-config \
     && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
@@ -26,10 +40,12 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cargo web build
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
+FROM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+# >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+# >>> end generated:docker-features-arg <<<
 
 # Install build dependencies. g++ is required by inkjet (zerocode's syntax
 # highlighter) to compile its tree-sitter grammars; the slim base ships cc but
@@ -46,10 +62,7 @@ COPY Cargo.toml Cargo.lock ./
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
-# aardvark-sys has an implicit build script (build.rs at its crate root) that
-# Cargo must compile during the dependency pre-fetch step; copy it explicitly.
 COPY --parents crates/*/Cargo.toml ./
-COPY --parents crates/aardvark-sys/build.rs ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -86,8 +99,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
+    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
       cargo build --release --locked -p zeroclawlabs -p zerocode; \
     fi
@@ -124,8 +137,8 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/.fingerprint/zerocode-* \
            target/release/deps/zerocode-* \
            target/release/incremental/zerocode-* && \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
+    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
       cargo build --release --locked -p zeroclawlabs -p zerocode; \
     fi && \
@@ -161,12 +174,13 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
-FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
+FROM ${ZEROCLAW_BASE_DEBIAN} AS dev
 
 # Install essential runtime dependencies only (use docker-compose.override.yml for dev tools)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
@@ -203,7 +217,7 @@ ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+FROM ${ZEROCLAW_BASE_DISTROLESS} AS release
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode

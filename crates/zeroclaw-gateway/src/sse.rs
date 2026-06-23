@@ -98,13 +98,16 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    let events: Vec<_> = state
-        .event_buffer
+    Json(history_events_payload(&state.event_buffer)).into_response()
+}
+
+fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
+    let events: Vec<_> = buffer
         .snapshot()
         .into_iter()
         .filter(is_public_sse_event)
         .collect();
-    Json(serde_json::json!({ "events": events })).into_response()
+    serde_json::json!({ "events": events })
 }
 
 /// Returns true for events that should be visible on the global SSE stream.
@@ -395,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn history_payload_returns_only_public_events() {
+        let buffer = EventBuffer::new(8);
+        buffer.push(serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private session notification"
+        }));
+        buffer.push(serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model_provider": "test",
+            "model": "test-model"
+        }));
+        buffer.push(serde_json::json!({
+            "type": "gateway_lifecycle",
+            "phase": "ready"
+        }));
+
+        let payload = history_events_payload(&buffer);
+        let events = payload["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "agent_start");
+        assert_eq!(events[1]["type"], "gateway_lifecycle");
+    }
+
+    #[test]
     fn observability_tagged_events_are_public_even_without_session_id() {
         // After #7151, observability frames keep the SSE pathway open even
         // though they would not otherwise carry a session_id discriminator.
@@ -525,7 +554,7 @@ mod tests {
 
         // Same factory call site as `process_message` in the agent loop.
         let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: "noop".into(),
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
             ..Default::default()
         };
         let observer = zeroclaw_runtime::observability::create_observer(&cfg);

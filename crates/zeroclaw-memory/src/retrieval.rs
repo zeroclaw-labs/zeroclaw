@@ -19,6 +19,37 @@ struct CachedResult {
     created_at: Instant,
 }
 
+/// Cache identity for a recall request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetrievalCacheKey {
+    query: String,
+    limit: usize,
+    session_id: Option<String>,
+    namespace: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+impl RetrievalCacheKey {
+    fn new(
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Self {
+        Self {
+            query: query.to_string(),
+            limit,
+            session_id: session_id.map(str::to_string),
+            namespace: namespace.map(str::to_string),
+            since: since.map(str::to_string),
+            until: until.map(str::to_string),
+        }
+    }
+}
+
 /// Multi-stage retrieval pipeline configuration.
 #[derive(Debug, Clone)]
 pub struct RetrievalConfig {
@@ -47,7 +78,7 @@ impl Default for RetrievalConfig {
 pub struct RetrievalPipeline {
     memory: Arc<dyn Memory>,
     config: RetrievalConfig,
-    hot_cache: Mutex<HashMap<String, CachedResult>>,
+    hot_cache: Mutex<HashMap<RetrievalCacheKey, CachedResult>>,
 }
 
 impl RetrievalPipeline {
@@ -65,18 +96,14 @@ impl RetrievalPipeline {
         limit: usize,
         session_id: Option<&str>,
         namespace: Option<&str>,
-    ) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            query,
-            limit,
-            session_id.unwrap_or(""),
-            namespace.unwrap_or("")
-        )
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> RetrievalCacheKey {
+        RetrievalCacheKey::new(query, limit, session_id, namespace, since, until)
     }
 
     /// Check the hot cache for a previous result.
-    fn check_cache(&self, key: &str) -> Option<Vec<MemoryEntry>> {
+    fn check_cache(&self, key: &RetrievalCacheKey) -> Option<Vec<MemoryEntry>> {
         let cache = self.hot_cache.lock();
         if let Some(cached) = cache.get(key)
             && cached.created_at.elapsed() < self.config.cache_ttl
@@ -87,7 +114,7 @@ impl RetrievalPipeline {
     }
 
     /// Store a result in the hot cache with LRU eviction.
-    fn store_in_cache(&self, key: String, entries: Vec<MemoryEntry>) {
+    fn store_in_cache(&self, key: RetrievalCacheKey, entries: Vec<MemoryEntry>) {
         let mut cache = self.hot_cache.lock();
 
         // LRU eviction: remove oldest entries if at capacity
@@ -120,7 +147,7 @@ impl RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let ck = Self::cache_key(query, limit, session_id, namespace);
+        let ck = Self::cache_key(query, limit, session_id, namespace, since, until);
 
         for stage in &self.config.stages {
             match stage.as_str() {
@@ -225,7 +252,7 @@ mod tests {
         let pipeline = RetrievalPipeline::new(memory, RetrievalConfig::default());
 
         // Force a cache entry
-        let ck = RetrievalPipeline::cache_key("test", 10, None, None);
+        let ck = RetrievalPipeline::cache_key("test", 10, None, None, None, None);
         pipeline.store_in_cache(ck, vec![]);
 
         assert_eq!(pipeline.cache_size(), 1);
@@ -235,12 +262,149 @@ mod tests {
 
     #[test]
     fn cache_key_includes_all_params() {
-        let k1 = RetrievalPipeline::cache_key("hello", 10, Some("sess-a"), Some("ns1"));
-        let k2 = RetrievalPipeline::cache_key("hello", 10, Some("sess-b"), Some("ns1"));
-        let k3 = RetrievalPipeline::cache_key("hello", 10, Some("sess-a"), Some("ns2"));
+        let base = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_query = RetrievalPipeline::cache_key(
+            "goodbye",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_limit = RetrievalPipeline::cache_key(
+            "hello",
+            11,
+            Some("sess-a"),
+            Some("ns1"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_session = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-b"),
+            Some("ns1"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_namespace = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns2"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_since = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            Some("2026-06-03T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let different_until = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-04T00:00:00Z"),
+        );
+        let absent_since = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            None,
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let empty_since = RetrievalPipeline::cache_key(
+            "hello",
+            10,
+            Some("sess-a"),
+            Some("ns1"),
+            Some(""),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        let delimiter_in_query =
+            RetrievalPipeline::cache_key("hello:10", 20, None, None, None, None);
+        let delimiter_in_limit_shape =
+            RetrievalPipeline::cache_key("hello", 10, Some("20"), None, None, None);
 
-        assert_ne!(k1, k2);
-        assert_ne!(k1, k3);
+        assert_ne!(base, different_query);
+        assert_ne!(base, different_limit);
+        assert_ne!(base, different_session);
+        assert_ne!(base, different_namespace);
+        assert_ne!(base, different_since);
+        assert_ne!(base, different_until);
+        assert_ne!(absent_since, empty_since);
+        assert_ne!(delimiter_in_query, delimiter_in_limit_shape);
+    }
+
+    #[tokio::test]
+    async fn retrieval_cache_distinguishes_time_windows() {
+        let memory = Arc::new(NoneMemory::new("none"));
+        let pipeline = RetrievalPipeline::new(memory, RetrievalConfig::default());
+        let cached_entry = MemoryEntry {
+            id: "cached-window".into(),
+            key: "project".into(),
+            content: "cached content".into(),
+            category: crate::traits::MemoryCategory::Core,
+            timestamp: "2026-06-01T00:00:00Z".into(),
+            session_id: Some("session-a".into()),
+            score: Some(0.9),
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
+        };
+        let first_window_key = RetrievalPipeline::cache_key(
+            "project",
+            10,
+            Some("session-a"),
+            None,
+            Some("2026-06-01T00:00:00Z"),
+            Some("2026-06-02T00:00:00Z"),
+        );
+        pipeline.store_in_cache(first_window_key, vec![cached_entry]);
+
+        let first = pipeline
+            .recall(
+                "project",
+                10,
+                Some("session-a"),
+                None,
+                Some("2026-06-01T00:00:00Z"),
+                Some("2026-06-02T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        let second = pipeline
+            .recall(
+                "project",
+                10,
+                Some("session-a"),
+                None,
+                Some("2026-06-03T00:00:00Z"),
+                Some("2026-06-04T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].content, "cached content");
+        assert!(
+            second.is_empty(),
+            "a different time window must not reuse a cached result"
+        );
     }
 
     #[tokio::test]
@@ -260,7 +424,7 @@ mod tests {
         assert!(results.is_empty());
 
         // Manually insert a cache entry
-        let ck = RetrievalPipeline::cache_key("cached_query", 5, None, None);
+        let ck = RetrievalPipeline::cache_key("cached_query", 5, None, None, None, None);
         let fake_entry = MemoryEntry {
             id: "1".into(),
             key: "k".into(),

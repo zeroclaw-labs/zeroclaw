@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
@@ -27,6 +27,11 @@ use crate::theme;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -44,7 +49,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -206,10 +211,42 @@ fn switch_tabs_keys() -> Vec<String> {
         .collect()
 }
 
+/// Display form of a config directory. Replaces the user's home prefix with
+/// "~" so a long path like "/home/alice/.zeroclaw" reads as
+/// "~/.zeroclaw" in the Config header. Falls back to the original path
+/// representation when the path is not under the current home directory or
+/// when the home directory cannot be resolved.
+fn shorten_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    // Canonicalize the home directory so the comparison is symmetric with the
+    // canonicalized config path. This handles symlinked $HOME setups common on
+    // macOS, NixOS, and container images.
+    let home_path = PathBuf::from(&home)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(home));
+    let to_tilde = |p: &Path| -> String {
+        match p.strip_prefix(&home_path) {
+            Ok(rel) => format!("~/{}", rel.to_string_lossy().trim_end_matches('/')),
+            Err(_) => p.display().to_string(),
+        }
+    };
+    if let Ok(canon) = path.canonicalize() {
+        return to_tilde(&canon);
+    }
+    to_tilde(path)
+}
+
 // ── App state ────────────────────────────────────────────────────
 
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
+    /// Cached display string for the active config directory, computed once at
+    /// construction so the tab bar does not re-stat the filesystem on every
+    /// render.
+    config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
@@ -232,6 +269,10 @@ pub(crate) struct App {
     aliases: Vec<String>,
     alias_enabled: Vec<Option<bool>>,
     alias_cursor: usize,
+    // Aliases/Costs tab on cost-bearing provider alias lists.
+    alias_tab: usize,
+    cost_resources: Vec<String>,
+    cost_cursor: usize,
     // Field list
     fields: Vec<ConfigFieldEntry>,
     field_cursor: usize,
@@ -269,6 +310,15 @@ pub(crate) struct App {
     last_section_pane_area: Rect,
     last_section_list_area: Rect,
     last_list_offset: usize,
+    /// Draw-time map of section-pane display rows to `sections` indices.
+    /// `None` rows are group headers; mouse clicks resolve through this
+    /// so headers are dead zones instead of off-by-N selections.
+    last_section_rows: Vec<Option<usize>>,
+    /// Scroll offset of the section-pane list at last draw. Dedicated to
+    /// the sections pane (not the shared `last_list_offset`, which the
+    /// right-pane draws overwrite) so a click on a scrolled section list
+    /// maps to the right row in any screen.
+    last_section_list_offset: usize,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -277,6 +327,7 @@ impl App {
     pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
+            config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
             section_tab_area: None,
@@ -293,6 +344,9 @@ impl App {
             aliases: Vec::new(),
             alias_enabled: Vec::new(),
             alias_cursor: 0,
+            alias_tab: 0,
+            cost_resources: Vec::new(),
+            cost_cursor: 0,
             fields: Vec::new(),
             field_cursor: 0,
             edit_buf: String::new(),
@@ -322,6 +376,8 @@ impl App {
             last_section_pane_area: Rect::default(),
             last_section_list_area: Rect::default(),
             last_list_offset: 0,
+            last_section_rows: Vec::new(),
+            last_section_list_offset: 0,
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -330,12 +386,54 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
+        // Group the section list for display: stable sort by group rank
+        // keeps the canonical (dependency-correct) order within each
+        // group. Daemons that predate group plumbing send "" for every
+        // entry — all ranks tie, the sort is a no-op, and the pane
+        // renders the flat list exactly as before.
+        self.sections.sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
+        self.section = ConfigSection::Zeroclaw;
+        self.zeroclaw_pane = ZeroclawPane::Detail;
+        self.deactivate_filter();
+
+        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
+            return Ok(());
+        };
+
+        self.section_cursor = section_idx;
+        self.loaded_section = Some(section_idx);
+        self.load_aliases("agents").await?;
+
+        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
+            self.alias_cursor = 0;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path: "agents".to_string(),
+                breadcrumb: vec!["agents".to_string()],
+            };
+            self.status_msg = None;
+            return Ok(());
+        };
+
+        self.alias_cursor = alias_idx;
+        let prefix = format!("agents.{alias}");
+        self.load_fields(&prefix).await?;
+        self.screen = Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb: vec!["agents".to_string(), alias.to_string()],
+        };
+        self.status_msg = None;
         Ok(())
     }
 
@@ -455,6 +553,15 @@ impl App {
             spans.push(Span::styled("   ", theme::dim_style()));
             spans.push(Span::styled(msg.to_string(), theme::warn_style()));
         }
+        // Surface the active config directory so the user can tell which
+        // on-disk state the displayed values came from when running with
+        // --config-dir, $ZEROCLAW_CONFIG_DIR, or a daemon backed by a
+        // different config source.
+        spans.push(Span::styled("   ", theme::dim_style()));
+        spans.push(Span::styled(
+            format!("config: {}", self.config_dir_display),
+            theme::dim_style(),
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -568,6 +675,38 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Aliases/Costs tab bar click on a cost-bearing provider list.
+                if self.alias_list_has_tabs()
+                    && let Some(tab_rect) = self.last_tab_area
+                    && mouse::in_rect(mouse.column, mouse.row, tab_rect)
+                {
+                    let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+                    let display: Vec<String> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            if i == self.alias_tab {
+                                format!("▸ {l}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect();
+                    let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
+                    if let Some(idx) =
+                        mouse::tab_click_index(mouse.column, mouse.row, tab_rect, &display_refs, 3)
+                        && idx != self.alias_tab
+                        && idx < labels.len()
+                    {
+                        self.alias_tab = idx;
+                        self.deactivate_filter();
+                        if idx == 1 {
+                            self.load_cost_resources().await?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 // Tab bar click (FieldList only).
                 if let Some(tab_rect) = self.last_tab_area
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
@@ -608,17 +747,16 @@ impl App {
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and preview that section on the right.
+                // the left pane, and preview that section on the right. Display
+                // rows resolve through the draw-time `last_section_rows` map so
+                // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
-                    let labels: Vec<String> =
-                        self.sections.iter().map(|s| s.label.clone()).collect();
-                    let visible = self.filtered_indices(&labels);
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
                         self.last_section_list_area,
-                        0,
-                        visible.len(),
-                    ) && let Some(&orig) = visible.get(pos)
+                        self.last_section_list_offset,
+                        self.last_section_rows.len(),
+                    ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
                         self.section_cursor = orig;
                     }
@@ -704,12 +842,16 @@ impl App {
                 self.filtered_indices(&names).len()
             }
             Screen::AliasList { .. } => {
-                let vis = self.filtered_indices(&self.aliases);
-                // +1 for [+ Add] when not filtering
-                if self.filter.is_none() {
-                    vis.len() + 1
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_resources.len() + 1 // +1 for [+ Add]
                 } else {
-                    vis.len()
+                    let vis = self.filtered_indices(&self.aliases);
+                    // +1 for [+ Add] when not filtering
+                    if self.filter.is_none() {
+                        vis.len() + 1
+                    } else {
+                        vis.len()
+                    }
                 }
             }
             Screen::AliasCreate { .. } => 0,
@@ -813,7 +955,9 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_cursor
+                } else if self.filter.is_some() {
                     self.filter_cursor
                 } else {
                     self.alias_cursor
@@ -882,7 +1026,10 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    let total = self.cost_resources.len() + 1; // +1 for [+ Add]
+                    self.cost_cursor = pos.min(total.saturating_sub(1));
+                } else if self.filter.is_some() {
                     let visible = self.filtered_indices(&self.aliases);
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else {
@@ -949,7 +1096,12 @@ impl App {
                 self.enter_type(idx).await?;
             }
             Screen::AliasList { .. } => {
-                if self.alias_cursor < self.aliases.len() {
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    if self.cost_cursor < self.cost_resources.len() {
+                        let idx = self.cost_cursor;
+                        self.enter_cost_resource(idx).await?;
+                    }
+                } else if self.alias_cursor < self.aliases.len() {
                     let idx = self.alias_cursor;
                     self.enter_alias(idx).await?;
                 }
@@ -1068,7 +1220,85 @@ impl App {
             self.alias_enabled.push(status);
         }
         self.alias_cursor = 0;
+        self.alias_tab = 0;
+        self.cost_resources.clear();
+        self.cost_cursor = 0;
         Ok(())
+    }
+
+    fn alias_list_cost_target(&self) -> Option<(String, String)> {
+        if let Screen::AliasList {
+            section_idx,
+            breadcrumb,
+            ..
+        } = &self.screen
+            && breadcrumb.len() >= 2
+        {
+            let category = &self.sections[*section_idx].cost_category;
+            if !category.is_empty() {
+                return Some((category.clone(), breadcrumb[1].clone()));
+            }
+        }
+        None
+    }
+
+    /// Base map path for the cost-rates resource list on the active provider
+    /// AliasList: `cost.rates.providers.<category>.<type>`.
+    fn cost_base_path(&self) -> Option<String> {
+        self.alias_list_cost_target()
+            .map(|(category, provider_type)| {
+                format!("cost.rates.providers.{category}.{provider_type}")
+            })
+    }
+
+    /// Whether the active AliasList carries the Aliases/Costs tab pair.
+    fn alias_list_has_tabs(&self) -> bool {
+        self.alias_list_cost_target().is_some()
+    }
+
+    async fn load_cost_resources(&mut self) -> Result<()> {
+        if let Some(base) = self.cost_base_path() {
+            self.cost_resources = self.rpc.config_map_keys(&base).await.unwrap_or_default();
+        } else {
+            self.cost_resources.clear();
+        }
+        self.cost_cursor = 0;
+        Ok(())
+    }
+
+    /// Pre-fill a freshly created cost-rate resource from the live provider
+    /// catalog, matching the web Costs editor. Reuses the existing
+    /// `catalog_models` RPC (same payload the gateway serves the dashboard);
+    /// only the `models` category carries token pricing, so other categories
+    /// are left for manual entry. Best-effort: any miss leaves the sheet
+    /// empty rather than surfacing an error.
+    async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
+        let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
+            return;
+        };
+        let Ok(catalog) = self.rpc.catalog_models(provider_type).await else {
+            return;
+        };
+        let Some(pricing) = catalog.pricing.as_ref().and_then(|p| p.get(resource)) else {
+            return;
+        };
+        // Catalog rates are USD per token; cost sheets store USD per million.
+        let per_mtok = |s: &Option<String>| -> Option<f64> {
+            s.as_ref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v * 1_000_000.0)
+        };
+        let fields = [
+            ("input_per_mtok", per_mtok(&pricing.prompt)),
+            ("output_per_mtok", per_mtok(&pricing.completion)),
+            ("cached_input_per_mtok", per_mtok(&pricing.input_cache_read)),
+        ];
+        for (field, value) in fields {
+            if let Some(v) = value {
+                let prop = format!("{base_path}.{resource}.{field}");
+                let _ = self.rpc.config_set(&prop, serde_json::json!(v)).await;
+            }
+        }
     }
 
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
@@ -1476,6 +1706,37 @@ impl App {
     // ── Alias list ───────────────────────────────────────────────
 
     async fn handle_alias_list(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigTabAction;
+        let has_tabs = self.alias_list_has_tabs();
+
+        // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
+        // the FieldList tab bar uses. On these screens those chords no longer
+        // mean back/into; Back is the only way out to the type list.
+        if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
+            match action {
+                ConfigTabAction::TabLeft => {
+                    if self.alias_tab > 0 {
+                        self.alias_tab -= 1;
+                        self.deactivate_filter();
+                    }
+                    return Ok(());
+                }
+                ConfigTabAction::TabRight => {
+                    if self.alias_tab == 0 {
+                        self.alias_tab = 1;
+                        self.deactivate_filter();
+                        self.load_cost_resources().await?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if has_tabs && self.alias_tab == 1 {
+            return self.handle_cost_tab(key).await;
+        }
+
         let visible = self.filtered_indices(&self.aliases);
         // +1 for [+ Add] (only when not filtering)
         let has_add = self.filter.is_none();
@@ -1498,10 +1759,26 @@ impl App {
         }
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
-        use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
+        // With tabs present, TabLeft no longer doubles as Back.
+        let back = if has_tabs {
+            matches!(action, Some(ConfigTabAction::Back))
+        } else {
+            matches!(
+                action,
+                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+            )
+        };
+        let into = if has_tabs {
+            matches!(action, Some(ConfigTabAction::Enter))
+        } else {
+            matches!(
+                action,
+                Some(ConfigTabAction::Enter | ConfigTabAction::TabRight)
+            )
+        };
         match action {
-            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
+            _ if back => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::AliasList {
                     section_idx,
@@ -1521,7 +1798,7 @@ impl App {
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
+            _ if into => {
                 if has_add && self.alias_cursor == add_pos {
                     if let Screen::AliasList {
                         section_idx,
@@ -1547,17 +1824,209 @@ impl App {
                     let map_path = map_path.clone();
                     match self.rpc.config_map_key_delete(&map_path, &alias).await {
                         Ok(()) => {
-                            self.status_msg = Some(format!("Deleted {alias}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-alias-deleted",
+                                &[("alias", &alias)],
+                            ));
                             self.load_aliases(&map_path).await?;
                             if self.alias_cursor > 0 && self.alias_cursor >= self.aliases.len() {
                                 self.alias_cursor = self.aliases.len().saturating_sub(1);
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-delete-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Costs-tab key handling on a cost-bearing provider AliasList. Mirrors
+    /// the Aliases tab: a resource list with [+ Add], Enter to open the rate
+    /// sheet, delete-row to remove a resource. The map path is the
+    /// `cost.rates.providers.<category>.<type>` subtree.
+    async fn handle_cost_tab(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigTabAction;
+        let Some(base) = self.cost_base_path() else {
+            return Ok(());
+        };
+        let add_pos = self.cost_resources.len();
+        let total = add_pos + 1; // [+ Add] always present on this tab
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::AliasList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    self.types = self.types_for_section(&self.sections[section_idx].key);
+                    self.screen = Screen::TypeList { section_idx };
+                }
+                self.status_msg = None;
+            }
+            Some(ConfigTabAction::Up) => {
+                self.cost_cursor = self.cost_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.cost_cursor + 1 < total => {
+                self.cost_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if self.cost_cursor == add_pos {
+                    if let Screen::AliasList {
+                        section_idx,
+                        breadcrumb,
+                        ..
+                    } = &self.screen
+                    {
+                        self.edit_buf.clear();
+                        let mut bc = breadcrumb.clone();
+                        bc.push(ConfigTab::Costs.label().to_string());
+                        self.screen = Screen::AliasCreate {
+                            section_idx: *section_idx,
+                            map_path: base,
+                            breadcrumb: bc,
+                        };
+                    }
+                } else if self.cost_cursor < self.cost_resources.len() {
+                    self.enter_cost_resource(self.cost_cursor).await?;
+                }
+            }
+            Some(ConfigTabAction::DeleteRow | ConfigTabAction::ToggleSecret)
+                if self.cost_cursor < self.cost_resources.len() =>
+            {
+                let resource = self.cost_resources[self.cost_cursor].clone();
+                match self.rpc.config_map_key_delete(&base, &resource).await {
+                    Ok(()) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-alias-deleted",
+                            &[("alias", &resource)],
+                        ));
+                        self.load_cost_resources().await?;
+                        if self.cost_cursor > 0 && self.cost_cursor >= self.cost_resources.len() {
+                            self.cost_cursor = self.cost_resources.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-delete-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn enter_cost_resource(&mut self, idx: usize) -> Result<()> {
+        let Some(base) = self.cost_base_path() else {
+            return Ok(());
+        };
+        if let Some(resource) = self.cost_resources.get(idx).cloned()
+            && let Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            } = &self.screen
+        {
+            let prefix = format!("{base}.{resource}");
+            let mut bc = breadcrumb.clone();
+            bc.push(ConfigTab::Costs.label().to_string());
+            bc.push(resource);
+            let si = *section_idx;
+            self.load_fields(&prefix).await?;
+            self.screen = Screen::FieldList {
+                section_idx: si,
+                prefix,
+                breadcrumb: bc,
+            };
+            self.status_msg = None;
+        }
+        Ok(())
+    }
+
+    /// Restore the provider AliasList when backing out of a FieldList. Pops
+    /// the trailing segment; if a `Costs` sentinel remains it strips that too
+    /// and reopens the AliasList on the Costs tab with its resource list
+    /// loaded. Otherwise it falls back to the alias-tier list as before.
+    async fn restore_alias_list_from_field_back(
+        &mut self,
+        section_idx: usize,
+        breadcrumb: Vec<String>,
+    ) -> Result<()> {
+        let mut bc = breadcrumb;
+        bc.pop();
+        let costs_label = ConfigTab::Costs.label();
+        let on_costs = bc.last().map(|s| s.as_str()) == Some(costs_label);
+        if on_costs {
+            bc.pop();
+        }
+        let section_key = &self.sections[section_idx].key;
+        let map_path = if bc.len() == 1 {
+            section_key.clone()
+        } else {
+            format!("{}.{}", section_key, bc[1..].join("."))
+        };
+        self.load_aliases(&map_path).await?;
+        self.screen = Screen::AliasList {
+            section_idx,
+            map_path,
+            breadcrumb: bc,
+        };
+        if on_costs {
+            self.alias_tab = 1;
+            self.load_cost_resources().await?;
+        }
+        Ok(())
+    }
+
+    /// Restore the provider AliasList when cancelling or failing a create.
+    /// A `cost.rates.` map path means the create targeted the Costs tab; the
+    /// breadcrumb ends in the `Costs` sentinel, so strip it and reopen on the
+    /// Costs tab. Otherwise reopen the alias-tier list at the map path.
+    async fn restore_alias_list_from_create_back(
+        &mut self,
+        section_idx: usize,
+        map_path: String,
+        breadcrumb: Vec<String>,
+    ) -> Result<()> {
+        let costs_label = ConfigTab::Costs.label();
+        let on_costs = breadcrumb.last().map(|s| s.as_str()) == Some(costs_label);
+        if on_costs {
+            let mut bc = breadcrumb;
+            bc.pop();
+            let section_key = &self.sections[section_idx].key;
+            let provider_path = if bc.len() == 1 {
+                section_key.clone()
+            } else {
+                format!("{}.{}", section_key, bc[1..].join("."))
+            };
+            self.load_aliases(&provider_path).await?;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path: provider_path,
+                breadcrumb: bc,
+            };
+            self.alias_tab = 1;
+            self.load_cost_resources().await?;
+        } else {
+            self.load_aliases(&map_path).await?;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            };
         }
         Ok(())
     }
@@ -1600,12 +2069,8 @@ impl App {
                     ..
                 } = std::mem::replace(&mut self.screen, Screen::SectionList)
                 {
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb,
-                    };
+                    self.restore_alias_list_from_create_back(section_idx, map_path, breadcrumb)
+                        .await?;
                 }
             }
             Some(ConfigEditorAction::Confirm) => {
@@ -1623,6 +2088,7 @@ impl App {
                 {
                     match self.rpc.config_map_key_create(&map_path, &name).await {
                         Ok(()) => {
+                            self.prefill_cost_rates_from_catalog(&map_path, &name).await;
                             let prefix = format!("{}.{}", map_path, name);
                             let mut bc = breadcrumb;
                             bc.push(name);
@@ -1635,13 +2101,16 @@ impl App {
                             self.status_msg = None;
                         }
                         Err(e) => {
-                            self.status_msg = Some(format!("Create failed: {e}"));
-                            self.load_aliases(&map_path).await?;
-                            self.screen = Screen::AliasList {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-alias-create-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                            self.restore_alias_list_from_create_back(
                                 section_idx,
                                 map_path,
                                 breadcrumb,
-                            };
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1725,20 +2194,8 @@ impl App {
                 } = screen
                     && breadcrumb.len() >= 2
                 {
-                    let mut bc = breadcrumb;
-                    bc.pop();
-                    let section_key = &self.sections[section_idx].key;
-                    let map_path = if bc.len() == 1 {
-                        section_key.clone()
-                    } else {
-                        format!("{}.{}", section_key, bc[1..].join("."))
-                    };
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb: bc,
-                    };
+                    self.restore_alias_list_from_field_back(section_idx, breadcrumb)
+                        .await?;
                 }
                 self.status_msg = None;
             }
@@ -1771,12 +2228,20 @@ impl App {
                         let prefix = prefix.clone();
                         match self.rpc.config_delete(&prop).await {
                             Ok(()) => {
-                                self.status_msg = Some(format!("Reset {prop}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-field-reset",
+                                    &[("prop", &prop)],
+                                ));
                                 self.load_fields(&prefix).await?;
                                 self.field_cursor =
                                     saved_cursor.min(self.fields.len().saturating_sub(1));
                             }
-                            Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                            Err(e) => {
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-delete-failed",
+                                    &[("err", &e.to_string())],
+                                ));
+                            }
                         }
                     }
                 }
@@ -1803,7 +2268,12 @@ impl App {
                 let _ = self.draw(term);
                 match self.load_personality_files().await {
                     Ok(()) => self.status_msg = None,
-                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
                 }
             }
             ConfigTab::Skills if self.skills_list.is_empty() => {
@@ -1811,7 +2281,12 @@ impl App {
                 let _ = self.draw(term);
                 match self.load_skills_list().await {
                     Ok(()) => self.status_msg = None,
-                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -1882,7 +2357,10 @@ impl App {
             Some(ConfigTabAction::Enter) => {
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
-                    self.status_msg = Some(format!("Loading {filename}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-personality-loading-file",
+                        &[("filename", &filename)],
+                    ));
                     let _ = self.draw(term);
                     match self.load_personality_file(&filename).await {
                         Ok(()) => {
@@ -1906,11 +2384,17 @@ impl App {
                                             Ok(_) => {
                                                 self.personality_loaded =
                                                     self.personality_content.clone();
-                                                self.status_msg = Some(format!("Saved {filename}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-personality-saved-file",
+                                                    &[("filename", &filename)],
+                                                ));
                                                 let _ = self.load_personality_files().await;
                                             }
                                             Err(e) => {
-                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-save-failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
                                             }
                                         }
                                     } else {
@@ -1923,7 +2407,12 @@ impl App {
                                 }
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-load-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -1975,16 +2464,25 @@ impl App {
                                         self.personality_active_file = None;
                                     }
                                     Err(_) => {
-                                        self.status_msg =
-                                            Some(format!("Template loaded for {filename}"));
+                                        self.status_msg = Some(crate::i18n::t_args(
+                                            "zc-config-status-template-loaded",
+                                            &[("filename", &filename)],
+                                        ));
                                     }
                                 }
                             } else {
-                                self.status_msg =
-                                    Some(format!("No template available for {filename}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-template-missing",
+                                    &[("filename", &filename)],
+                                ));
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Template fetch failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-template-fetch-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2016,16 +2514,27 @@ impl App {
                         ));
                         return Ok(());
                     }
-                    self.status_msg = Some(format!("Saving {filename}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-personality-saving-file",
+                        &[("filename", &filename)],
+                    ));
                     let _ = self.draw(term);
                     match self.rpc.personality_put(&agent, &filename, &content).await {
                         Ok(_) => {
                             self.personality_loaded = self.personality_content.clone();
-                            self.status_msg = Some(format!("Saved {filename}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-personality-saved-file",
+                                &[("filename", &filename)],
+                            ));
                             let _ = self.load_personality_files().await;
                             self.personality_active_file = Some(filename);
                         }
-                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-save-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2107,7 +2616,10 @@ impl App {
             Some(ConfigTabAction::Enter) => {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
-                    self.status_msg = Some(format!("Loading {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-loading",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self.load_skill(&name).await {
                         Ok(()) => {
@@ -2126,10 +2638,16 @@ impl App {
                                         {
                                             Ok(_) => {
                                                 self.skills_body_loaded = self.skills_body.clone();
-                                                self.status_msg = Some(format!("Saved {name}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-skill-saved",
+                                                    &[("name", &name)],
+                                                ));
                                             }
                                             Err(e) => {
-                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-save-failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
                                             }
                                         }
                                     } else {
@@ -2143,7 +2661,12 @@ impl App {
                                 }
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-load-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2151,14 +2674,25 @@ impl App {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     let bundle = self.skills_bundle.clone();
-                    self.status_msg = Some(format!("Deleting {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-deleting",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self.rpc.skills_delete(&bundle, &name).await {
                         Ok(_) => {
-                            self.status_msg = Some(format!("Archived {name}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-skill-archived",
+                                &[("name", &name)],
+                            ));
                             let _ = self.load_skills_list().await;
                         }
-                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-delete-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2183,7 +2717,10 @@ impl App {
                     let bundle = self.skills_bundle.clone();
                     let frontmatter = self.skills_frontmatter.clone();
                     let body = self.skills_body.clone();
-                    self.status_msg = Some(format!("Saving {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-saving",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self
                         .rpc
@@ -2193,9 +2730,17 @@ impl App {
                         Ok(_) => {
                             self.skills_body_loaded = self.skills_body.clone();
                             self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
-                            self.status_msg = Some(format!("Saved {name}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-skill-saved",
+                                &[("name", &name)],
+                            ));
                         }
-                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-save-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2234,7 +2779,10 @@ impl App {
                 let family = segments[2].to_string();
 
                 // Show loading indicator before the blocking RPC call.
-                self.status_msg = Some(format!("Fetching models for {family}..."));
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-fetching-models",
+                    &[("family", &family)],
+                ));
                 let _ = self.draw(term);
 
                 match self.rpc.catalog_models(&family).await {
@@ -2258,50 +2806,23 @@ impl App {
             }
         }
 
-        // `risk_profile` / `runtime_profile` inside an agent alias →
-        // present a picker populated from the matching map's aliases.
-        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
-        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
-        if field_path.starts_with("agents.") {
-            let segs: Vec<&str> = field_path.split('.').collect();
-            // Expect agents.<alias>.<field>
-            if segs.len() == 3 {
-                let map_path = match segs[2] {
-                    "risk_profile" => Some("risk_profiles"),
-                    "runtime_profile" => Some("runtime_profiles"),
-                    _ => None,
-                };
-                if let Some(map_path) = map_path {
-                    self.status_msg = Some(format!("Loading {map_path}..."));
-                    let _ = self.draw(term);
-                    match self.rpc.config_list(Some(map_path)).await {
-                        Ok(entries) => {
-                            let prefix = format!("{map_path}.");
-                            let mut aliases: Vec<String> = entries
-                                .iter()
-                                .filter_map(|e| e.path.strip_prefix(&prefix))
-                                .filter_map(|rest| rest.split('.').next())
-                                .map(|s| s.to_string())
-                                .collect();
-                            aliases.sort();
-                            aliases.dedup();
-                            if !aliases.is_empty() {
-                                self.select_cursor = aliases
-                                    .iter()
-                                    .position(|v| v == &field_current)
-                                    .unwrap_or(0);
-                                self.select_items = aliases;
-                                self.status_msg = None;
-                            } else {
-                                self.status_msg =
-                                    Some(format!("No {map_path} defined — enter manually"));
-                            }
-                        }
-                        Err(_) => {
-                            self.status_msg =
-                                Some(format!("{map_path} fetch failed — enter manually"));
-                        }
-                    }
+        // Alias-reference fields resolve their picker list generically from
+        // the field's `alias_source` — no per-path special-casing.
+        if let Some(source) = self.fields[idx].alias_source {
+            self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
+            let _ = self.draw(term);
+            match self.rpc.config_resolve_alias_source(source).await {
+                Ok(values) if !values.is_empty() => {
+                    self.select_cursor =
+                        values.iter().position(|v| v == &field_current).unwrap_or(0);
+                    self.select_items = values;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
                 }
             }
         }
@@ -2500,11 +3021,19 @@ impl App {
                         );
                         match self.rpc.config_set(&prop, value).await {
                             Ok(()) => {
-                                self.status_msg = Some(format!("Set {prop}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-field-set",
+                                    &[("prop", &prop)],
+                                ));
                                 self.load_fields(&prefix).await?;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
-                            Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                            Err(e) => {
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-set-failed",
+                                    &[("err", &e.to_string())],
+                                ));
+                            }
                         }
                     }
                 }
@@ -2534,11 +3063,19 @@ impl App {
                     let prefix = prefix.clone();
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
-                            self.status_msg = Some(format!("Set {prop}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-field-set",
+                                &[("prop", &prop)],
+                            ));
                             self.load_fields(&prefix).await?;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
-                        Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-set-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2605,11 +3142,19 @@ impl App {
             let prefix = prefix.clone();
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
-                    self.status_msg = Some(format!("Set {prop}"));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-field-set",
+                        &[("prop", &prop)],
+                    ));
                     self.load_fields(&prefix).await?;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
-                Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                Err(e) => {
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-set-failed",
+                        &[("err", &e.to_string())],
+                    ));
+                }
             }
         }
         Ok(())
@@ -2667,6 +3212,30 @@ impl App {
     /// Persistent left pane: the section list. `active` is true while the
     /// SectionList screen holds focus (bright highlight); once a section is
     /// entered the list dims to a "you are here" marker.
+    /// Display rank of a section-group label. Mirror of
+    /// `zeroclaw_config::sections::SECTION_GROUPS` — zerocode talks to
+    /// remote daemons over the wire, so like the dashboard's
+    /// `GROUP_ORDER` (web/src/pages/Config.tsx) it carries its own copy
+    /// of the order instead of linking the config crate. Unknown and
+    /// empty labels rank with "Other" so nothing ever vanishes.
+    fn group_rank(label: &str) -> usize {
+        const ORDER: &[&str] = &[
+            "Foundation",
+            "Agent",
+            "Multi-agent",
+            "Tools",
+            "Integrations",
+            "Network",
+            "Storage",
+            "Operations",
+            "Other",
+        ];
+        ORDER
+            .iter()
+            .position(|g| *g == label)
+            .unwrap_or(ORDER.len() - 1)
+    }
+
     fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
         use ratatui::layout::{Constraint, Direction, Layout};
         // Reserve one line at the top for the filter bar when filtering.
@@ -2690,24 +3259,48 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        let items: Vec<ListItem> = visible
-            .iter()
-            .map(|&i| {
-                let s = &self.sections[i];
-                let badge = if s.completed { " ✓" } else { "" };
-                ListItem::new(Line::from(Span::styled(
-                    format!("{}{badge}", s.label),
-                    theme::body_style(),
-                )))
-            })
-            .collect();
+        // Grouped display: dim header rows between groups, sections
+        // beneath. Active only when the daemon sent group labels and no
+        // filter narrows the list — filtering and old daemons render the
+        // flat all-sections list unchanged. `row_map` records what each
+        // display row is so the cursor and mouse hit-testing resolve
+        // through it instead of assuming row == section position.
+        let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
+        let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
+        let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
+        let mut last_group: Option<&str> = None;
+        for &i in &visible {
+            let s = &self.sections[i];
+            if grouped {
+                let group = if s.group.is_empty() {
+                    "Other"
+                } else {
+                    s.group.as_str()
+                };
+                if last_group != Some(group) {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        group.to_string(),
+                        theme::dim_style().add_modifier(Modifier::BOLD),
+                    ))));
+                    row_map.push(None);
+                    last_group = Some(group);
+                }
+            }
+            let badge = if s.completed { " ✓" } else { "" };
+            let indent = if grouped { " " } else { "" };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("{indent}{}{badge}", s.label),
+                theme::body_style(),
+            ))));
+            row_map.push(Some(i));
+        }
 
         let cursor = if self.filter.is_some() {
             self.filter_cursor
         } else {
-            visible
+            row_map
                 .iter()
-                .position(|&i| i == self.section_cursor)
+                .position(|r| *r == Some(self.section_cursor))
                 .unwrap_or(0)
         };
 
@@ -2732,7 +3325,9 @@ impl App {
         );
         self.last_main_area = list_area;
         self.last_section_list_area = list_area;
+        self.last_section_rows = row_map;
         self.last_list_offset = state.offset();
+        self.last_section_list_offset = state.offset();
         self.last_tab_area = None;
     }
 
@@ -2854,12 +3449,50 @@ impl App {
         section_idx: usize,
         breadcrumb: &[String],
     ) {
-        let r = regions(area);
+        let mut r = regions(area);
         let section = &self.sections[section_idx];
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        // Aliases/Costs tab bar on cost-bearing provider types. Reuses the
+        // same two-row help split the FieldList tab bar uses.
+        let has_tabs = self.alias_list_has_tabs();
+        let tab_area = if has_tabs {
+            use ratatui::layout::{Constraint, Direction, Layout};
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(r.help);
+            r.help = split[1];
+            Some(split[0])
+        } else {
+            None
+        };
+        if let Some(tab_rect) = tab_area {
+            let labels = [ConfigTab::Aliases.label(), ConfigTab::Costs.label()];
+            let mut spans = Vec::new();
+            for (i, label) in labels.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" │ ", theme::dim_style()));
+                }
+                if i == self.alias_tab {
+                    spans.push(Span::styled(
+                        format!("▸ {label}"),
+                        theme::accent_style().add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(*label, theme::dim_style()));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), tab_rect);
+        }
+
+        if has_tabs && self.alias_tab == 1 {
+            self.draw_cost_resource_list(frame, r, tab_area);
+            return;
+        }
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
@@ -2917,7 +3550,7 @@ impl App {
         );
         self.last_main_area = r.main;
         self.last_list_offset = state.offset();
-        self.last_tab_area = None;
+        self.last_tab_area = tab_area;
 
         let hints = if self.filter.is_some() {
             format!(
@@ -2930,6 +3563,51 @@ impl App {
             "?=help".to_string()
         };
         self.draw_footer(frame, r, &hints);
+    }
+
+    /// Costs-tab body: the resource rate sheets under
+    /// `cost.rates.providers.<category>.<type>`, with an [+ Add] affordance.
+    fn draw_cost_resource_list(&mut self, frame: &mut Frame, r: Regions, tab_area: Option<Rect>) {
+        let base = self.cost_base_path().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{base}.<resource>"),
+                theme::dim_style(),
+            )),
+            r.help,
+        );
+
+        let mut items: Vec<ListItem> = self
+            .cost_resources
+            .iter()
+            .map(|res| ListItem::new(Line::from(Span::styled(res.clone(), theme::body_style()))))
+            .collect();
+        items.push(ListItem::new(Line::from(Span::styled(
+            "[+ Add]",
+            theme::accent_style(),
+        ))));
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(self.cost_cursor.min(items.len().saturating_sub(1))));
+        }
+
+        let (dstyle, dsym) = self.detail_highlight();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    ConfigTab::Costs.label()
+                )))
+                .highlight_style(dstyle)
+                .highlight_symbol(dsym),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = tab_area;
+        self.draw_footer(frame, r, "?=help");
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -3370,7 +4048,7 @@ impl App {
 
             let title = match field.kind {
                 PropKind::Bool => format!(" {short_name} (toggle) "),
-                PropKind::Enum => format!(" {short_name} (select) "),
+                PropKind::Enum | PropKind::AliasRef => format!(" {short_name} (select) "),
                 _ => format!(" {short_name} "),
             };
 
@@ -3656,6 +4334,20 @@ impl App {
                         clear_filter(),
                         help(),
                     ])
+                } else if self.alias_list_has_tabs() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        E::new(
+                            switch_tabs_keys(),
+                            crate::i18n::t("zc-config-help-switch-tabs"),
+                        ),
+                        k(A::Enter, "zc-config-help-open-alias"),
+                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        back(),
+                        help(),
+                        E::spacer(),
+                        mouse_open(),
+                    ])
                 } else {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
@@ -3917,15 +4609,9 @@ fn edit_in_external_editor(
     content: &str,
     filename_hint: &str,
 ) -> Result<String, String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "vi".into()
-            }
-        });
+    let Some(editor) = crate::editor::editor_from_env_or_path() else {
+        return Err("no external editor found; set VISUAL or EDITOR".to_string());
+    };
 
     // Write content to a temp file with the right extension.
     let dir = std::env::temp_dir();
@@ -3954,7 +4640,7 @@ fn edit_in_external_editor(
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     // Force a full redraw so ratatui repaints everything.
@@ -3975,5 +4661,19 @@ fn edit_in_external_editor(
             let _ = std::fs::remove_file(&tmp_path);
             Err(format!("failed to launch {editor}: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_enhancement_flags_disambiguate_modified_enter() {
+        assert!(
+            keyboard_enhancement_flags()
+                .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
     }
 }

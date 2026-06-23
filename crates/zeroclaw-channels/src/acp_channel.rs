@@ -16,7 +16,21 @@
 //!   first-class method until the [elicitation RFD][rfd] lands; until then
 //!   `ask_user` callers under ACP must supply structured `choices`.
 //!
+//! ## Wire format
+//!
+//! Per the [ACP conventions][acp-conventions]: ACP-defined JSON object
+//! property keys use **camelCase** (`sessionId`, `toolCallId`, `rawInput`,
+//! `sessionUpdate`, `oldText`, `newText`, …), and string values carried by
+//! discriminator fields use **snake_case** (`agent_message_chunk`,
+//! `allow_once`, `reject_with_edit`, …). The JSON-RPC envelope follows the
+//! 2.0 spec and is constructed by [`zeroclaw_api::jsonrpc`] using the
+//! shared [`JSONRPC_VERSION`][zeroclaw_api::jsonrpc::JSONRPC_VERSION]
+//! constant. Do **not** snake_case-rewrite these property keys: the
+//! upstream ACP spec is the contract these IDE clients (Zed, Toad, …)
+//! parse against, and divergence breaks them.
+//!
 //! [rfd]: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+//! [acp-conventions]: https://agentclientprotocol.com/protocol/v1/overview#conventions
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -434,6 +448,7 @@ impl Channel for AcpChannel {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+    use zeroclaw_api::jsonrpc::JSONRPC_VERSION;
 
     fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
@@ -463,7 +478,7 @@ mod tests {
 
         let line = rx.recv().await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["sessionId"], "sess-1");
         assert_eq!(

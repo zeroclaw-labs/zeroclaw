@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use traits::ObserverMetric;
-use zeroclaw_config::schema::ObservabilityConfig;
+use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
 /// Process-wide broadcast hook installed by long-running subsystems (today: the
 /// gateway) so that events emitted by observers built in *other* subsystems —
@@ -157,10 +157,10 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
 }
 
 fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    match config.backend.as_str() {
-        "log" => Box::new(LogObserver::new()),
-        "verbose" => Box::new(VerboseObserver::new()),
-        "prometheus" => {
+    match config.backend {
+        ObservabilityBackend::Log => Box::new(LogObserver::new()),
+        ObservabilityBackend::Verbose => Box::new(VerboseObserver::new()),
+        ObservabilityBackend::Prometheus => {
             #[cfg(feature = "observability-prometheus")]
             {
                 Box::new(PrometheusObserver::shared())
@@ -176,7 +176,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 Box::new(NoopObserver)
             }
         }
-        "otel" | "opentelemetry" | "otlp" => {
+        ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
             match OtelObserver::new(
                 config.otel_endpoint.as_deref(),
@@ -217,19 +217,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 Box::new(NoopObserver)
             }
         }
-        "none" | "noop" => Box::new(NoopObserver),
-        _ => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Unknown observability backend '{}', falling back to noop",
-                    config.backend
-                )
-            );
-            Box::new(NoopObserver)
-        }
+        ObservabilityBackend::None => Box::new(NoopObserver),
     }
 }
 
@@ -240,7 +228,7 @@ mod tests {
     #[test]
     fn factory_none_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "none".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -249,7 +237,7 @@ mod tests {
     #[test]
     fn factory_noop_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -258,7 +246,7 @@ mod tests {
     #[test]
     fn factory_log_returns_log() {
         let cfg = ObservabilityConfig {
-            backend: "log".into(),
+            backend: ObservabilityBackend::Log,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "log");
@@ -267,7 +255,7 @@ mod tests {
     #[test]
     fn factory_verbose_returns_verbose() {
         let cfg = ObservabilityConfig {
-            backend: "verbose".into(),
+            backend: ObservabilityBackend::Verbose,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "verbose");
@@ -276,7 +264,7 @@ mod tests {
     #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
-            backend: "prometheus".into(),
+            backend: ObservabilityBackend::Prometheus,
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-prometheus") {
@@ -290,7 +278,7 @@ mod tests {
     #[test]
     fn factory_otel_returns_otel() {
         let cfg = ObservabilityConfig {
-            backend: "otel".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -306,7 +294,7 @@ mod tests {
     #[test]
     fn factory_opentelemetry_alias() {
         let cfg = ObservabilityConfig {
-            backend: "opentelemetry".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -322,7 +310,7 @@ mod tests {
     #[test]
     fn factory_otlp_alias() {
         let cfg = ObservabilityConfig {
-            backend: "otlp".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -336,30 +324,12 @@ mod tests {
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: "xyzzy_unknown".into(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
-    }
-
-    #[test]
-    fn factory_empty_string_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: String::new(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
-    }
-
-    #[test]
-    fn factory_garbage_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: "xyzzy_garbage_123".into(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
+    fn unknown_backend_falls_back_to_noop_at_load() {
+        let bad: ObservabilityConfig = toml::from_str("backend = \"xyzzy_unknown\"").unwrap();
+        assert_eq!(bad.backend, ObservabilityBackend::None);
+        let empty: ObservabilityConfig = toml::from_str("backend = \"\"").unwrap();
+        assert_eq!(empty.backend, ObservabilityBackend::None);
+        assert_eq!(create_observer(&bad).name(), "noop");
     }
 
     use parking_lot::Mutex as PlMutex;
@@ -404,7 +374,7 @@ mod tests {
         set_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -429,7 +399,7 @@ mod tests {
         set_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -449,7 +419,7 @@ mod tests {
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -468,7 +438,7 @@ mod tests {
         let broadcast_guard = set_scoped_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -495,7 +465,7 @@ mod tests {
         drop(old_guard);
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -519,7 +489,7 @@ mod tests {
         let new_guard = set_scoped_broadcast_hook(new_hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -546,7 +516,7 @@ mod tests {
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
-            backend: "log".into(),
+            backend: ObservabilityBackend::Log,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);

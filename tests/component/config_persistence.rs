@@ -14,52 +14,35 @@ use zeroclaw::config::{Config, MemoryConfig};
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn config_default_has_expected_provider() {
+fn config_default_has_no_model_provider_profiles() {
     let config = Config::default();
-    // Default config has no model_provider until configured
     assert!(
-        config.providers.models.is_empty() || !config.providers.models.is_empty(),
-        "default config should be constructible"
+        config.providers.models.is_empty(),
+        "default config should not synthesize provider profiles"
+    );
+    assert_eq!(
+        config.providers.models.iter_entries().count(),
+        0,
+        "default config should have no typed provider entries"
     );
 }
 
 #[test]
-fn config_default_has_expected_model() {
+fn config_default_has_no_resolved_model() {
     let config = Config::default();
-    // Default config has no model until configured
-    assert!(
-        config
-            .providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(_, _, e)| e)
-            .and_then(|e| e.model.as_deref())
-            .is_none()
-            || config
-                .providers
-                .models
-                .iter_entries()
-                .next()
-                .map(|(_, _, e)| e)
-                .and_then(|e| e.model.as_deref())
-                .is_some(),
-        "default config should be constructible"
+    assert_eq!(
+        config.resolve_default_model(),
+        None,
+        "default config should not resolve a model until one is configured"
     );
 }
 
 #[test]
-fn config_default_temperature_positive() {
+fn config_default_validates_without_provider_profiles() {
     let config = Config::default();
-    let temp = config
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(_, _, e)| e)
-        .and_then(|e| e.temperature)
-        .unwrap_or(0.7);
-    assert!(temp > 0.0, "default temperature should be positive");
+    config
+        .validate()
+        .expect("default config should validate without provider profiles");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

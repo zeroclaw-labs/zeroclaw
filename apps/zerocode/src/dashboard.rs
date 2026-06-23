@@ -26,6 +26,10 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// of the conversation. Long sessions never load the full history.
 const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
+pub(crate) enum DashboardMouseAction {
+    OpenAgentConfig(String),
+}
+
 // ── Tab enum ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +127,7 @@ pub(crate) struct Dashboard {
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
+    overview_agents_area: Rect,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
 }
@@ -167,6 +172,7 @@ impl Dashboard {
             search_query_saved: String::new(),
             tab_area: Rect::default(),
             list_area: Rect::default(),
+            overview_agents_area: Rect::default(),
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
         }
@@ -460,7 +466,7 @@ impl Dashboard {
 
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -573,6 +579,7 @@ impl Dashboard {
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
         let agents_inner = agents_block.inner(chunks[1]);
+        self.overview_agents_area = chunks[1];
         frame.render_widget(agents_block, chunks[1]);
 
         let items: Vec<ListItem> = self
@@ -1875,7 +1882,11 @@ impl Dashboard {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(&mut self, evt: MouseEvent, _content_area: Rect) {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        evt: MouseEvent,
+        _content_area: Rect,
+    ) -> Option<DashboardMouseAction> {
         use crossterm::event::MouseButton;
 
         let col = evt.column;
@@ -1883,6 +1894,19 @@ impl Dashboard {
 
         match evt.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tab == Tab::Overview
+                    && mouse::in_rect(col, row, self.overview_agents_area)
+                    && let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.overview_agents_area,
+                        0,
+                        self.agents.len(),
+                    )
+                    && let Some(agent) = self.agents.get(idx)
+                {
+                    return Some(DashboardMouseAction::OpenAgentConfig(agent.alias.clone()));
+                }
+
                 // Tab bar clicks
                 let labels: Vec<String> = TABS
                     .iter()
@@ -1891,7 +1915,7 @@ impl Dashboard {
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
                     self.tab = TABS[idx];
-                    return;
+                    return None;
                 }
 
                 // List clicks
@@ -1934,6 +1958,7 @@ impl Dashboard {
             }
             _ => {}
         }
+        None
     }
 
     // ── Navigation helpers ───────────────────────────────────────

@@ -57,15 +57,22 @@ bash scripts/release/bump-version.sh X.Y.Z
 
 </div>
 
-This updates README badges, the Tauri config, and
-workflow description examples. Commit everything together:
+This updates README badges, the Tauri config, and workflow description
+examples, then regenerates every spec-driven install surface via
+`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
+`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
+feature lists from the canonical install spec (`Cargo.toml` plus
+`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
+never hand-edit a generated region. Commit everything together:
 
 ```text
 chore: bump version to vX.Y.Z
 ```
 
 Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
-CI is green.
+CI is green. The **Installer Drift** gate in CI fails the PR if a generated
+surface is out of sync with the spec, so a missed regeneration cannot land.
 
 **Confirm the merge landed correctly:**
 
@@ -318,7 +325,8 @@ ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is 
 ### What happens automatically
 
 - Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
-- If the tag is a GA release (no pre-release suffix), it is also copied to `/stable/`.
+- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
+- `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 
 ### Bootstrapping `gh-pages`
@@ -331,6 +339,9 @@ If `gh-pages` is ever deleted or needs to be fully recreated, seed the versions 
 
 > [!IMPORTANT]
 > `master` must be deployed **last** during bootstrapping. It writes the definitive `_shared/` chrome layer that all other versions use.
+
+> [!NOTE]
+> Stable resolves from `docs/book/stable-version.txt` (committed in source, published to the gh-pages root as `stable-version.txt`). After bootstrapping, confirm that file names the intended GA release; the root redirect and the "Stable (latest release)" selector entry follow it. No `/stable/` directory is created.
 
 ### Manual redeploys and the Version Floor
 
@@ -347,7 +358,7 @@ To prevent accidentally deploying very old or unsupported versions, the workflow
 
 If you need to raise the floor to drop support for an older version:
 1. Update the `DOCS_MIN_VERSION` environment variable in `.github/workflows/docs-deploy.yml`.
-2. (Optional) Delete the old version's directory from the `gh-pages` branch to save space.
+2. Old version directories are pruned automatically on the next deploy by the `DOCS_KEEP_VERSIONS` retention pass; no manual `gh-pages` edit is required to reclaim space.
 
 ---
 

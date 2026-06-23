@@ -82,9 +82,13 @@ if [[ -f "$ROOT_CARGO" ]]; then
   # [workspace.package] version — first bare `version = "..."` line in the file
   sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
     || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
-  # [workspace.dependencies] path-dep version pins, skipping aardvark*
-  sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
-    || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
+  # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
+  # both crates/ and apps/ path deps (e.g. apps/zerocode) so every in-tree
+  # member tracks the workspace version; a missed apps/ pin leaves the lockfile
+  # unresolvable and breaks `cargo metadata` mid-bump. Uses '#' as the sed
+  # delimiter so the (crates|apps) alternation pipe is not read as a delimiter.
+  sed -i -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO"
   after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then
     echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
@@ -181,6 +185,45 @@ for f in "${docs_files[@]}"; do
       ;;
   esac
 done
+
+# ── Docs stable-version pointer ────────────────────────────────────
+# Single source of truth for "which deployed docs version is Stable". The
+# docs-deploy workflow reads this to resolve the "Stable (latest release)"
+# selector entry and the root redirect, with no numeric guessing and no duplicate
+# stable/ tree. Running bump-version IS the declaration that this version is
+# the new stable; landing this change on master refreshes the stable metadata
+# (root redirect and selector entry resolve to this release's existing version
+# dir). It does not rebuild or republish the release tag's docs.
+echo "Docs stable-version pointer..."
+STABLE_PTR="$REPO_ROOT/docs/book/stable-version.txt"
+if [[ -f "$STABLE_PTR" ]]; then
+  before="$(cat "$STABLE_PTR")"
+  printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
+  if [[ "$before" != "$(cat "$STABLE_PTR")" ]]; then
+    echo "  updated: docs/book/stable-version.txt"
+    changed=$((changed + 1))
+  fi
+else
+  printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
+  echo "  created: docs/book/stable-version.txt"
+  changed=$((changed + 1))
+fi
+
+# ── Generated install surfaces (single source of truth) ───────────
+# After the workspace version is bumped, regenerate every spec-driven install
+# surface so version and feature sets stay canonical. This OWNS the version and
+# feature content of setup.bat, dist/aur/PKGBUILD, dist/scoop/zeroclaw.json,
+# flake.nix, the Dockerfiles/Containerfile feature sets, and
+# dev/ci/docker-tags.toml. No per-file sed hacks for those. CI's Installer
+# Drift gate fails if this is skipped.
+echo "Generated install surfaces (cargo generate installers)..."
+if command -v cargo >/dev/null 2>&1; then
+  ( cd "$REPO_ROOT" && cargo generate installers ) \
+    && { echo "  regenerated install surfaces"; changed=$((changed + 1)); } \
+    || echo "  warn: cargo generate installers failed; run it manually and commit the result"
+else
+  echo "  skip: cargo not on PATH; run 'cargo generate installers' before committing"
+fi
 
 echo ""
 if [[ $changed -gt 0 ]]; then

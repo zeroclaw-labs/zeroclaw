@@ -123,7 +123,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         AliasedAgentConfig {
             enabled: true,
             model_provider: format!("{provider_type}.default").into(),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..Default::default()
         },
     );

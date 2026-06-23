@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
+use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -59,6 +59,7 @@ pub mod method {
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
+    pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
@@ -89,6 +90,7 @@ pub mod method {
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
+    pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
@@ -808,6 +810,19 @@ impl RpcClient {
         Ok(result.keys)
     }
 
+    pub async fn config_resolve_alias_source(
+        &self,
+        source: crate::wire::AliasSource,
+    ) -> Result<Vec<String>> {
+        let result: ConfigResolveAliasSourceResult = self
+            .call(
+                method::CONFIG_RESOLVE_ALIAS_SOURCE,
+                serde_json::json!({ "source": source }),
+            )
+            .await?;
+        Ok(result.values)
+    }
+
     pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
         let _: Value = self
             .call(
@@ -1123,6 +1138,10 @@ impl RpcClient {
         self.call(method::HEALTH, serde_json::json!({})).await
     }
 
+    pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
+        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+    }
+
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
         self.call(method::COST_QUERY, serde_json::json!({ "agent": agent }))
             .await
@@ -1321,6 +1340,12 @@ pub struct ConfigMapKeysResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct ConfigResolveAliasSourceResult {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigSectionsResult {
     pub sections: Vec<ConfigSectionEntry>,
 }
@@ -1332,8 +1357,16 @@ pub struct ConfigSectionEntry {
     pub label: String,
     pub help: String,
     pub completed: bool,
+    /// Display group label (`"Foundation"`, `"Tools"`, …) from
+    /// `zeroclaw_config::sections::SectionGroup::label()`. Empty when
+    /// the daemon predates group plumbing — the sections pane falls
+    /// back to the flat ungrouped list.
+    #[serde(default)]
+    pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
+    #[serde(default)]
+    pub cost_category: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1346,8 +1379,27 @@ pub struct ConfigTemplatesResult {
 #[serde(rename_all = "snake_case")]
 pub struct CatalogModelsResult {
     pub models: Vec<String>,
+    /// Pricing keyed by upstream model id, when the provider's catalog
+    /// returns it. Mirrors the gateway `/api/config/catalog/models` payload
+    /// (same RPC) so the Costs tab can pre-fill rate sheets.
+    #[serde(default)]
+    pub pricing: Option<std::collections::HashMap<String, CatalogModelPricing>>,
     #[serde(default)]
     pub live: bool,
+}
+
+/// Per-token USD pricing strings as emitted by the catalog RPC. Field names
+/// match `zeroclaw_api::model_provider::ModelPricing`; only the rates the
+/// cost-rate sheet consumes are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CatalogModelPricing {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub completion: Option<String>,
+    #[serde(default)]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1952,8 +2004,6 @@ pub struct TuiListEntry {
 pub struct TuiListResult {
     pub tuis: Vec<TuiListEntry>,
 }
-
-// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod session_method_tests {

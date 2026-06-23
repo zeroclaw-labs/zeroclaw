@@ -161,7 +161,7 @@ the handoff.
    |---|---|
    | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
    | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
-   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @singlerider and @theonlyhennygod; use @JordanTheJet for hardware, edge-deployment, or project-lead scope → go to step 6 |
+   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @singlerider; use @JordanTheJet only for hardware, edge-deployment, or project-lead scope → go to step 6 |
    | No scope match + feature, but PR is approved, clean, labels/body are aligned, required checks are green, and the reviewer is preparing merge | Assign the **earliest open milestone** by version order → go to step 5 |
 
    "Earliest open milestone" means the lowest semver among all currently open
@@ -209,7 +209,7 @@ the handoff.
    merge-ready:**
 
    Post a comment on the PR tagging the milestone owners for alignment. Default
-   to @singlerider and @theonlyhennygod; use @JordanTheJet only when the unclear
+   to @singlerider; use @JordanTheJet only when the unclear
    placement is primarily about hardware, edge deployments, or project-lead
    scope. Do this only when the PR is not otherwise ready to merge. If the PR is
    approved, clean, labels/body are aligned, required checks are green, and the
@@ -220,7 +220,7 @@ the handoff.
    Example comment:
    ```bash
    gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
-     --body "@singlerider @theonlyhennygod — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+     --body "@singlerider — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
    ```
 
    Note this in `tmp/handoff.md` so the next session knows alignment is

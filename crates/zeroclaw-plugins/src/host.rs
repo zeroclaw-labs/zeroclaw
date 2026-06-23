@@ -27,24 +27,45 @@ struct LoadedPlugin {
 }
 
 impl PluginHost {
-    /// Create a new plugin host with the given plugins directory.
+    /// Create a new plugin host rooted at `workspace_dir`, scanning its
+    /// `plugins/` subdirectory.
     pub fn new(workspace_dir: &Path) -> Result<Self, PluginError> {
         Self::with_security(workspace_dir, SignatureMode::Disabled, Vec::new())
     }
 
-    /// Create a new plugin host with signature verification settings.
+    /// Create a host rooted at `workspace_dir` (scanning `workspace_dir/plugins`)
+    /// with signature verification settings.
     pub fn with_security(
         workspace_dir: &Path,
         signature_mode: SignatureMode,
         trusted_publisher_keys: Vec<String>,
     ) -> Result<Self, PluginError> {
-        let plugins_dir = workspace_dir.join("plugins");
+        Self::from_plugins_dir_with_security(
+            &workspace_dir.join("plugins"),
+            signature_mode,
+            trusted_publisher_keys,
+        )
+    }
+
+    /// Create a host that scans `plugins_dir` directly (no `plugins/` suffix is
+    /// appended). Use this when the caller already holds the fully resolved
+    /// plugin directory, e.g. `PluginsConfig::resolved_plugins_dir()`.
+    pub fn from_plugins_dir(plugins_dir: &Path) -> Result<Self, PluginError> {
+        Self::from_plugins_dir_with_security(plugins_dir, SignatureMode::Disabled, Vec::new())
+    }
+
+    /// [`Self::from_plugins_dir`] with signature verification settings.
+    pub fn from_plugins_dir_with_security(
+        plugins_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+    ) -> Result<Self, PluginError> {
         if !plugins_dir.exists() {
-            std::fs::create_dir_all(&plugins_dir)?;
+            std::fs::create_dir_all(plugins_dir)?;
         }
 
         let mut host = Self {
-            plugins_dir,
+            plugins_dir: plugins_dir.to_path_buf(),
             loaded: HashMap::new(),
             signature_mode,
             trusted_publisher_keys,
@@ -464,6 +485,43 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Move every plugin (a subdirectory containing a `manifest.toml`) from `from`
+/// into `to`, returning the number moved.
+///
+/// Uses `rename`, falling back to a recursive copy + remove when the source and
+/// destination live on different filesystems. An existing `to/<name>` is never
+/// overwritten — that plugin is skipped. A missing or empty `from` is a no-op.
+/// Used by `zeroclaw plugin migrate` to relocate plugins stranded in legacy
+/// install directories into the configured one.
+pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(0);
+    };
+
+    let mut moved = 0usize;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if !src.is_dir() || !src.join("manifest.toml").exists() {
+            continue;
+        }
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dest = to.join(name);
+        if dest.exists() {
+            continue; // never clobber an existing plugin
+        }
+        std::fs::create_dir_all(to)?;
+        // `rename` is atomic but fails across filesystems; fall back to copy+remove.
+        if std::fs::rename(&src, &dest).is_err() {
+            copy_dir_recursive(&src, &dest)?;
+            std::fs::remove_dir_all(&src)?;
+        }
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +557,130 @@ permissions = []
         let plugins = host.list_plugins();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[test]
+    fn from_plugins_dir_scans_the_path_directly() {
+        // Plugin lives directly under the given dir (no extra `plugins/` level).
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("direct-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "direct-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::from_plugins_dir(dir.path()).unwrap();
+        let plugins = host.list_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "direct-plugin");
+    }
+
+    #[test]
+    fn new_still_appends_plugins_subdir() {
+        // `new`/`with_security` keep the legacy "workspace dir" contract:
+        // a (valid) plugin placed directly under the root is NOT discovered,
+        // but the same one under `<root>/plugins/` is.
+        let manifest = "name = \"p\"\nversion = \"0.1.0\"\nwasm_path = \"p.wasm\"\ncapabilities = [\"tool\"]\n";
+
+        let dir = tempdir().unwrap();
+        let stray = dir.path().join("p");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("manifest.toml"), manifest).unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(
+            host.list_plugins().is_empty(),
+            "plugin directly under root must not be discovered by `new`"
+        );
+
+        // Same manifest under `<root>/plugins/` is found.
+        let nested = dir.path().join("plugins").join("p");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("manifest.toml"), manifest).unwrap();
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert_eq!(host.list_plugins().len(), 1);
+        assert_eq!(host.list_plugins()[0].name, "p");
+    }
+
+    #[test]
+    fn install_then_discover_round_trip_uses_same_dir() {
+        // Regression for the install/discovery path divergence (issue #6254):
+        // a plugin installed into a resolved plugins dir must be discoverable
+        // by a fresh host pointed at the *same* dir.
+        let src = tempdir().unwrap();
+        std::fs::write(
+            src.path().join("manifest.toml"),
+            r#"
+name = "roundtrip"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(src.path().join("plugin.wasm"), b"\0asm").unwrap();
+
+        let plugins_dir = tempdir().unwrap();
+        let mut installer = PluginHost::from_plugins_dir(plugins_dir.path()).unwrap();
+        installer
+            .install(src.path().to_str().unwrap())
+            .expect("install should succeed");
+
+        // Fresh host over the same dir — mirrors the CLI install vs. runtime
+        // discovery split, both now resolving via `from_plugins_dir`.
+        let discoverer = PluginHost::from_plugins_dir(plugins_dir.path()).unwrap();
+        let plugins = discoverer.list_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "roundtrip");
+    }
+
+    fn write_manifest(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("manifest.toml"),
+            format!("name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_plugins_dir_moves_and_never_clobbers() {
+        let from = tempdir().unwrap();
+        let to = tempdir().unwrap();
+        write_manifest(from.path(), "alpha");
+        write_manifest(from.path(), "beta");
+        // `beta` already exists in the target → must be skipped, not overwritten.
+        write_manifest(to.path(), "beta");
+
+        let moved = migrate_plugins_dir(from.path(), to.path()).unwrap();
+
+        assert_eq!(moved, 1, "only alpha should move; beta collides");
+        assert!(to.path().join("alpha").join("manifest.toml").exists());
+        assert!(!from.path().join("alpha").exists(), "alpha source removed");
+        assert!(
+            from.path().join("beta").exists(),
+            "skipped source left in place"
+        );
+    }
+
+    #[test]
+    fn migrate_plugins_dir_is_noop_for_missing_or_empty() {
+        let to = tempdir().unwrap();
+        // Missing source.
+        assert_eq!(
+            migrate_plugins_dir(&to.path().join("nope"), to.path()).unwrap(),
+            0
+        );
+        // Empty source.
+        let empty = tempdir().unwrap();
+        assert_eq!(migrate_plugins_dir(empty.path(), to.path()).unwrap(), 0);
     }
 
     #[test]

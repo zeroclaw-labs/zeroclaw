@@ -288,6 +288,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
+    /// Whether an inbound message is a direct, one-to-one conversation
+    /// with the bot (a DM/IM), as opposed to a group or broadcast
+    /// channel. A direct message is definitionally addressed to the
+    /// bot, so the orchestrator skips the reply-intent classifier and
+    /// goes straight to the tool-capable agent turn.
+    ///
+    /// Default `false`: channels that cannot prove a one-to-one context
+    /// keep the classifier precheck. Channels that distinguish DMs from
+    /// group traffic override this.
+    fn is_direct_message(&self, _msg: &ChannelMessage) -> bool {
+        false
+    }
+
     /// Whether this channel supports multi-message streaming delivery.
     fn supports_multi_message_streaming(&self) -> bool {
         false
@@ -399,6 +412,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         Ok(None)
+    }
+
+    /// The name of the back-channel that produced the most recent
+    /// [`Channel::request_approval`] decision, when this channel fans a single
+    /// request out to several registered back-channels (the agent's approval
+    /// bridge does this so an ACP editor and a WebSocket dashboard can both
+    /// answer). Ordinary single channels return `None` — their own
+    /// [`Channel::name`] already identifies the deciding surface — so the
+    /// approval audit trail can record the channel that actually decided
+    /// instead of the turn loop's static channel name.
+    fn last_decision_channel(&self) -> Option<String> {
+        None
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.

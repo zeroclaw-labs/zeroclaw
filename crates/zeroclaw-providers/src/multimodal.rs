@@ -278,6 +278,27 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Count image markers in the **most recent** genuine user message (the newest
+/// inbound user turn), ignoring tool-result carriers and any earlier user
+/// messages still present in history.
+///
+/// This is the turn-scoped counterpart to [`count_user_image_markers`]. It lets
+/// the vision router distinguish "the user *just* sent an image we cannot see"
+/// (surface a capability error so the attachment is not silently ignored) from
+/// "an earlier user image is merely carried over in history" (degrade to
+/// text-only). Erroring on a carried-over marker would poison every later turn,
+/// since the marker lives in the long-lived session history permanently. That
+/// was the reported bug: a single image to a non-vision provider made every
+/// subsequent text turn fail.
+pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .unwrap_or(0)
+}
+
 /// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
 /// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
 /// `[media attachment]`. Match is case-insensitive to align with the channel
@@ -504,29 +525,16 @@ async fn prepare_messages_inner(
         });
     }
 
-    // When image count exceeds the limit, strip markers from oldest messages
-    // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
-    // cumulative image count crosses the threshold.
-    let trimmed = if total_images > max_images {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "total_images": total_images,
-                    "max_images": max_images,
-                    "trimmed_to": max_images,
-                })),
-            "multimodal: trimming oldest images — conversation exceeds image limit"
-        );
-        trim_old_images(messages, max_images)
-    } else {
-        messages.to_vec()
-    };
-
+    // Normalize every image marker first, then enforce the per-request image
+    // cap further below based only on images that *successfully* normalize.
+    // Trimming the oldest images *before* normalization is unsafe: a newer
+    // image ref that fails to load would evict an older valid one that could
+    // still have been sent (see `skipped_images_do_not_consume_image_budget`).
+    // The post-normalization cap keeps the most recent successful images and
+    // prevents conversations from sticking once the cumulative count crosses
+    // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(&trimmed);
+    let latest_tool_indices = latest_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
@@ -1799,6 +1807,44 @@ mod tests {
         assert_eq!(count_image_markers(&messages), 1);
     }
 
+    #[test]
+    fn count_latest_user_image_markers_scopes_to_newest_user_message() {
+        // No user messages at all -> zero.
+        assert_eq!(count_latest_user_image_markers(&[]), 0);
+
+        // The newest user message carries the image -> counted (the user just
+        // sent it; the vision router surfaces a capability error).
+        let just_sent = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&just_sent), 1);
+
+        // An earlier user message carried an image, but the newest user message
+        // is plain text -> zero. This is the poison-prevention case: the carried
+        // over marker must NOT keep re-triggering the capability error.
+        let carried_over = vec![
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&carried_over), 0);
+        // The history-wide count still sees the carried-over marker, which is
+        // why the router must distinguish the two.
+        assert_eq!(count_user_image_markers(&carried_over), 1);
+
+        // A trailing tool-result carrier does not mask the real latest user
+        // message (its markers are not user-sent and must not be counted here).
+        let trailing_tool_result = vec![
+            ChatMessage::user("inspect [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
+    }
+
     #[tokio::test]
     async fn prepare_messages_trims_excess_images_from_older_messages() {
         // 3 messages, each with 1 image — max is 2.
@@ -2038,6 +2084,71 @@ mod tests {
         // Second and third should have base64-encoded images
         assert!(result.messages[1].content.contains("data:image"));
         assert!(result.messages[2].content.contains("data:image"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_caps_to_newest_successful_images() {
+        // Regression for the dead pre-normalization trim: with more valid images
+        // than the cap, normalization must run on all of them and the cap must
+        // keep the *newest* `max_images`, dropping the oldest. Exactly one
+        // "post-normalization image cap exceeded" path should fire — there is no
+        // longer a separate, misleading pre-normalization "trimmed_to" warning.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        // Nine distinct valid image files across nine user messages, max 4.
+        let mut messages = Vec::new();
+        for i in 0..9 {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_data).unwrap();
+            messages.push(ChatMessage::user(format!(
+                "[IMAGE:{}]\nImage {i}",
+                p.display()
+            )));
+        }
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0, // disable age-based trimming to isolate the cap
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("should succeed");
+
+        // Output is capped to exactly max_images...
+        let surviving = result
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("data:image"))
+            .count();
+        assert_eq!(surviving, 4, "output should keep exactly max_images");
+
+        // ...and it is the newest four that survive; the oldest five are stripped.
+        for (i, m) in result.messages.iter().enumerate() {
+            if i < 5 {
+                assert!(
+                    !m.content.contains("data:image"),
+                    "oldest message {i} should be capped out"
+                );
+                assert!(m.content.contains(&format!("Image {i}")));
+            } else {
+                assert!(
+                    m.content.contains("data:image"),
+                    "newest message {i} should survive the cap"
+                );
+            }
+        }
     }
 
     #[tokio::test]

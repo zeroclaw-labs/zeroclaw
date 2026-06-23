@@ -1,7 +1,8 @@
 use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
-    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
-    next_run_for_schedule, skip_missed_run, sync_declarative_jobs,
+    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
+    clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
+    sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -180,6 +181,26 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
         ),
     }
 
+    // ── Stale-lock recovery: any in-flight lock present at boot was left by a
+    //    run that died with the previous process. Clear it so those jobs are
+    //    eligible again instead of being wedged out of `due_jobs` forever.
+    match clear_stale_locks(&config) {
+        Ok(0) => {}
+        Ok(cleared) => ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"cleared": cleared})),
+            "Cleared stale cron in-flight locks at startup"
+        ),
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Failed to clear stale cron in-flight locks at startup"
+        ),
+    }
+
     // ── Startup catch-up: run ALL overdue jobs before entering the
     //    normal polling loop. The regular loop is capped by `max_tasks`,
     //    which could leave some overdue jobs waiting across many cycles
@@ -217,6 +238,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             }
         };
 
+        let jobs = claim_due_jobs(&config, jobs);
         process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
     }
 }
@@ -279,6 +301,7 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
         "Scheduler startup: catching up overdue jobs"
     );
 
+    let jobs = claim_due_jobs(config, jobs);
     process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
 
     ::zeroclaw_log::record!(
@@ -399,6 +422,13 @@ fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> Secur
     policy
 }
 
+fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
+    match target {
+        SessionTarget::Main => std::path::PathBuf::from("main"),
+        SessionTarget::Isolated => std::path::PathBuf::from(format!("cron-{run_session_id}")),
+    }
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -435,6 +465,44 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
+/// Atomically claim each due job, returning only the jobs this scheduler won.
+///
+/// Claiming is part of selection: a job already in flight (claimed by an earlier
+/// poll, the startup catch-up, or a concurrent trigger) is dropped here so it is
+/// never launched again while a prior run is still running (issue #6037). Each
+/// claimed job's lock is released in `execute_and_persist_job` once its run
+/// completes. Callers pass jobs sourced from `due_jobs` / `all_overdue_jobs`,
+/// which are always DB-backed, so a failed claim means the row is locked (or the
+/// claim query errored) rather than absent.
+fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
+    jobs.into_iter()
+        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
+            Ok(true) => true,
+            Ok(false) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"job_id": job.id})),
+                    "Cron job already in flight; skipping duplicate launch"
+                );
+                false
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                        ),
+                    "Cron job: failed to claim in-flight lock; skipping launch"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 async fn process_due_jobs(
     config: &Config,
     jobs: Vec<CronJob>,
@@ -447,9 +515,13 @@ async fn process_due_jobs(
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
         // Resolve owning agent per-job. Skip orphans with a warning so a
-        // mis-configured job can't take down the scheduler loop.
+        // mis-configured job can't take down the scheduler loop. The job was
+        // claimed in `claim_due_jobs`, so release the lock on every skip path
+        // here — otherwise a skipped job would stay filtered out of `due_jobs`
+        // until restart instead of being retried next poll (issue #6037).
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            let _ = release_job(config, &job.id);
             return None;
         };
         let agent_alias = agent_alias.to_owned();
@@ -457,6 +529,7 @@ async fn process_due_jobs(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
+                let _ = release_job(config, &job.id);
                 return None;
             }
         };
@@ -523,6 +596,20 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
+
+    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
+    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
+    // done. A deleted one-shot row simply releases nothing. If this fails the lock
+    // is recovered by `clear_stale_locks` at the next startup (issue #6037).
+    if let Err(e) = release_job(config, &job.id) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "Cron job: failed to release in-flight lock after run"
+        );
+    }
 
     (job.id.clone(), success, output)
 }
@@ -617,12 +704,12 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
-    // Assign a unique session ID so memories written during this run can be
-    // purged atomically if the run fails (prevents snowball accumulation).
-    // Doubles as the SubAgent run_id in the tracing span so a failed
-    // memory purge can be correlated with its sub-run.
+    // Assign a unique run ID for tracing. Isolated jobs also use it in the
+    // session path so failed-run memory purge stays scoped per execution.
+    // Main-target jobs reuse the stable `main` session path documented in
+    // `session_target`.
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+    let session_path = cron_agent_session_path(&job.session_target, &run_session_id);
 
     let subagent_span = zeroclaw_log::info_span!(
         "subagent",
@@ -683,26 +770,28 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            // Purge memories written during this failed run so they don't
-            // pollute future recall and cause context snowball. Routes
-            // through the cron-owning agent's per-agent memory wrapper
-            // so the purge stays scoped to the agent that wrote them.
-            // Sanitize the session key so it matches what the runtime
-            // writes via the orchestrator session-key sanitizer.
-            let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                "cli:{}",
-                session_path.display()
-            ));
-            if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                config,
-                agent_alias,
-                config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .await
-            {
-                let _ = mem.purge_session(&mem_session_key).await;
+            if matches!(job.session_target, SessionTarget::Isolated) {
+                // Purge memories written during this failed run so they don't
+                // pollute future recall and cause context snowball. Routes
+                // through the cron-owning agent's per-agent memory wrapper
+                // so the purge stays scoped to the agent that wrote them.
+                // Sanitize the session key so it matches what the runtime
+                // writes via the orchestrator session-key sanitizer.
+                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                    "cli:{}",
+                    session_path.display()
+                ));
+                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+                    config,
+                    agent_alias,
+                    config
+                        .model_provider_for_agent(agent_alias)
+                        .and_then(|e| e.api_key.as_deref()),
+                )
+                .await
+                {
+                    let _ = mem.purge_session(&mem_session_key).await;
+                }
             }
             (false, format!("agent job failed: {e}"))
         }
@@ -1086,8 +1175,8 @@ mod tests {
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -1199,6 +1288,18 @@ mod tests {
     }
 
     #[test]
+    fn cron_agent_session_path_main_is_stable() {
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Main, "ignored"),
+            std::path::PathBuf::from("main")
+        );
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Isolated, "abc").to_string_lossy(),
+            "cron-abc"
+        );
+    }
+
+    #[test]
     fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
@@ -1241,6 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1254,6 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1267,6 +1370,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1311,14 +1415,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["cat".into()];
-        let job = test_job("cat /etc/passwd");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("cat {outside_path}"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1330,14 +1435,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep --file=/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep --file={outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1349,17 +1455,19 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep -f/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep -f{outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_tilde_user_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1379,6 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_input_redirection_path_bypass() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1432,7 +1541,18 @@ mod tests {
         assert!(output.contains("rate limit exceeded"));
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_recovers_after_first_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1465,6 +1585,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_exhausts_attempts() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -2160,6 +2281,61 @@ mod tests {
         assert_eq!(event["job_id"], "test-job");
         assert_eq!(event["success"], false);
         assert!(event["timestamp"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn claim_due_jobs_skips_in_flight_job() {
+        // Regression for #6037: once a due job is claimed for execution, a
+        // subsequent selection pass must not pick it up again until the prior
+        // run releases it — otherwise a job that runs longer than the poll
+        // interval is launched repeatedly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+
+        let claimed = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(claimed.len(), 1, "first selection claims the job");
+
+        let claimed_again = claim_due_jobs(&config, vec![job.clone()]);
+        assert!(
+            claimed_again.is_empty(),
+            "an in-flight job must be skipped by the next selection pass"
+        );
+
+        cron::release_job(&config, &job.id).unwrap();
+        let after_release = claim_due_jobs(&config, vec![job]);
+        assert_eq!(
+            after_release.len(),
+            1,
+            "after release the job is selectable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_releases_lock_for_skipped_orphan_job() {
+        // A job claimed for execution but then skipped by process_due_jobs (here
+        // an orphan with no owning agent) must have its in-flight lock released,
+        // so it is retried on the next poll instead of being wedged out of
+        // due_jobs until restart (issue #6037).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // Insert a real, claimable DB row under a configured agent, then drive
+        // process_due_jobs with an in-memory view whose agent_alias is cleared.
+        // With an empty alias and an id bound to no [agents.<x>].cron_jobs list,
+        // resolve_owning_agent returns None, so the job is skipped as an orphan.
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo orphan").unwrap();
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let orphan = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+
+        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "a skipped orphan job's in-flight lock must be released, not leaked"
+        );
     }
 
     #[tokio::test]

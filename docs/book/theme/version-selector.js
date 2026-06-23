@@ -5,11 +5,10 @@
 // then renders a dropdown linking to the same page in each version.
 (function () {
   // Parse the current version from URL path.
-  // Expected formats: /v0.7.5/en/..., /main/en/..., /stable/en/...
+  // Expected formats: /v0.7.5/en/..., /master/en/...
   const pathSegments = window.location.pathname.split("/").filter((s) => s);
   if (pathSegments.length < 2) return; // Not in a versioned docs path
 
-  const possibleVersions = ["master", "stable"];
   const versionPattern = /^v\d+\.\d+\.\d+(-[a-z0-9.-]+)?$/i;
 
   let currentVersion = null;
@@ -17,11 +16,7 @@
 
   for (let i = 0; i < pathSegments.length; i++) {
     const seg = pathSegments[i];
-    if (
-      seg === "master" ||
-      seg === "stable" ||
-      versionPattern.test(seg)
-    ) {
+    if (seg === "master" || versionPattern.test(seg)) {
       currentVersion = seg;
       versionIndex = i;
       break;

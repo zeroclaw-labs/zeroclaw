@@ -50,21 +50,13 @@ use zeroclaw_providers::{
 /// When the queue is exhausted it returns a simple "done" text response.
 struct ScriptedModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
-    /// Records every request for assertion.
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl ScriptedModelProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            requests: Mutex::new(Vec::new()),
         }
-    }
-
-    #[allow(dead_code)]
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
     }
 }
 
@@ -82,15 +74,10 @@ impl ModelProvider for ScriptedModelProvider {
 
     async fn chat(
         &self,
-        request: ChatRequest<'_>,
+        _request: ChatRequest<'_>,
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        self.requests
-            .lock()
-            .unwrap()
-            .push(request.messages.to_vec());
-
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {

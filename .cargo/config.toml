@@ -2,6 +2,7 @@
 mdbook = "run --release -p xtask --bin mdbook --"
 fluent = "run --release -p xtask --bin fluent --"
 web = "run --release -p xtask --bin web --"
+generate = "run --release -p xtask --bin generate --"
 
 [build]
 rustdocflags = ["--default-theme=ayu"]

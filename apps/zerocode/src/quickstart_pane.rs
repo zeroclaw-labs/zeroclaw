@@ -209,12 +209,13 @@ fn queue_apply_handoff(
     let Ok(mut guard) = reconnect_state.lock() else {
         return None;
     };
-    guard.start_chat_now = Some(alias.clone());
     if daemon_restarted {
-        guard.start_chat_with = Some(alias.clone());
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect(
+            alias.clone(),
+        ));
         Some(alias)
     } else {
-        guard.start_chat_with = None;
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::Immediate(alias));
         None
     }
 }
@@ -1954,9 +1955,7 @@ impl QuickstartPane {
         self.model_catalog_rx = Some(rx);
         tokio::spawn(async move {
             let models = match rpc.catalog_models(&type_key).await {
-                Ok(res) if res.live && !res.models.is_empty() => {
-                    sort_quickstart_models(&type_key, res.models)
-                }
+                Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
                 _ => None,
             };
             let _ = tx.send(ModelCatalogFetchResult { type_key, models });
@@ -2127,7 +2126,8 @@ impl QuickstartPane {
         // Arm the Stage-2 hand-off **before** any daemon reload can kick
         // in. When reload is signalled the socket dies shortly after
         // this returns, the TUI waits during the disconnect, and the
-        // next `app::run` pane rebuild consumes `start_chat_with`.
+        // next `app::run` pane rebuild consumes the pending reconnect
+        // chat handoff.
         //
         // Test/standalone daemons can report `daemon_restarted = false`.
         // In that case no disconnect is coming, so freezing Quickstart
@@ -2307,10 +2307,6 @@ fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
     field.key.eq_ignore_ascii_case("model") || field.label.eq_ignore_ascii_case("model")
 }
 
-fn sort_quickstart_models(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
-    zeroclaw_providers::catalog::sort_model_catalog_for_chat(provider, models)
-}
-
 fn build_field_form_rows(
     section: QuickstartFieldSection,
     fields: Vec<QuickstartFieldDescriptor>,
@@ -2386,7 +2382,7 @@ fn missing_template_error(filename: &str) -> QuickstartError {
     QuickstartError {
         step: QuickstartStep::Agent,
         field: filename.to_string(),
-        message: format!("No template is available for `{filename}`"),
+        message: crate::i18n::t_args("zc-quickstart-no-template", &[("filename", filename)]),
     }
 }
 
@@ -2768,7 +2764,10 @@ fn draw_modal(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
-                    Span::styled(format!("{:14}", "name"), name_style),
+                    Span::styled(
+                        format!("{:14}", crate::i18n::t("zc-quickstart-agent-name-field")),
+                        name_style,
+                    ),
                     Span::styled("  ", Style::default()),
                     Span::styled(display, theme::dim_style()),
                     if on_name {
@@ -2800,7 +2799,10 @@ fn draw_modal(
                     let status = if content.trim().is_empty() {
                         "—".to_string()
                     } else {
-                        format!("{} bytes", content.len())
+                        crate::i18n::t_args(
+                            "zc-quickstart-file-bytes",
+                            &[("bytes", &content.len().to_string())],
+                        )
                     };
                     lines.push(Line::from(vec![
                         Span::styled(glyph, theme::accent_style()),
@@ -3072,8 +3074,12 @@ mod tests {
         let guard = state.lock().unwrap();
 
         assert_eq!(applied_alias.as_deref(), Some("agent-a"));
-        assert_eq!(guard.start_chat_with.as_deref(), Some("agent-a"));
-        assert_eq!(guard.start_chat_now.as_deref(), Some("agent-a"));
+        assert_eq!(
+            guard.pending_quickstart_chat,
+            Some(crate::app::PendingQuickstartChat::AfterReconnect(
+                "agent-a".into()
+            ))
+        );
     }
 
     #[test]
@@ -3086,8 +3092,12 @@ mod tests {
         let guard = state.lock().unwrap();
 
         assert!(applied_alias.is_none());
-        assert!(guard.start_chat_with.is_none());
-        assert_eq!(guard.start_chat_now.as_deref(), Some("agent-a"));
+        assert_eq!(
+            guard.pending_quickstart_chat,
+            Some(crate::app::PendingQuickstartChat::Immediate(
+                "agent-a".into()
+            ))
+        );
     }
 
     #[test]
@@ -3297,50 +3307,6 @@ mod tests {
             Some(["false".to_string(), "true".to_string()].as_slice())
         );
         assert_eq!(row.buf, "false");
-    }
-
-    #[test]
-    fn quickstart_model_sort_prefers_chat_and_coding_models() {
-        let sorted = sort_quickstart_models(
-            "openai",
-            vec![
-                "chatgpt-image-latest".into(),
-                "text-embedding-ada-002".into(),
-                "gpt-3.5-turbo".into(),
-                "gpt-5".into(),
-                "tts-1".into(),
-            ],
-        )
-        .expect("chat model catalog");
-
-        assert_eq!(sorted[0], "gpt-5");
-        assert!(!sorted.iter().any(|m| m == "chatgpt-image-latest"));
-        assert!(!sorted.iter().any(|m| m == "text-embedding-ada-002"));
-        assert!(!sorted.iter().any(|m| m == "tts-1"));
-
-        let sorted = sort_quickstart_models(
-            "openrouter",
-            vec![
-                "ai21/jamba-mini".into(),
-                "openai/gpt-4.1".into(),
-                "some/image-model".into(),
-                "anthropic/claude-sonnet-4".into(),
-            ],
-        )
-        .expect("chat model catalog");
-        assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
-        assert_eq!(sorted[1], "openai/gpt-4.1");
-        assert!(!sorted.iter().any(|m| m == "some/image-model"));
-    }
-
-    #[test]
-    fn quickstart_model_sort_returns_none_when_only_non_chat_models_exist() {
-        let sorted = sort_quickstart_models(
-            "openai",
-            vec!["gpt-image-1.5".into(), "text-embedding-ada-002".into()],
-        );
-
-        assert!(sorted.is_none());
     }
 
     #[test]

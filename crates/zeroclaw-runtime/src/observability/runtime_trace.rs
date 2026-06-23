@@ -14,10 +14,10 @@ pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
-        log_persistence: config.log_persistence.clone(),
+        log_persistence: config.log_persistence.as_wire().to_string(),
         log_persistence_path: config.log_persistence_path.clone(),
         log_persistence_max_entries: config.log_persistence_max_entries,
-        log_tool_io: config.log_tool_io.clone(),
+        log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
     }
