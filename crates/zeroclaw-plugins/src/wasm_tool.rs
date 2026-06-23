@@ -138,7 +138,7 @@ impl Tool for WasmTool {
         // Extism Plugin is !Send, so we must create it inside spawn_blocking.
         tokio::task::spawn_blocking(move || {
             let mut plugin = runtime::create_plugin(&wasm_path, &permissions)?;
-            runtime::call_execute(&mut plugin, &args_json, &config)
+            runtime::call_execute(&mut plugin, &args_json, &config, &permissions)
         })
         .await?
     }
