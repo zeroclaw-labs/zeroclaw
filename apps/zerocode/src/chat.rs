@@ -2106,7 +2106,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // hands its full area to the input bar here.
     let input_area = area;
 
-    let queue_paused_hint = if state.queue_paused() {
+    let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
         Some(crate::i18n::t_args(
             "zc-queue-paused-ghost",
             &[("key", &resume_queue_chord_label())],
@@ -2820,12 +2820,15 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         format!("{title}\n\n  {summary}\n\n  {keys}")
     };
 
+    let fill = theme::fill_style();
     let p = Paragraph::new(text)
+        .style(fill)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(" Approval Required ", theme::warn_style()))
-                .style(theme::approval_border_style()),
+                .border_style(theme::approval_border_style())
+                .style(fill),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, overlay_area);
@@ -4116,7 +4119,7 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.input_bar.cleanup_temps();
-        if !clean && !self.resume_override {
+        if !clean && !self.resume_override && !self.message_queue.is_empty() {
             self.queue_paused = true;
         }
         self.resume_override = false;
@@ -5149,6 +5152,44 @@ mod tests {
     }
 
     #[test]
+    fn approval_overlay_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete modal background"
+        );
+
+        let mut s = state();
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "command: pwd".to_string(),
+            timeout_secs: 120,
+        });
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_approval_overlay(frame, &s, area);
+            })
+            .expect("draw approval overlay");
+
+        let cell = &terminal.backend().buffer()[(10, 28)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
     fn thought_chunk_visible_before_commit() {
         let mut s = state();
         s.turn_in_flight = true;
@@ -5704,6 +5745,17 @@ mod tests {
         s.clear_queue_cmd(Some(9));
         s.clear_queue_cmd(Some(0));
         assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn non_clean_commit_with_empty_queue_does_not_pause() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.commit_turn(String::new(), false);
+        assert!(
+            !s.queue_paused(),
+            "cancel/fail with no queued backlog must not show queue-paused state"
+        );
     }
 
     #[test]
