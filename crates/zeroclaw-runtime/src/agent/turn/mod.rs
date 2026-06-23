@@ -77,7 +77,9 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
-pub use execution::{ResolvedAgentExecution, ResolvedModelAccess};
+pub use execution::{
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};

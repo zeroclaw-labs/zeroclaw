@@ -46,23 +46,35 @@ the failure #8120 was an instance of.
 
 ## The convergence target: one resolution seam
 
-The structural fix is to stop re-deriving the policy per path. Every path
-resolves through one seam - `ResolvedAgentExecution::resolve` (the behavior-neutral
-trunk introduced by #8156) - instead of assembling the engine input inline. When
-every path calls `resolve`:
+The structural fix is to stop re-deriving the policy per path. #8156 introduced
+the `ResolvedAgentExecution` carrier - a behavior-neutral regrouping of the engine's
+per-agent inputs into one bundle (`agent/turn/execution.rs`). This change adds its
+`ResolvedAgentExecution::resolve` constructor and routes every production turn path
+through it (grouping the inputs into `ResolvedIo` + `ResolvedRuntimeKnobs` layers), so
+the bundle is produced in one seam rather than assembled inline at each site. Today
+`resolve()` spreads already-resolved inputs (behavior-neutral); later surface PRs move
+the per-field resolution (tools via a scoped registry, approval, the runtime knobs)
+into it and seal the inputs. With that resolution and sealing in place:
 
 - there is exactly one place a setting is applied, so there is nothing to diverge;
 - a newtype with a private field (for example a scoped tool registry that only the
   resolver can mint) makes handing the engine an unresolved policy a compile error.
 
 The end state is that the divergence is uncompilable rather than merely tested
-against.
+against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()`
+constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on
+`master` and every production path constructs through them; absorbing each surface's
+per-field resolution into `resolve()`, and sealing the bundle's fields behind it, are
+the work later surface PRs do.
 
 ## The harness
 
-The parity harness lands in `crates/zeroclaw-runtime/src/agent/parity.rs`, a
-`#[cfg(test)]` sibling of the `#7415` `safety_net.rs` turn-engine oracle. It grows
-one surface at a time and asserts only what no other test covers:
+The parity harness does not exist on `master` yet: today the runtime has
+`agent/safety_net.rs` and `agent/turn/execution.rs`, not `agent/parity.rs`. The
+harness will live in `crates/zeroclaw-runtime/src/agent/parity.rs`, a `#[cfg(test)]`
+sibling of the `#7415` `safety_net.rs` turn-engine oracle - that is the intended
+location if it remains the chosen shape. A future surface PR creates it; thereafter
+it grows one surface at a time and asserts only what no other test covers:
 
 - A surface (tools, approval, runtime budgets, context and history, memory,
   skills) is strangled into `resolve` one PR at a time.
@@ -76,7 +88,9 @@ Until a surface has a single resolution seam, there is nothing to assert parity
 against, so its row stays in the divergence record as documentation rather than as
 a premature test.
 
-## Adding a surface (for the owning change)
+## Adding a surface (the workflow each future surface PR follows)
+
+With `resolve()` in place (see above), each surface PR follows these steps:
 
 1. Move the surface's resolution and wiring from the construction sites into
    `ResolvedAgentExecution::resolve`; delete the per-site copies.
