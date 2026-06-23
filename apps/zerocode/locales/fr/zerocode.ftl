@@ -21,6 +21,7 @@ zc-app-quit-prompt = Quitter zerocode ?
 zc-app-quit-explainer = L'interface TUI se ferme. Le démon continue de fonctionner ; reconnectez-vous à tout moment.
 zc-app-reload-status-signalled = Rechargement du démon signalé — reconnexion…
 zc-app-reload-confirm-row = { $confirm_chord } = recharger   { $cancel_chord } = annuler
+zc-error-daemon-version-mismatch = Incompatibilité de version : zerocode est en { $client_version }, mais le démon est en { $server_version }. Recompilez et redémarrez le démon depuis le même checkout que zerocode.
 zc-zerocode-tab-theme = Thème
 zc-zerocode-tab-agent-theme = Thèmes d'agent
 zc-zerocode-tab-presets = Préréglages

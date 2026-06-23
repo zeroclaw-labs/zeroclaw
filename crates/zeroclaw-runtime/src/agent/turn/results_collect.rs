@@ -3,7 +3,8 @@
 //! identical-output abort.
 
 use crate::agent::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
+    truncate_tool_result,
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
@@ -115,7 +116,13 @@ pub(crate) fn collect_tool_results(
                 }
             }
         }
-        let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
+        // Provenance-gated: search/listing tools (content_search, glob_search)
+        // must not have incidental image paths promoted to routable [IMAGE:...]
+        // markers, or they falsely trigger vision routing on a text-only
+        // provider. Image-producing/fetching tools keep canonicalization.
+        // See PR #7345.
+        let canonical_output =
+            canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
         let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
