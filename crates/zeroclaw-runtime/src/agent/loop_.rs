@@ -3320,7 +3320,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
@@ -4626,6 +4628,55 @@ mod tests {
                 output: format!("counted:{value}"),
                 error: None,
             })
+        }
+    }
+
+    struct ApprovingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl ApprovingChannel {
+        fn new(approval_requests: Arc<AtomicUsize>) -> Self {
+            Self { approval_requests }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ApprovingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "approving-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approving-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
         }
     }
 
@@ -6664,6 +6715,286 @@ mod tests {
             .expect("tool results message should be present");
         assert!(tool_results.content.contains("hello"));
         assert!(!tool_results.content.contains("Denied by user."));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell"),
+        ];
+        let observer = NoopObserver;
+        let knobs = LoopKnobs {
+            dedup_enabled: false,
+            ..LoopKnobs::default()
+        };
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect_err("identical prompt-required shell call should abort before another prompt");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not execute a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_skips_same_round_prompt_required_shell_duplicate_without_reprompting()
+     {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell in one response"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("same-round prompt-required duplicate should use duplicate result path");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not execute a second time"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(tool_results.content.contains("counted:"));
+        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_prompt_guard_ignores_same_round_dedup_exempt_tools() {
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat dedup-exempt shell"),
+        ];
+        let observer = NoopObserver;
+        let dedup_exempt = vec!["shell".to_string()];
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &dedup_exempt,
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect_err("dedup-exempt prompt-required repeats should still abort before reprompting");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not execute a second time"
+        );
     }
 
     #[tokio::test]
