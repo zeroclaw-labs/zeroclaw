@@ -13,6 +13,7 @@ pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
+pub mod channel_room;
 pub mod claude_code;
 pub mod claude_code_runner;
 pub mod cli_discovery;

@@ -66,6 +66,10 @@ pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
 
 static ACTIVE: LazyLock<RwLock<Theme>> = LazyLock::new(|| RwLock::new(default_theme()));
 
+#[cfg(test)]
+static ACTIVE_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Per-agent theme overrides, keyed by agent alias. A process-global registry
 /// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
 /// restart), and the app loop reads it each frame to tint the Code/Chat pane
@@ -136,6 +140,32 @@ pub(crate) fn active_raw() -> Theme {
         .read()
         .map(|g| *g)
         .unwrap_or_else(|_| default_theme())
+}
+
+#[cfg(test)]
+pub(crate) struct ActiveThemeTestGuard {
+    previous: Theme,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ActiveThemeTestGuard {
+    fn drop(&mut self) {
+        set_active(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_active_for_test(theme: Theme) -> ActiveThemeTestGuard {
+    let lock = ACTIVE_TEST_LOCK
+        .lock()
+        .expect("active theme test lock poisoned");
+    let previous = active_raw();
+    set_active(theme);
+    ActiveThemeTestGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 pub(crate) fn default_theme() -> Theme {
@@ -342,6 +372,20 @@ pub(crate) fn fill_style() -> Style {
     }
 }
 
+/// Bottom bar / status bar background: dim foreground on theme background.
+/// Used by the mode tab bar, status bar, and info bar so they share a
+/// consistent muted look that grounds the chrome without competing with
+/// the content area.
+pub(crate) fn bar_style() -> Style {
+    let t = active();
+    let s = Style::default().fg(t.dim);
+    if t.background == Color::Reset {
+        s
+    } else {
+        s.bg(t.background)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,16 +418,10 @@ mod tests {
         // `active()` routes through the colour-depth downgrade; assert on the
         // stored palette via the registry lookup so the test is independent of
         // the terminal depth detected in the test environment.
-        set_active(theme_by_name("nord_dark").unwrap());
-        assert_eq!(
-            theme_by_name("nord_dark").unwrap().title,
-            Color::Rgb(136, 192, 208)
-        );
+        let _theme_guard = set_active_for_test(theme_by_name("nord_dark").unwrap());
+        assert_eq!(active_raw().title, Color::Rgb(136, 192, 208));
         set_active(theme_by_name("icy_blue").unwrap());
-        assert_eq!(
-            theme_by_name("icy_blue").unwrap().title,
-            Color::Rgb(100, 200, 255)
-        );
+        assert_eq!(active_raw().title, Color::Rgb(100, 200, 255));
     }
 
     #[test]

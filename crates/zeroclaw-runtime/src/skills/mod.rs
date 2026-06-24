@@ -41,7 +41,7 @@ const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
-// ─── ClawhHub / OpenClaw registry installers ───────────────────────────────
+// ─── ClawHub / OpenClaw registry installers ───────────────────────────────
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
@@ -52,6 +52,12 @@ const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zerocla
 const SKILLS_REGISTRY_DIR_NAME: &str = "skills-registry";
 const SKILLS_REGISTRY_SYNC_MARKER: &str = ".zeroclaw-skills-registry-sync";
 const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
+
+// ─── Extra (user-configured) registries ──────────────────────────────────────
+/// Each `[[skills.extra_registries]]` entry is cloned to its own
+/// `<workspace>/extra-registry-<name>/` directory, reusing the same git
+/// clone/pull/sync machinery as the default skills registry.
+const EXTRA_REGISTRY_DIR_PREFIX: &str = "extra-registry-";
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -503,15 +509,8 @@ pub fn load_skills_for_agent(
                 continue;
             }
         };
-        let include: std::collections::HashSet<&str> =
-            bundle.include.iter().map(String::as_str).collect();
-        let exclude: std::collections::HashSet<&str> =
-            bundle.exclude.iter().map(String::as_str).collect();
         for skill in load_skills_from_directory(&dir, allow_scripts) {
-            if !include.is_empty() && !include.contains(skill.name.as_str()) {
-                continue;
-            }
-            if exclude.contains(skill.name.as_str()) {
+            if !bundle.admits_skill(&skill.name) {
                 continue;
             }
             // First-write wins so workspace skills override bundle skills
@@ -1705,13 +1704,13 @@ fn clawhub_download_url(source: &str) -> Result<String> {
             .join("/");
 
         if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
         }
 
         return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
     }
 
-    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+    anyhow::bail!("unrecognised ClawHub source format: {source}")
 }
 
 fn normalize_skill_name(s: &str) -> String {
@@ -1987,13 +1986,73 @@ pub fn install_git_skill_source(
     }
 }
 
+/// True when a zip entry path could escape the extraction root (parent
+/// traversal, absolute path, backslash, drive/scheme colon) or is empty.
+fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
+    raw_name.is_empty()
+        || raw_name.contains("..")
+        || raw_name.starts_with('/')
+        || raw_name.contains('\\')
+        || raw_name.contains(':')
+}
+
+/// Securely extract a downloaded skill zip into `dest`.
+///
+/// Rejects archives larger than `max_bytes` and any entry whose path could
+/// escape `dest`. On a rejected entry the partially-created `dest` is removed
+/// before returning. Shared by the ClawHub installer and unit-tested directly.
+fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "skill zip rejected: too large ({} bytes > {})",
+            bytes.len(),
+            max_bytes
+        );
+    }
+
+    std::fs::create_dir_all(dest)?;
+
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+
+        if is_unsafe_zip_entry_name(&raw_name) {
+            let _ = std::fs::remove_dir_all(dest);
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let out_path = dest.join(&raw_name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
+            format!(
+                "failed to create extracted file: {}",
+                out_path.display().to_string()
+            )
+        })?;
+        std::io::copy(&mut entry, &mut out_file)?;
+    }
+
+    Ok(())
+}
+
 pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
 ) -> Result<(PathBuf, usize)> {
     let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawhHub source: {source}"))?;
+        .with_context(|| format!("invalid ClawHub source: {source}"))?;
     let skill_dir_name = clawhub_skill_dir_name(source)?;
     let installed_dir = skills_path.join(&skill_dir_name);
     if installed_dir.exists() {
@@ -2014,58 +2073,14 @@ pub async fn install_clawhub_skill_source(
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawhHub rate limit reached (HTTP 429). Wait a moment and retry.");
+        anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
     }
     if !resp.status().is_success() {
-        anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
+        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
     }
 
     let bytes = resp.bytes().await?.to_vec();
-    if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
-        anyhow::bail!(
-            "ClawhHub zip rejected: too large ({} bytes > {})",
-            bytes.len(),
-            MAX_CLAWHUB_ZIP_BYTES
-        );
-    }
-
-    std::fs::create_dir_all(&installed_dir)?;
-
-    let cursor = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-
-        if raw_name.is_empty()
-            || raw_name.contains("..")
-            || raw_name.starts_with('/')
-            || raw_name.contains('\\')
-            || raw_name.contains(':')
-        {
-            let _ = std::fs::remove_dir_all(&installed_dir);
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
-        let out_path = installed_dir.join(&raw_name);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
-            format!(
-                "failed to create extracted file: {}",
-                out_path.display().to_string()
-            )
-        })?;
-        std::io::copy(&mut entry, &mut out_file)?;
-    }
+    extract_zip_secure(bytes, &installed_dir, MAX_CLAWHUB_ZIP_BYTES)?;
 
     let has_manifest = installed_dir.join("SKILL.md").exists()
         || installed_dir.join("SKILL.toml").exists()
@@ -2074,7 +2089,7 @@ pub async fn install_clawhub_skill_source(
         std::fs::write(
             installed_dir.join("SKILL.toml"),
             format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawhHub installed skill\"\nversion = \"0.1.0\"\n",
+                "[skill]\nname = \"{}\"\ndescription = \"ClawHub installed skill\"\nversion = \"0.1.0\"\n",
                 skill_dir_name
             ),
         )?;
@@ -2107,6 +2122,25 @@ pub fn is_registry_source(source: &str) -> bool {
     source
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// True when `source` is an extra-registry spec `registry:<name>/<skill>`
+/// with both segments being bare registry-safe identifiers.
+pub fn is_extra_registry_source(source: &str) -> bool {
+    parse_extra_registry_source(source).is_some()
+}
+
+/// Parse `registry:<name>/<skill>` into `(registry_name, skill_name)`.
+/// Returns `None` unless it is exactly one registry name and one skill name,
+/// both matching their install-spec identifiers.
+pub fn parse_extra_registry_source(source: &str) -> Option<(String, String)> {
+    let rest = source.strip_prefix("registry:")?;
+    let (name, skill) = rest.split_once('/')?;
+    if !zeroclaw_config::schema::ExternalRegistry::is_valid_name(name) || !is_registry_source(skill)
+    {
+        return None;
+    }
+    Some((name.to_string(), skill.to_string()))
 }
 
 fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
@@ -2279,6 +2313,119 @@ pub fn install_registry_skill_source(
     )
 }
 
+/// Clone (or refresh) a user-configured extra registry into its own
+/// `<workspace>/extra-registry-<name>/` directory, reusing the default
+/// registry's clone/pull/sync helpers.
+fn ensure_extra_registry(
+    workspace_dir: &Path,
+    registry_name: &str,
+    repo_url: &str,
+) -> Result<PathBuf> {
+    let registry_dir = workspace_dir.join(format!("{EXTRA_REGISTRY_DIR_PREFIX}{registry_name}"));
+
+    if !registry_dir.exists() {
+        clone_skills_registry(&registry_dir, repo_url)?;
+        return Ok(registry_dir);
+    }
+
+    if should_sync_skills_registry(&registry_dir) {
+        if pull_skills_registry(&registry_dir) {
+            let _ = mark_skills_registry_synced(&registry_dir);
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "extra registry update failed; using local copy from {}",
+                    registry_dir.display().to_string()
+                )
+            );
+        }
+    }
+
+    Ok(registry_dir)
+}
+
+/// Install a skill from a user-configured extra registry, addressed as
+/// `registry:<name>/<skill>`. The named registry must be present, enabled, and
+/// of `kind = "git"`; it reuses the same git-clone registry mechanism as the
+/// default bare-name registry and then installs the skill locally.
+pub fn install_extra_registry_skill_source(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+    extra_registries: &[zeroclaw_config::schema::ExternalRegistry],
+    suppress_tier_banner: bool,
+) -> Result<(PathBuf, usize)> {
+    let (registry_name, skill_name) = parse_extra_registry_source(source).with_context(|| {
+        format!("invalid extra-registry spec '{source}': expected 'registry:<name>/<skill>'")
+    })?;
+
+    let registry = extra_registries
+        .iter()
+        .find(|r| r.name == registry_name && r.enabled)
+        .with_context(|| {
+            let configured: Vec<&str> = extra_registries
+                .iter()
+                .filter(|r| r.enabled)
+                .map(|r| r.name.as_str())
+                .collect();
+            if configured.is_empty() {
+                format!(
+                    "registry '{registry_name}' is not configured or is disabled. \
+                     Add it under [[skills.extra_registries]] in your config."
+                )
+            } else {
+                format!(
+                    "registry '{registry_name}' is not configured or is disabled. \
+                     Configured registries: {}",
+                    configured.join(", ")
+                )
+            }
+        })?;
+
+    if registry.kind != zeroclaw_config::schema::ExternalRegistryKind::Git {
+        anyhow::bail!(
+            "registry '{registry_name}' uses unsupported kind '{}'; only 'git' is supported",
+            registry.kind
+        );
+    }
+
+    let registry_dir = ensure_extra_registry(workspace_dir, &registry_name, &registry.url)?;
+    let skill_dir = registry_dir.join("skills").join(&skill_name);
+
+    if !skill_dir.is_dir() {
+        let available = list_registry_skill_names(&registry_dir);
+        if available.is_empty() {
+            anyhow::bail!(
+                "skill '{skill_name}' not found in registry '{registry_name}' and no skills are available"
+            );
+        }
+        anyhow::bail!(
+            "skill '{skill_name}' not found in registry '{registry_name}'.\nAvailable skills: {}",
+            available.join(", ")
+        );
+    }
+
+    if !suppress_tier_banner {
+        let (tier, version) = lookup_registry_skill_tier(&registry_dir, &skill_name);
+        print_install_tier_banner(&skill_name, version.as_deref(), tier);
+    }
+
+    install_local_skill_source(
+        skill_dir.to_str().with_context(|| {
+            format!(
+                "registry path is not valid UTF-8: {}",
+                skill_dir.display().to_string()
+            )
+        })?,
+        skills_path,
+        allow_scripts,
+    )
+}
+
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
 /// Load skills from skill-capable plugins discovered by the plugin host.
@@ -2419,6 +2566,131 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+
+    #[test]
+    fn test_is_extra_registry_source_accepts_valid() {
+        assert!(is_extra_registry_source("registry:myreg/auto-coder"));
+        assert!(is_extra_registry_source("registry:co_op/data_analyst"));
+        assert!(is_extra_registry_source("registry:r1/ci-helper"));
+    }
+
+    #[test]
+    fn test_is_extra_registry_source_rejects_malformed() {
+        assert!(!is_extra_registry_source(""));
+        assert!(!is_extra_registry_source("registry:"));
+        assert!(!is_extra_registry_source("registry:onlyname"));
+        assert!(!is_extra_registry_source("registry:a/b/c"));
+        assert!(!is_extra_registry_source("registry:../x"));
+        assert!(!is_extra_registry_source("registry:a /b"));
+        assert!(!is_extra_registry_source("registry:a/b:c"));
+        assert!(!is_extra_registry_source("registry:/skill"));
+        assert!(!is_extra_registry_source("registry:name/"));
+        // A bare name has no prefix and stays a Tier-1 registry install.
+        assert!(!is_extra_registry_source("auto-coder"));
+    }
+
+    #[test]
+    fn test_is_extra_registry_source_rejects_competing_schemes() {
+        assert!(!is_extra_registry_source("clawhub:x"));
+        assert!(!is_extra_registry_source("https://github.com/o/r"));
+        assert!(!is_extra_registry_source("git@github.com:o/r"));
+        assert!(!is_extra_registry_source("./local"));
+    }
+
+    #[test]
+    fn test_parse_extra_registry_source_splits() {
+        assert_eq!(
+            parse_extra_registry_source("registry:myreg/auto-coder"),
+            Some(("myreg".to_string(), "auto-coder".to_string()))
+        );
+        assert_eq!(parse_extra_registry_source("registry:onlyname"), None);
+        assert_eq!(parse_extra_registry_source("registry:a/b/c"), None);
+        assert_eq!(parse_extra_registry_source("auto-coder"), None);
+    }
+
+    #[test]
+    fn test_is_unsafe_zip_entry_name() {
+        assert!(is_unsafe_zip_entry_name(""));
+        assert!(is_unsafe_zip_entry_name("../evil.txt"));
+        assert!(is_unsafe_zip_entry_name("a/../b"));
+        assert!(is_unsafe_zip_entry_name("/abs/path"));
+        assert!(is_unsafe_zip_entry_name("dir\\file"));
+        assert!(is_unsafe_zip_entry_name("c:/win"));
+        assert!(!is_unsafe_zip_entry_name("SKILL.md"));
+        assert!(!is_unsafe_zip_entry_name("scripts/run.sh"));
+    }
+
+    #[test]
+    fn test_extract_zip_secure_happy_path() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("SKILL.md", opts).unwrap();
+            w.write_all(b"# demo").unwrap();
+            w.start_file("scripts/run.txt", opts).unwrap();
+            w.write_all(b"echo hi").unwrap();
+            w.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "# demo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("scripts/run.txt")).unwrap(),
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_oversize() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("SKILL.md", opts).unwrap();
+            w.write_all(b"# demo").unwrap();
+            w.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 1).expect_err("oversize zip must be rejected");
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        assert!(
+            !dest.exists(),
+            "dest must not be created when the zip is rejected for size"
+        );
+    }
+
+    #[test]
+    fn test_install_extra_registry_unknown_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_extra_registry_skill_source(
+            "registry:nope/demo",
+            &skills_path,
+            false,
+            &workspace,
+            &[],
+            true,
+        )
+        .expect_err("unknown registry must error before any git work");
+        assert!(err.to_string().contains("nope"), "got: {err}");
     }
 
     #[test]

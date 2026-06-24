@@ -363,7 +363,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
     async fn file_write_normalizes_workspace_prefixed_relative_path() {
         let root = std::env::temp_dir().join("zeroclaw_test_file_write_workspace_prefixed");
         let workspace = root.join("workspace");
@@ -371,10 +370,9 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let tool = test_tool(workspace.clone());
-        let workspace_prefixed = workspace
-            .strip_prefix(std::path::Path::new("/"))
-            .unwrap()
-            .join("nested/out.txt");
+        let workspace_prefixed =
+            crate::util_helpers::workspace_prefixed_relative_path_for_test(&workspace)
+                .join("nested/out.txt");
         let result = tool
             .execute(json!({
                 "path": workspace_prefixed.to_string_lossy(),
