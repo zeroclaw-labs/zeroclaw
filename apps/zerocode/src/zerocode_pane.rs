@@ -285,12 +285,22 @@ impl ZerocodePane {
 
     /// Highlight style + symbol for a detail-pane list: active (full) when the
     /// cursor is in the detail, dimmed "you are here" when it has stepped back to
-    /// the section list.
+    /// the section list. `preserve_fg` keeps row span colours (theme swatches).
     fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        match self.cursor {
-            PaneCursor::Detail => (theme::selected_style(), "› "),
-            PaneCursor::Sections => (theme::selected_inactive_style(), "  "),
-        }
+        self.list_highlight(self.cursor == PaneCursor::Detail, false)
+    }
+
+    /// Canonical highlight resolver shared by every list in this pane: the
+    /// themed selection style plus the gutter arrow. `focused` is whether the
+    /// list being drawn currently holds the cursor; `preserve_fg` is set for
+    /// rows whose own colours must survive (theme swatches).
+    fn list_highlight(
+        &self,
+        focused: bool,
+        preserve_fg: bool,
+    ) -> (ratatui::style::Style, &'static str) {
+        let symbol = if focused { "\u{203a} " } else { "  " };
+        (theme::selection_highlight(focused, preserve_fg), symbol)
     }
 
     fn draw_focus_list(&self, frame: &mut Frame, area: Rect) {
@@ -305,12 +315,10 @@ impl ZerocodePane {
             .collect();
         let mut state = ListState::default();
         state.select(FOCI.iter().position(|f| *f == self.focus));
-        // Active highlight when the cursor lives in the section list; a dimmed
-        // "you are here" highlight when the cursor has stepped into the detail.
-        let (style, symbol) = match self.cursor {
-            PaneCursor::Sections => (theme::selected_style(), "› "),
-            PaneCursor::Detail => (theme::selected_inactive_style(), "  "),
-        };
+        // The section list is the active surface when the cursor lives in it;
+        // a dimmed "you are here" highlight when the cursor has stepped into the
+        // detail.
+        let (style, symbol) = self.list_highlight(self.cursor == PaneCursor::Sections, false);
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" zerocode "))
@@ -370,14 +378,15 @@ impl ZerocodePane {
             Some(alias) => format!(" Theme → {alias} "),
             None => " Theme ".to_string(),
         };
+        let (hstyle, hsym) = self.list_highlight(self.cursor == PaneCursor::Detail, true);
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&title))
-                // A fg-less highlight (bg + bold only) so the per-swatch colours
-                // on the highlighted row survive — a full `selected_style` would
-                // patch every span's fg and flatten the palette preview.
-                .highlight_style(theme::selected_bg_style())
-                .highlight_symbol("› "),
+                // A fg-less highlight so the per-swatch colours on the
+                // highlighted row survive — a full fg override would patch every
+                // span's fg and flatten the palette preview.
+                .highlight_style(hstyle)
+                .highlight_symbol(hsym),
             area,
             &mut state,
         );
@@ -443,8 +452,8 @@ impl ZerocodePane {
             .split(inner);
         frame.render_stateful_widget(
             List::new(items)
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             rows[0],
             &mut state,
         );

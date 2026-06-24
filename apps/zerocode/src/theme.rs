@@ -261,6 +261,28 @@ pub(crate) fn selected_inactive_style() -> Style {
     Style::default().fg(t.dim).bg(t.selection_bg)
 }
 
+/// Inactive ("you are here") selection without a foreground override: the
+/// selection background only, for rows whose spans carry their own meaningful
+/// colours (theme swatches) that a dim fg would flatten.
+pub(crate) fn selected_inactive_bg_style() -> Style {
+    Style::default().bg(active().selection_bg)
+}
+
+/// Canonical selection highlight resolver for every split-pane detail list.
+///
+/// `focused` is true when the cursor lives in the pane being drawn (active
+/// selection); false renders the dim "you are here" marker for the pane that
+/// has stepped back. `preserve_fg` is true for rows whose own span colours must
+/// survive (theme swatches), suppressing the foreground override.
+pub(crate) fn selection_highlight(focused: bool, preserve_fg: bool) -> Style {
+    match (focused, preserve_fg) {
+        (true, false) => selected_style(),
+        (true, true) => selected_bg_style(),
+        (false, false) => selected_inactive_style(),
+        (false, true) => selected_inactive_bg_style(),
+    }
+}
+
 pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }

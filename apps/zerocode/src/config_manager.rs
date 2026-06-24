@@ -522,27 +522,17 @@ impl App {
         }
     }
 
-    /// Highlight style + symbol for the right (detail) pane lists.
-    ///
-    /// Three visual states are intentionally separated so a *selected* field
-    /// in the field list is no longer mistaken for an *editable* input:
-    ///
-    /// 1. FieldList (selection) — the row is highlighted with the selection
-    ///    background but kept dim and un-bolded. The arrow gutter is a thin
-    ///    ">" instead of the bold "› " reserved for active editing.
-    /// 2. FieldEdit (active editing) — bold + bright foreground on the
-    ///    selection background with the "› " gutter, matching the rest of
-    ///    the editor's active surfaces.
-    /// 3. Other screens / section-list holds focus — dim "you are here"
-    ///    marker, identical to the previous behavior.
+    /// Highlight style + symbol for the right (detail) pane lists, mirroring
+    /// `zerocode_pane::ZerocodePane::detail_highlight`: the active selection
+    /// style and "› " gutter when the detail pane holds focus, the dim "you
+    /// are here" marker when focus has stepped back to the section list.
     fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        match (&self.screen, self.zeroclaw_pane) {
-            (Screen::FieldEdit { .. }, _) => (theme::selected_style(), "\u{203a} "),
-            (Screen::FieldList { .. }, ZeroclawPane::Detail) => {
-                (theme::selected_inactive_style(), ">")
-            }
-            _ => (theme::selected_inactive_style(), "  "),
-        }
+        let focused = matches!(
+            (&self.screen, self.zeroclaw_pane),
+            (Screen::FieldEdit { .. }, _) | (_, ZeroclawPane::Detail)
+        );
+        let symbol = if focused { "\u{203a} " } else { "  " };
+        (theme::selection_highlight(focused, false), symbol)
     }
 
     fn draw_section_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -3322,9 +3312,9 @@ impl App {
         }
 
         let (style, symbol) = if active {
-            (theme::selected_style(), "› ")
+            (theme::selection_highlight(true, false), "\u{203a} ")
         } else {
-            (theme::selected_inactive_style(), "  ")
+            (theme::selection_highlight(false, false), "  ")
         };
 
         frame.render_stateful_widget(
@@ -4086,8 +4076,8 @@ impl App {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&title))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(theme::selection_highlight(true, false))
+                    .highlight_symbol("\u{203a} "),
                 r.main,
                 &mut state,
             );
