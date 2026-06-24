@@ -16777,6 +16777,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
+        self.collect_a2a_exposed_skills_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -16796,6 +16797,41 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
+    /// `exposed_skills` is a narrowing filter over the agent's resolved skill
+    /// set, which comes from `skill_bundles`. An agent that lists
+    /// `a2a.exposed_skills` but declares no `skill_bundles` advertises an empty
+    /// `skills: []` array on its agent card with no error, because every wanted
+    /// id is dropped for belonging to a bundle the agent does not declare. The
+    /// same silent emptiness happens when a wanted id names no skill in any
+    /// declared bundle, or when the owning bundle's include/exclude filter
+    /// excludes it; those need disk resolution, so this offline check covers the
+    /// common structural case: exposed skills with zero declared bundles.
+    fn collect_a2a_exposed_skills_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (agent_alias, agent) in &self.agents {
+            if agent.a2a.exposed_skills.is_empty() {
+                continue;
+            }
+            if !agent.skill_bundles.is_empty() {
+                continue;
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "a2a_exposed_skills_without_bundles",
+                format!(
+                    "agent `{agent_alias}` lists a2a.exposed_skills but declares no \
+                     skill_bundles, so its agent card advertises no skills (skills: []). \
+                     exposed_skills is a filter over the agent's resolved skill set; add \
+                     the owning bundle(s) to agents.{agent_alias}.skill_bundles so the \
+                     listed skills resolve."
+                ),
+                format!("agents.{agent_alias}.a2a.exposed_skills"),
+            ));
+        }
     }
 
     /// Surface the #7964 cross-provider shape on a legacy config that has NOT
@@ -29994,6 +30030,69 @@ allowed_users = []
             w.message.contains("beta -> custom.p2"),
             "message names beta + provider: {}",
             w.message
+        );
+    }
+
+    // exposed_skills set with no skill_bundles -> the agent card resolves no
+    // skills (skills: []) silently; the diagnostic fires and names the agent.
+    #[tokio::test]
+    async fn collect_warnings_flags_exposed_skills_without_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get", "ucp_merchant_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "a2a_exposed_skills_without_bundles")
+            .expect("expected a2a_exposed_skills_without_bundles warning");
+        assert_eq!(w.path, "agents.merchant.a2a.exposed_skills");
+        assert!(
+            w.message.contains("merchant"),
+            "message names the agent: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("skill_bundles"),
+            "message points at skill_bundles: {}",
+            w.message
+        );
+    }
+
+    // exposed_skills set alongside at least one declared skill_bundle -> no
+    // structural diagnostic (disk resolution governs whether ids actually
+    // resolve; that is out of scope for this offline check).
+    #[tokio::test]
+    async fn collect_warnings_silent_for_exposed_skills_with_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+            skill_bundles = ["commerce"]
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "a2a_exposed_skills_without_bundles"),
+            "no exposed_skills warning when a bundle is declared: {warnings:?}"
         );
     }
 

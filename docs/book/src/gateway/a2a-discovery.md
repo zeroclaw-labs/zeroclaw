@@ -325,6 +325,14 @@ actually carries: it must live in one of the agent's skill bundles and its
 skill in a bundle the agent does not declare, is dropped silently rather than
 advertised.
 
+The most common cause of an empty `skills: []` array is setting
+`a2a.exposed_skills` on an agent that declares no `skill_bundles`.
+`exposed_skills` only narrows the agent's resolved skill set; it does not load
+skills on its own. With no bundle declared there is nothing for the filter to
+keep, so every name drops and the card advertises nothing. Add the owning
+bundle(s) to `agents.<alias>.skill_bundles`. Config validation surfaces this
+case as a startup warning (`a2a_exposed_skills_without_bundles`).
+
 ### What publishing actually exposes
 
 Read this before you publish. Once the server is enabled and an alias is
