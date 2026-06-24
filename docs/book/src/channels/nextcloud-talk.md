@@ -45,9 +45,7 @@ zeroclaw daemon
 Configure your Talk bot's webhook URL to point at the alias of the
 `[channels.nextcloud_talk.<alias>]` instance that should receive it:
 
-```
-https://<your-public-url>/nextcloud-talk/<alias>
-```
+`https://<your-public-url>/nextcloud-talk/<alias>`
 
 For example, `[channels.nextcloud_talk.work]` receives `POST /nextcloud-talk/work`.
 This per-alias routing (#6312) lets you run several Talk bots side by side and

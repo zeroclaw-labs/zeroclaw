@@ -4,6 +4,27 @@ Use this page when adding or changing a built-in ZeroClaw provider, channel, too
 
 This page is not for out-of-process plugins. If the extension can live outside the core binary, start with [Plugin protocol](./plugin-protocol.md) or [MCP](../tools/mcp.md) before adding a first-party implementation.
 
+## Choose Built-In Or External
+
+Keep the core binary lean by choosing the narrowest durable home for each
+capability before adding or removing code. An external integration is not, by
+itself, a reason to delete a first-party tool; the boundary depends on the
+contract ZeroClaw must preserve for operators, agents, and existing configs.
+
+| Surface | Use when | Avoid when |
+|---|---|---|
+| Baseline built-in capability | The capability is part of the agent's baseline operating contract, needs tight autonomy/receipt integration, or must work before plugins, skills, or MCP servers are configured. | The behavior is just a wrapper around one vendor API, product, SaaS, or optional local program. |
+| Feature-gated first-party implementation | The implementation is first-party, security-sensitive, or needs Rust trait integration, but the dependency, platform, or binary-size cost should not affect minimal builds. New crates still need the architecture map, RFC, and stability-tier checks. | The feature flag would become a hidden compatibility trap or a second source of truth for config/state. |
+| WASM plugin | The capability should be installed, upgraded, permissioned, or distributed independently while still using ZeroClaw's plugin ABI and manifest permissions. | The current plugin ABI cannot express the needed security, lifecycle, or data contract. |
+| [Skill package](../tools/skills.md) | The value is mostly instructions, prompts, repeatable workflows, scripts, or CLI recipes that can run through existing tools. | The capability needs a new trusted runtime primitive, long-lived service, or direct config/schema ownership. |
+| MCP server | A local or remote service already exposes an appropriate Model Context Protocol surface, or the integration should remain outside the ZeroClaw process. | The project needs a stable first-party guarantee, offline default behavior, or a ZeroClaw-specific security model the server cannot provide. |
+| CLI-backed integration | A mature external CLI already owns authentication, API drift, and platform behavior, and ZeroClaw only needs to call it through existing shell/tool policy. | The CLI output is too unstable, requires broad ambient permissions, or would hide side effects from tool receipts and approval policy. |
+
+Use this as a decision checklist: document the required contract first,
+then choose a small migration candidate if code proof is needed. Do not start by
+removing tools or integrations until compatibility, config, security policy,
+operator visibility, and rollback are explicit.
+
 ## Choose The Smallest Surface
 
 Before writing code, decide which extension surface owns the behavior.

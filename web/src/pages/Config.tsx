@@ -379,7 +379,8 @@ export default function Config() {
           }
         />
       );
-      const costsCategory = costCategoryForSection(activeSection.key);
+      const costsCategory =
+        (activeSection.cost_category as CostRatesCategory) || null;
       if (costsCategory) {
         return (
           <SectionTabs
@@ -917,13 +918,6 @@ const BACKEND_PICKER_FIELD: Record<string, string> = {
   tunnel: "tunnel.tunnel_provider",
   memory: "memory.backend",
 };
-
-function costCategoryForSection(sectionKey: string): CostRatesCategory | null {
-  if (sectionKey === "providers.models") return "models";
-  if (sectionKey === "providers.tts") return "tts";
-  if (sectionKey === "providers.transcription") return "transcription";
-  return null;
-}
 
 function isDirectChannelSetting(path: string): boolean {
   const prefix = "channels.";
