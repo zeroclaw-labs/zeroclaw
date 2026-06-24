@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Check, Circle, Loader2 } from 'lucide-react';
+import { Check, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { t } from '@/lib/i18n';
 import {
@@ -312,7 +312,10 @@ export function UpgradeDialog({
                   </div>
                 )}
 
-                {/* Phase checklist */}
+                {/* Phase checklist — every unfinished step shows a Loader2
+                    spinner; the active one is full-strength, the pending ones
+                    are faded down so the eye is drawn to where work is
+                    actually happening without the list looking dead. */}
                 <ol className="text-xs flex flex-col gap-1.5">
                   {PHASE_LABELS.map((key, i) => {
                     const n = i + 1;
@@ -328,7 +331,10 @@ export function UpgradeDialog({
                         ) : active ? (
                           <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-pc-text" />
                         ) : (
-                          <Circle className="h-3.5 w-3.5 shrink-0 text-pc-text-muted opacity-40" />
+                          <Loader2
+                            className="h-3.5 w-3.5 shrink-0 animate-spin text-pc-text-muted opacity-30"
+                            aria-hidden="true"
+                          />
                         )}
                         <span className={done || active ? 'text-pc-text' : 'text-pc-text-muted'}>
                           {t(key)}
