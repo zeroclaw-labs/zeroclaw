@@ -895,4 +895,18 @@ pub enum SopCommands {
         /// Name of the SOP to show
         name: String,
     },
+    /// Approve a SOP run waiting for out-of-band approval (talks to the running daemon)
+    Approve {
+        /// The run ID to approve
+        run_id: String,
+    },
+    /// Deny (cancel) a SOP run waiting for approval (talks to the running daemon)
+    Deny {
+        /// The run ID to deny
+        run_id: String,
+        /// Optional reason recorded in the approval ledger
+        reason: Option<String>,
+    },
+    /// List SOP runs currently waiting for approval (talks to the running daemon)
+    Pending,
 }
