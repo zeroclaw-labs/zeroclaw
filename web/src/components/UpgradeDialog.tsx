@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Check, Loader2 } from 'lucide-react';
+import { Check, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { t } from '@/lib/i18n';
 import {
@@ -24,6 +24,11 @@ export interface UpgradeDialogProps {
   restartMode?: 'supervised' | 'self_respawn' | 'manual';
   /** Manual-restart command to show after a swap. */
   restartHint?: string;
+  /** Trigger a forced re-check against the upstream release feed, bypassing
+   *  the server-side 1h cache. The Info view exposes this as a refresh icon
+   *  next to the title so users can poke for an update on demand instead of
+   *  waiting for the next 6h tick. */
+  onRefetch?: () => void;
   /** Close the dialog (Esc, backdrop, or Close button). */
   onClose: () => void;
 }
@@ -57,6 +62,7 @@ export function UpgradeDialog({
   allowSelfUpgrade,
   restartMode,
   restartHint,
+  onRefetch,
   onClose,
 }: UpgradeDialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -211,9 +217,27 @@ export function UpgradeDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-5 pb-4 flex flex-col gap-3">
-          <h2 id={titleId} className="text-sm font-semibold text-pc-text">
-            {t('upgrade.title')}
-          </h2>
+          <div className="flex items-center justify-between gap-2">
+            <h2 id={titleId} className="text-sm font-semibold text-pc-text">
+              {t('upgrade.title')}
+            </h2>
+            {/* Manual re-check: bypass the server-side 1h cache. Only meaningful
+                in the read-only Info view — once an upgrade is in flight the
+                version_check result is frozen anyway. The icon mirrors the
+                `loading` state by spinning while a check is in flight. */}
+            {(view === 'info' || view === 'confirm') && onRefetch && (
+              <button
+                type="button"
+                onClick={onRefetch}
+                disabled={loading}
+                title={t('upgrade.recheck')}
+                aria-label={t('upgrade.recheck')}
+                className="inline-flex h-6 w-6 items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted hover:text-pc-text hover:bg-pc-surface transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              </button>
+            )}
+          </div>
 
           {/* ── Version summary (always shown except terminal states) ── */}
           {(view === 'info' || view === 'confirm') &&

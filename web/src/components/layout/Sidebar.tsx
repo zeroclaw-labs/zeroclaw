@@ -217,7 +217,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
   }, []);
   // `check_updates` is undefined on older gateways → treat as enabled.
   const checkUpdates = status?.check_updates !== false;
-  const { info, loading } = useVersionCheck(checkUpdates);
+  const { info, loading, refetch } = useVersionCheck(checkUpdates);
   const hasUpdate = info?.is_newer === true;
   const version = status?.version ?? null;
   const [upgradeOpen, setUpgradeOpen] = useState(false);
@@ -291,6 +291,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         allowSelfUpgrade={status?.allow_self_upgrade === true}
         restartMode={status?.restart_mode}
         restartHint={status?.restart_hint}
+        onRefetch={refetch}
         onClose={() => setUpgradeOpen(false)}
       />
     </>
