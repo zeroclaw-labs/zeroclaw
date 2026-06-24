@@ -1540,8 +1540,11 @@ impl InputBarState {
         }
 
         // Terminal owns cursor blinking; a software blink that skips
-        // set_cursor_position can latch the cursor hidden.
-        if show_cursor && !turn_in_flight && inner_width > 0 && self.file_explorer.is_none() {
+        // set_cursor_position can latch the cursor hidden. The cursor shows
+        // whenever the input box is editable — including while a turn is in
+        // flight, since the user can type a queued message then. Only an
+        // approval overlay (show_cursor=false) or the file browser suppress it.
+        if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
             if cursor_row < self.scroll_offset {
