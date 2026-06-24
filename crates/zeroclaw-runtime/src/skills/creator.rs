@@ -256,9 +256,14 @@ impl SkillCreator {
             &scrub_secrets(final_answer),
             self.config.max_final_answer_chars,
         );
+        // The slug is derived from the task description, so it can carry the
+        // same credential-shaped content; scrub the copy that enters the prompt
+        // too. (The local `SKILL.md` frontmatter `name` keeps the raw slug via
+        // `normalize_reflected_md`, which never leaves the host.)
+        let safe_slug = scrub_secrets(slug);
 
         format!(
-            "Suggested skill name (use as the frontmatter `name`): {slug}\n\n\
+            "Suggested skill name (use as the frontmatter `name`): {safe_slug}\n\n\
              ## Task the user asked for\n{task}\n\n\
              ## Tools the agent used, in order\n{trace}\n\n\
              ## Final answer the agent produced\n{answer}\n\n\
@@ -274,11 +279,12 @@ impl SkillCreator {
     /// cannot allocate a large intermediate string before the caller's final
     /// truncation.
     ///
-    /// Each call's serialized args are scrubbed of credential-shaped data (see
-    /// [`scrub_secrets`]) before the per-call cap is applied, so raw secrets
-    /// embedded in tool arguments never enter the reflection prompt. Scrubbing
-    /// precedes the cap so a secret is matched on the full serialized args
-    /// rather than on a truncated prefix.
+    /// Both the tool name and each call's serialized args are scrubbed of
+    /// credential-shaped data (see [`scrub_secrets`]) before they enter the
+    /// trace — the args before the per-call cap is applied — so no raw secret
+    /// embedded in a tool name or argument reaches the reflection prompt.
+    /// Scrubbing precedes the cap so a secret is matched on the full serialized
+    /// args rather than on a truncated prefix.
     fn render_tool_trace(tool_calls: &[ToolCallRecord], budget: usize) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -287,11 +293,12 @@ impl SkillCreator {
                 let _ = writeln!(out, "…[{} more tool call(s) omitted]", tool_calls.len() - i);
                 break;
             }
+            let name = scrub_secrets(&call.name);
             let args = truncate_chars(
                 &scrub_secrets(&serde_json::to_string(&call.args).unwrap_or_default()),
                 MAX_TOOL_ARG_CHARS,
             );
-            let _ = writeln!(out, "{}. {} {}", i + 1, call.name, args);
+            let _ = writeln!(out, "{}. {} {}", i + 1, name, args);
         }
         out
     }
@@ -1525,6 +1532,17 @@ tags = ["auto-generated"]
         assert!(prompt.contains("…[truncated]"));
         // The full, unbounded answer must never appear verbatim.
         assert!(!prompt.contains(&long_answer));
+        // Clean content must survive the scrub: the bounded prefixes of the
+        // (secret-free) task and answer are still present, so scrubbing did not
+        // wrongly destroy non-credential input.
+        assert!(
+            prompt.contains("TASKW"),
+            "clean task prefix dropped: {prompt}"
+        );
+        assert!(
+            prompt.contains("ANSWER"),
+            "clean answer prefix dropped: {prompt}"
+        );
     }
 
     #[test]
@@ -1564,10 +1582,47 @@ tags = ["auto-generated"]
             "Anthropic key leaked: {prompt}"
         );
         assert!(!prompt.contains(db_url), "database URL leaked: {prompt}");
-        // ...and the redaction markers prove the scrub ran on each surface.
+        // ...and each surface's specific marker is present, so a future regex
+        // regression that silently stops matching one pattern is caught rather
+        // than masked by another pattern's marker.
         assert!(
-            prompt.contains("[REDACTED"),
-            "no redaction marker: {prompt}"
+            prompt.contains("[REDACTED_AWS_CREDENTIAL]"),
+            "AWS key (task + answer) not redacted: {prompt}"
+        );
+        assert!(
+            prompt.contains("[REDACTED_API_KEY]"),
+            "Anthropic key (tool args) not redacted: {prompt}"
+        );
+        assert!(
+            prompt.contains("[REDACTED_DATABASE_URL]"),
+            "database URL (tool args + answer) not redacted: {prompt}"
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_scrubs_credential_shaped_slug() {
+        // The slug is interpolated into the prompt as the suggested skill name.
+        // It is normally derived from the task (lowercased + hyphenated), which
+        // mangles most credential shapes, but the scrub is defense-in-depth: the
+        // prompt-bound copy of *any* slug must be redacted. Drive the boundary
+        // directly with a credential-shaped slug.
+        let creator = SkillCreator::new(std::path::PathBuf::from("/tmp"), reflect_config());
+        let key_slug = "sk-ant-api03-AbC123dEf456GhI789jKl012MnO345pQr678";
+
+        let prompt = creator.build_reflection_prompt(
+            key_slug,
+            "A clean task",
+            &two_calls(),
+            "Clean answer.",
+        );
+
+        assert!(
+            !prompt.contains(key_slug),
+            "credential-shaped slug leaked into prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("[REDACTED_API_KEY]"),
+            "slug not redacted: {prompt}"
         );
     }
 
@@ -1619,10 +1674,33 @@ tags = ["auto-generated"]
             !sent.contains(anthropic_key),
             "Anthropic key reached the provider: {sent}"
         );
+        // Pin the specific markers: the AWS key (final answer) and the Anthropic
+        // key (tool args) must each be individually redacted, so dropping either
+        // pattern is caught rather than hidden behind the other's marker.
         assert!(
-            sent.contains("[REDACTED"),
-            "expected redaction marker in provider prompt: {sent}"
+            sent.contains("[REDACTED_AWS_CREDENTIAL]"),
+            "AWS key not redacted in provider prompt: {sent}"
         );
+        assert!(
+            sent.contains("[REDACTED_API_KEY]"),
+            "Anthropic key not redacted in provider prompt: {sent}"
+        );
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_and_preserves() {
+        // Direct contract for the redaction helper: a known credential is
+        // replaced with its marker, clean text passes through byte-for-byte, and
+        // the empty string is handled.
+        let redacted = scrub_secrets("key AKIAIOSFODNN7EXAMPLE here");
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(redacted.contains("[REDACTED_AWS_CREDENTIAL]"));
+
+        assert_eq!(
+            scrub_secrets("just a normal sentence"),
+            "just a normal sentence"
+        );
+        assert_eq!(scrub_secrets(""), "");
     }
 
     #[test]
