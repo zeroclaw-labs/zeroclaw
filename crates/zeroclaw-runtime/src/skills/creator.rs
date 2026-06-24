@@ -12,6 +12,13 @@
 //     the execution. The reflection path always falls back to `SKILL.toml`
 //     when the provider call or its output is unusable, so enabling it can
 //     never leave a skill un-created.
+//
+// The reflection path forwards turn content (task, tool-call trace, final
+// answer) to the model provider, so every variable-length input is scrubbed of
+// credential-shaped data via the shared outbound-content `LeakDetector` *before*
+// it is composed into the prompt — the redaction is a hard privacy boundary
+// applied before the request leaves the process, not an instruction the model
+// is asked to honor after it has already received the raw content.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -25,7 +32,7 @@ use super::document::SkillDocument;
 /// System prompt for the reflection path. Constrains the model to emit a
 /// single canonical `SKILL.md` and nothing else.
 const REFLECTION_SYSTEM_PROMPT: &str = "You convert a completed task execution into a reusable agent skill.\n\
-Return ONLY a single agentskills.io-style SKILL.md document and nothing else.\n\
+Return ONLY a single standard SKILL.md document and nothing else.\n\
 The document MUST begin with a YAML frontmatter block delimited by `---` lines containing at least:\n\
   name: <short-kebab-case-name>\n\
   description: <one sentence: what the skill does and when to use it>\n\
@@ -222,9 +229,13 @@ impl SkillCreator {
     }
 
     /// Build the bounded user prompt. Every variable-length input (task,
-    /// tool-call trace, final answer) is independently truncated to its
-    /// configured character budget so a large execution cannot produce an
-    /// unbounded reflection request.
+    /// tool-call trace, final answer) is first scrubbed of credential-shaped
+    /// data (see [`scrub_secrets`]) and then independently truncated to its
+    /// configured character budget, so a large execution cannot produce an
+    /// unbounded reflection request and raw secrets cannot reach the provider.
+    ///
+    /// Scrubbing precedes truncation so a secret straddling the budget boundary
+    /// is detected on the whole input rather than on a severed prefix.
     fn build_reflection_prompt(
         &self,
         slug: &str,
@@ -232,15 +243,19 @@ impl SkillCreator {
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
     ) -> String {
-        let task = truncate_chars(task_description, self.config.max_task_chars);
+        let task = truncate_chars(&scrub_secrets(task_description), self.config.max_task_chars);
         // `render_tool_trace` is already budget-aware (per-call arg cap + early
-        // stop), so it never builds a large intermediate string; the outer
-        // truncate is the final hard cap.
+        // stop) and scrubs each call's serialized args before they enter the
+        // trace, so it never builds a large or secret-bearing intermediate
+        // string; the outer truncate is the final hard cap.
         let trace = truncate_chars(
             &Self::render_tool_trace(tool_calls, self.config.max_tool_trace_chars),
             self.config.max_tool_trace_chars,
         );
-        let answer = truncate_chars(final_answer, self.config.max_final_answer_chars);
+        let answer = truncate_chars(
+            &scrub_secrets(final_answer),
+            self.config.max_final_answer_chars,
+        );
 
         format!(
             "Suggested skill name (use as the frontmatter `name`): {slug}\n\n\
@@ -258,6 +273,12 @@ impl SkillCreator {
     /// reaches `budget`, so a pathological execution (many calls, huge args)
     /// cannot allocate a large intermediate string before the caller's final
     /// truncation.
+    ///
+    /// Each call's serialized args are scrubbed of credential-shaped data (see
+    /// [`scrub_secrets`]) before the per-call cap is applied, so raw secrets
+    /// embedded in tool arguments never enter the reflection prompt. Scrubbing
+    /// precedes the cap so a secret is matched on the full serialized args
+    /// rather than on a truncated prefix.
     fn render_tool_trace(tool_calls: &[ToolCallRecord], budget: usize) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -267,7 +288,7 @@ impl SkillCreator {
                 break;
             }
             let args = truncate_chars(
-                &serde_json::to_string(&call.args).unwrap_or_default(),
+                &scrub_secrets(&serde_json::to_string(&call.args).unwrap_or_default()),
                 MAX_TOOL_ARG_CHARS,
             );
             let _ = writeln!(out, "{}. {} {}", i + 1, call.name, args);
@@ -524,6 +545,24 @@ fn extract_skill_description(manifest: &std::path::Path, content: &str) -> Optio
             .map(|doc| doc.frontmatter.description)
     } else {
         extract_description_from_toml(content)
+    }
+}
+
+/// Redact credential-shaped substrings — API keys, tokens, AWS credentials,
+/// PEM private keys, JWTs, database connection URLs, and high-entropy secrets —
+/// from `s`, returning the input unchanged when nothing is detected.
+///
+/// This is the privacy boundary for the reflection path: raw turn content
+/// (task, tool arguments, final answer) must be scrubbed *before* it is placed
+/// in the prompt sent to the model provider, not merely generalized away by the
+/// model after it has already received the raw content. It reuses the same
+/// [`LeakDetector`](crate::security::LeakDetector) guardrail applied to
+/// outbound channel responses, so the two outbound surfaces share one
+/// redaction policy.
+fn scrub_secrets(s: &str) -> String {
+    match crate::security::LeakDetector::new().scan(s) {
+        crate::security::LeakResult::Clean => s.to_string(),
+        crate::security::LeakResult::Detected { redacted, .. } => redacted,
     }
 }
 
@@ -1199,10 +1238,12 @@ tags = ["auto-generated"]
 
     /// Minimal `ModelProvider` for reflection tests: returns a canned reply or
     /// fails, counting calls so "skipped" paths can assert the provider was
-    /// never invoked.
+    /// never invoked and capturing the last user prompt so privacy tests can
+    /// assert exactly what content was sent.
     struct MockModelProvider {
         reply: MockReply,
         calls: std::sync::atomic::AtomicUsize,
+        last_prompt: std::sync::Mutex<Option<String>>,
     }
 
     impl MockModelProvider {
@@ -1210,16 +1251,22 @@ tags = ["auto-generated"]
             Self {
                 reply: MockReply::Md(md.into()),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                last_prompt: std::sync::Mutex::new(None),
             }
         }
         fn failing() -> Self {
             Self {
                 reply: MockReply::Fail,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                last_prompt: std::sync::Mutex::new(None),
             }
         }
         fn call_count(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// The user prompt passed to the most recent `chat_with_system` call.
+        fn last_prompt(&self) -> Option<String> {
+            self.last_prompt.lock().unwrap().clone()
         }
     }
 
@@ -1228,11 +1275,12 @@ tags = ["auto-generated"]
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
-            _message: &str,
+            message: &str,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_prompt.lock().unwrap() = Some(message.to_string());
             match &self.reply {
                 MockReply::Md(s) => Ok(s.clone()),
                 MockReply::Fail => anyhow::bail!("mock provider failure"),
@@ -1477,6 +1525,104 @@ tags = ["auto-generated"]
         assert!(prompt.contains("…[truncated]"));
         // The full, unbounded answer must never appear verbatim.
         assert!(!prompt.contains(&long_answer));
+    }
+
+    #[test]
+    fn reflection_prompt_scrubs_credential_shaped_inputs() {
+        // Credential-shaped values in the task, tool args, and final answer must
+        // be redacted by `build_reflection_prompt` itself — the prompt is what
+        // `reflect_skill_md` sends to the provider, so the secrets must be gone
+        // before the string is ever composed.
+        let creator = SkillCreator::new(std::path::PathBuf::from("/tmp"), reflect_config());
+
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let anthropic_key = "sk-ant-api03-AbC123dEf456GhI789jKl012MnO345pQr678";
+        let db_url = "postgres://admin:hunter2pw@db.internal:5432/prod";
+
+        let calls = vec![
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": format!("export ANTHROPIC_API_KEY={anthropic_key}")}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": format!("psql {db_url} -c 'select 1'")}),
+            },
+        ];
+
+        let prompt = creator.build_reflection_prompt(
+            "deploy-the-service",
+            &format!("Deploy using key {aws_key}"),
+            &calls,
+            &format!("Authenticated with {aws_key} against {db_url}."),
+        );
+
+        // No raw secret may survive into the prompt sent to the provider.
+        assert!(!prompt.contains(aws_key), "AWS key leaked: {prompt}");
+        assert!(
+            !prompt.contains(anthropic_key),
+            "Anthropic key leaked: {prompt}"
+        );
+        assert!(!prompt.contains(db_url), "database URL leaked: {prompt}");
+        // ...and the redaction markers prove the scrub ran on each surface.
+        assert!(
+            prompt.contains("[REDACTED"),
+            "no redaction marker: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflected_scrubs_secrets_before_provider_call() {
+        // End-to-end: drive the reflected creation path and assert the prompt
+        // the provider actually received carries no raw credential-shaped data.
+        let dir = tempfile::tempdir().unwrap();
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let anthropic_key = "sk-ant-api03-AbC123dEf456GhI789jKl012MnO345pQr678";
+
+        let provider = MockModelProvider::replying(
+            "---\nname: x\ndescription: Deploy the service.\n---\n# Deploy\n\nSteps here.\n",
+        );
+        let creator = SkillCreator::new(dir.path().to_path_buf(), reflect_config());
+
+        let calls = vec![
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": format!("export ANTHROPIC_API_KEY={anthropic_key}")}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "deploy --prod"}),
+            },
+        ];
+
+        creator
+            .create_from_execution_reflected(
+                "Deploy the service",
+                &calls,
+                &format!("Done. Authenticated with {aws_key}."),
+                None,
+                &provider,
+                "test-model",
+            )
+            .await
+            .unwrap()
+            .expect("a skill should be created");
+
+        let sent = provider
+            .last_prompt()
+            .expect("the provider should have been called");
+        assert!(
+            !sent.contains(aws_key),
+            "AWS key reached the provider: {sent}"
+        );
+        assert!(
+            !sent.contains(anthropic_key),
+            "Anthropic key reached the provider: {sent}"
+        );
+        assert!(
+            sent.contains("[REDACTED"),
+            "expected redaction marker in provider prompt: {sent}"
+        );
     }
 
     #[test]
