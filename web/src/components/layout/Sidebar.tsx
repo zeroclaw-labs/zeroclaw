@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  ArrowDownToLine,
   Bot,
   Clock,
   LayoutDashboard,
@@ -368,7 +369,9 @@ interface FooterProps {
 
 // Rail footer — version tag as a button, centered, with a native tooltip
 // carrying the full "ZeroClaw Gateway vX" string since the rail has no room for
-// the label. An accent dot marks an available update.
+// the label. When an update is available the version row is replaced by a
+// pulsing download-arrow icon stacked above the version text — the dot was
+// too easy to miss against the muted `text-faint` colour.
 function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
   const title = hasUpdate
     ? t('sidebar.update_available')
@@ -386,18 +389,29 @@ function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
           onClick={onOpen}
           title={title}
           aria-label={title}
-          className="relative flex items-center justify-center rounded px-1.5 py-0.5 cursor-pointer hover:bg-pc-surface transition-colors"
+          className={[
+            'relative flex flex-col items-center justify-center gap-0.5 rounded px-1.5 py-1 cursor-pointer transition-colors',
+            hasUpdate
+              ? 'bg-pc-accent/10 hover:bg-pc-accent/20'
+              : 'hover:bg-pc-surface',
+          ].join(' ')}
         >
-          <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
-            {version ? `v${version}` : t('upgrade.title')}
-          </span>
           {hasUpdate && (
-            <span
+            <ArrowDownToLine
               aria-hidden="true"
-              className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full"
-              style={{ background: 'var(--pc-accent)' }}
+              className="h-3.5 w-3.5 animate-bounce-soft"
+              style={{ color: 'var(--pc-accent)' }}
             />
           )}
+          <span
+            style={{
+              fontSize: '9px',
+              color: hasUpdate ? 'var(--pc-accent)' : 'var(--pc-text-faint)',
+              fontWeight: hasUpdate ? 600 : undefined,
+            }}
+          >
+            {version ? `v${version}` : t('upgrade.title')}
+          </span>
         </button>
       )}
     </div>
@@ -405,6 +419,8 @@ function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
 }
 
 // Drawer footer — full labelled gateway line for mobile, clickable to upgrade.
+// When an update is available the dot is replaced by a soft-bouncing download
+// arrow rendered at body-text size so the affordance is unmistakable.
 function DrawerFooter({ version, hasUpdate, onOpen }: FooterProps) {
   return (
     <div
@@ -415,16 +431,21 @@ function DrawerFooter({ version, hasUpdate, onOpen }: FooterProps) {
         type="button"
         onClick={onOpen}
         title={hasUpdate ? t('sidebar.update_available') : undefined}
-        className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity uppercase tracking-wider"
+        className={[
+          'flex items-center gap-1.5 cursor-pointer transition-opacity uppercase tracking-wider',
+          hasUpdate ? 'opacity-100' : 'hover:opacity-80',
+        ].join(' ')}
+        style={hasUpdate ? { color: 'var(--pc-accent)' } : undefined}
       >
-        <span>{t('sidebar.gateway')}</span>
         {hasUpdate && (
-          <span
+          <ArrowDownToLine
             aria-hidden="true"
-            className="h-1.5 w-1.5 rounded-full"
-            style={{ background: 'var(--pc-accent)' }}
+            className="h-3.5 w-3.5 animate-bounce-soft"
           />
         )}
+        <span>
+          {hasUpdate ? t('sidebar.update_available') : t('sidebar.gateway')}
+        </span>
       </button>
       {version && (
         <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
