@@ -5,6 +5,7 @@
 //! `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`
 //! for the design rationale.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Capability block parsed from `initialize.clientCapabilities.elicitation`.
@@ -45,6 +46,46 @@ impl ElicitationCapabilities {
             url: obj.contains_key("url"),
         }
     }
+}
+
+/// Elicitation transport mode.
+///
+/// Phase 1 callers only ever emit `Form`. `Url` is defined so the wire
+/// types are complete and so a stray future caller compiles, but the
+/// send-site in `AcpChannel` asserts the mode is `Form`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitationMode {
+    Form,
+    Url,
+}
+
+/// Params for an outbound `elicitation/create` JSON-RPC request.
+///
+/// Only the session-scoped variant is modeled — Phase 1 has no
+/// caller for request-scoped elicitation (auth/config phase).
+#[derive(Debug, Clone, Serialize)]
+pub struct ElicitationRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub mode: ElicitationMode,
+    pub message: String,
+    #[serde(rename = "requestedSchema")]
+    pub requested_schema: Value,
+}
+
+/// Response to an `elicitation/create` request.
+///
+/// Three-action model per the RFD. `Decline` and `Cancel` both
+/// collapse to `Ok(None)` at the `Channel::request_choice` layer
+/// in Phase 1 — see the design spec's "Open Questions" for the
+/// rationale on deferring the distinction.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum ElicitationResponse {
+    Accept { content: Value },
+    Decline,
+    Cancel,
 }
 
 #[cfg(test)]
@@ -108,5 +149,53 @@ mod tests {
         let caps = ElicitationCapabilities::from_value(Some(&v));
         assert!(caps.form);
         assert!(!caps.url);
+    }
+
+    #[test]
+    fn request_serializes_with_camelcase_keys() {
+        let req = ElicitationRequest {
+            session_id: "sess_1".to_string(),
+            mode: ElicitationMode::Form,
+            message: "Pick one".to_string(),
+            requested_schema: json!({ "type": "object" }),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["sessionId"], "sess_1");
+        assert_eq!(v["mode"], "form");
+        assert_eq!(v["message"], "Pick one");
+        assert!(v["requestedSchema"].is_object());
+    }
+
+    #[test]
+    fn response_accept_parses() {
+        let raw = json!({ "action": "accept", "content": { "choice": "choice-1" } });
+        let parsed: ElicitationResponse = serde_json::from_value(raw).unwrap();
+        match parsed {
+            ElicitationResponse::Accept { content } => {
+                assert_eq!(content["choice"], "choice-1");
+            }
+            other => panic!("expected Accept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_decline_parses() {
+        let raw = json!({ "action": "decline" });
+        let parsed: ElicitationResponse = serde_json::from_value(raw).unwrap();
+        assert!(matches!(parsed, ElicitationResponse::Decline));
+    }
+
+    #[test]
+    fn response_cancel_parses() {
+        let raw = json!({ "action": "cancel" });
+        let parsed: ElicitationResponse = serde_json::from_value(raw).unwrap();
+        assert!(matches!(parsed, ElicitationResponse::Cancel));
+    }
+
+    #[test]
+    fn response_unknown_action_is_error() {
+        let raw = json!({ "action": "frobnicate" });
+        let res: Result<ElicitationResponse, _> = serde_json::from_value(raw);
+        assert!(res.is_err());
     }
 }
