@@ -2,11 +2,8 @@
 //! `ChannelPlugin` trait's capability-gated default stubs, work end-to-end
 //! through the real, unmodified host. `examples/channel-echo` implements
 //! only the required methods and declares zero optional capabilities, so
-//! the host never calls the four capability-gated functions
-//! (self-handle/self-addressed-mention/drop-self-message/
-//! multi-message-delay-ms) that are still `trappable` host-side pending
-//! the channel sync-call fix — this test exercises only the required
-//! `send`/`poll-message` path, which is unaffected by that open issue.
+//! the host never calls the optional capability-gated functions. This test
+//! exercises only the required `send`/`poll-message` path.
 
 mod common;
 
