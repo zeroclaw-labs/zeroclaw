@@ -13,18 +13,6 @@ const RETRY_BASE_DELAY_MS: u64 = 2000;
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
-/// Find the largest byte index <= `max_bytes` that falls on a UTF-8 char boundary.
-fn floor_utf8_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut idx = max_bytes;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
 /// Notion channel — polls a Notion database for pending tasks and writes results back.
 ///
 /// The channel connects to the Notion API, queries a database for rows with a "pending"
@@ -313,7 +301,7 @@ impl NotionChannel {
                         ),
                     }
                 });
-                let short_id_end = floor_utf8_char_boundary(page_id, 8);
+                let short_id_end = crate::util::floor_char_boundary(page_id, 8);
                 let short_id = &page_id[..short_id_end];
                 if let Err(e) = self
                     .api_call(reqwest::Method::PATCH, &page_url, Some(payload))
@@ -430,7 +418,7 @@ impl Channel for NotionChannel {
                         );
 
                         if input_text.trim().is_empty() {
-                            let short_end = floor_utf8_char_boundary(&page_id, 8);
+                            let short_end = crate::util::floor_char_boundary(&page_id, 8);
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -566,7 +554,7 @@ fn truncate_result(value: &str) -> String {
     }
     let cut = MAX_RESULT_LENGTH.saturating_sub(30);
     // Ensure we cut on a char boundary
-    let end = floor_utf8_char_boundary(value, cut);
+    let end = crate::util::floor_char_boundary(value, cut);
     format!("{}\n\n... [output truncated]", &value[..end])
 }
 

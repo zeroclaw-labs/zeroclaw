@@ -23,7 +23,7 @@ uuid = { version = "1.18", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
 
 # zeroclaw-log IS the log pipeline. The `record!` macro it exports is
 # the workspace-wide deny gate for `tracing::info!`/`warn!`/etc. — see

@@ -37,6 +37,7 @@ impl Channel for CliChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let _utf8_erase_guard = zeroclaw_runtime::cli_input::ensure_terminal_utf8_erase();
         let stdin = io::stdin();
         let reader = BufReader::new(stdin);
         let mut lines = reader.lines();

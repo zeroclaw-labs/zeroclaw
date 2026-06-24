@@ -4,22 +4,7 @@ Practical SOP templates in the runtime-supported `SOP.toml` + `SOP.md` format.
 
 ## 1. Human-in-the-Loop Deployment
 
-`SOP.toml`:
-
-```toml
-[sop]
-name = "deploy-prod"
-description = "Manual deployment with explicit approval gate"
-version = "1.0.0"
-priority = "high"
-execution_mode = "supervised"
-max_concurrent = 1
-
-[[triggers]]
-type = "manual"
-```
-
-`SOP.md`:
+The `SOP.toml` defines the trigger and steps (see [Syntax](./syntax.md)). The `SOP.md` body:
 
 ```md
 ## Steps
@@ -34,23 +19,7 @@ type = "manual"
 
 ## 2. IoT Alert Handler (MQTT)
 
-`SOP.toml`:
-
-```toml
-[sop]
-name = "high-temp-alert"
-description = "Handle high temperature telemetry alerts"
-version = "1.0.0"
-priority = "critical"
-execution_mode = "priority_based"
-
-[[triggers]]
-type = "mqtt"
-topic = "sensors/temp/alert"
-condition = "$.temperature_c >= 85"
-```
-
-`SOP.md`:
+The `SOP.toml` defines the trigger and steps (see [Syntax](./syntax.md)). The `SOP.md` body:
 
 ```md
 ## Steps
@@ -64,22 +33,7 @@ condition = "$.temperature_c >= 85"
 
 ## 3. Daily Digest (Cron)
 
-`SOP.toml`:
-
-```toml
-[sop]
-name = "daily-summary"
-description = "Generate daily operational summary"
-version = "1.0.0"
-priority = "normal"
-execution_mode = "supervised"
-
-[[triggers]]
-type = "cron"
-expression = "0 9 * * *"
-```
-
-`SOP.md`:
+The `SOP.toml` defines the trigger and steps (see [Syntax](./syntax.md)). The `SOP.md` body:
 
 ```md
 ## Steps

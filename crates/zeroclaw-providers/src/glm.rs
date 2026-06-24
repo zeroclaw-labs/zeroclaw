@@ -22,7 +22,8 @@ pub struct GlmModelProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +98,7 @@ impl GlmModelProvider {
         if self.api_key_id.is_empty() || self.api_key_secret.is_empty() {
             anyhow::bail!(
                 "GLM API key not set or invalid format. Expected 'id.secret'. \
-                 Run `zeroclaw onboard` or set GLM_API_KEY env var."
+                 Set GLM_API_KEY env var or run `zeroclaw quickstart --model-provider glm --api-key <id.secret>`."
             );
         }
 
@@ -158,7 +159,6 @@ impl ModelProvider for GlmModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let mut messages = Vec::new();
@@ -220,7 +220,6 @@ impl ModelProvider for GlmModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let api_messages: Vec<Message> = messages

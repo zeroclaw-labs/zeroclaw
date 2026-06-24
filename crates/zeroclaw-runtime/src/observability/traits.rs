@@ -68,6 +68,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

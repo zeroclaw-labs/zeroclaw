@@ -12,6 +12,7 @@ use crate::conflict;
 use crate::importance;
 use crate::traits::{Memory, MemoryCategory};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_providers::ProviderDispatch;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -40,7 +41,7 @@ Do not include any text outside the JSON object."#;
 /// Phase 1: Write a history entry to the Daily memory category.
 /// Phase 2: Write a memory update to the Core category (if the LLM identified new facts).
 ///
-/// This function is designed to be called fire-and-forget via `tokio::spawn`.
+/// This function is designed to be called fire-and-forget via `zeroclaw_spawn::spawn!`.
 /// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
 /// that contain local filesystem paths.  These must never be forwarded to
 /// upstream model_provider APIs — they would leak local paths and cause API errors.
@@ -80,7 +81,7 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    let raw = model_provider
+    let raw = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,

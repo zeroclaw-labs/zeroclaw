@@ -8,7 +8,23 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::{ChannelAliasInfo, Config};
+use zeroclaw_memory::MemoryEntry;
+
+const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
+
+fn integration_entry_json(
+    entry: &zeroclaw_runtime::integrations::IntegrationEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": &entry.name,
+        "description": &entry.description,
+        "category": entry.category,
+        "category_label": entry.category.label(),
+        "status": entry.status,
+    })
+}
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -105,7 +121,10 @@ pub struct CronAddBody {
 #[derive(Deserialize)]
 pub struct CronPatchBody {
     /// Configured agent alias whose risk profile gates the new shell
-    /// command (when `command` is being patched). Required.
+    /// command. Only consulted when `command` is being patched; optional
+    /// otherwise (e.g. a pure schedule/name change or an enable/disable
+    /// toggle), so non-command patches need not supply it.
+    #[serde(default)]
     pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
@@ -113,6 +132,9 @@ pub struct CronPatchBody {
     pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+    /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
+    /// the current state unchanged.
+    pub enabled: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -206,9 +228,8 @@ pub async fn handle_api_status(
     let config = state.config.read().clone();
     let health = zeroclaw_runtime::health::snapshot();
 
-    // Per-alias map keyed by composite `<type>.<alias>` (v0.8.0). Every
-    // populated `[channels.<type>.<alias>]` is a separate dashboard row;
-    // collapsing them to one-per-type was a pre-v0.8.0 holdover.
+    // Per-alias map keyed by composite `<type>.<alias>`. Every
+    // populated `[channels.<type>.<alias>]` is a separate dashboard row.
     let mut channels = serde_json::Map::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
@@ -250,7 +271,12 @@ pub async fn handle_api_status(
                 (provider_ref, model, temperature, backend)
             }
             None => (
-                config.first_model_provider_alias(),
+                config
+                    .providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
                 state.model.clone(),
                 state.temperature,
                 state.mem.name().to_string(),
@@ -598,16 +624,6 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.read().clone();
-    if config.agent(&body.agent).is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!(
-                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
-                a = body.agent
-            )})),
-        )
-            .into_response();
-    }
     let agent_alias = body.agent.clone();
     let CronPatchBody {
         agent: _,
@@ -617,6 +633,7 @@ pub async fn handle_api_cron_patch(
         clear_tz,
         command,
         prompt,
+        enabled,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -633,6 +650,26 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    // The agent only gates a shell `command` change (risk profile). For a shell
+    // job the new command can arrive via either `command` OR `prompt` (the
+    // `prompt` field is folded into the command below), so the existence check
+    // must cover both. Skip it for patches that don't set a shell command —
+    // schedule, name, and enable/disable toggles don't need an agent supplied —
+    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
+    // command, and so is not agent-gated. This needs `existing.job_type`, hence
+    // it runs after the job is fetched.
+    let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
+    if setting_shell_command && config.agent(&agent_alias).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
+                a = agent_alias
+            )})),
+        )
+            .into_response();
+    }
     let new_expr = schedule_expr
         .as_deref()
         .map(str::trim)
@@ -667,7 +704,6 @@ pub async fn handle_api_cron_patch(
     } else {
         None
     };
-    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
         (None, command.or(prompt))
     } else {
@@ -679,6 +715,7 @@ pub async fn handle_api_cron_patch(
         schedule,
         command: patch_command,
         prompt: patch_prompt,
+        enabled,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -793,17 +830,7 @@ pub async fn handle_api_integrations(
     let config = state.config.read().clone();
     let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
-    let integrations: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "name": entry.name,
-                "description": entry.description,
-                "category": entry.category,
-                "status": entry.status,
-            })
-        })
-        .collect();
+    let integrations: Vec<serde_json::Value> = entries.iter().map(integration_entry_json).collect();
 
     Json(serde_json::json!({"integrations": integrations})).into_response()
 }
@@ -947,7 +974,10 @@ pub async fn handle_api_memory_list(
                         .collect(),
                     None => entries,
                 };
-                Json(serde_json::json!({"entries": entries})).into_response()
+                Json(serde_json::json!({
+                    "entries": sanitize_memory_entries_for_api(entries)
+                }))
+                .into_response()
             }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -965,7 +995,10 @@ pub async fn handle_api_memory_list(
         });
 
         match mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => Json(serde_json::json!({
+                "entries": sanitize_memory_entries_for_api(entries)
+            }))
+            .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
@@ -973,6 +1006,32 @@ pub async fn handle_api_memory_list(
                 .into_response(),
         }
     }
+}
+
+fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.content = truncate_with_ellipsis_total_chars(entry.content);
+            entry
+        })
+        .collect()
+}
+
+fn truncate_with_ellipsis_total_chars(mut s: String) -> String {
+    if s.char_indices().nth(MEMORY_API_CONTENT_MAX_CHARS).is_none() {
+        return s;
+    }
+
+    let keep_chars = MEMORY_API_CONTENT_MAX_CHARS - 3;
+    let cut_idx = s
+        .char_indices()
+        .nth(keep_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    s.truncate(cut_idx);
+    s.push_str("...");
+    s
 }
 
 /// POST /api/memory — store a memory entry
@@ -1113,7 +1172,27 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    let tools = zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[]);
+    // `discover_cli_tools` spawns child processes and blocks; keep it off the
+    // async executor so a slow PATH scan can't stall other gateway requests.
+    let tools = match tokio::task::spawn_blocking(|| {
+        zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[])
+    })
+    .await
+    {
+        Ok(tools) => tools,
+        Err(e) => {
+            // The blocking task panicked; degrade to an empty list rather
+            // than failing the request, but record why it was empty.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "cli-tools discovery task failed; returning empty list"
+            );
+            Vec::new()
+        }
+    };
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
@@ -1128,28 +1207,246 @@ pub async fn handle_api_channels(
     }
 
     let config = state.config.read().clone();
-    // One entry per `[channels.<type>.<alias>]` block (v0.8.0). Owning
+    let health = zeroclaw_runtime::health::snapshot();
+    // One entry per `[channels.<type>.<alias>]` block. Owning
     // agent comes from the agents.<alias>.channels reverse lookup.
     let channels: Vec<serde_json::Value> = config
         .channels_by_alias()
         .into_iter()
         .map(|info| {
             let composite = format!("{}.{}", info.channel_type, info.alias);
+            let compiled_key = compiled_readiness_key_for_alias(&config, &info);
+            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(compiled_key);
+            let readiness = channel_readiness(&config, &info, &health, &state);
+            let (status, health_status) = if compiled {
+                channel_readiness_summary(&readiness)
+            } else {
+                ("not_compiled", "unavailable")
+            };
             serde_json::json!({
                 "name": composite,
                 "type": info.channel_type,
                 "alias": info.alias,
                 "owning_agent": info.owning_agent,
                 "enabled": info.enabled,
-                "status": "active",
+                "compiled": compiled,
+                "status": status,
                 "message_count": 0,
                 "last_message_at": null,
-                "health": "healthy",
+                "health": health_status,
+                "readiness": readiness,
             })
         })
         .collect();
 
     Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
+/// GET /api/tuis — list connected TUI sessions
+pub async fn handle_api_tuis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let tuis: Vec<serde_json::Value> = state
+        .tui_registry
+        .as_ref()
+        .map(|r| {
+            r.list()
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "tui_id": e.tui_id,
+                        "connected_at": e.connected_at.to_rfc3339(),
+                        "peer_label": e.peer_label,
+                        "transport": e.transport,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
+    if info.channel_type == "whatsapp"
+        && config
+            .channels
+            .whatsapp
+            .get(&info.alias)
+            .is_some_and(|whatsapp| whatsapp.backend_type() == "web")
+    {
+        "whatsapp-web"
+    } else {
+        info.channel_type.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ChannelReadinessState {
+    Ready,
+    Missing,
+    Unknown,
+}
+
+const CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelReadiness {
+    enabled: ChannelReadinessState,
+    bound_to_agent: ChannelReadinessState,
+    authenticated: ChannelReadinessState,
+    listening: ChannelReadinessState,
+    requirements: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn channel_readiness(
+    config: &zeroclaw_config::schema::Config,
+    info: &zeroclaw_config::schema::ChannelAliasInfo,
+    health: &zeroclaw_runtime::health::HealthSnapshot,
+    state: &AppState,
+) -> ChannelReadiness {
+    let mut readiness = ChannelReadiness {
+        enabled: if info.enabled {
+            ChannelReadinessState::Ready
+        } else {
+            ChannelReadinessState::Missing
+        },
+        bound_to_agent: if info.owning_agent.is_some() {
+            ChannelReadinessState::Ready
+        } else {
+            ChannelReadinessState::Missing
+        },
+        authenticated: ChannelReadinessState::Unknown,
+        listening: ChannelReadinessState::Unknown,
+        requirements: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    if readiness.enabled == ChannelReadinessState::Missing {
+        readiness
+            .requirements
+            .push("Enable this channel alias.".to_string());
+    }
+    if readiness.bound_to_agent == ChannelReadinessState::Missing {
+        readiness
+            .requirements
+            .push("Bind this channel to an enabled agent.".to_string());
+    }
+
+    if readiness.enabled == ChannelReadinessState::Ready
+        && readiness.bound_to_agent == ChannelReadinessState::Ready
+    {
+        if info.channel_type == "webhook" {
+            apply_webhook_readiness(config, &info.alias, health, state, &mut readiness);
+        } else {
+            readiness.notes.push(format!(
+                "Live readiness is not checked for `{}` channels yet.",
+                info.channel_type
+            ));
+        }
+    }
+
+    readiness
+}
+
+fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'static str) {
+    if readiness.enabled == ChannelReadinessState::Missing
+        || readiness.bound_to_agent == ChannelReadinessState::Missing
+    {
+        return ("inactive", "degraded");
+    }
+
+    if readiness.authenticated == ChannelReadinessState::Unknown
+        && readiness.listening == ChannelReadinessState::Unknown
+    {
+        return ("unknown", "degraded");
+    }
+
+    if readiness.authenticated == ChannelReadinessState::Ready
+        && readiness.listening == ChannelReadinessState::Ready
+    {
+        ("active", "healthy")
+    } else {
+        ("error", "down")
+    }
+}
+
+fn apply_webhook_readiness(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    health: &zeroclaw_runtime::health::HealthSnapshot,
+    state: &AppState,
+    readiness: &mut ChannelReadiness,
+) {
+    let Some(webhook) = config.channels.webhook.get(alias) else {
+        readiness.authenticated = ChannelReadinessState::Missing;
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness
+            .requirements
+            .push("Webhook config block is missing.".to_string());
+        return;
+    };
+
+    if state.pairing.require_pairing() && !state.pairing.is_paired() {
+        readiness.authenticated = ChannelReadinessState::Missing;
+        readiness
+            .requirements
+            .push("Pair the gateway before using the webhook endpoint.".to_string());
+    } else {
+        readiness.authenticated = ChannelReadinessState::Ready;
+    }
+
+    let component = format!("channel:webhook.{alias}");
+    let component_health = health.components.get(&component);
+    let component_status = component_health.map(|component| component.status.as_str());
+    let supervised_listener_ok = component_health.is_some_and(component_health_ok_and_fresh);
+    let listen_path = normalized_webhook_path(webhook.listen_path.as_deref());
+
+    if supervised_listener_ok {
+        readiness.listening = ChannelReadinessState::Ready;
+    } else if component_status == Some("error") {
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness.requirements.push(format!(
+            "Resolve the listener error for `webhook.{alias}` before using this channel."
+        ));
+    } else {
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness.requirements.push(format!(
+            "Start a channel listener for `webhook.{alias}` on port {}{}.",
+            webhook.port, listen_path
+        ));
+    }
+}
+
+fn component_health_ok_and_fresh(component: &zeroclaw_runtime::health::ComponentHealth) -> bool {
+    if component.status != "ok" {
+        return false;
+    }
+
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&component.updated_at) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc));
+    age >= chrono::Duration::zero()
+        && age <= chrono::Duration::seconds(CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS)
+}
+
+fn normalized_webhook_path(path: Option<&str>) -> String {
+    let trimmed = path.unwrap_or("/webhook").trim();
+    if trimmed.is_empty() {
+        "/webhook".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 /// GET /api/health — component health snapshot
@@ -1186,8 +1483,8 @@ pub async fn handle_api_sessions_list(
         .into_response();
     };
 
-    // Include every session that's attributable in v0.8.0 (agent_alias
-    // stamped, or a channel_id that resolves to an owning agent).
+    // Include every session that's attributable (agent_alias stamped,
+    // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
     let all_metadata = backend.list_sessions_with_metadata();
@@ -1630,6 +1927,11 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// Shared test helper: `api_config` tests reuse this AppState builder for the
+// agent rename/delete cascade handlers (#7907 regression coverage).
+#[cfg(test)]
+pub(crate) use tests::test_state;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1638,6 +1940,8 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::RwLock;
+    #[cfg(feature = "channel-linq")]
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_infra::session_backend::SessionBackend;
@@ -1646,7 +1950,10 @@ mod tests {
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
-    struct MockMemory;
+    #[derive(Default)]
+    struct MockMemory {
+        entries: Vec<MemoryEntry>,
+    }
 
     #[async_trait]
     impl Memory for MockMemory {
@@ -1672,7 +1979,7 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -1684,7 +1991,7 @@ mod tests {
             _category: Option<&MemoryCategory>,
             _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
@@ -1696,7 +2003,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            Ok(0)
+            Ok(self.entries.len())
         }
 
         async fn health_check(&self) -> bool {
@@ -1783,20 +2090,27 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );
         config
     }
 
-    fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+    pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
-            mem: Arc::new(MockMemory),
+            mem: Arc::new(MockMemory::default()),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(MockMemory::default()),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -1804,13 +2118,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -1828,9 +2150,22 @@ mod tests {
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             reload_tx: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+        }
+    }
+
+    fn test_state_with_memory(
+        config: zeroclaw_config::schema::Config,
+        entries: Vec<MemoryEntry>,
+    ) -> AppState {
+        AppState {
+            mem: Arc::new(MockMemory { entries }),
+            ..test_state(config)
         }
     }
 
@@ -1844,6 +2179,235 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    #[test]
+    fn integration_entry_json_derives_category_label_from_category() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Browser".into(),
+            description: "Run browser automation".into(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["category"], "ToolsAutomation");
+        assert_eq!(json["category_label"], "Tools & Automation");
+        assert_eq!(json["status"], "Active");
+    }
+
+    fn memory_entry_with_content(content: String) -> MemoryEntry {
+        MemoryEntry {
+            id: "entry-1".into(),
+            key: "huge-memory".into(),
+            content,
+            category: MemoryCategory::Conversation,
+            timestamp: "2026-04-06T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.5),
+            superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn memory_content_from_response(json: &serde_json::Value) -> &str {
+        json["entries"][0]["content"]
+            .as_str()
+            .expect("string content")
+    }
+
+    #[test]
+    fn truncate_memory_api_content_caps_total_chars_with_ellipsis() {
+        let exact = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS);
+        assert_eq!(truncate_with_ellipsis_total_chars(exact.clone()), exact);
+
+        let short = "short memory".to_string();
+        assert_eq!(truncate_with_ellipsis_total_chars(short.clone()), short);
+
+        let over = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 1);
+        let truncated = truncate_with_ellipsis_total_chars(over.clone());
+        assert_eq!(truncated.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(truncated.ends_with("..."));
+        assert_ne!(truncated, over);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_list_truncates_oversized_content() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: None,
+                category: None,
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_eq!(json["entries"][0]["key"], "huge-memory");
+        assert_eq!(json["entries"][0]["category"], "conversation");
+        assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_search_truncates_oversized_content_after_filtering() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("huge".into()),
+                category: Some("conversation".into()),
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_ne!(content, huge);
+    }
+
+    #[test]
+    fn api_channels_readiness_key_tracks_whatsapp_backend_type() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "cloud".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "ambiguous".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+
+        let web = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "web".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let cloud = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "cloud".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let ambiguous = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "ambiguous".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let discord = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "discord".to_string(),
+            alias: "default".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &web),
+            "whatsapp-web"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &cloud),
+            "whatsapp"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &ambiguous),
+            "whatsapp",
+            "ambiguous WhatsApp configs follow runtime Cloud precedence"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &discord),
+            "discord"
+        );
+    }
+
+    #[cfg(not(feature = "channel-nextcloud"))]
+    #[tokio::test]
+    async fn api_channels_marks_configured_uncompiled_channel_unavailable() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.nextcloud_talk.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NextcloudTalkConfig {
+                enabled: true,
+                base_url: "https://cloud.example.com".to_string(),
+                app_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channels = json["channels"].as_array().expect("channels array");
+        let nextcloud = channels
+            .iter()
+            .find(|channel| channel["alias"] == "default")
+            .expect("configured channel is listed");
+
+        assert!(
+            matches!(
+                nextcloud["type"].as_str(),
+                Some("nextcloud-talk" | "nextcloud_talk")
+            ),
+            "unexpected channel type: {}",
+            nextcloud["type"]
+        );
+        assert_eq!(nextcloud["enabled"], true);
+        assert_eq!(nextcloud["compiled"], false);
+        assert_eq!(nextcloud["status"], "not_compiled");
+        assert_eq!(nextcloud["health"], "unavailable");
+    }
+
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
         state
             .config
@@ -1853,6 +2417,244 @@ mod tests {
             .expect("test-agent configured by with_test_agent")
             .cron_jobs
             .push(job_id.to_string());
+    }
+
+    fn config_with_webhook(
+        alias: &str,
+        enabled: bool,
+        bound: bool,
+        port: u16,
+        listen_path: Option<&str>,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.port = 42617;
+        config.gateway.require_pairing = false;
+        config.channels.webhook.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled,
+                port,
+                listen_path: listen_path.map(ToString::to_string),
+                ..Default::default()
+            },
+        );
+        if bound {
+            config.agents.insert(
+                "rowan".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec![zeroclaw_config::providers::ChannelRef::new(format!(
+                        "webhook.{alias}"
+                    ))],
+                    ..Default::default()
+                },
+            );
+        }
+        config
+    }
+
+    fn config_with_telegram(alias: &str) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "rowan".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(format!(
+                    "telegram.{alias}"
+                ))],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn first_channel_info(
+        config: &zeroclaw_config::schema::Config,
+    ) -> zeroclaw_config::schema::ChannelAliasInfo {
+        config
+            .channels_by_alias()
+            .into_iter()
+            .next()
+            .expect("channel alias should be present")
+    }
+
+    #[test]
+    fn channel_readiness_webhook_does_not_call_gateway_route_healthy_without_listener() {
+        let config = config_with_webhook("default", true, true, 42617, Some("/webhook"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Start a channel listener"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_webhook_does_not_call_custom_path_healthy_without_listener() {
+        let config = config_with_webhook("custom_path", true, true, 42632, Some("/eyrie"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Start a channel listener"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_webhook_uses_supervised_listener_health_for_custom_path() {
+        let config = config_with_webhook("supervised", true, true, 42632, Some("/eyrie"));
+        zeroclaw_runtime::health::mark_component_ok("channel:webhook.supervised");
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.listening, ChannelReadinessState::Ready);
+        assert_eq!(channel_readiness_summary(&readiness), ("active", "healthy"));
+    }
+
+    #[test]
+    fn channel_readiness_webhook_rejects_stale_listener_health() {
+        let config = config_with_webhook("stale", true, true, 42632, Some("/eyrie"));
+        let component = "channel:webhook.stale".to_string();
+        let old = (chrono::Utc::now()
+            - chrono::Duration::seconds(CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS + 5))
+        .to_rfc3339();
+        let health = zeroclaw_runtime::health::HealthSnapshot {
+            pid: std::process::id(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            uptime_seconds: 1,
+            components: std::collections::BTreeMap::from([(
+                component,
+                zeroclaw_runtime::health::ComponentHealth {
+                    status: "ok".to_string(),
+                    updated_at: old,
+                    last_ok: None,
+                    last_error: None,
+                    restart_count: 0,
+                },
+            )]),
+        };
+        let state = test_state(config.clone());
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+    }
+
+    #[test]
+    fn channel_readiness_webhook_uses_live_pairing_guard_for_auth() {
+        let config = config_with_webhook("paired", true, true, 42632, Some("/eyrie"));
+        zeroclaw_runtime::health::mark_component_ok("channel:webhook.paired");
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Missing);
+        assert_eq!(readiness.listening, ChannelReadinessState::Ready);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+    }
+
+    #[test]
+    fn channel_readiness_unchecked_channel_types_are_unknown_not_down() {
+        let config = config_with_telegram("ops");
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.enabled, ChannelReadinessState::Ready);
+        assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Ready);
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Unknown);
+        assert_eq!(readiness.listening, ChannelReadinessState::Unknown);
+        assert_eq!(
+            channel_readiness_summary(&readiness),
+            ("unknown", "degraded")
+        );
+        assert!(readiness.requirements.is_empty());
+        assert!(
+            readiness
+                .notes
+                .iter()
+                .any(|item| item.contains("not checked"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_orphan_channel_reports_missing_agent_binding_without_broken_health() {
+        let config = config_with_webhook("orphan", true, false, 42617, Some("/webhook"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Missing);
+        assert_eq!(readiness.listening, ChannelReadinessState::Unknown);
+        assert_eq!(
+            channel_readiness_summary(&readiness),
+            ("inactive", "degraded")
+        );
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Bind this channel"))
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channels_serializes_readiness_without_duplicate_summary_fields() {
+        let config = config_with_webhook("ops", true, true, 42617, Some("/webhook"));
+        let state = test_state(config);
+
+        let response = handle_api_channels(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let channel = &json["channels"][0];
+        let webhook_compiled = zeroclaw_channels::listing::is_channel_type_compiled("webhook");
+        assert_eq!(channel["name"], "webhook.ops");
+        assert_eq!(channel["compiled"], webhook_compiled);
+        if webhook_compiled {
+            assert_eq!(channel["status"], "error");
+            assert_eq!(channel["health"], "down");
+        } else {
+            assert_eq!(channel["status"], "not_compiled");
+            assert_eq!(channel["health"], "unavailable");
+        }
+        assert_eq!(channel["readiness"]["enabled"], "ready");
+        assert_eq!(channel["readiness"]["authenticated"], "ready");
+        assert_eq!(channel["readiness"]["listening"], "missing");
+        assert!(channel["readiness"].get("configured").is_none());
+        assert!(channel["readiness"].get("status").is_none());
+        assert!(channel["readiness"].get("health").is_none());
     }
 
     fn test_state_with_session_backend(
@@ -2462,6 +3264,280 @@ mod tests {
         );
     }
 
+    // --- PATCH agent-requirement boundary (#7666) ---------------------------
+    // These pin the relaxed `agent` rule: it is required only when a patch sets a
+    // *shell command* (the risk-profile gate), and not for enable/disable,
+    // metadata-only patches, or agent-type jobs. Regression coverage for the
+    // `#[serde(default)] agent` + `setting_shell_command` scoping so a future
+    // refactor can't silently reopen the gate or re-require agent where it isn't.
+
+    #[tokio::test]
+    async fn cron_api_patch_enabled_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("toggle-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // No `agent` field at all — pause/resume must not require one.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({ "enabled": false }))
+                    .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "enable/disable toggle must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert!(!updated.enabled, "job should be disabled after the patch");
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_name_and_schedule_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("old-name".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Metadata-only patch (no command/prompt) — agent must be optional.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "name": "new-name",
+                    "schedule": "30 9 * * *"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "name/schedule patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(updated.name.as_deref(), Some("new-name"));
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_command_requires_known_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Setting a shell `command` still hits the risk gate: a missing agent
+        // must be a clean 400, not a fall-through.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "command": "echo bye" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell command patch with no agent must be rejected at the risk gate"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown agent"),
+            "error should name the unknown agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_prompt_unknown_agent_is_bad_request_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // For a shell job a new command can arrive via `prompt`; it still routes
+        // through the command-risk gate, so an unknown agent is a 400 — not the
+        // 500 that an unguarded path would surface.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "ghost",
+                    "prompt": "echo bye"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell-job prompt with unknown agent must be 400, not 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_agent_prompt_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "command": "ignored",
+                    "prompt": "old prompt"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        // For an agent-type job `prompt` is an LLM prompt, not a shell command,
+        // so it is not agent-gated and may omit `agent`.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "prompt": "new prompt" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "agent-type prompt patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &id)
+            .expect("updated job");
+        assert_eq!(updated.prompt.as_deref(), Some("new prompt"));
+    }
+
     #[tokio::test]
     async fn cron_api_rejects_announce_delivery_without_target() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2664,5 +3740,414 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Token rotation / device revocation security tests ────────────────────
+    //
+    // GHSA-f385-f6h2-3gqj follow-up (#6984): `POST /api/devices/{id}/token/rotate`
+    // and `DELETE /api/devices/{id}` must both invalidate the bearer token
+    // associated with the device, not just rotate a code or delete the row.
+
+    use crate::api_pairing::{
+        DeviceInfo, DeviceRegistry, revoke_device, rotate_token as rotate_device_token,
+        submit_pairing_enhanced,
+    };
+    use chrono::Utc;
+
+    async fn paired_state_with_device(tmp: &tempfile::TempDir) -> (AppState, String, String) {
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let code = pairing.pairing_code().unwrap();
+        let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
+        let token_hash = PairingGuard::token_hash(&token);
+
+        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let device_id = "dev-1".to_string();
+        registry.register(
+            token_hash,
+            DeviceInfo {
+                id: device_id.clone(),
+                name: None,
+                device_type: None,
+                paired_at: Utc::now(),
+                last_seen: Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+
+        let mut state = test_state(config);
+        state.pairing = pairing;
+        state.device_registry = Some(registry);
+        (state, token, device_id)
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// The backfill inserts a placeholder row for every paired-token hash that
+    /// has no device entry, skips hashes that already have one (without
+    /// clobbering their metadata), and is idempotent across restarts.
+    #[tokio::test]
+    async fn reconcile_backfills_orphan_token_hashes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = DeviceRegistry::new(tmp.path());
+
+        // A real, already-registered device with a name.
+        let known_hash = "a".repeat(64);
+        registry.register(
+            known_hash.clone(),
+            DeviceInfo {
+                id: "known".into(),
+                name: Some("My Laptop".into()),
+                device_type: Some("desktop".into()),
+                paired_at: Utc::now(),
+                last_seen: Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+
+        let orphan_a = "b".repeat(64);
+        let orphan_b = "c".repeat(64);
+        let inserted = registry
+            .reconcile_from_token_hashes(&[known_hash.clone(), orphan_a.clone(), orphan_b.clone()])
+            .unwrap();
+        assert_eq!(inserted, 2, "only the two orphan hashes should be inserted");
+        assert_eq!(registry.device_count(), 3);
+
+        // Existing metadata is preserved, not clobbered.
+        let known = registry
+            .list()
+            .into_iter()
+            .find(|d| d.id == "known")
+            .expect("known device still present");
+        assert_eq!(known.name.as_deref(), Some("My Laptop"));
+
+        // Re-running is a no-op (idempotent).
+        let again = registry
+            .reconcile_from_token_hashes(&[known_hash, orphan_a, orphan_b])
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(registry.device_count(), 3);
+    }
+
+    /// Security-management contract: a token paired through the legacy `/pair`
+    /// route is an orphan (authenticates, but absent from the registry). After
+    /// backfill it is keyed by the SAME `token_hash` the auth gate uses, so the
+    /// revoke-by-device path (`revoke` → `PairingGuard::revoke_token_hash`)
+    /// invalidates exactly that bearer token.
+    #[tokio::test]
+    async fn backfilled_orphan_is_revocable_by_its_real_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let token = pairing
+            .try_pair(&code, "legacy-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pairing.is_authenticated(&token));
+
+        // Simulate the `/pair` orphan: token is paired but never registered.
+        let registry = DeviceRegistry::new(&data_dir);
+        assert_eq!(registry.device_count(), 0);
+
+        let inserted = registry
+            .reconcile_from_token_hashes(&pairing.tokens())
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        // The backfilled row is keyed by the auth hash, so revoke returns it and
+        // revoking that hash from the guard actually de-authenticates the token.
+        let device = registry
+            .list()
+            .into_iter()
+            .next()
+            .expect("one backfilled device");
+        let revoked_hash = registry
+            .revoke(&device.id)
+            .unwrap()
+            .expect("device existed");
+        assert_eq!(revoked_hash, PairingGuard::token_hash(&token));
+        assert!(pairing.revoke_token_hash(&revoked_hash));
+        assert!(
+            !pairing.is_authenticated(&token),
+            "token must not authenticate after revoke"
+        );
+    }
+
+    /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
+    /// old bearer token. The pre-fix handler only issued a new pairing code
+    /// and left the leaked token authenticating (GHSA-f385-f6h2-3gqj
+    /// incident-response gap).
+    #[tokio::test]
+    async fn rotate_token_invalidates_old_bearer_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+        assert!(state.pairing.is_authenticated(&old_token));
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&old_token),
+            "old bearer token must not authenticate after rotate"
+        );
+
+        let json = response_json(response).await;
+        assert_eq!(json["device_id"], device_id);
+        assert!(json["pairing_code"].is_string());
+    }
+
+    /// Enforcement: after rotate, the on-disk `gateway.paired_tokens` field
+    /// must not still contain the revoked token, so a daemon restart cannot
+    /// resurrect it.
+    #[tokio::test]
+    async fn rotate_token_persists_revocation_to_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+        let old_hash = PairingGuard::token_hash(&old_token);
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let persisted = state.config.read().gateway.paired_tokens.clone();
+        assert!(
+            !persisted.contains(&old_hash),
+            "revoked token hash must not remain in gateway.paired_tokens"
+        );
+    }
+
+    /// Regression: `POST /api/pair` MUST persist the newly issued token to
+    /// `gateway.paired_tokens` before reporting success. The pre-fix handler
+    /// registered the device and returned "Pairing successful" but left the
+    /// token only in memory, so a restart after rotate/re-pair silently
+    /// dropped the replacement credential (GHSA-f385-f6h2-3gqj §5).
+    #[tokio::test]
+    async fn submit_pairing_enhanced_persists_new_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, _old_token, _device_id) = paired_state_with_device(&tmp).await;
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("require_pairing was enabled");
+
+        let response = submit_pairing_enhanced(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::json!({ "code": code, "device_name": "repaired" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(json["persisted"], true);
+        let new_token = json["token"].as_str().expect("token in response");
+        let new_hash = PairingGuard::token_hash(new_token);
+        assert!(
+            state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&new_hash),
+            "newly paired token hash must be persisted to gateway.paired_tokens"
+        );
+    }
+
+    /// Enforcement: `DELETE /api/devices/{id}` must also invalidate the
+    /// device's bearer token, not just the SQLite row.
+    #[tokio::test]
+    async fn revoke_device_invalidates_bearer_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+
+        let response = revoke_device(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&old_token),
+            "bearer token must not authenticate after device delete"
+        );
+        let old_hash = PairingGuard::token_hash(&old_token);
+        assert!(
+            !state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&old_hash),
+            "deleted device's token must be dropped from persisted paired_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_unknown_device_returns_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = paired_state_with_device(&tmp).await;
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path("does-not-exist".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "unknown-device rotate must not touch existing tokens"
+        );
+    }
+
+    /// Enforcement: when a pairing code is already pending, rotate still
+    /// revokes the bearer token (that is the load-bearing security effect)
+    /// but does not issue a new code; the pending code from the other flow
+    /// is preserved. The check + write must be atomic — see
+    /// `concurrent_rotates_do_not_both_issue_a_pairing_code` below.
+    #[tokio::test]
+    async fn rotate_with_pending_code_revokes_but_returns_null_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, token, device_id) = paired_state_with_device(&tmp).await;
+
+        let pending_code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("require_pairing was enabled");
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(device_id.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&token),
+            "old bearer token must be revoked even when a pairing code is pending"
+        );
+        assert_eq!(
+            state.pairing.pairing_code().as_deref(),
+            Some(pending_code.as_str()),
+            "pending pairing code must survive rotate",
+        );
+
+        let json = response_json(response).await;
+        assert!(json["pairing_code"].is_null());
+        assert_eq!(json["device_id"], device_id);
+    }
+
+    /// Enforcement: two rotates that race must not both succeed in issuing
+    /// a pairing code. The first one wins the slot; the second observes the
+    /// occupied slot atomically and returns `pairing_code: null`. Both
+    /// rotates revoke the bearer token they target, because revocation is
+    /// the load-bearing action and must not depend on the slot.
+    #[tokio::test]
+    async fn concurrent_rotates_do_not_both_issue_a_pairing_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let code = pairing.pairing_code().unwrap();
+        let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
+
+        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        for id in ["dev-a", "dev-b"] {
+            // Each device needs its own paired token so revoke has a hash.
+            let code = pairing
+                .generate_new_pairing_code()
+                .expect("pairing enabled");
+            let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
+            registry.register(
+                PairingGuard::token_hash(&tok),
+                DeviceInfo {
+                    id: id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            );
+        }
+
+        let mut state = test_state(config);
+        state.pairing = pairing;
+        state.device_registry = Some(registry);
+
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let h1 = bearer_headers(&admin_token);
+        let h2 = bearer_headers(&admin_token);
+        let (r1, r2) = tokio::join!(
+            async move {
+                rotate_device_token(State(s1), h1, Path("dev-a".into()))
+                    .await
+                    .into_response()
+            },
+            async move {
+                rotate_device_token(State(s2), h2, Path("dev-b".into()))
+                    .await
+                    .into_response()
+            },
+        );
+
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r2.status(), StatusCode::OK);
+        let j1 = response_json(r1).await;
+        let j2 = response_json(r2).await;
+        let codes_issued = usize::from(j1["pairing_code"].is_string())
+            + usize::from(j2["pairing_code"].is_string());
+        assert_eq!(
+            codes_issued, 1,
+            "exactly one of two racing rotates must win the pairing slot, \
+             got {codes_issued} (j1={j1}, j2={j2})"
+        );
     }
 }

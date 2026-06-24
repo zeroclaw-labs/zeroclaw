@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Clock,
   Globe,
@@ -23,15 +23,19 @@ import {
   MemoryStick,
   Brain,
   Search,
-} from 'lucide-react';
+  Monitor,
+  ArrowRight,
+} from "lucide-react";
 import type {
   StatusResponse,
   CostSummary,
   Session,
   ChannelDetail,
+  ChannelReadinessState,
   SessionMessageRow,
   ProcessStats,
-} from '@/types/api';
+  TuiEntry,
+} from "@/types/api";
 import {
   getStatus,
   getCost,
@@ -43,51 +47,132 @@ import {
   storeMemory,
   deleteMemory,
   getMapKeys,
-  getOnboardStatus,
-} from '@/lib/api';
-import { resolveModelToProviderType } from '@/lib/configuredModels';
+  getQuickstartState,
+  getTuis,
+  listProps,
+} from "@/lib/api";
+import { resolveModelToProviderType } from "@/lib/configuredModels";
+import DoctorFixModal from "@/components/DoctorFixModal";
 
-type CostWindow = 'today' | '7d' | '30d' | 'month' | 'all';
+type CostWindow = "today" | "7d" | "30d" | "month" | "all";
+
+/**
+ * A component's `last_error` is sometimes a config path (e.g.
+ * `agents.cronos.model_provider`) — the field whose misconfiguration is crashing
+ * the supervisor. When we can parse a known config entity out of it, offer the
+ * same inline "fix in place" modal the Doctor page uses (edit the entity, save,
+ * no navigation). Returns null when nothing parseable is present (error shown as
+ * plain text). Mirrors Doctor's `remediationTarget`.
+ */
+// Convert a `ConfigTab` label ("Providers", "Peer Groups") into the `?tab=`
+// URL key. Mirrors the key derivation in Config.tsx `wireTabSpecs` so a deep
+// link lands on the same tab the config page renders (shared convention).
+function tabSlug(tabLabel: string): string {
+  return tabLabel.toLowerCase().replace(/\s+/g, "-");
+}
+
+function healthFixTarget(
+  err: string | null | undefined,
+  tabForPath?: (path: string) => string | undefined,
+): { prefix: string; entity: string; href: string } | null {
+  if (!err) return null;
+  // Anchor at the start (like Doctor's remediationTarget) so a config path is
+  // only matched when the error IS one (e.g. "agents.cronos.model_provider"),
+  // not when prose merely contains the word — "failed to load agents.json"
+  // must NOT yield a bogus Fix target for entity `agents.json`.
+  // agents.<alias>[.<field>] — edit the agent; deep-link the field's tab.
+  const agent = err.match(/^\s*agents\.([a-z0-9_-]+)(?:\.([a-z0-9_.-]+))?/i);
+  if (agent?.[1]) {
+    const alias = agent[1];
+    const field = agent[2] ?? "";
+    // Deep-link the field's tab by reading its backend `ConfigTab` metadata
+    // (via the entry index) rather than pattern-matching the field name, so a
+    // re-tabbed or newly added field routes correctly with no change here.
+    // Falls back to no tab when the entry/tab is unknown (older errors,
+    // ungrouped fields, index not yet loaded).
+    const tabLabel = field
+      ? tabForPath?.(`agents.${alias}.${field}`)
+      : undefined;
+    const tab = tabLabel ? `?tab=${tabSlug(tabLabel)}` : "";
+    return {
+      prefix: `agents.${alias}`,
+      entity: `agents.${alias}`,
+      href: `/config/agents/${encodeURIComponent(alias)}${tab}`,
+    };
+  }
+  // channels.<type>.<alias>
+  const chan = err.match(/^\s*channels\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
+  if (chan?.[1] && chan[2]) {
+    return {
+      prefix: `channels.${chan[1]}.${chan[2]}`,
+      entity: `${chan[1]}.${chan[2]}`,
+      href: `/config/channels/${encodeURIComponent(chan[1])}/${encodeURIComponent(chan[2])}`,
+    };
+  }
+  // providers.models.<type>.<alias>
+  const prov = err.match(/^\s*providers\.models\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
+  if (prov?.[1] && prov[2]) {
+    return {
+      prefix: `providers.models.${prov[1]}.${prov[2]}`,
+      entity: `${prov[1]}.${prov[2]}`,
+      href: `/config/providers.models/${encodeURIComponent(prov[1])}/${encodeURIComponent(prov[2])}`,
+    };
+  }
+  return null;
+}
 
 function costWindowBounds(window: CostWindow): { from?: Date; to?: Date } {
   const now = new Date();
   switch (window) {
-    case 'today': {
+    case "today": {
       const start = new Date(now);
       start.setHours(0, 0, 0, 0);
       const end = new Date(start);
       end.setDate(end.getDate() + 1);
       return { from: start, to: end };
     }
-    case '7d': {
+    case "7d": {
       const from = new Date(now);
       from.setDate(from.getDate() - 7);
       return { from };
     }
-    case '30d': {
+    case "30d": {
       const from = new Date(now);
       from.setDate(from.getDate() - 30);
       return { from };
     }
-    case 'month': {
+    case "month": {
       const from = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
       const to = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
       return { from, to };
     }
-    case 'all':
+    case "all":
     default:
       return {};
   }
 }
-import type { MemoryEntry } from '@/types/api';
-import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
-import AgentCard from '@/components/AgentCard';
-import EntityLink from '@/components/EntityLink';
-import EntityEnabledToggle from '@/components/EntityEnabledToggle';
-import { useSSE } from '@/hooks/useSSE';
-import { t } from '@/lib/i18n';
+import type { MemoryEntry } from "@/types/api";
+import {
+  loadAgentSummaries,
+  toggleAgentEnabled,
+  type AgentSummary,
+} from "@/lib/agents";
+import AgentCard from "@/components/AgentCard";
+import AgentDrawer from "@/components/AgentDrawer";
+import EntityLink from "@/components/EntityLink";
+import EntityEnabledToggle from "@/components/EntityEnabledToggle";
+import { useSSE } from "@/hooks/useSSE";
+import { usePolling } from "@/hooks/usePolling";
+import { t } from "@/lib/i18n";
+import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
-type TabId = 'overview' | 'sessions' | 'channels' | 'memories' | 'health' | 'cost';
+type TabId =
+  | "overview"
+  | "sessions"
+  | "channels"
+  | "memories"
+  | "health"
+  | "cost";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -103,8 +188,8 @@ function formatUSD(value: number): string {
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '—';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let v = bytes;
   let i = 0;
   while (v >= 1024 && i < units.length - 1) {
@@ -125,29 +210,32 @@ function ProcessRamCard({ process }: { process?: ProcessStats }) {
       <div className="flex items-center gap-3 mb-3">
         <div
           className="p-2 rounded-2xl"
-          style={{ background: 'rgba(var(--pc-accent-rgb), 0.08)', color: '#fbbf24' }}
+          style={{
+            background: "rgba(var(--pc-accent-rgb), 0.08)",
+            color: "#fbbf24",
+          }}
         >
           <MemoryStick className="h-5 w-5" />
         </div>
         <span
           className="text-xs uppercase tracking-wider font-medium"
-          style={{ color: 'var(--pc-text-muted)' }}
+          style={{ color: "var(--pc-text-muted)" }}
         >
-          RAM
+          {t("dashboard.ram.label")}
         </span>
       </div>
       <p
         className="text-lg font-semibold truncate"
-        style={{ color: 'var(--pc-text-primary)' }}
+        style={{ color: "var(--pc-text-primary)" }}
       >
-        {supported ? formatBytes(process!.rss_bytes) : '—'}
+        {supported ? formatBytes(process!.rss_bytes) : "—"}
       </p>
-      <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
+      <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
         {pct !== null
-          ? `${pct.toFixed(pct < 1 ? 2 : 1)}% of ${formatBytes(process!.system_ram_total_bytes)}`
+          ? `${pct.toFixed(pct < 1 ? 2 : 1)}% ${t("dashboard.ram.of")} ${formatBytes(process!.system_ram_total_bytes)}`
           : supported
-            ? 'resident (zeroclaw)'
-            : 'not supported on this platform'}
+            ? t("dashboard.ram.resident")
+            : t("dashboard.ram.unsupported")}
       </p>
     </div>
   );
@@ -162,29 +250,32 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
       <div className="flex items-center gap-3 mb-3">
         <div
           className="p-2 rounded-2xl"
-          style={{ background: 'rgba(var(--pc-accent-rgb), 0.08)', color: '#a78bfa' }}
+          style={{
+            background: "rgba(var(--pc-accent-rgb), 0.08)",
+            color: "#a78bfa",
+          }}
         >
           <Cpu className="h-5 w-5" />
         </div>
         <span
           className="text-xs uppercase tracking-wider font-medium"
-          style={{ color: 'var(--pc-text-muted)' }}
+          style={{ color: "var(--pc-text-muted)" }}
         >
-          CPU
+          {t("dashboard.cpu.label")}
         </span>
       </div>
       <p
         className="text-lg font-semibold truncate"
-        style={{ color: 'var(--pc-text-primary)' }}
+        style={{ color: "var(--pc-text-primary)" }}
       >
-        {supported ? `${pct.toFixed(1)}%` : '—'}
+        {supported ? `${pct.toFixed(1)}%` : "—"}
       </p>
-      <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
+      <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
         {supported
           ? ncpu > 0
-            ? `${ncpu} cores · ${(pct / ncpu).toFixed(1)}% normalized`
-            : 'across all cores'
-          : 'not supported on this platform'}
+            ? `${ncpu} ${t("dashboard.cpu.cores")} · ${(pct / ncpu).toFixed(1)}% ${t("dashboard.cpu.normalized")}`
+            : t("dashboard.cpu.across_all_cores")
+          : t("dashboard.cpu.unsupported")}
       </p>
     </div>
   );
@@ -195,12 +286,12 @@ function formatLocalDateTime(iso: string): string {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
     return d.toLocaleString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
     });
   } catch {
     return iso;
@@ -211,13 +302,13 @@ function formatRelative(iso: string): string {
   try {
     const diff = Date.now() - new Date(iso).getTime();
     const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 60) return `${seconds}${t("dashboard.rel.seconds_ago")}`;
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
+    if (minutes < 60) return `${minutes}${t("dashboard.rel.minutes_ago")}`;
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
+    if (hours < 24) return `${hours}${t("dashboard.rel.hours_ago")}`;
     const days = Math.floor(hours / 24);
-    return `${days}d ago`;
+    return `${days}${t("dashboard.rel.days_ago")}`;
   } catch {
     return iso;
   }
@@ -225,45 +316,79 @@ function formatRelative(iso: string): string {
 
 function healthColor(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'var(--color-status-success)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'var(--color-status-warning)';
+    case "ok":
+    case "healthy":
+      return "var(--color-status-success)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "var(--color-status-warning)";
     default:
-      return 'var(--color-status-error)';
+      return "var(--color-status-error)";
   }
 }
 
 function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.2)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.2)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.2)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.2)";
     default:
-      return 'rgba(255, 68, 102, 0.2)';
+      return "rgba(255, 68, 102, 0.2)";
   }
 }
 
 function healthBg(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.05)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.05)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.05)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.05)";
     default:
-      return 'rgba(255, 68, 102, 0.05)';
+      return "rgba(255, 68, 102, 0.05)";
   }
 }
+
+function readinessColor(state: ChannelReadinessState): string {
+  switch (state) {
+    case 'ready':
+      return 'var(--color-status-success)';
+    case 'missing':
+      return 'var(--color-status-error)';
+    case 'unknown':
+      return 'var(--pc-text-muted)';
+  }
+}
+
+function readinessLabel(state: ChannelReadinessState): string {
+  switch (state) {
+    case 'ready':
+      return t('dashboard.readiness.ready');
+    case 'missing':
+      return t('dashboard.readiness.missing');
+    case 'unknown':
+      return t('dashboard.readiness.not_checked');
+  }
+}
+
+// Label keys resolved at render; the second tuple element is the readiness
+// field the row reads.
+const CHANNEL_READINESS_ROWS: Array<[
+  string,
+  'enabled' | 'bound_to_agent' | 'authenticated' | 'listening',
+]> = [
+  ['dashboard.readiness.enabled', 'enabled'],
+  ['dashboard.readiness.agent', 'bound_to_agent'],
+  ['dashboard.readiness.authenticated', 'authenticated'],
+  ['dashboard.readiness.listening', 'listening'],
+];
 
 // Genuinely process-global tiles only. Provider/Model and Memory Backend
 // were single-agent leftovers from pre-v0.8.0 and are gone: each agent now
@@ -287,12 +412,12 @@ const STATUS_CARDS = [
 ];
 
 const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
-  { id: 'overview', labelKey: 'dashboard.tab_overview', icon: LayoutDashboard },
-  { id: 'sessions', labelKey: 'dashboard.tab_sessions', icon: Users },
-  { id: 'channels', labelKey: 'dashboard.tab_channels', icon: Wifi },
-  { id: 'memories', labelKey: 'dashboard.tab_memories', icon: Brain },
-  { id: 'health', labelKey: 'dashboard.tab_health', icon: Heart },
-  { id: 'cost', labelKey: 'dashboard.tab_cost', icon: DollarSign },
+  { id: "overview", labelKey: "dashboard.tab_overview", icon: LayoutDashboard },
+  { id: "sessions", labelKey: "dashboard.tab_sessions", icon: Users },
+  { id: "channels", labelKey: "dashboard.tab_channels", icon: Wifi },
+  { id: "memories", labelKey: "dashboard.tab_memories", icon: Brain },
+  { id: "health", labelKey: "dashboard.tab_health", icon: Heart },
+  { id: "cost", labelKey: "dashboard.tab_cost", icon: DollarSign },
 ];
 
 // ---------------------------------------------------------------------------
@@ -302,11 +427,13 @@ const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
 function OverviewTab({
   status,
   cost,
+  tuis,
   showAllChannels,
   setShowAllChannels,
 }: {
   status: StatusResponse;
   cost: CostSummary;
+  tuis: TuiEntry[];
   showAllChannels: boolean;
   setShowAllChannels: (fn: (v: boolean) => boolean) => void;
 }) {
@@ -314,25 +441,80 @@ function OverviewTab({
     cost.session_cost_usd,
     cost.daily_cost_usd,
     cost.monthly_cost_usd,
-    0.001
+    0.001,
   );
+
+  // Component Health → "fix in place" modal target (set when an error row's
+  // last_error parses to a config entity). Same modal as the Doctor page.
+  const [healthFix, setHealthFix] = useState<{
+    prefix: string;
+    entity: string;
+    href: string;
+  } | null>(null);
+
+  // Index of agent config field path -> ConfigTab label, so a health "Fix"
+  // deep-link routes to the field's real tab from backend metadata instead of
+  // guessing it from the field name. Best-effort: an empty index just omits the
+  // ?tab= and lands on the agent's default tab.
+  const [fieldTabs, setFieldTabs] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    void listProps("agents")
+      .then((resp) => {
+        if (cancelled) return;
+        const index = new Map<string, string>();
+        for (const e of resp.entries) {
+          if (e.tab) index.set(e.path, e.tab);
+        }
+        setFieldTabs(index);
+      })
+      .catch(() => {
+        /* deep-link tab is best-effort; ignore load failures */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <>
       {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
-          <div key={labelKey} className="card p-5 animate-slide-in-up">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent, }}>
-                <Icon className="h-5 w-5" />
+        {STATUS_CARDS.map(
+          ({ icon: Icon, accent, labelKey, getValue, getSub }) => (
+            <div key={labelKey} className="card p-5 animate-slide-in-up">
+              <div className="flex items-center gap-3 mb-3">
+                <div
+                  className="p-2 rounded-2xl"
+                  style={{
+                    background: `rgba(var(--pc-accent-rgb), 0.08)`,
+                    color: accent,
+                  }}
+                >
+                  <Icon className="h-5 w-5" />
+                </div>
+                <span
+                  className="text-xs uppercase tracking-wider font-medium"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
+                  {t(labelKey)}
+                </span>
               </div>
-              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
+              <p
+                className="text-lg font-semibold truncate"
+                style={{ color: "var(--pc-text-primary)" }}
+              >
+                {getValue(status)}
+              </p>
+              <p
+                className="text-sm truncate"
+                style={{ color: "var(--pc-text-muted)" }}
+              >
+                {getSub(status)}
+              </p>
             </div>
-            <p className="text-lg font-semibold truncate" style={{ color: "var(--pc-text-primary)" }}>{getValue(status)}</p>
-            <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>{getSub(status)}</p>
-          </div>
-        ))}
+          ),
+        )}
         <ProcessRamCard process={status.process} />
         <ProcessCpuCard process={status.process} />
       </div>
@@ -341,8 +523,16 @@ function OverviewTab({
         {/* Cost Widget */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
-            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--pc-text-primary)" }}>{t("dashboard.cost_overview")}</h2>
+            <DollarSign
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.cost_overview")}
+            </h2>
           </div>
           <div className="space-y-4">
             {[
@@ -394,7 +584,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.total_tokens_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.total_tokens.toLocaleString()}
             </span>
           </div>
@@ -402,7 +595,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.requests_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.request_count.toLocaleString()}
             </span>
           </div>
@@ -450,57 +646,71 @@ function OverviewTab({
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
               </p>
-            ) : (() => {
-              const entries = Object.entries(status.channels).filter(
-                ([, active]) => showAllChannels || active
-              );
-              if (entries.length === 0) {
-                return (
-                  <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-                    {t("dashboard.no_active_channels")}
-                  </p>
+            ) : (
+              (() => {
+                const entries = Object.entries(status.channels).filter(
+                  ([, active]) => showAllChannels || active,
                 );
-              }
-              return entries.map(([name, active]) => (
-                <EntityLink
-                  key={name}
-                  kind="channel"
-                  id={name}
-                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
-                  style={{ background: 'var(--pc-bg-elevated)' }}
-                  title={`Open channels.${name} config`}
-                >
-                  <span
-                    className="text-sm font-mono font-medium"
-                    style={{ color: 'var(--pc-text-primary)' }}
+                if (entries.length === 0) {
+                  return (
+                    <p
+                      className="text-sm"
+                      style={{ color: "var(--pc-text-faint)" }}
+                    >
+                      {t("dashboard.no_active_channels")}
+                    </p>
+                  );
+                }
+                return entries.map(([name, active]) => (
+                  <EntityLink
+                    key={name}
+                    kind="channel"
+                    id={name}
+                    className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
+                    style={{ background: "var(--pc-bg-elevated)" }}
+                    title={`${t("dashboard.open_config_prefix")}channels.${name}${t("dashboard.open_config_suffix")}`}
                   >
-                    {name}
-                  </span>
-                  <span className="flex items-center gap-2">
                     <span
-                      className="status-dot"
-                      style={
-                        active
-                          ? {
-                              background: 'var(--color-status-success)',
-                              boxShadow: '0 0 6px var(--color-status-success)',
-                            }
-                          : { background: 'var(--pc-text-faint)' }
-                      }
-                    />
-                    <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                      {active ? t('dashboard.active') : t('dashboard.inactive')}
+                      className="text-sm font-mono font-medium"
+                      style={{ color: "var(--pc-text-primary)" }}
+                    >
+                      {name}
                     </span>
-                  </span>
-                </EntityLink>
-              ));
-            })()}
+                    <span className="flex items-center gap-2">
+                      <span
+                        className="status-dot"
+                        style={
+                          active
+                            ? {
+                                background: "var(--color-status-success)",
+                                boxShadow:
+                                  "0 0 6px var(--color-status-success)",
+                              }
+                            : { background: "var(--pc-text-faint)" }
+                        }
+                      />
+                      <span
+                        className="text-xs"
+                        style={{ color: "var(--pc-text-muted)" }}
+                      >
+                        {active
+                          ? t("dashboard.active")
+                          : t("dashboard.inactive")}
+                      </span>
+                    </span>
+                  </EntityLink>
+                ));
+              })()
+            )}
           </div>
         </div>
 
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <Activity
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
             <h2
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
@@ -515,16 +725,21 @@ function OverviewTab({
             // Component Health is for process-level supervisors only
             // (gateway, daemon, scheduler, ...).
             const entries = Object.entries(components).filter(
-              ([name]) => !name.startsWith('channel:'),
+              ([name]) => !name.startsWith("channel:"),
             );
             if (entries.length === 0) {
               return (
-                <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+                <p
+                  className="text-sm"
+                  style={{ color: "var(--pc-text-faint)" }}
+                >
                   {t("dashboard.no_components")}
                 </p>
               );
             }
-            const sorted = entries.slice().sort((a, b) => a[0].localeCompare(b[0]));
+            const sorted = entries
+              .slice()
+              .sort((a, b) => a[0].localeCompare(b[0]));
             return (
               <div className="space-y-2">
                 {sorted.map(([name, comp]) => {
@@ -558,7 +773,7 @@ function OverviewTab({
                           className="ml-auto text-[10px] uppercase font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
                           style={{
                             color: healthColor(comp.status),
-                            background: 'transparent',
+                            background: "transparent",
                             border: `1px solid ${healthBorder(comp.status)}`,
                           }}
                         >
@@ -566,22 +781,49 @@ function OverviewTab({
                         </span>
                       </div>
                       {lastErr ? (
-                        <p
-                          className="text-[11px] mt-1 font-mono break-words"
-                          style={{ color: 'var(--color-status-error)' }}
-                          title={lastErr}
-                        >
-                          ⚠ {lastErr.length > 120 ? lastErr.slice(0, 117) + '…' : lastErr}
-                        </p>
+                        (() => {
+                          const fix = healthFixTarget(lastErr, (p) =>
+                            fieldTabs.get(p),
+                          );
+                          return (
+                            <div className="mt-1 flex items-start gap-2">
+                              <p
+                                className="flex-1 text-[11px] font-mono break-words"
+                                style={{ color: "var(--color-status-error)" }}
+                                title={lastErr}
+                              >
+                                ⚠{" "}
+                                {lastErr.length > 120
+                                  ? lastErr.slice(0, 117) + "…"
+                                  : lastErr}
+                              </p>
+                              {fix && (
+                                <button
+                                  type="button"
+                                  onClick={() => setHealthFix(fix)}
+                                  className="inline-flex h-6 flex-shrink-0 items-center gap-1 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-2 text-[11px] font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base cursor-pointer"
+                                >
+                                  {t("dashboard.fix")}
+                                  <ArrowRight className="h-3 w-3" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })()
                       ) : null}
-                      <div className="flex items-center gap-3 text-[11px] mt-0.5" style={{ color: "var(--pc-text-muted)" }}>
+                      <div
+                        className="flex items-center gap-3 text-[11px] mt-0.5"
+                        style={{ color: "var(--pc-text-muted)" }}
+                      >
                         {lastOk && (
-                          <span title={`last ok: ${lastOk}`}>
-                            ok {formatRelative(lastOk)}
+                          <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                            {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                           </span>
                         )}
                         {comp.restart_count > 0 && (
-                          <span style={{ color: "var(--color-status-warning)" }}>
+                          <span
+                            style={{ color: "var(--color-status-warning)" }}
+                          >
                             {t("dashboard.restarts")}: {comp.restart_count}
                           </span>
                         )}
@@ -594,6 +836,84 @@ function OverviewTab({
           })()}
         </div>
       </div>
+
+      {/* Connected TUIs */}
+      {tuis.length > 0 && (
+        <div className="card p-5 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <Monitor
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.connected_tuis")}
+            </h2>
+            <span
+              className="text-xs font-mono px-2 py-0.5 rounded-full"
+              style={{
+                background: "rgba(var(--pc-accent-rgb), 0.1)",
+                color: "var(--pc-accent)",
+              }}
+            >
+              {tuis.length}
+            </span>
+          </div>
+          <div className="space-y-2 overflow-y-auto max-h-48 pr-1">
+            {tuis.map((tui) => (
+              <div
+                key={tui.tui_id}
+                className="flex items-center justify-between py-2.5 px-3 rounded-xl"
+                style={{ background: "var(--pc-bg-elevated)" }}
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className="status-dot flex-shrink-0"
+                    style={{
+                      background: "var(--color-status-success)",
+                      boxShadow: "0 0 6px var(--color-status-success)",
+                    }}
+                  />
+                  <span
+                    className="text-sm font-mono font-medium"
+                    style={{ color: "var(--pc-text-primary)" }}
+                  >
+                    {tui.tui_id}
+                  </span>
+                  <span
+                    className="text-xs font-mono px-1.5 py-0.5 rounded"
+                    style={{
+                      background: "rgba(var(--pc-accent-rgb), 0.08)",
+                      color: "var(--pc-text-muted)",
+                    }}
+                  >
+                    {tui.peer_label || tui.transport || t("dashboard.unknown")}
+                  </span>
+                </div>
+                <span
+                  className="text-xs"
+                  style={{ color: "var(--pc-text-muted)" }}
+                  title={tui.connected_at}
+                >
+                  {formatRelative(tui.connected_at)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Component Health "fix in place" modal — same editor as the Doctor page.
+          Opens when an error row with a parseable config entity is actioned. */}
+      <DoctorFixModal
+        open={healthFix !== null}
+        prefix={healthFix?.prefix ?? ""}
+        entity={healthFix?.entity ?? ""}
+        href={healthFix?.href ?? ""}
+        onClose={() => setHealthFix(null)}
+      />
     </>
   );
 }
@@ -603,20 +923,20 @@ function OverviewTab({
 // ---------------------------------------------------------------------------
 
 type SessionSort =
-  | 'activity-desc'
-  | 'activity-asc'
-  | 'created-desc'
-  | 'created-asc'
-  | 'messages-desc'
-  | 'messages-asc';
+  | "activity-desc"
+  | "activity-asc"
+  | "created-desc"
+  | "created-asc"
+  | "messages-desc"
+  | "messages-asc";
 
-const SESSION_SORT_OPTIONS: { value: SessionSort; label: string }[] = [
-  { value: 'activity-desc', label: 'Recent activity' },
-  { value: 'activity-asc', label: 'Oldest activity' },
-  { value: 'created-desc', label: 'Newest first' },
-  { value: 'created-asc', label: 'Oldest first' },
-  { value: 'messages-desc', label: 'Busiest' },
-  { value: 'messages-asc', label: 'Quietest' },
+const SESSION_SORT_OPTIONS: { value: SessionSort; labelKey: string }[] = [
+  { value: "activity-desc", labelKey: "dashboard.sort.recent_activity" },
+  { value: "activity-asc", labelKey: "dashboard.sort.oldest_activity" },
+  { value: "created-desc", labelKey: "dashboard.sort.newest_first" },
+  { value: "created-asc", labelKey: "dashboard.sort.oldest_first" },
+  { value: "messages-desc", labelKey: "dashboard.sort.busiest" },
+  { value: "messages-asc", labelKey: "dashboard.sort.quietest" },
 ];
 
 function isSessionSort(v: string): v is SessionSort {
@@ -628,12 +948,14 @@ function SessionsTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
-  const agentFilter = searchParams.get('agent') ?? '';
-  const channelFilter = searchParams.get('channel') ?? '';
-  const searchQuery = searchParams.get('q') ?? '';
-  const sortRaw = searchParams.get('sort') ?? '';
-  const sortBy: SessionSort = isSessionSort(sortRaw) ? sortRaw : 'activity-desc';
-  const setFilter = (key: 'agent' | 'channel' | 'q' | 'sort', value: string) =>
+  const agentFilter = searchParams.get("agent") ?? "";
+  const channelFilter = searchParams.get("channel") ?? "";
+  const searchQuery = searchParams.get("q") ?? "";
+  const sortRaw = searchParams.get("sort") ?? "";
+  const sortBy: SessionSort = isSessionSort(sortRaw)
+    ? sortRaw
+    : "activity-desc";
+  const setFilter = (key: "agent" | "channel" | "q" | "sort", value: string) =>
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -643,11 +965,11 @@ function SessionsTab() {
       },
       { replace: true },
     );
-  const setAgentFilter = (v: string) => setFilter('agent', v);
-  const setChannelFilter = (v: string) => setFilter('channel', v);
-  const setSearchQuery = (v: string) => setFilter('q', v);
+  const setAgentFilter = (v: string) => setFilter("agent", v);
+  const setChannelFilter = (v: string) => setFilter("channel", v);
+  const setSearchQuery = (v: string) => setFilter("q", v);
   const setSortBy = (v: SessionSort) =>
-    setFilter('sort', v === 'activity-desc' ? '' : v);
+    setFilter("sort", v === "activity-desc" ? "" : v);
   const [inspect, setInspect] = useState<{
     session: Session;
     messages: SessionMessageRow[] | null;
@@ -655,9 +977,11 @@ function SessionsTab() {
   } | null>(null);
   const [inspectNewestFirst, setInspectNewestFirst] = useState(true);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The session queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['session_update', 'session_created', 'session_closed'],
+    filterTypes: ["session_update", "session_created", "session_closed"],
     autoConnect: true,
   });
 
@@ -703,11 +1027,11 @@ function SessionsTab() {
         const haystack = [
           s.session_id,
           s.session_key,
-          s.name ?? '',
-          s.agent_alias ?? '',
-          s.channel_id ?? '',
+          s.name ?? "",
+          s.agent_alias ?? "",
+          s.channel_id ?? "",
         ]
-          .join(' ')
+          .join(" ")
           .toLowerCase();
         if (!haystack.includes(needle)) return false;
       }
@@ -716,17 +1040,17 @@ function SessionsTab() {
     const sorted = [...filtered];
     sorted.sort((a, b) => {
       switch (sortBy) {
-        case 'activity-asc':
+        case "activity-asc":
           return a.last_activity.localeCompare(b.last_activity);
-        case 'created-desc':
+        case "created-desc":
           return b.created_at.localeCompare(a.created_at);
-        case 'created-asc':
+        case "created-asc":
           return a.created_at.localeCompare(b.created_at);
-        case 'messages-desc':
+        case "messages-desc":
           return b.message_count - a.message_count;
-        case 'messages-asc':
+        case "messages-asc":
           return a.message_count - b.message_count;
-        case 'activity-desc':
+        case "activity-desc":
         default:
           return b.last_activity.localeCompare(a.last_activity);
       }
@@ -753,16 +1077,19 @@ function SessionsTab() {
       );
   };
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (session: Session) => {
     if (deleting) return;
-    if (!window.confirm(`Delete session ${session.session_id}? This cannot be undone.`)) {
-      return;
-    }
+    setPendingDelete(null);
     setDeleting(session.session_key);
     try {
       await deleteSession(session.session_key);
-      setSessions((prev) => prev.filter((s) => s.session_key !== session.session_key));
-      if (inspect?.session.session_key === session.session_key) setInspect(null);
+      setSessions((prev) =>
+        prev.filter((s) => s.session_key !== session.session_key),
+      );
+      if (inspect?.session.session_key === session.session_key)
+        setInspect(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -776,10 +1103,13 @@ function SessionsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
-          <span className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-            {t('dashboard.loading_sessions')}
+          <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            {t("dashboard.loading_sessions")}
           </span>
         </div>
       </div>
@@ -791,12 +1121,12 @@ function SessionsTab() {
       <div
         className="rounded-2xl border p-4"
         style={{
-          background: 'var(--color-status-error-alpha-08)',
-          borderColor: 'var(--color-status-error-alpha-20)',
-          color: 'var(--color-status-error)',
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
         }}
       >
-        {t('dashboard.load_sessions_error')}: {error}
+        {t("dashboard.load_sessions_error")}: {error}
       </div>
     );
   }
@@ -804,54 +1134,55 @@ function SessionsTab() {
   return (
     <div className="card p-5 animate-slide-in-up space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Users className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+        <Users className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: 'var(--pc-text-primary)' }}
+          style={{ color: "var(--pc-text-primary)" }}
         >
-          {t('dashboard.sessions_title')}
+          {t("dashboard.sessions_title")}
         </h2>
         <span
           className="text-xs font-mono px-2 py-0.5 rounded-full"
-          style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
+          style={{
+            background: "rgba(var(--pc-accent-rgb), 0.1)",
+            color: "var(--pc-accent)",
+          }}
         >
           {visible.length}
-          {visible.length !== sessions.length ? ` / ${sessions.length}` : ''}
+          {visible.length !== sessions.length ? ` / ${sessions.length}` : ""}
         </span>
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <div className="relative">
             <Search
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <input
               type="search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search…"
+              placeholder={t("dashboard.search_placeholder")}
               className="input-electric pl-7 pr-2 py-1 text-xs w-40"
-              title="Substring match on id, key, name, agent, channel"
-              aria-label="Search sessions"
+              title={t("dashboard.session_search_title")}
+              aria-label={t("dashboard.session_search_aria")}
             />
           </div>
           <div className="relative">
             <ArrowUpDown
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={sortBy}
-              onChange={(e) =>
-                setSortBy(e.target.value as SessionSort)
-              }
+              onChange={(e) => setSortBy(e.target.value as SessionSort)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Sort sessions"
-              aria-label="Sort sessions"
+              title={t("dashboard.session_sort_title")}
+              aria-label={t("dashboard.session_sort_title")}
             >
               {SESSION_SORT_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {t(o.labelKey)}
                 </option>
               ))}
             </select>
@@ -859,15 +1190,15 @@ function SessionsTab() {
           <div className="relative">
             <Bot
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={agentFilter}
               onChange={(e) => setAgentFilter(e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning agent"
+              title={t("dashboard.filter_agent_title")}
             >
-              <option value="">All agents</option>
+              <option value="">{t("dashboard.all_agents")}</option>
               {knownAgents.map((a) => (
                 <option key={a} value={a}>
                   {a}
@@ -878,15 +1209,15 @@ function SessionsTab() {
           <div className="relative">
             <Filter
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={channelFilter}
               onChange={(e) => setChannelFilter(e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning channel"
+              title={t("dashboard.filter_channel_title")}
             >
-              <option value="">All channels</option>
+              <option value="">{t("dashboard.all_channels")}</option>
               {knownChannels.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -898,10 +1229,13 @@ function SessionsTab() {
       </div>
 
       {visible.length === 0 ? (
-        <p className="text-sm py-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>
+        <p
+          className="text-sm py-8 text-center"
+          style={{ color: "var(--pc-text-faint)" }}
+        >
           {sessions.length === 0
-            ? t('dashboard.no_sessions')
-            : 'No sessions match the current search and filters'}
+            ? t("dashboard.no_sessions")
+            : t("dashboard.no_sessions_match")}
         </p>
       ) : (
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
@@ -909,13 +1243,16 @@ function SessionsTab() {
             <div
               key={session.session_key}
               className="flex items-center justify-between py-3 px-4 rounded-xl"
-              style={{ background: 'var(--pc-bg-elevated)', border: '1px solid transparent' }}
+              style={{
+                background: "var(--pc-bg-elevated)",
+                border: "1px solid transparent",
+              }}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
                   <span
                     className="text-sm font-medium font-mono break-all"
-                    style={{ color: 'var(--pc-text-primary)' }}
+                    style={{ color: "var(--pc-text-primary)" }}
                   >
                     {session.session_id}
                   </span>
@@ -925,10 +1262,10 @@ function SessionsTab() {
                       id={session.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
-                        color: 'var(--pc-accent-light)',
+                        background: "rgba(var(--pc-accent-rgb), 0.10)",
+                        color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${session.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${session.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.agent_alias}
                     </EntityLink>
@@ -939,10 +1276,10 @@ function SessionsTab() {
                       id={session.channel_id}
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: 'rgba(167, 139, 250, 0.10)',
-                        color: '#a78bfa',
+                        background: "rgba(167, 139, 250, 0.10)",
+                        color: "#a78bfa",
                       }}
-                      title={`Open channels.${session.channel_id} config`}
+                      title={`${t("dashboard.open_config_prefix")}channels.${session.channel_id}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.channel_id}
                     </EntityLink>
@@ -950,7 +1287,7 @@ function SessionsTab() {
                 </div>
                 <div
                   className="flex items-center gap-3 text-xs"
-                  style={{ color: 'var(--pc-text-muted)' }}
+                  style={{ color: "var(--pc-text-muted)" }}
                 >
                   <span className="flex items-center gap-1">
                     <MessageSquare className="h-3 w-3" />
@@ -964,18 +1301,18 @@ function SessionsTab() {
                   type="button"
                   onClick={() => openInspect(session)}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
-                  title="View messages"
-                  style={{ color: 'var(--pc-text-muted)' }}
+                  title={t("dashboard.view_messages")}
+                  style={{ color: "var(--pc-text-muted)" }}
                 >
                   <Eye className="h-4 w-4" />
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDelete(session)}
+                  onClick={() => setPendingDelete(session)}
                   disabled={deleting === session.session_key}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
-                  title="Delete session"
-                  style={{ color: 'var(--color-status-error)' }}
+                  title={t("dashboard.delete_session")}
+                  style={{ color: "var(--color-status-error)" }}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
@@ -988,7 +1325,7 @@ function SessionsTab() {
       {inspect && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: 'rgba(0,0,0,0.5)' }}
+          style={{ background: "rgba(0,0,0,0.5)" }}
           onClick={() => setInspect(null)}
         >
           <div
@@ -999,13 +1336,13 @@ function SessionsTab() {
               <div className="min-w-0">
                 <p
                   className="text-xs uppercase tracking-wider mb-1"
-                  style={{ color: 'var(--pc-text-faint)' }}
+                  style={{ color: "var(--pc-text-faint)" }}
                 >
-                  Session
+                  {t("dashboard.session_label")}
                 </p>
                 <p
                   className="text-sm font-mono break-all"
-                  style={{ color: 'var(--pc-text-primary)' }}
+                  style={{ color: "var(--pc-text-primary)" }}
                 >
                   {inspect.session.session_id}
                 </p>
@@ -1016,8 +1353,8 @@ function SessionsTab() {
                       id={inspect.session.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full hover:underline"
                       style={{
-                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
-                        color: 'var(--pc-accent-light)',
+                        background: "rgba(var(--pc-accent-rgb), 0.10)",
+                        color: "var(--pc-accent-light)",
                       }}
                     >
                       {inspect.session.agent_alias}
@@ -1029,8 +1366,8 @@ function SessionsTab() {
                       id={inspect.session.channel_id}
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full hover:underline"
                       style={{
-                        background: 'rgba(167, 139, 250, 0.10)',
-                        color: '#a78bfa',
+                        background: "rgba(167, 139, 250, 0.10)",
+                        color: "#a78bfa",
                       }}
                     >
                       {inspect.session.channel_id}
@@ -1045,20 +1382,22 @@ function SessionsTab() {
                     onClick={() => setInspectNewestFirst((v) => !v)}
                     className="text-[10px] font-medium px-2 py-1 rounded-lg hover:bg-[var(--pc-hover)] border"
                     style={{
-                      color: 'var(--pc-text-muted)',
-                      borderColor: 'var(--pc-border)',
+                      color: "var(--pc-text-muted)",
+                      borderColor: "var(--pc-border)",
                     }}
-                    title="Flip transcript order"
+                    title={t("dashboard.flip_transcript")}
                   >
-                    {inspectNewestFirst ? 'newest first' : 'oldest first'}
+                    {inspectNewestFirst
+                      ? t("dashboard.newest_first_short")
+                      : t("dashboard.oldest_first_short")}
                   </button>
                 )}
                 <button
                   type="button"
                   onClick={() => setInspect(null)}
                   className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                  title="Close"
+                  style={{ color: "var(--pc-text-muted)" }}
+                  title={t("common.close")}
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -1066,16 +1405,25 @@ function SessionsTab() {
             </div>
             <div className="flex-1 overflow-y-auto space-y-3 pr-1">
               {inspect.error ? (
-                <p className="text-sm" style={{ color: 'var(--color-status-error)' }}>
+                <p
+                  className="text-sm"
+                  style={{ color: "var(--color-status-error)" }}
+                >
                   {inspect.error}
                 </p>
               ) : inspect.messages === null ? (
-                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-                  Loading transcript…
+                <p
+                  className="text-sm"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
+                  {t("dashboard.loading_transcript")}
                 </p>
               ) : inspect.messages.length === 0 ? (
-                <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-                  No persisted messages for this session.
+                <p
+                  className="text-sm"
+                  style={{ color: "var(--pc-text-faint)" }}
+                >
+                  {t("dashboard.no_persisted_messages")}
                 </p>
               ) : (
                 (inspectNewestFirst
@@ -1085,19 +1433,19 @@ function SessionsTab() {
                   <div
                     key={i}
                     className="rounded-xl px-3 py-2"
-                    style={{ background: 'var(--pc-bg-elevated)' }}
+                    style={{ background: "var(--pc-bg-elevated)" }}
                   >
                     <div className="flex items-baseline justify-between gap-3 mb-1">
                       <p
                         className="text-[10px] uppercase tracking-wider font-mono"
-                        style={{ color: 'var(--pc-text-faint)' }}
+                        style={{ color: "var(--pc-text-faint)" }}
                       >
                         {m.role}
                       </p>
                       {m.created_at && (
                         <p
                           className="text-[10px] font-mono whitespace-nowrap"
-                          style={{ color: 'var(--pc-text-faint)' }}
+                          style={{ color: "var(--pc-text-faint)" }}
                           title={m.created_at}
                         >
                           {formatLocalDateTime(m.created_at)}
@@ -1106,7 +1454,7 @@ function SessionsTab() {
                     </div>
                     <p
                       className="text-sm whitespace-pre-wrap break-words"
-                      style={{ color: 'var(--pc-text-primary)' }}
+                      style={{ color: "var(--pc-text-primary)" }}
                     >
                       {m.content}
                     </p>
@@ -1117,6 +1465,24 @@ function SessionsTab() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.confirm_delete_session_prefix")} ${pendingDelete?.session_id ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -1131,7 +1497,7 @@ function ChannelsTab() {
   const [error, setError] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['channel_update', 'channel_status'],
+    filterTypes: ["channel_update", "channel_status"],
     autoConnect: true,
   });
 
@@ -1163,7 +1529,10 @@ function ChannelsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)" }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
             {t("dashboard.loading_channels")}
@@ -1177,7 +1546,11 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
+        style={{
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
+        }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -1187,7 +1560,10 @@ function ChannelsTab() {
   if (channels.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
+        <p
+          className="text-sm py-8 text-center"
+          style={{ color: "var(--pc-text-faint)" }}
+        >
           {t("dashboard.no_channels_detail")}
         </p>
       </div>
@@ -1218,7 +1594,10 @@ function ChannelsTab() {
             <div className="flex items-center gap-3 min-w-0">
               <div
                 className="p-2 rounded-2xl flex-shrink-0"
-                style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: "var(--pc-accent)" }}
+                style={{
+                  background: `rgba(var(--pc-accent-rgb), 0.08)`,
+                  color: "var(--pc-accent)",
+                }}
               >
                 <Radio className="h-5 w-5" />
               </div>
@@ -1227,25 +1606,30 @@ function ChannelsTab() {
                   kind="channel"
                   id={channel.name}
                   className="text-sm font-semibold font-mono break-all hover:underline"
-                  title={`Open channels.${channel.name} config`}
+                  title={`${t("dashboard.open_config_prefix")}channels.${channel.name}${t("dashboard.open_config_suffix")}`}
                 >
-                  <span style={{ color: 'var(--pc-text-primary)' }}>{channel.name}</span>
+                  <span style={{ color: "var(--pc-text-primary)" }}>
+                    {channel.name}
+                  </span>
                 </EntityLink>
-                <span className="text-xs block" style={{ color: 'var(--pc-text-muted)' }}>
+                <span
+                  className="text-xs block"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
                   {channel.owning_agent ? (
                     <>
-                      owned by{' '}
+                      {t("dashboard.owned_by")}{" "}
                       <EntityLink
                         kind="agent"
                         id={channel.owning_agent}
                         className="hover:underline font-mono"
-                        title={`Open agents.${channel.owning_agent} config`}
+                        title={`${t("dashboard.open_config_prefix")}agents.${channel.owning_agent}${t("dashboard.open_config_suffix")}`}
                       >
                         {channel.owning_agent}
                       </EntityLink>
                     </>
                   ) : (
-                    'no owning agent'
+                    t("dashboard.no_owning_agent")
                   )}
                 </span>
               </div>
@@ -1263,13 +1647,7 @@ function ChannelsTab() {
             <EntityEnabledToggle
               prefix={`channels.${channel.type}.${channel.alias}`}
               enabled={channel.enabled}
-              onChange={(next) =>
-                setChannels((prev) =>
-                  prev.map((c) =>
-                    c.name === channel.name ? { ...c, enabled: next } : c,
-                  ),
-                )
-              }
+              onChange={() => loadChannels()}
             />
           </div>
 
@@ -1281,12 +1659,55 @@ function ChannelsTab() {
             className="pt-3 border-t space-y-2"
             style={{ borderColor: "var(--pc-border)" }}
           >
+            {channel.readiness ? (
+              <>
+                {CHANNEL_READINESS_ROWS.map(([labelKey, key]) => {
+                  const value = channel.readiness?.[key];
+                  return value ? (
+                    <div key={key} className="flex justify-between gap-3 text-xs">
+                      <span style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
+                      <span style={{ color: readinessColor(value) }}>
+                        {readinessLabel(value)}
+                      </span>
+                    </div>
+                  ) : null;
+                })}
+              </>
+            ) : null}
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.health")}</span>
+              <span style={{ color: "var(--pc-text-muted)" }}>
+                {t("dashboard.health")}
+              </span>
               <span style={{ color: healthColor(channel.health) }}>
                 {channel.health}
               </span>
             </div>
+            {channel.readiness?.requirements?.length ? (
+              <div className="pt-2 space-y-1">
+                {channel.readiness.requirements.map((requirement) => (
+                  <p
+                    key={requirement}
+                    className="text-xs leading-snug"
+                    style={{ color: "var(--color-status-warning)" }}
+                  >
+                    {requirement}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+            {channel.readiness?.notes?.length ? (
+              <div className="pt-2 space-y-1">
+                {channel.readiness.notes.map((note) => (
+                  <p
+                    key={note}
+                    className="text-xs leading-snug"
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
+                    {note}
+                  </p>
+                ))}
+              </div>
+            ) : null}
           </div>
         </div>
       ))}
@@ -1298,37 +1719,45 @@ function ChannelsTab() {
 // Main Dashboard Component
 // ---------------------------------------------------------------------------
 
-const TAB_IDS: TabId[] = ['overview', 'sessions', 'channels', 'memories', 'health', 'cost'];
+const TAB_IDS: TabId[] = [
+  "overview",
+  "sessions",
+  "channels",
+  "memories",
+  "health",
+  "cost",
+];
 
 function parseTab(raw: string | null): TabId {
   if (raw && (TAB_IDS as string[]).includes(raw)) return raw as TabId;
-  return 'overview';
+  return "overview";
 }
 
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
-  const [costWindow, setCostWindow] = useState<CostWindow>('today');
+  const [tuis, setTuis] = useState<TuiEntry[]>([]);
+  const [costWindow, setCostWindow] = useState<CostWindow>("today");
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = parseTab(searchParams.get('tab'));
+  const activeTab = parseTab(searchParams.get("tab"));
   const setActiveTab = (id: TabId) => {
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (id === 'overview') next.delete('tab');
-        else next.set('tab', id);
+        if (id === "overview") next.delete("tab");
+        else next.set("tab", id);
         // Filters belong to specific tabs; drop them when leaving so deep
         // links don't drag a stale agent= into the wrong tab.
-        if (id !== 'sessions' && id !== 'memories') {
-          next.delete('agent');
+        if (id !== "sessions" && id !== "memories") {
+          next.delete("agent");
         }
-        if (id !== 'sessions') {
-          next.delete('channel');
+        if (id !== "sessions") {
+          next.delete("channel");
         }
-        if (id !== 'memories') {
-          next.delete('category');
+        if (id !== "memories") {
+          next.delete("category");
         }
         return next;
       },
@@ -1336,34 +1765,38 @@ export default function Dashboard() {
     );
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
+  // Uptime ticks every second on the server; poll every 5s so the tile and
+  // health badges stay live — but only while the tab is visible (paused when
+  // backgrounded), and re-armed when the cost window changes.
+  usePolling(
+    (isStale) => {
       const { from, to } = costWindowBounds(costWindow);
-      Promise.all([getStatus(), getCost(from, to)])
-        .then(([s, c]) => {
-          if (cancelled) return;
+      Promise.all([getStatus(), getCost(from, to), getTuis()])
+        .then(([s, c, t]) => {
+          if (isStale()) return;
           setStatus(s);
           setCost(c);
+          setTuis(t);
         })
         .catch((err) => {
-          if (!cancelled) setError(err.message);
+          if (!isStale()) setError(err.message);
         });
-    };
-    refresh();
-    // Uptime ticks every second on the server; poll every 5s so the tile and
-    // health badges stay live without hammering the gateway.
-    const id = window.setInterval(refresh, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [costWindow]);
+    },
+    5000,
+    [costWindow],
+  );
 
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
+        <div
+          className="rounded-2xl border p-4"
+          style={{
+            background: "var(--color-status-error-alpha-08)",
+            borderColor: "var(--color-status-error-alpha-20)",
+            color: "var(--color-status-error)",
+          }}
+        >
           {t("dashboard.load_error")}: {error}
         </div>
       </div>
@@ -1373,7 +1806,13 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)", }}/>
+        <div
+          className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
+        />
       </div>
     );
   }
@@ -1382,16 +1821,22 @@ export default function Dashboard() {
     <div className="p-6 space-y-6 animate-fade-in">
       <AgentsSection />
 
-      {/* Global system stats — tab navigation */}
+      {/* Global system stats — tab navigation. Scrolls horizontally when the
+          six tabs don't fit (mobile) instead of overflowing the frame; each
+          button keeps its size (flex-shrink-0) so labels never get clipped. */}
       <div
-        className="flex items-center gap-1 p-1 rounded-2xl"
+        className="flex items-center gap-1 p-1 rounded-2xl overflow-x-auto"
         style={{ background: "var(--pc-bg-elevated)" }}
+        role="tablist"
+        aria-label={t("nav.dashboard")}
       >
         {TABS.map(({ id, labelKey, icon: Icon }) => (
           <button
             key={id}
+            role="tab"
+            aria-selected={activeTab === id}
             onClick={() => setActiveTab(id)}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
+            className="flex flex-shrink-0 items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all whitespace-nowrap"
             style={
               activeTab === id
                 ? {
@@ -1422,20 +1867,25 @@ export default function Dashboard() {
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'overview' && (
+      {activeTab === "overview" && (
         <OverviewTab
           status={status}
           cost={cost}
+          tuis={tuis}
           showAllChannels={showAllChannels}
           setShowAllChannels={setShowAllChannels}
         />
       )}
-      {activeTab === 'sessions' && <SessionsTab />}
-      {activeTab === 'channels' && <ChannelsTab />}
-      {activeTab === 'memories' && <MemoriesTab />}
-      {activeTab === 'health' && <HealthTab status={status} />}
-      {activeTab === 'cost' && (
-        <CostTab cost={cost} window={costWindow} onWindowChange={setCostWindow} />
+      {activeTab === "sessions" && <SessionsTab />}
+      {activeTab === "channels" && <ChannelsTab />}
+      {activeTab === "memories" && <MemoriesTab />}
+      {activeTab === "health" && <HealthTab status={status} />}
+      {activeTab === "cost" && (
+        <CostTab
+          cost={cost}
+          window={costWindow}
+          onWindowChange={setCostWindow}
+        />
       )}
     </div>
   );
@@ -1448,13 +1898,13 @@ export default function Dashboard() {
 function HealthTab({ status }: { status: StatusResponse }) {
   const components = status.health?.components ?? {};
   const entries = Object.entries(components).filter(
-    ([name]) => !name.startsWith('channel:'),
+    ([name]) => !name.startsWith("channel:"),
   );
   if (entries.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-          {t('dashboard.no_components')}
+        <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+          {t("dashboard.no_components")}
         </p>
       </div>
     );
@@ -1463,12 +1913,12 @@ function HealthTab({ status }: { status: StatusResponse }) {
   return (
     <div className="card p-5 animate-slide-in-up">
       <div className="flex items-center gap-2 mb-5">
-        <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+        <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: 'var(--pc-text-primary)' }}
+          style={{ color: "var(--pc-text-primary)" }}
         >
-          {t('dashboard.component_health')}
+          {t("dashboard.component_health")}
         </h2>
       </div>
       <div className="space-y-2">
@@ -1494,7 +1944,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
                 />
                 <span
                   className="text-sm font-medium font-mono break-all"
-                  style={{ color: 'var(--pc-text-primary)' }}
+                  style={{ color: "var(--pc-text-primary)" }}
                 >
                   {name}
                 </span>
@@ -1502,7 +1952,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
                   className="ml-auto text-[10px] uppercase font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
                   style={{
                     color: healthColor(comp.status),
-                    background: 'transparent',
+                    background: "transparent",
                     border: `1px solid ${healthBorder(comp.status)}`,
                   }}
                 >
@@ -1512,7 +1962,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
               {lastErr && (
                 <p
                   className="text-[11px] mt-1 font-mono break-words"
-                  style={{ color: 'var(--color-status-error)' }}
+                  style={{ color: "var(--color-status-error)" }}
                   title={lastErr}
                 >
                   ⚠ {lastErr}
@@ -1520,12 +1970,16 @@ function HealthTab({ status }: { status: StatusResponse }) {
               )}
               <div
                 className="flex items-center gap-3 text-[11px] mt-0.5"
-                style={{ color: 'var(--pc-text-muted)' }}
+                style={{ color: "var(--pc-text-muted)" }}
               >
-                {lastOk && <span title={`last ok: ${lastOk}`}>ok {formatRelative(lastOk)}</span>}
+                {lastOk && (
+                  <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                    {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
+                  </span>
+                )}
                 {comp.restart_count > 0 && (
-                  <span style={{ color: 'var(--color-status-warning)' }}>
-                    {t('dashboard.restarts')}: {comp.restart_count}
+                  <span style={{ color: "var(--color-status-warning)" }}>
+                    {t("dashboard.restarts")}: {comp.restart_count}
                   </span>
                 )}
               </div>
@@ -1543,12 +1997,12 @@ function HealthTab({ status }: { status: StatusResponse }) {
 
 // Cost dashboard: per-day totals plus per-agent and per-model rollups
 // with input / output / cached token splits. Both rollups are daily-scoped
-const COST_WINDOW_OPTIONS: { value: CostWindow; label: string }[] = [
-  { value: 'today', label: 'Today' },
-  { value: '7d', label: 'Last 7 days' },
-  { value: '30d', label: 'Last 30 days' },
-  { value: 'month', label: 'This month' },
-  { value: 'all', label: 'All time' },
+const COST_WINDOW_OPTIONS: { value: CostWindow; labelKey: string }[] = [
+  { value: "today", labelKey: "dashboard.cost.today" },
+  { value: "7d", labelKey: "dashboard.cost.last_7_days" },
+  { value: "30d", labelKey: "dashboard.cost.last_30_days" },
+  { value: "month", labelKey: "dashboard.cost.this_month" },
+  { value: "all", labelKey: "dashboard.cost.all_time" },
 ];
 
 function CostTab({
@@ -1563,23 +2017,28 @@ function CostTab({
   const byModel = Object.values(cost.by_model);
   const byAgent = Object.values(cost.by_agent);
   const navigate = useNavigate();
-  const windowLabel =
-    COST_WINDOW_OPTIONS.find((o) => o.value === costWindow)?.label.toLowerCase() ?? costWindow;
+  const windowLabelKey = COST_WINDOW_OPTIONS.find(
+    (o) => o.value === costWindow,
+  )?.labelKey;
+  const windowLabel = windowLabelKey
+    ? t(windowLabelKey).toLowerCase()
+    : costWindow;
 
   const openModelRates = async (modelId: string) => {
-    const map = await resolveModelToProviderType('models').catch(() => null);
+    const map = await resolveModelToProviderType("models").catch(() => null);
     const type = map?.[modelId];
     if (!type) return;
-    navigate(
-      `/config/providers.models/${encodeURIComponent(type)}?tab=costs`,
-    );
+    navigate(`/config/providers.models/${encodeURIComponent(type)}?tab=costs`);
   };
 
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center gap-2">
-        <label className="text-xs uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-          Window
+        <label
+          className="text-xs uppercase tracking-wider"
+          style={{ color: "var(--pc-text-secondary)" }}
+        >
+          {t("dashboard.cost.window")}
         </label>
         <select
           value={costWindow}
@@ -1588,122 +2047,148 @@ function CostTab({
         >
           {COST_WINDOW_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
-              {opt.label}
+              {t(opt.labelKey)}
             </option>
           ))}
         </select>
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <div className="card p-5 animate-slide-in-up">
-        <div className="flex items-center gap-2 mb-5">
-          <Bot className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-          <h2
-            className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: 'var(--pc-text-primary)' }}
-          >
-            Spend by agent · {windowLabel}
-          </h2>
-        </div>
-        {byAgent.length === 0 ? (
-          <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-            No per-agent tracking. Enable <code>[cost].track_per_agent</code>.
-          </p>
-        ) : (
-          <ul className="space-y-2 text-sm">
-            {byAgent
-              .slice()
-              .sort((a, b) => b.cost_usd - a.cost_usd)
-              .map((row) => (
-                <li
-                  key={row.agent_alias}
-                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
-                  style={{ background: 'var(--pc-bg-elevated)' }}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <EntityLink
-                      kind="agent"
-                      id={row.agent_alias}
-                      className="font-mono hover:underline"
-                      title={`agents.${row.agent_alias}`}
-                    >
-                      agents.{row.agent_alias}
-                    </EntityLink>
-                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-                      {formatUSD(row.cost_usd)}
-                    </span>
-                  </div>
-                  <div
-                    className="flex items-center gap-3 text-xs flex-wrap"
-                    style={{ color: 'var(--pc-text-muted)' }}
+        <div className="card p-5 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <Bot className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.cost.spend_by_agent")} · {windowLabel}
+            </h2>
+          </div>
+          {byAgent.length === 0 ? (
+            <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+              {t("dashboard.cost.no_per_agent_pre")}{" "}
+              <code>[cost].track_per_agent</code>
+              {t("dashboard.cost.no_per_agent_post")}
+            </p>
+          ) : (
+            <ul className="space-y-2 text-sm">
+              {byAgent
+                .slice()
+                .sort((a, b) => b.cost_usd - a.cost_usd)
+                .map((row) => (
+                  <li
+                    key={row.agent_alias}
+                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                    style={{ background: "var(--pc-bg-elevated)" }}
                   >
-                    <span>{row.request_count} exchanges</span>
-                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
-                    {row.cached_input_tokens > 0 && (
-                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
-                    )}
-                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
-                  </div>
-                </li>
-              ))}
-          </ul>
-        )}
-      </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <EntityLink
+                        kind="agent"
+                        id={row.agent_alias}
+                        className="font-mono hover:underline"
+                        title={`agents.${row.agent_alias}`}
+                      >
+                        agents.{row.agent_alias}
+                      </EntityLink>
+                      <span
+                        className="font-mono"
+                        style={{ color: "var(--pc-text-primary)" }}
+                      >
+                        {formatUSD(row.cost_usd)}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-3 text-xs flex-wrap"
+                      style={{ color: "var(--pc-text-muted)" }}
+                    >
+                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
+                      <span>
+                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
+                      </span>
+                      {row.cached_input_tokens > 0 && (
+                        <span>
+                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
+                        </span>
+                      )}
+                      <span>
+                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
 
-      <div className="card p-5 lg:col-span-2 animate-slide-in-up">
-        <div className="flex items-center gap-2 mb-5">
-          <DollarSign className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-          <h2
-            className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: 'var(--pc-text-primary)' }}
-          >
-            Spend by model · {windowLabel}
-          </h2>
-        </div>
-        {byModel.length === 0 ? (
-          <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-            No model usage recorded in this window.
-          </p>
-        ) : (
-          <ul className="space-y-2 text-sm">
-            {byModel
-              .slice()
-              .sort((a, b) => b.cost_usd - a.cost_usd)
-              .map((row) => (
-                <li
-                  key={row.model}
-                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
-                  style={{ background: 'var(--pc-bg-elevated)' }}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <button
-                      type="button"
-                      onClick={() => void openModelRates(row.model)}
-                      className="font-mono break-all hover:underline text-left"
-                      style={{ color: 'var(--pc-text-primary)', background: 'transparent' }}
-                      title={`Open the rate sheet entry for ${row.model}`}
-                    >
-                      {row.model}
-                    </button>
-                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-                      {formatUSD(row.cost_usd)}
-                    </span>
-                  </div>
-                  <div
-                    className="flex items-center gap-3 text-xs flex-wrap"
-                    style={{ color: 'var(--pc-text-muted)' }}
+        <div className="card p-5 lg:col-span-2 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <DollarSign
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.cost.spend_by_model")} · {windowLabel}
+            </h2>
+          </div>
+          {byModel.length === 0 ? (
+            <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+              {t("dashboard.cost.no_model_usage")}
+            </p>
+          ) : (
+            <ul className="space-y-2 text-sm">
+              {byModel
+                .slice()
+                .sort((a, b) => b.cost_usd - a.cost_usd)
+                .map((row) => (
+                  <li
+                    key={row.model}
+                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                    style={{ background: "var(--pc-bg-elevated)" }}
                   >
-                    <span>{row.request_count} exchanges</span>
-                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
-                    {row.cached_input_tokens > 0 && (
-                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
-                    )}
-                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
-                  </div>
-                </li>
-              ))}
-          </ul>
-        )}
-      </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void openModelRates(row.model)}
+                        className="font-mono break-all hover:underline text-left"
+                        style={{
+                          color: "var(--pc-text-primary)",
+                          background: "transparent",
+                        }}
+                        title={`${t("dashboard.cost.open_rate_sheet_title")} ${row.model}`}
+                      >
+                        {row.model}
+                      </button>
+                      <span
+                        className="font-mono"
+                        style={{ color: "var(--pc-text-primary)" }}
+                      >
+                        {formatUSD(row.cost_usd)}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-3 text-xs flex-wrap"
+                      style={{ color: "var(--pc-text-muted)" }}
+                    >
+                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
+                      <span>
+                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
+                      </span>
+                      {row.cached_input_tokens > 0 && (
+                        <span>
+                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
+                        </span>
+                      )}
+                      <span>
+                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1716,13 +2201,13 @@ function CostTab({
 // for creating new rows; this tab is the cross-agent inspection surface.
 // ---------------------------------------------------------------------------
 
-type MemorySort = 'newest' | 'oldest' | 'key-asc' | 'key-desc';
+type MemorySort = "newest" | "oldest" | "key-asc" | "key-desc";
 
-const MEMORY_SORT_OPTIONS: { value: MemorySort; label: string }[] = [
-  { value: 'newest', label: 'Newest first' },
-  { value: 'oldest', label: 'Oldest first' },
-  { value: 'key-asc', label: 'Key A → Z' },
-  { value: 'key-desc', label: 'Key Z → A' },
+const MEMORY_SORT_OPTIONS: { value: MemorySort; labelKey: string }[] = [
+  { value: "newest", labelKey: "dashboard.mem.sort.newest" },
+  { value: "oldest", labelKey: "dashboard.mem.sort.oldest" },
+  { value: "key-asc", labelKey: "dashboard.mem.sort.key_asc" },
+  { value: "key-desc", labelKey: "dashboard.mem.sort.key_desc" },
 ];
 
 function isMemorySort(v: string): v is MemorySort {
@@ -1734,11 +2219,11 @@ function MemoriesTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
-  const agentFilter = searchParams.get('agent') ?? '';
-  const categoryFilter = searchParams.get('category') ?? '';
-  const searchQuery = searchParams.get('q') ?? '';
-  const sortRaw = searchParams.get('sort') ?? '';
-  const sortBy: MemorySort = isMemorySort(sortRaw) ? sortRaw : 'newest';
+  const agentFilter = searchParams.get("agent") ?? "";
+  const categoryFilter = searchParams.get("category") ?? "";
+  const searchQuery = searchParams.get("q") ?? "";
+  const sortRaw = searchParams.get("sort") ?? "";
+  const sortBy: MemorySort = isMemorySort(sortRaw) ? sortRaw : "newest";
   // Debounced query so each keystroke doesn't fire a recall request to the
   // backend (which then hits the configured memory store — markdown read,
   // sqlite scan, qdrant vector search, etc.).
@@ -1749,12 +2234,14 @@ function MemoriesTab() {
   }, [searchQuery]);
   const [knownAgents, setKnownAgents] = useState<string[]>([]);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The entry queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<MemoryEntry | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAddForm, setShowAddForm] = useState(false);
-  const [formKey, setFormKey] = useState('');
-  const [formContent, setFormContent] = useState('');
-  const [formCategory, setFormCategory] = useState('');
-  const [formAgent, setFormAgent] = useState('');
+  const [formKey, setFormKey] = useState("");
+  const [formContent, setFormContent] = useState("");
+  const [formCategory, setFormCategory] = useState("");
+  const [formAgent, setFormAgent] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -1766,7 +2253,7 @@ function MemoriesTab() {
       return next;
     });
 
-  const setFilter = (key: 'agent' | 'category' | 'q' | 'sort', value: string) =>
+  const setFilter = (key: "agent" | "category" | "q" | "sort", value: string) =>
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -1776,9 +2263,9 @@ function MemoriesTab() {
       },
       { replace: true },
     );
-  const setSearchQuery = (v: string) => setFilter('q', v);
+  const setSearchQuery = (v: string) => setFilter("q", v);
   const setSortBy = (v: MemorySort) =>
-    setFilter('sort', v === 'newest' ? '' : v);
+    setFilter("sort", v === "newest" ? "" : v);
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -1802,7 +2289,7 @@ function MemoriesTab() {
   }, [reload]);
 
   useEffect(() => {
-    getMapKeys('agents')
+    getMapKeys("agents")
       .then((r) => setKnownAgents(r.keys))
       .catch(() => {
         /* dropdown stays empty; filter still works as a typed value */
@@ -1819,13 +2306,13 @@ function MemoriesTab() {
     const sorted = [...entries];
     sorted.sort((a, b) => {
       switch (sortBy) {
-        case 'oldest':
+        case "oldest":
           return a.timestamp.localeCompare(b.timestamp);
-        case 'key-asc':
+        case "key-asc":
           return a.key.localeCompare(b.key);
-        case 'key-desc':
+        case "key-desc":
           return b.key.localeCompare(a.key);
-        case 'newest':
+        case "newest":
         default:
           return b.timestamp.localeCompare(a.timestamp);
       }
@@ -1833,9 +2320,11 @@ function MemoriesTab() {
     return sorted;
   }, [entries, sortBy]);
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (entry: MemoryEntry) => {
     if (deleting) return;
-    if (!window.confirm(`Delete memory ${entry.key}? This cannot be undone.`)) return;
+    setPendingDelete(null);
     setDeleting(entry.id);
     try {
       // Per-agent rows resolve through the agent's own memory backend; the
@@ -1853,7 +2342,7 @@ function MemoriesTab() {
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
-      setFormError('Key and content are required');
+      setFormError(t("dashboard.mem.error_key_content_required"));
       return;
     }
     setSubmitting(true);
@@ -1866,10 +2355,10 @@ function MemoriesTab() {
         formAgent.trim() || undefined,
       );
       setShowAddForm(false);
-      setFormKey('');
-      setFormContent('');
-      setFormCategory('');
-      setFormAgent('');
+      setFormKey("");
+      setFormContent("");
+      setFormCategory("");
+      setFormAgent("");
       reload();
     } catch (e) {
       setFormError(e instanceof Error ? e.message : String(e));
@@ -1884,10 +2373,13 @@ function MemoriesTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
-          <span className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-            Loading memories…
+          <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            {t("dashboard.mem.loading")}
           </span>
         </div>
       </div>
@@ -1899,9 +2391,9 @@ function MemoriesTab() {
       <div
         className="rounded-2xl border p-4"
         style={{
-          background: 'var(--color-status-error-alpha-08)',
-          borderColor: 'var(--color-status-error-alpha-20)',
-          color: 'var(--color-status-error)',
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
         }}
       >
         {error}
@@ -1912,19 +2404,24 @@ function MemoriesTab() {
   return (
     <div className="card p-5 animate-slide-in-up space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Brain className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+        <Brain className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: 'var(--pc-text-primary)' }}
+          style={{ color: "var(--pc-text-primary)" }}
         >
-          Memories
+          {t("dashboard.mem.heading")}
         </h2>
         <span
           className="text-xs font-mono px-2 py-0.5 rounded-full"
-          style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
+          style={{
+            background: "rgba(var(--pc-accent-rgb), 0.1)",
+            color: "var(--pc-accent)",
+          }}
         >
           {visibleEntries.length}
-          {visibleEntries.length !== entries.length ? ` / ${entries.length}` : ''}
+          {visibleEntries.length !== entries.length
+            ? ` / ${entries.length}`
+            : ""}
         </span>
         <button
           type="button"
@@ -1939,43 +2436,43 @@ function MemoriesTab() {
             setFormAgent(agentFilter);
           }}
           className="btn-electric text-xs ml-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg"
-          title="Add a memory entry"
+          title={t("dashboard.mem.add_title")}
         >
           <Plus className="h-3 w-3" />
-          {t('dashboard.add_memory')}
+          {t("dashboard.add_memory")}
         </button>
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <div className="relative">
             <Search
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <input
               type="search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search…"
+              placeholder={t("dashboard.search_placeholder")}
               className="input-electric pl-7 pr-2 py-1 text-xs w-40"
-              title="Backend-side recall — searches across the configured memory store. Combined with the agent and category filters."
-              aria-label="Search memories"
+              title={t("dashboard.mem.search_title")}
+              aria-label={t("dashboard.mem.search_aria")}
             />
           </div>
           <div className="relative">
             <ArrowUpDown
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as MemorySort)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Sort memories"
-              aria-label="Sort memories"
+              title={t("dashboard.mem.sort_title")}
+              aria-label={t("dashboard.mem.sort_aria")}
             >
               {MEMORY_SORT_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {t(o.labelKey)}
                 </option>
               ))}
             </select>
@@ -1983,15 +2480,15 @@ function MemoriesTab() {
           <div className="relative">
             <Bot
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={agentFilter}
-              onChange={(e) => setFilter('agent', e.target.value)}
+              onChange={(e) => setFilter("agent", e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning agent"
+              title={t("dashboard.filter_agent_title")}
             >
-              <option value="">All agents</option>
+              <option value="">{t("dashboard.all_agents")}</option>
               {knownAgents.map((a) => (
                 <option key={a} value={a}>
                   {a}
@@ -2002,15 +2499,15 @@ function MemoriesTab() {
           <div className="relative">
             <Filter
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <select
               value={categoryFilter}
-              onChange={(e) => setFilter('category', e.target.value)}
+              onChange={(e) => setFilter("category", e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by category"
+              title={t("dashboard.mem.filter_category_title")}
             >
-              <option value="">All categories</option>
+              <option value="">{t("dashboard.mem.all_categories")}</option>
               {knownCategories.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -2022,8 +2519,11 @@ function MemoriesTab() {
       </div>
 
       {visibleEntries.length === 0 ? (
-        <p className="text-sm py-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>
-          No memories match the current search and filters
+        <p
+          className="text-sm py-8 text-center"
+          style={{ color: "var(--pc-text-faint)" }}
+        >
+          {t("dashboard.mem.no_match")}
         </p>
       ) : (
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
@@ -2031,13 +2531,13 @@ function MemoriesTab() {
             <div
               key={entry.id}
               className="flex items-center justify-between gap-3 py-3 px-4 rounded-xl"
-              style={{ background: 'var(--pc-bg-elevated)' }}
+              style={{ background: "var(--pc-bg-elevated)" }}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
                   <span
                     className="text-sm font-medium font-mono break-all"
-                    style={{ color: 'var(--pc-text-primary)' }}
+                    style={{ color: "var(--pc-text-primary)" }}
                   >
                     {entry.key}
                   </span>
@@ -2047,10 +2547,10 @@ function MemoriesTab() {
                       id={entry.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
-                        color: 'var(--pc-accent-light)',
+                        background: "rgba(var(--pc-accent-rgb), 0.10)",
+                        color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${entry.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${entry.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {entry.agent_alias}
                     </EntityLink>
@@ -2059,8 +2559,8 @@ function MemoriesTab() {
                     <span
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full flex-shrink-0"
                       style={{
-                        background: 'rgba(167, 139, 250, 0.10)',
-                        color: '#a78bfa',
+                        background: "rgba(167, 139, 250, 0.10)",
+                        color: "#a78bfa",
                       }}
                     >
                       {entry.category}
@@ -2074,7 +2574,7 @@ function MemoriesTab() {
                 />
                 <p
                   className="text-[10px] font-mono mt-1"
-                  style={{ color: 'var(--pc-text-faint)' }}
+                  style={{ color: "var(--pc-text-faint)" }}
                   title={entry.timestamp}
                 >
                   {formatLocalDateTime(entry.timestamp)}
@@ -2082,11 +2582,11 @@ function MemoriesTab() {
               </div>
               <button
                 type="button"
-                onClick={() => handleDelete(entry)}
+                onClick={() => setPendingDelete(entry)}
                 disabled={deleting === entry.id}
                 className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50 flex-shrink-0"
-                title="Delete memory"
-                style={{ color: 'var(--color-status-error)' }}
+                title={t("dashboard.mem.delete")}
+                style={{ color: "var(--color-status-error)" }}
               >
                 <Trash2 className="h-4 w-4" />
               </button>
@@ -2098,7 +2598,7 @@ function MemoriesTab() {
       {showAddForm && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: 'rgba(0,0,0,0.5)' }}
+          style={{ background: "rgba(0,0,0,0.5)" }}
           onClick={() => setShowAddForm(false)}
         >
           <div
@@ -2108,15 +2608,15 @@ function MemoriesTab() {
             <div className="flex items-center justify-between mb-4">
               <h3
                 className="text-lg font-semibold"
-                style={{ color: 'var(--pc-text-primary)' }}
+                style={{ color: "var(--pc-text-primary)" }}
               >
-                {t('dashboard.add_memory')}
+                {t("dashboard.add_memory")}
               </h3>
               <button
                 type="button"
                 onClick={() => setShowAddForm(false)}
                 className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
-                style={{ color: 'var(--pc-text-muted)' }}
+                style={{ color: "var(--pc-text-muted)" }}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -2125,9 +2625,9 @@ function MemoriesTab() {
               <div
                 className="mb-4 rounded-xl border p-3 text-sm"
                 style={{
-                  background: 'var(--color-status-error-alpha-08)',
-                  borderColor: 'var(--color-status-error-alpha-20)',
-                  color: 'var(--color-status-error)',
+                  background: "var(--color-status-error-alpha-08)",
+                  borderColor: "var(--color-status-error-alpha-20)",
+                  color: "var(--color-status-error)",
                 }}
               >
                 {formError}
@@ -2137,29 +2637,31 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: 'var(--pc-text-secondary)' }}
+                  style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Key <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                  {t("dashboard.mem.field_key")}{" "}
+                  <span style={{ color: "var(--color-status-error)" }}>*</span>
                 </label>
                 <input
                   type="text"
                   value={formKey}
                   onChange={(e) => setFormKey(e.target.value)}
-                  placeholder="e.g. user_preferences"
+                  placeholder={t("dashboard.mem.key_placeholder")}
                   className="input-electric w-full px-3 py-2.5 text-sm"
                 />
               </div>
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: 'var(--pc-text-secondary)' }}
+                  style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Content <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                  {t("dashboard.mem.field_content")}{" "}
+                  <span style={{ color: "var(--color-status-error)" }}>*</span>
                 </label>
                 <textarea
                   value={formContent}
                   onChange={(e) => setFormContent(e.target.value)}
-                  placeholder="Memory content…"
+                  placeholder={t("dashboard.mem.content_placeholder")}
                   rows={4}
                   className="input-electric w-full px-3 py-2.5 text-sm resize-none"
                 />
@@ -2167,31 +2669,31 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: 'var(--pc-text-secondary)' }}
+                  style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Category (optional)
+                  {t("dashboard.mem.field_category")}
                 </label>
                 <input
                   type="text"
                   value={formCategory}
                   onChange={(e) => setFormCategory(e.target.value)}
-                  placeholder="e.g. preferences, context, facts"
+                  placeholder={t("dashboard.mem.category_placeholder")}
                   className="input-electric w-full px-3 py-2.5 text-sm"
                 />
               </div>
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: 'var(--pc-text-secondary)' }}
+                  style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Agent (optional)
+                  {t("dashboard.mem.field_agent")}
                 </label>
                 <select
                   value={formAgent}
                   onChange={(e) => setFormAgent(e.target.value)}
                   className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
                 >
-                  <option value="">Install-wide (no agent attribution)</option>
+                  <option value="">{t("dashboard.mem.install_wide")}</option>
                   {knownAgents.map((a) => (
                     <option key={a} value={a}>
                       {a}
@@ -2200,10 +2702,9 @@ function MemoriesTab() {
                 </select>
                 <p
                   className="text-[11px] mt-1"
-                  style={{ color: 'var(--pc-text-faint)' }}
+                  style={{ color: "var(--pc-text-faint)" }}
                 >
-                  Picks which agent's memory backend the row lands in. Leave
-                  blank to write to the gateway's default backend.
+                  {t("dashboard.mem.agent_hint")}
                 </p>
               </div>
             </div>
@@ -2213,7 +2714,7 @@ function MemoriesTab() {
                 onClick={() => setShowAddForm(false)}
                 className="btn-secondary px-4 py-2 text-sm font-medium"
               >
-                Cancel
+                {t("dashboard.mem.cancel")}
               </button>
               <button
                 type="button"
@@ -2221,12 +2722,30 @@ function MemoriesTab() {
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium disabled:opacity-50"
               >
-                {submitting ? 'Saving…' : 'Save'}
+                {submitting ? t("dashboard.mem.saving") : t("dashboard.mem.save")}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.mem.confirm_delete_prefix")} ${pendingDelete?.key ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -2257,7 +2776,7 @@ function MemoryContent({
     <>
       <p
         className="text-sm whitespace-pre-wrap break-words"
-        style={{ color: 'var(--pc-text-secondary)' }}
+        style={{ color: "var(--pc-text-secondary)" }}
       >
         {display}
       </p>
@@ -2266,11 +2785,11 @@ function MemoryContent({
           type="button"
           onClick={onToggle}
           className="text-[11px] mt-1 hover:underline"
-          style={{ color: 'var(--pc-accent)' }}
+          style={{ color: "var(--pc-accent)" }}
         >
           {expanded
-            ? 'Collapse'
-            : `Expand (${content.length.toLocaleString()} chars, ${newlines + 1} lines)`}
+            ? t("dashboard.mem.collapse")
+            : `${t("dashboard.mem.expand")} (${content.length.toLocaleString()} ${t("dashboard.mem.chars")}, ${newlines + 1} ${t("dashboard.mem.lines")})`}
         </button>
       )}
     </>
@@ -2282,15 +2801,92 @@ function truncateForPreview(content: string): string {
   // dropped lines, the `…` reflects real omission. Then char-limit if the
   // newline slice is still too wide; the slice + `…` always means there's
   // more behind the cut.
-  const lines = content.split('\n');
+  const lines = content.split("\n");
   const slicedByNewline = lines.length > MEMORY_PREVIEW_NEWLINES;
   const byNewline = slicedByNewline
-    ? lines.slice(0, MEMORY_PREVIEW_NEWLINES).join('\n')
+    ? lines.slice(0, MEMORY_PREVIEW_NEWLINES).join("\n")
     : content;
   if (byNewline.length > MEMORY_PREVIEW_CHARS) {
     return `${byNewline.slice(0, MEMORY_PREVIEW_CHARS).trimEnd()}…`;
   }
   return slicedByNewline ? `${byNewline}\n…` : byNewline;
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard metrics row — real aggregates derived from the agents list the
+// section already loads. Every value is computed from AgentSummary fields, so
+// nothing here is fabricated. Metrics that depend on data the page does not
+// have are simply omitted.
+// ---------------------------------------------------------------------------
+
+function formatMetricUsd(value: number): string {
+  if (value <= 0) return "$0";
+  if (value < 0.01) return "<$0.01";
+  // Below $100 keep cents; the prior `< 1` and `< 100` branches were identical.
+  if (value < 100) return `$${value.toFixed(2)}`;
+  return `$${Math.round(value).toLocaleString()}`;
+}
+
+function DashboardMetrics({ agents }: { agents: AgentSummary[] }) {
+  const total = agents.length;
+  const enabled = agents.filter((a) => a.enabled).length;
+  const totalSessions = agents.reduce((sum, a) => sum + a.sessionCount, 0);
+  const totalMemories = agents.reduce((sum, a) => sum + a.memoryCount, 0);
+  // monthCostUsd is null when per-agent cost tracking is disabled; only sum the
+  // agents that actually report a figure, and surface whether any did.
+  const trackedSpend = agents.filter((a) => a.monthCostUsd !== null);
+  const totalSpend = trackedSpend.reduce(
+    (sum, a) => sum + (a.monthCostUsd ?? 0),
+    0,
+  );
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-5">
+      <StatCard
+        label={t("dash.metric.agents")}
+        value={total}
+        sublabel={
+          total === 0
+            ? t("dash.metric.agents.none")
+            : `${enabled} ${t("dash.metric.agents.enabled_sub")}`
+        }
+        icon={<Bot className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.enabled")}
+        value={`${enabled}/${total}`}
+        sublabel={t("dash.metric.enabled.sub")}
+        icon={<Activity className="h-5 w-5" />}
+        tone={enabled > 0 ? "ok" : "neutral"}
+      />
+      <StatCard
+        label={t("dash.metric.sessions")}
+        value={totalSessions.toLocaleString()}
+        sublabel={t("dash.metric.sessions.sub")}
+        icon={<MessageSquare className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.memories")}
+        value={totalMemories.toLocaleString()}
+        sublabel={t("dash.metric.memories.sub")}
+        icon={<Brain className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.spend")}
+        value={trackedSpend.length === 0 ? "—" : formatMetricUsd(totalSpend)}
+        sublabel={
+          trackedSpend.length === 0
+            ? t("dash.metric.spend.untracked")
+            : t("dash.metric.spend.sub")
+        }
+        icon={<DollarSign className="h-5 w-5" />}
+        tone="neutral"
+      />
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2301,43 +2897,53 @@ function truncateForPreview(content: string): string {
 
 function AgentsSection() {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
-  const [onboardButtonLabel, setOnboardButtonLabel] = useState('Start onboarding');
+  const [quickstartLabel, setQuickstartLabel] = useState(
+    t("dashboard.start_quickstart"),
+  );
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+  // Selecting a row sets the drawer's agent (by alias); closing clears it.
+  // Keying off the alias keeps the open drawer in sync with live toggles.
+  const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
 
   useEffect(() => {
     loadAgentSummaries()
       .then(setAgents)
       .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : 'Failed to load agents'),
+        setError(
+          err instanceof Error ? err.message : t("dashboard.load_agents_error"),
+        ),
       );
   }, []);
 
   useEffect(() => {
-    getOnboardStatus()
-      .then((status) => {
-        if (status.reason === 'has_dispatchable_agent') {
-          setOnboardButtonLabel('Run onboarding again');
-        } else if (status.has_partial_state || status.reason === 'incomplete_agent') {
-          setOnboardButtonLabel('Continue onboarding');
+    getQuickstartState()
+      .then((state) => {
+        if (state.agents.length > 0) {
+          setQuickstartLabel(t("dashboard.create_another_agent"));
         } else {
-          setOnboardButtonLabel('Start onboarding');
+          setQuickstartLabel(t("dashboard.start_quickstart"));
         }
       })
-      .catch(() => setOnboardButtonLabel('Start onboarding'));
+      .catch(() => setQuickstartLabel(t("dashboard.start_quickstart")));
   }, []);
 
   const handleToggle = useCallback(async (agent: AgentSummary) => {
     setToggling((prev) => new Set(prev).add(agent.alias));
     try {
       await toggleAgentEnabled(agent.alias, !agent.enabled);
-      setAgents((prev) =>
-        prev?.map((a) =>
-          a.alias === agent.alias ? { ...a, enabled: !a.enabled } : a,
-        ) ?? null,
+      setAgents(
+        (prev) =>
+          prev?.map((a) =>
+            a.alias === agent.alias ? { ...a, enabled: !a.enabled } : a,
+          ) ?? null,
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`);
+      setError(
+        err instanceof Error
+          ? err.message
+          : `${t("dashboard.toggle_agent_error_prefix")} ${agent.alias}`,
+      );
     } finally {
       setToggling((prev) => {
         const next = new Set(prev);
@@ -2358,45 +2964,68 @@ function AgentsSection() {
         return a.alias.localeCompare(b.alias);
       })
     : null;
-  const visibleAgents = sortedAgents ? sortedAgents.slice(0, AGENT_GLANCE_LIMIT) : null;
-  const hiddenCount = sortedAgents ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT) : 0;
+  const visibleAgents = sortedAgents
+    ? sortedAgents.slice(0, AGENT_GLANCE_LIMIT)
+    : null;
+  const hiddenCount = sortedAgents
+    ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT)
+    : 0;
+
+  const selectedAgent =
+    selectedAlias === null
+      ? null
+      : (agents?.find((a) => a.alias === selectedAlias) ?? null);
 
   return (
-    <section>
-      <header className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <h2
-            className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: 'var(--pc-text-primary)' }}
+    <section className="space-y-6">
+      <PageHeader
+        title={t("dash.title")}
+        description={t("dash.subtitle")}
+        actions={
+          <Link
+            to="/agents"
+            className="text-xs flex items-center gap-1 hover:underline"
+            style={{ color: "var(--pc-text-muted)" }}
           >
-            Agents
-          </h2>
-          {sortedAgents && sortedAgents.length > 0 && (
-            <span
-              className="text-xs font-mono px-2 py-0.5 rounded-full"
-              style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
-            >
-              {sortedAgents.length}
-            </span>
-          )}
-        </div>
-        <Link
-          to="/agents"
-          className="text-xs flex items-center gap-1 hover:underline"
-          style={{ color: 'var(--pc-text-muted)' }}
+            {hiddenCount > 0
+              ? `${t("dash.view_all")} (${sortedAgents!.length})`
+              : t("dash.view_all")}
+            <ChevronRight className="h-3 w-3" />
+          </Link>
+        }
+      />
+
+      {sortedAgents && sortedAgents.length > 0 && (
+        <DashboardMetrics agents={sortedAgents} />
+      )}
+
+      <header className="flex items-center gap-2">
+        <h2
+          className="text-sm font-semibold uppercase tracking-wider"
+          style={{ color: "var(--pc-text-secondary)" }}
         >
-          {hiddenCount > 0 ? `View all (${sortedAgents!.length})` : 'View all'}
-          <ChevronRight className="h-3 w-3" />
-        </Link>
+          {t("dash.agents_heading")}
+        </h2>
+        {sortedAgents && sortedAgents.length > 0 && (
+          <span
+            className="text-xs font-mono px-2 py-0.5 rounded-full"
+            style={{
+              background: "rgba(var(--pc-accent-rgb), 0.1)",
+              color: "var(--pc-accent)",
+            }}
+          >
+            {sortedAgents.length}
+          </span>
+        )}
       </header>
 
       {error && (
         <div
           className="mb-3 px-3 py-2 rounded-xl border text-xs"
           style={{
-            background: 'var(--color-status-error-alpha-08)',
-            borderColor: 'var(--color-status-error-alpha-20)',
-            color: 'var(--color-status-error)',
+            background: "var(--color-status-error-alpha-08)",
+            borderColor: "var(--color-status-error-alpha-20)",
+            color: "var(--color-status-error)",
           }}
         >
           {error}
@@ -2406,59 +3035,63 @@ function AgentsSection() {
       {agents === null ? (
         <div
           className="rounded-2xl border p-6 text-center text-sm"
-          style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            color: "var(--pc-text-muted)",
+          }}
         >
-          Loading agents...
+          {t("dashboard.loading_agents")}
         </div>
       ) : agents.length === 0 ? (
         <div
           className="rounded-2xl border-2 border-dashed p-6 text-center"
-          style={{ borderColor: 'var(--pc-border)' }}
+          style={{ borderColor: "var(--pc-border)" }}
         >
           <p
             className="text-sm font-medium mb-2"
-            style={{ color: 'var(--pc-text-primary)' }}
+            style={{ color: "var(--pc-text-primary)" }}
           >
-            No agents configured yet.
+            {t("dashboard.no_agents_configured")}
           </p>
           <Link
-            to="/onboard"
+            to="/quickstart"
             className="btn-electric inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs"
           >
             <Plus className="h-3.5 w-3.5" />
-            {onboardButtonLabel}
+            {quickstartLabel}
           </Link>
         </div>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface overflow-hidden">
           {visibleAgents!.map((agent) => (
             <AgentCard
               key={agent.alias}
               agent={agent}
-              toggling={toggling.has(agent.alias)}
-              onToggle={() => handleToggle(agent)}
+              selected={agent.alias === selectedAlias}
+              onSelect={() => setSelectedAlias(agent.alias)}
             />
           ))}
           {hiddenCount > 0 && (
             <Link
               to="/agents"
-              className="rounded-2xl border p-5 flex flex-col items-center justify-center text-center transition-colors hover:opacity-90"
-              style={{
-                background: 'var(--pc-bg-surface)',
-                borderColor: 'var(--pc-border)',
-                borderStyle: 'dashed',
-                color: 'var(--pc-text-muted)',
-              }}
+              className="flex items-center justify-center gap-1.5 px-4 py-3 text-sm font-medium border-t border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text"
             >
-              <Plus className="h-6 w-6 mb-2" style={{ color: 'var(--pc-accent)' }} />
-              <p className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
-                {hiddenCount} more {hiddenCount === 1 ? 'agent' : 'agents'}
-              </p>
-              <p className="text-xs mt-1">View all on /agents</p>
+              {t("dash.view_all")} · {hiddenCount}{" "}
+              {hiddenCount === 1
+                ? t("dashboard.more_agent")
+                : t("dashboard.more_agents")}
+              <ChevronRight className="h-3.5 w-3.5" />
             </Link>
           )}
         </div>
       )}
+
+      <AgentDrawer
+        agent={selectedAgent}
+        onClose={() => setSelectedAlias(null)}
+        onToggle={handleToggle}
+        toggling={selectedAgent ? toggling.has(selectedAgent.alias) : false}
+      />
     </section>
   );
 }

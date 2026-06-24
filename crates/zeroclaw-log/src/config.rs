@@ -27,7 +27,7 @@ impl Default for LogConfig {
             log_persistence_path: String::new(),
             log_persistence_max_entries: 10_000,
             log_tool_io: "redacted".into(),
-            log_tool_io_truncate_bytes: 2048,
+            log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
         }
     }

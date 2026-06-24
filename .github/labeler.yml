@@ -279,11 +279,13 @@
           - "src/runtime/**"
           - "crates/zeroclaw-runtime/src/**"
 
-"onboard":
+"quickstart":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/onboard/**"
-          - "crates/zeroclaw-runtime/src/onboard/**"
+          - "crates/zeroclaw-runtime/src/quickstart/**"
+          - "crates/zeroclaw-gateway/src/api_quickstart.rs"
+          - "apps/zerocode/src/quickstart_pane.rs"
+          - "web/src/pages/quickstart/**"
 
 "provider":
   - changed-files:
@@ -426,6 +428,13 @@
           - "src/tools/cron_run.rs"
           - "src/tools/cron_runs.rs"
           - "src/tools/cron_update.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_add.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_common.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_list.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_remove.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_run.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_runs.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_update.rs"
 
 "tool:file":
   - changed-files:
@@ -436,6 +445,7 @@
           - "src/tools/glob_search.rs"
           - "src/tools/content_search.rs"
           - "crates/zeroclaw-tools/src/file_edit.rs"
+          - "crates/zeroclaw-runtime/src/tools/file_read.rs"
           - "crates/zeroclaw-tools/src/file_write.rs"
           - "crates/zeroclaw-tools/src/glob_search.rs"
           - "crates/zeroclaw-tools/src/content_search.rs"
@@ -482,6 +492,8 @@
           - "src/tools/shell.rs"
           - "src/tools/node_tool.rs"
           - "src/tools/cli_discovery.rs"
+          - "crates/zeroclaw-runtime/src/tools/shell.rs"
+          - "crates/zeroclaw-gateway/src/node_tool.rs"
           - "crates/zeroclaw-tools/src/cli_discovery.rs"
 
 "tool:sop":
@@ -492,6 +504,11 @@
           - "src/tools/sop_execute.rs"
           - "src/tools/sop_list.rs"
           - "src/tools/sop_status.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_advance.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_approve.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_execute.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_list.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_status.rs"
 
 "tool:web":
   - changed-files:
@@ -510,6 +527,8 @@
       - any-glob-to-any-file:
           - "src/tools/security_ops.rs"
           - "src/tools/verifiable_intent.rs"
+          - "crates/zeroclaw-runtime/src/tools/security_ops.rs"
+          - "crates/zeroclaw-runtime/src/tools/verifiable_intent.rs"
 
 "tool:cloud":
   - changed-files:

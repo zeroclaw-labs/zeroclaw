@@ -1,8 +1,49 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::{DateTime, FixedOffset, Local, NaiveDate};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+/// Decide whether a markdown entry's `timestamp` stem falls inside the
+/// recall `[since, until]` window. Markdown timestamps are file stems, not
+/// RFC 3339 strings: daily logs use a bare `YYYY-MM-DD` date and the core
+/// file uses `MEMORY.md`. We therefore (1) try RFC 3339, (2) fall back to a
+/// `NaiveDate` compared at day granularity, and (3) leave non-date stems
+/// (e.g. `MEMORY.md`) unfiltered so evergreen core memories still surface.
+fn entry_in_window(
+    timestamp: &str,
+    since: Option<&DateTime<FixedOffset>>,
+    until: Option<&DateTime<FixedOffset>>,
+) -> bool {
+    if let Ok(ts) = DateTime::parse_from_rfc3339(timestamp) {
+        if let Some(s) = since
+            && ts < *s
+        {
+            return false;
+        }
+        if let Some(u) = until
+            && ts > *u
+        {
+            return false;
+        }
+        return true;
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
+        if let Some(s) = since
+            && date < s.date_naive()
+        {
+            return false;
+        }
+        if let Some(u) = until
+            && date > u.date_naive()
+        {
+            return false;
+        }
+        return true;
+    }
+    // Non-date stems (e.g. MEMORY.md) are evergreen; never window-filtered.
+    true
+}
 
 /// Markdown-based memory — plain files as source of truth
 ///
@@ -218,16 +259,7 @@ impl Memory for MarkdownMemory {
         let mut scored: Vec<MemoryEntry> = all
             .into_iter()
             .filter_map(|mut entry| {
-                if let Some(ref s) = since_dt
-                    && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                    && ts < *s
-                {
-                    return None;
-                }
-                if let Some(ref u) = until_dt
-                    && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                    && ts > *u
-                {
+                if !entry_in_window(&entry.timestamp, since_dt.as_ref(), until_dt.as_ref()) {
                     return None;
                 }
                 if keywords.is_empty() {
@@ -352,6 +384,7 @@ impl ::zeroclaw_api::attribution::Attributable for MarkdownMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tempfile::TempDir;
 
     fn temp_workspace() -> (TempDir, MarkdownMemory) {
@@ -537,5 +570,56 @@ mod tests {
             );
             assert!(row.agent_id.is_none(), "list path must not synthesize ids");
         }
+    }
+
+    // Markdown entry timestamps are file stems (a bare `YYYY-MM-DD` for daily
+    // logs), not RFC 3339. `recall` must still honour the `since`/`until`
+    // window: a daily entry is dropped when the window ends before its date
+    // and surfaces when the window opens in the past. Evergreen `MEMORY.md`
+    // entries (non-date stems) must NOT be filtered out by the window.
+    #[tokio::test]
+    async fn markdown_recall_since_until_filters_daily() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("today", "daily standup note", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("core", "evergreen daily fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let today = Local::now().date_naive();
+        let yesterday = (today - chrono::Duration::days(1))
+            .and_hms_opt(23, 59, 59)
+            .unwrap();
+        let yesterday_rfc = Local.from_local_datetime(&yesterday).unwrap().to_rfc3339();
+        let past = (today - chrono::Duration::days(7))
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let past_rfc = Local.from_local_datetime(&past).unwrap().to_rfc3339();
+
+        // until = yesterday: today's daily entry is outside the window and
+        // must be dropped, but the evergreen MEMORY.md entry must survive.
+        let bounded = mem
+            .recall("daily", 10, None, None, Some(&yesterday_rfc))
+            .await
+            .unwrap();
+        assert!(
+            !bounded.iter().any(|e| e.content.contains("standup")),
+            "today's daily entry must be excluded when until=yesterday"
+        );
+        assert!(
+            bounded.iter().any(|e| e.content.contains("evergreen")),
+            "evergreen MEMORY.md entry must not be window-filtered"
+        );
+
+        // since = a week ago: today's daily entry is inside the window.
+        let recent = mem
+            .recall("daily", 10, None, Some(&past_rfc), None)
+            .await
+            .unwrap();
+        assert!(
+            recent.iter().any(|e| e.content.contains("standup")),
+            "today's daily entry must be included when since is in the past"
+        );
     }
 }

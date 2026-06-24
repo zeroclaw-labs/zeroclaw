@@ -11,7 +11,8 @@ zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tools.workspace = true
-aardvark-sys.workspace = true
+# Only used behind the `hardware` feature (the aardvark module + boot() discovery).
+aardvark-sys = { workspace = true, optional = true }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -38,6 +39,22 @@ rppal = { version = "0.22", optional = true }
 
 [features]
 default = []
-hardware = ["dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
+hardware = ["dep:aardvark-sys", "dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
 peripheral-rpi = ["rppal"]
 probe = ["dep:probe-rs"]
+# Extends the serial peripheral allow-list with `/tmp/zc-sim-*` for hardware-free
+# local testing (paired with the `esp32_sim` example). Off by default; opt-in.
+#
+# Note: this feature is normally used together with the `hardware` feature
+# (i.e. `--features "hardware,dev-sim"`).
+dev-sim = []
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+zeroclaw-spawn.workspace = true
+
+[[example]]
+name = "esp32_sim"
+required-features = ["hardware", "dev-sim"]

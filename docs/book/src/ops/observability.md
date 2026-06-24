@@ -10,42 +10,10 @@ the shape of the events, and how to query them.
 
 ## Config (`[observability]`)
 
-```toml
-[observability]
-# Storage policy for the JSONL log.
-# "none"    — in-process broadcast only (no disk writes).
-# "rolling" — append + trim once `log_persistence_max_entries` is exceeded.
-# "full"    — append forever, operator manages rotation.
-log_persistence = "rolling"
-
-# Workspace-relative path (or absolute).
-log_persistence_path = "state/runtime-trace.jsonl"
-
-# Cap for "rolling".
-log_persistence_max_entries = 200
-
-# Tool input/output capture policy.
-# "off"      — only tool name + outcome + duration; no I/O bodies.
-# "redacted" — bodies are leak-scanned and truncated at `log_tool_io_truncate_bytes`.
-# "full"     — bodies are leak-scanned; no truncation.
-log_tool_io = "redacted"
-log_tool_io_truncate_bytes = 8192
-
-# Tool names whose I/O is never persisted beyond name + outcome + duration,
-# regardless of `log_tool_io`. For tools whose I/O is intrinsically sensitive.
-log_tool_io_denylist = []
-
-# OTel / Prometheus backend (independent of the JSONL log).
-backend = "none"            # "none" | "log" | "verbose" | "prometheus" | "otel"
-otel_endpoint = "http://localhost:4318"
-otel_service_name = "zeroclaw"
-# otel_headers = { Authorization = "Bearer …" }
-```
-
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
-`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 8192`. A fresh
+`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`. A fresh
 install produces a 200-event rolling JSONL at
-`~/.zeroclaw/state/runtime-trace.jsonl`, and the dashboard's Logs page
+`~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
 `log_persistence = "none"` disables persistence entirely. The broadcast
@@ -55,7 +23,7 @@ events; only the JSONL writer is gated.
 ## On-disk format
 
 JSONL: one event per line, UTF-8, `0o600` permissions on Unix. Every
-line is `sync_data`'d after write — the line is durable before the
+line is `sync_data`'d after write, the line is durable before the
 emitting code returns.
 
 Line shape mirrors `zeroclaw_log::event::LogEvent`. Top-level keys:
@@ -92,7 +60,7 @@ Composite prefixes get three keys: `<prefix>`, `<prefix>_type`,
 match either coarse or precise.
 
 When a tracing call sets a composite-prefix field to a bare type (no
-`.`), only the `_type` slot is populated — that way a
+`.`), only the `_type` slot is populated, that way a
 `tracing::*!(model_provider = name, …)` call inside a span that
 already carries the full `<type>.<alias>` composite doesn't clobber it
 on the leaf→root merge.
@@ -111,13 +79,17 @@ Top-level filters (query params): `since_ts`, `until_ts`, `until_id`,
 `event.category = "internal"`), `limit`.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
-filter — the gateway validates the key against `is_attribution_field`
+filter, the gateway validates the key against `is_attribution_field`
 and rejects unknowns with `400`. The response includes
 `attribution_keys: string[]`, so callers don't have to guess.
 
 Examples:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # All WARN+ events since the daemon started.
 curl "$ZEROCLAW_GATEWAY/api/logs?severity_min=13"
 
@@ -130,6 +102,8 @@ curl "$ZEROCLAW_GATEWAY/api/logs?channel=discord.glados"
 # A single agent turn:
 curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 ```
+
+</div>
 
 Pagination is reverse-cursor. The response includes
 `next_cursor: [timestamp, id] | null`; pass these back as `until_ts` +
@@ -224,7 +198,7 @@ Span fields are visible inline.
 
 On startup, if `log_persistence` is enabled and the file exists, the
 writer streams any schema-1 rows through an in-place migration to
-schema-2 before the first append. Pure streaming — bounded by a
+schema-2 before the first append. Pure streaming, bounded by a
 single line's allocation regardless of file size. The migrated file is
 atomically renamed into place. Files already at v2 are left untouched.
 
@@ -245,18 +219,18 @@ volume governor for genuine errors.
 
 ## Files of interest
 
-- `crates/zeroclaw-log/src/event.rs` — the canonical `LogEvent` shape.
-- `crates/zeroclaw-log/src/layer.rs` — the `tracing-subscriber` Layer
+- `crates/zeroclaw-log/src/event.rs`: the canonical `LogEvent` shape.
+- `crates/zeroclaw-log/src/layer.rs`: the `tracing-subscriber` Layer
   that captures every `tracing::*` call and feeds the pipeline.
-- `crates/zeroclaw-log/src/macro.rs` — `record!`, `scope!`, `spawn!`.
-- `crates/zeroclaw-log/src/writer.rs` — append + rolling trim.
-- `crates/zeroclaw-log/src/reader.rs` — `/api/logs` reader.
-- `crates/zeroclaw-log/src/config.rs` — `StoragePolicy`, `ToolIoPolicy`,
+- `crates/zeroclaw-log/src/macro.rs`: `record!`, `scope!`, `spawn!`.
+- `crates/zeroclaw-log/src/writer.rs`: append + rolling trim.
+- `crates/zeroclaw-log/src/reader.rs`: `/api/logs` reader.
+- `crates/zeroclaw-log/src/config.rs`: `StoragePolicy`, `ToolIoPolicy`,
   `ResolvedPolicy`.
-- `crates/zeroclaw-log/src/migrate.rs` — schema-1 → schema-2 streaming
+- `crates/zeroclaw-log/src/migrate.rs`: schema-1 → schema-2 streaming
   migration.
-- `crates/zeroclaw-log/src/observer_bridge.rs` — typed `Observer`
+- `crates/zeroclaw-log/src/observer_bridge.rs`: typed `Observer`
   projection for Prometheus / OTel consumers.
-- `crates/zeroclaw-gateway/src/api_logs.rs` — the HTTP adapter.
+- `crates/zeroclaw-gateway/src/api_logs.rs`: the HTTP adapter.
 
 Touch the source before you trust the prose on this page.

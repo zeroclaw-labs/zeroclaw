@@ -94,6 +94,7 @@ mod tests {
         let telegram = TelegramConfig {
             enabled: true,
             bot_token: "token".into(),
+            api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
@@ -102,6 +103,8 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let discord = DiscordConfig {
@@ -113,13 +116,19 @@ mod tests {
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_command_scope: schema::SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            slash_commands: false,
+            intents_mask: None,
+            reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let lark = LarkConfig {
@@ -134,6 +143,11 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            ack_reactions: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,

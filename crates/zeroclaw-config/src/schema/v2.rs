@@ -95,6 +95,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "email",
     "gmail_push",
     "irc",
+    "twitch",
     "lark",
     "line",
     "dingtalk",
@@ -112,6 +113,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "voice_wake",
     "voice_duplex",
     "mqtt",
+    "amqp",
 ];
 
 impl V2Config {
@@ -620,10 +622,14 @@ fn normalize_provider_type(
         "friendli" | "friendliai" => Some("friendli"),
         // Lepton: was lepton|lepton-ai
         "lepton" | "lepton-ai" => Some("lepton"),
+        // Lambda AI: lambda_ai|lambda-ai
+        "lambda_ai" | "lambda-ai" => Some("lambda_ai"),
+        // GitHub Models: github_models|github-models
+        "github_models" | "github-models" => Some("github_models"),
         // Stepfun: was stepfun|step (stepfun-intl handled below as variant)
         "stepfun" | "step" => Some("stepfun"),
-        // KiloCli: was kilocli|kilo
-        "kilocli" | "kilo" => Some("kilocli"),
+        // KiloCli: was kilocli|kilo-cli
+        "kilocli" | "kilo-cli" => Some("kilocli"),
         _ => None,
     };
 
@@ -1580,18 +1586,11 @@ fn synthesize_agent_brains(
             }
         }
 
-        // max_iterations → max_tool_iterations (V3 inline rename).
-        if let Some(v) = agent_table.remove("max_iterations") {
-            agent_table
-                .entry("max_tool_iterations".to_string())
-                .or_insert(v);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"alias": alias})),
-                "agents..max_iterations → agents..max_tool_iterations"
-            );
-        }
+        // max_iterations lifts into the synthesized per-agent runtime
+        // profile as max_tool_iterations.
+        let max_iterations = agent_table
+            .remove("max_iterations")
+            .or_else(|| agent_table.remove("max_tool_iterations"));
 
         // V2 per-agent overrides split into authorization (risk) and
         // operational (runtime) buckets, matching the V3 profile shape:
@@ -1622,7 +1621,11 @@ fn synthesize_agent_brains(
             );
         }
 
-        if agentic_flag.is_some() || max_depth.is_some() || agentic_timeout_secs.is_some() {
+        if agentic_flag.is_some()
+            || max_depth.is_some()
+            || agentic_timeout_secs.is_some()
+            || max_iterations.is_some()
+        {
             let mut overrides = toml::Table::new();
             if let Some(v) = agentic_flag {
                 overrides.insert("agentic".to_string(), v);
@@ -1632,6 +1635,9 @@ fn synthesize_agent_brains(
             }
             if let Some(t) = agentic_timeout_secs {
                 overrides.insert("agentic_timeout_secs".to_string(), t);
+            }
+            if let Some(mi) = max_iterations {
+                overrides.insert("max_tool_iterations".to_string(), mi);
             }
             install_profile_entry(passthrough, "runtime_profiles", &profile_alias, overrides);
             agent_table
@@ -1643,7 +1649,7 @@ fn synthesize_agent_brains(
                     .with_attrs(
                         ::serde_json::json!({"alias": alias, "profile_alias": profile_alias})
                     ),
-                "agents.: agentic/max_depth/agentic_timeout_secs → runtime_profiles."
+                "agents.: agentic/max_depth/agentic_timeout_secs/max_iterations → runtime_profiles."
             );
         }
 
@@ -2859,7 +2865,7 @@ pub struct FilesystemMigrationReport {
 /// 2. Iterate legacy top-level entries; for each, look up the V3
 ///    destination via [`workspace_toplevel_v3_path`] (or the
 ///    [`memory_subentry_v3_path`] sub-dispatch for `memory/`) and move it.
-/// 3. Heal intermediate v0.8.0-pre installs by relocating
+/// 3. Heal intermediate installs that landed under the old layout by relocating
 ///    `agents/default/workspace/skills/` to `shared/skills/`.
 ///
 /// Idempotent: on a fresh install or an already-migrated install the
@@ -3119,7 +3125,7 @@ fn move_with_refuse_to_clobber(src: &Path, dst: &Path) -> MigResult<bool> {
     Ok(true)
 }
 
-/// Heal intermediate v0.8.0-pre installs that landed skills under
+/// Heal intermediate installs that landed skills under
 /// `agents/default/workspace/skills/` before the host-wide
 /// `shared/skills/` layout was introduced. Idempotent.
 pub fn relocate_default_agent_skills_to_shared(install_root: &Path) -> MigResult<bool> {
@@ -3207,6 +3213,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> MigResult<()> {
 /// PRAGMA detection.
 pub const SQLITE_MEMORY_SCHEMA_VERSION: i64 = 1;
 
+#[cfg(feature = "memory-postgres")]
+fn postgres_memory_schema_version() -> MigResult<i32> {
+    i32::try_from(SQLITE_MEMORY_SCHEMA_VERSION)
+        .context("Postgres memory schema version exceeds INTEGER range")
+}
+
 /// Migrate a SQLite memory database to the V3 multi-agent shape.
 ///
 /// Adds the `agents` table, the `agent_id` column on `memories`,
@@ -3220,7 +3232,7 @@ pub const SQLITE_MEMORY_SCHEMA_VERSION: i64 = 1;
 /// `PRAGMA foreign_keys = ON` (and any other backend-specific PRAGMA
 /// tuning); this function operates on the open connection.
 pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResult<()> {
-    if sqlite_memories_agent_id_is_not_null(conn)? {
+    if sqlite_memories_agent_id_is_not_null(conn)? && sqlite_memories_has_unique_agent_key(conn)? {
         return Ok(());
     }
 
@@ -3377,6 +3389,48 @@ fn sqlite_memories_has_agent_id_column(conn: &Connection) -> MigResult<bool> {
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(Result::ok)
         .any(|name| name == "agent_id"))
+}
+
+/// Returns `true` when the `memories` table has a UNIQUE index that covers
+/// exactly `(agent_id, key)` — the constraint required by the `ON CONFLICT`
+/// upsert clause.  A DB that has `agent_id NOT NULL` + FK but was created
+/// before the table-rebuild step (or had it skipped) will return `false`,
+/// causing `migrate_sqlite_memory_to_v3` to fall through and finish the job.
+fn sqlite_memories_has_unique_agent_key(conn: &Connection) -> MigResult<bool> {
+    // `PRAGMA index_list` returns one row per index; `PRAGMA index_info`
+    // returns one row per column in that index.  We want an index that is
+    // UNIQUE and whose column set is exactly {"agent_id", "key"}.
+    let mut idx_stmt = conn.prepare("PRAGMA index_list(memories)")?;
+    let index_names: Vec<(String, bool)> = idx_stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let unique: i64 = row.get(2)?;
+            Ok((name, unique != 0))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+
+    for (idx_name, is_unique) in index_names {
+        if !is_unique {
+            continue;
+        }
+        // PRAGMA index_info does not support parameter binding; format inline.
+        // Index names come from sqlite_master and are controlled by SQLite
+        // itself or our own migrations, so this is safe.
+        let pragma = format!("PRAGMA index_info(\"{}\")", idx_name.replace('"', "\"\""));
+        let mut info_stmt = conn.prepare(&pragma)?;
+        let cols: Vec<String> = info_stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .filter_map(Result::ok)
+            .collect();
+        if cols.len() == 2
+            && cols.contains(&"agent_id".to_string())
+            && cols.contains(&"key".to_string())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn sqlite_memories_row_count(conn: &Connection) -> MigResult<i64> {
@@ -3554,13 +3608,14 @@ pub fn migrate_postgres_memory_to_v3(
             applied_at TIMESTAMPTZ NOT NULL
         );"
     ))?;
+    let memory_schema_version = postgres_memory_schema_version()?;
     client.execute(
         &format!(
             "INSERT INTO {schema_ident}.schema_version (component, version, applied_at) \
              VALUES ('memories', $1, NOW()) \
              ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at"
         ),
-        &[&SQLITE_MEMORY_SCHEMA_VERSION],
+        &[&memory_schema_version],
     )?;
     Ok(())
 }
@@ -3965,6 +4020,91 @@ mod fs_db_migration_tests {
             1,
             "in-DB SQLite migration must write exactly one backup file"
         );
+    }
+
+    /// Regression test: a DB that already has `agent_id NOT NULL` + FK to
+    /// `agents` but is **missing** the `UNIQUE (agent_id, key)` constraint
+    /// (e.g. created by an intermediate build) must still be migrated.
+    /// Before the fix the guard returned `Ok(true)` too early and the
+    /// `ON CONFLICT(agent_id, key)` upsert would fail at runtime.
+    #[test]
+    fn migrate_sqlite_memory_to_v3_adds_unique_constraint_when_missing() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Manually build the "partially-migrated" shape: agent_id NOT NULL +
+        // FK, but NO UNIQUE (agent_id, key) constraint.
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id         TEXT PRIMARY KEY,
+                alias      TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+             );
+             INSERT INTO agents VALUES ('uuid-1','default','2025-01-01T00:00:00Z');
+
+             CREATE TABLE memories (
+                id         TEXT PRIMARY KEY,
+                key        TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                category   TEXT NOT NULL DEFAULT 'core',
+                embedding  BLOB,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                session_id TEXT,
+                namespace  TEXT DEFAULT 'default',
+                importance REAL DEFAULT 0.5,
+                superseded_by TEXT,
+                agent_id   TEXT NOT NULL REFERENCES agents(id)
+                -- intentionally NO UNIQUE (agent_id, key)
+             );
+             INSERT INTO memories VALUES (
+                'mid-1','test-key','test-content','core',NULL,
+                '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',
+                NULL,'default',0.5,NULL,'uuid-1'
+             );",
+        )
+        .unwrap();
+
+        // Migration must detect the missing unique constraint and re-run.
+        migrate_sqlite_memory_to_v3(&db_path, &conn)
+            .expect("migration must succeed on partially-migrated DB");
+
+        // Idempotent second call must also succeed.
+        migrate_sqlite_memory_to_v3(&db_path, &conn).expect("second migration run must be a no-op");
+
+        // The unique index must now exist.
+        let has_unique = sqlite_memories_has_unique_agent_key(&conn).unwrap();
+        assert!(
+            has_unique,
+            "UNIQUE (agent_id, key) must be present after migration"
+        );
+
+        // Existing row must have survived.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key='test-key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "existing memory row must survive the migration");
+    }
+
+    #[cfg(feature = "memory-postgres")]
+    #[test]
+    fn memory_schema_version_binds_to_postgres_int4() {
+        use postgres::types::{ToSql, Type};
+
+        fn accepts_int4<T: ToSql>(_: &T) -> bool {
+            T::accepts(&Type::INT4)
+        }
+
+        let version = postgres_memory_schema_version().expect("version fits Postgres INTEGER");
+        assert_eq!(i64::from(version), SQLITE_MEMORY_SCHEMA_VERSION);
+        assert!(accepts_int4(&version));
     }
 
     /// Predict the V3 absolute path for a legacy path relative to

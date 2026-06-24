@@ -40,12 +40,20 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Open issue on advisory failure
+        id: advisory_issue
         if: steps.scan.outcome == 'failure'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          issues_enabled=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')
+          if [[ "$issues_enabled" != "true" ]]; then
+            echo "issue_url=" >> "$GITHUB_OUTPUT"
+            echo "::notice::Repository issues are disabled; skipping advisory issue creation."
+            exit 0
+          fi
+
           # Avoid opening a duplicate while an advisory issue is still open.
           open_count=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
@@ -69,18 +77,25 @@ jobs:
             printf 'Review `deny.toml` for the current ignore list. If this advisory is a known\n'
             printf 'acceptable risk, add an entry with a `reason` field. If it requires a\n'
             printf 'dependency update, open a tracking issue and link it here.\n\n'
-            printf 'cc @JordanTheJet @theonlyhennygod\n'
+            printf 'cc @JordanTheJet @Audacity88 @singlerider\n'
           } > /tmp/issue-body.md
 
-          gh issue create \
+          issue_url=$(gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "ci: Advisory scan failed — $(date -u +%Y-%m-%d)" \
             --label "security" \
             --label "risk: high" \
-            --body-file /tmp/issue-body.md
+            --body-file /tmp/issue-body.md)
+          echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
 
       - name: Propagate scan failure
         if: steps.scan.outcome == 'failure'
+        env:
+          ISSUE_URL: ${{ steps.advisory_issue.outputs.issue_url }}
         run: |
-          echo "::error::Advisory scan failed. See the issue opened above for details."
+          if [[ -n "$ISSUE_URL" ]]; then
+            echo "::error::Advisory scan failed. See $ISSUE_URL for details."
+          else
+            echo "::error::Advisory scan failed. Repository issues are disabled or issue creation was skipped; inspect this workflow log for details."
+          fi
           exit 1

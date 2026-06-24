@@ -76,17 +76,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             );
         })
         .ok();
+    let canvas_store = state.canvas_store.clone();
     let server = if let Some(store) = store {
-        Arc::new(AcpServer::new_with_writer_and_store(
-            config, acp_config, output_tx, store,
-        ))
+        Arc::new(
+            AcpServer::new_with_writer_and_store(config, acp_config, output_tx, store)
+                .with_canvas_store(canvas_store)
+                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone()),
+        )
     } else {
-        Arc::new(AcpServer::new_with_writer(config, acp_config, output_tx))
+        Arc::new(
+            AcpServer::new_with_writer(config, acp_config, output_tx)
+                .with_canvas_store(canvas_store)
+                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone()),
+        )
     };
 
-    let server_task = tokio::spawn(Arc::clone(&server).run_messages(input_rx));
+    let server_task = zeroclaw_spawn::spawn!(Arc::clone(&server).run_messages(input_rx));
 
-    let output_task = tokio::spawn(async move {
+    let output_task = zeroclaw_spawn::spawn!(async move {
         while let Some(line) = output_rx.recv().await {
             if sender.send(Message::Text(line.into())).await.is_err() {
                 break;

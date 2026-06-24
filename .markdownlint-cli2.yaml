@@ -13,3 +13,7 @@ config:
 
 ignores:
   - "target/**"
+  # mdBook's SUMMARY.md uses empty-link syntax `[Label]()` for collapsible,
+  # label-only section parents. That is valid mdBook navigation, not prose,
+  # so MD042 (no-empty-links) does not apply here.
+  - "docs/book/src/SUMMARY.md"

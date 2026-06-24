@@ -6,9 +6,8 @@
 //! For now, callers (the dashboard devtools console during testing) take
 //! responsibility for not running scripts they wouldn't run themselves.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
-
-/// Run an AppleScript snippet via `osascript -e`.
 ///
 /// Returns the trimmed stdout on success, or the stderr from osascript on
 /// failure (which usually surfaces the per-app TCC prompt rejection).

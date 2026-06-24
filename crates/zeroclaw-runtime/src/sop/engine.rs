@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
 use super::condition::evaluate_condition;
 use super::load_sops;
+use super::metrics::SopMetricsCollector;
+use super::store::{InMemoryRunStore, PersistedRun, SopRunStore};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
     SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
@@ -23,6 +26,12 @@ pub struct SopEngine {
     run_counter: u64,
     /// Cumulative savings from deterministic execution.
     deterministic_savings: DeterministicSavings,
+    /// Durable run-state store. Defaults to an ephemeral in-memory store
+    /// (current behavior); `build_sop_engine` injects the configured backend.
+    store: Arc<dyn SopRunStore>,
+    /// Run-execution metrics collector. Per-engine fresh in `new()` (test
+    /// isolation); `build_sop_engine` swaps in the process-shared collector.
+    metrics: Arc<SopMetricsCollector>,
 }
 
 impl SopEngine {
@@ -35,6 +44,109 @@ impl SopEngine {
             config,
             run_counter: 0,
             deterministic_savings: DeterministicSavings::default(),
+            store: Arc::new(InMemoryRunStore::new()),
+            metrics: Arc::new(SopMetricsCollector::new()),
+        }
+    }
+
+    /// Inject a durable run-state store (used by `build_sop_engine`). Default is
+    /// an ephemeral in-memory store, so callers that don't set one keep today's
+    /// behavior exactly.
+    pub fn with_store(mut self, store: Arc<dyn SopRunStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Inject the metrics collector. `build_sop_engine` passes the process-shared
+    /// collector so the engine's completion metrics and the SOP tools' reports
+    /// observe one set; the default per-engine collector keeps tests isolated.
+    pub fn with_metrics(mut self, metrics: Arc<SopMetricsCollector>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Reconstruct in-flight runs from the store at startup (durable backends).
+    /// No-op for the in-memory default. Does not overwrite already-present runs.
+    pub fn restore_runs(&mut self) {
+        match self.store.load_active_runs() {
+            Ok(runs) => {
+                let mut restored = 0usize;
+                for pr in runs {
+                    if self
+                        .active_runs
+                        .insert(pr.run.run_id.clone(), pr.run)
+                        .is_none()
+                    {
+                        restored += 1;
+                    }
+                }
+                if restored > 0 {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"restored": restored})),
+                        &format!("SOP engine restored {restored} run(s) from store")
+                    );
+                }
+            }
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "SOP engine: failed to restore runs from store"
+            ),
+        }
+    }
+
+    /// Next monotonic revision for a run: one past whatever the store currently
+    /// holds (0 if absent). Keeps every persist strictly newer so the store's
+    /// revision guard accepts it; a cheap indexed lookup on either backend.
+    fn next_run_revision(&self, run_id: &str) -> u64 {
+        match self.store.load_run(run_id) {
+            Ok(Some(existing)) => existing.revision.saturating_add(1),
+            _ => 0,
+        }
+    }
+
+    /// Persist a still-active run (best-effort; logs on failure). Cheap no-op
+    /// effect for the in-memory default.
+    fn persist_active(&self, run_id: &str) {
+        if let Some(run) = self.active_runs.get(run_id) {
+            let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+            // Each persist is a new state revision; the store rejects a
+            // same-revision divergent write, so advance past what is stored.
+            pr.revision = self.next_run_revision(run_id);
+            if let Err(e) = self.store.save_run(&pr) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"run_id": run_id, "error": e.to_string()})
+                        ),
+                    "SOP engine: failed to persist run"
+                );
+            }
+        }
+    }
+
+    /// Persist a run that has reached a terminal state (best-effort).
+    fn persist_terminal(&self, run: &SopRun) {
+        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        // The terminal write is the run's final revision; advance past the last
+        // active snapshot so the store's revision guard accepts it.
+        pr.revision = self.next_run_revision(&run.run_id);
+        if let Err(e) = self.store.finish_run(&run.run_id, &pr) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"run_id": run.run_id, "error": e.to_string()})
+                    ),
+                "SOP engine: failed to persist terminal run"
+            );
         }
     }
 
@@ -201,6 +313,7 @@ impl SopEngine {
             run.waiting_since = Some(now_iso8601());
         }
 
+        self.persist_active(&run_id);
         Ok(action)
     }
 
@@ -234,6 +347,22 @@ impl SopEngine {
                 anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
             })?
             .clone();
+
+        // Deterministic runs are driven through the dedicated piping path so the
+        // same `sop_advance` tool advances every execution mode. A failed step
+        // fails the run; otherwise the step output is piped to the next step.
+        if sop.execution_mode == SopExecutionMode::Deterministic {
+            if result.status == SopStepStatus::Failed {
+                let reason = format!("Step {} failed: {}", result.step_number, result.output);
+                return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
+            }
+            let piped = serde_json::Value::String(result.output.clone());
+            return self.advance_deterministic_step(
+                run_id,
+                piped,
+                Some((result.started_at.clone(), result.completed_at.clone())),
+            );
+        }
 
         // Record step result
         run.step_results.push(result.clone());
@@ -284,6 +413,7 @@ impl SopEngine {
             run.waiting_since = Some(now_iso8601());
         }
 
+        self.persist_active(run_id);
         Ok(action)
     }
 
@@ -315,9 +445,23 @@ impl SopEngine {
             anyhow::Error::msg(format!("Active run not found: {run_id}"))
         })?;
 
+        // A deterministic run paused at a checkpoint resumes through the
+        // deterministic piping path: the checkpoint step is recorded as
+        // completed and its output (or the previous step's) is piped forward.
+        if run.status == SopRunStatus::PausedCheckpoint {
+            let piped = run
+                .step_results
+                .last()
+                .map(|r| serde_json::Value::String(r.output.clone()))
+                .unwrap_or(serde_json::Value::Null);
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+            return self.advance_deterministic_step(run_id, piped, None);
+        }
+
         if run.status != SopRunStatus::WaitingApproval {
             bail!(
-                "Run {run_id} is not waiting for approval (status: {})",
+                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {})",
                 run.status
             );
         }
@@ -346,6 +490,7 @@ impl SopEngine {
         let step = sop.steps[step_idx].clone();
         let context = format_step_context(&sop, run, &step);
 
+        self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
             run_id: run_id.to_string(),
             step,
@@ -453,6 +598,7 @@ impl SopEngine {
         &mut self,
         run_id: &str,
         step_output: serde_json::Value,
+        step_timestamps: Option<(String, Option<String>)>,
     ) -> Result<SopRunAction> {
         let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -483,13 +629,16 @@ impl SopEngine {
             .clone();
 
         // Record step result
-        let now = now_iso8601();
+        let (started_at, completed_at) = match step_timestamps {
+            Some((started, completed)) => (started, completed),
+            None => (run.started_at.clone(), Some(now_iso8601())),
+        };
         let step_result = SopStepResult {
             step_number: run.current_step,
             status: SopStepStatus::Completed,
             output: step_output.to_string(),
-            started_at: run.started_at.clone(),
-            completed_at: Some(now),
+            started_at,
+            completed_at,
         };
         run.step_results.push(step_result);
 
@@ -630,12 +779,22 @@ impl SopEngine {
                 )
             );
 
+            // Mirror the paused checkpoint into the shared run store (alongside
+            // the deterministic state file) so a restart leaves a non-terminal
+            // row for restore_runs() to rehydrate.
+            self.persist_active(run_id);
+
             Ok(SopRunAction::CheckpointWait {
                 run_id: run_id.to_string(),
                 step: step.clone(),
                 state_file,
             })
         } else {
+            // Persist the active (Running) deterministic run so a restart mid-run
+            // leaves a non-terminal row for restore_runs() to rehydrate. This is
+            // the single sink for start / advance / resume deterministic steps.
+            self.persist_active(run_id);
+
             Ok(SopRunAction::DeterministicStep {
                 run_id: run_id.to_string(),
                 step: step.clone(),
@@ -790,6 +949,8 @@ impl SopEngine {
         run.completed_at = Some(now_iso8601());
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
+        self.metrics.record_run_complete(&run);
+        self.persist_terminal(&run);
         self.finished_runs.push(run);
 
         // Evict oldest finished runs when over capacity
@@ -954,16 +1115,17 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
         sop.name, run.run_id, step.number, run.total_steps
     );
 
-    let _ = writeln!(
-        ctx,
-        "Trigger: {} {}",
+    // Untrusted trigger metadata (topic + payload) can carry injected
+    // instructions, so it is capped, sanitized, and framed before it ever
+    // reaches the model, never raw (audit finding E). A forged end-marker can't
+    // escape the block because sanitize_untrusted defangs the SOP_UNTRUSTED token;
+    // the marker id (run_id) is provenance/correlation only, NOT a secret.
+    ctx.push_str(&super::payload_safety::frame_trigger(
+        run.trigger_event.payload.as_deref(),
+        run.trigger_event.topic.as_deref(),
         run.trigger_event.source,
-        run.trigger_event.topic.as_deref().unwrap_or("(no topic)")
-    );
-
-    if let Some(ref payload) = run.trigger_event.payload {
-        let _ = writeln!(ctx, "Payload: {payload}");
-    }
+        &run.run_id,
+    ));
 
     // Previous step summary
     if let Some(prev) = run.step_results.last() {
@@ -2141,7 +2303,7 @@ mod tests {
         // Advance step 1 with output
         let output = serde_json::json!({"result": "step1_done"});
         let action = engine
-            .advance_deterministic_step(&run_id, output.clone())
+            .advance_deterministic_step(&run_id, output.clone(), None)
             .unwrap();
 
         // Step 2 is a checkpoint — should pause
@@ -2159,7 +2321,7 @@ mod tests {
 
         // Complete step 1
         let action = engine
-            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}))
+            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}), None)
             .unwrap();
 
         // Should be at checkpoint
@@ -2202,13 +2364,13 @@ mod tests {
 
         // Complete step 1
         let action = engine
-            .advance_deterministic_step(&run_id, serde_json::json!("s1"))
+            .advance_deterministic_step(&run_id, serde_json::json!("s1"), None)
             .unwrap();
         assert!(matches!(action, SopRunAction::DeterministicStep { .. }));
 
         // Complete step 2
         let action = engine
-            .advance_deterministic_step(&run_id, serde_json::json!("s2"))
+            .advance_deterministic_step(&run_id, serde_json::json!("s2"), None)
             .unwrap();
         assert!(matches!(action, SopRunAction::Completed { .. }));
 
@@ -2281,5 +2443,327 @@ type = "manual"
             "reload must populate SOPs from disk"
         );
         assert_eq!(engine.sops()[0].name, "test-sop");
+    }
+
+    fn deterministic_sop_all_execute(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                },
+                SopStep {
+                    number: 2,
+                    title: "Step two".into(),
+                    body: "Do step two".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+        }
+    }
+
+    #[test]
+    fn deterministic_run_drives_to_completion_through_advance_step() {
+        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-run")]);
+        let action = engine.start_run("det-run", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1)
+        );
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "step1-output".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 2),
+            "advance_step on a deterministic run must route to the deterministic path"
+        );
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 2,
+                    status: SopStepStatus::Completed,
+                    output: "step2-output".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "deterministic run should complete after its final step"
+        );
+    }
+
+    #[test]
+    fn deterministic_failed_step_fails_run_through_advance_step() {
+        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-fail")]);
+        let action = engine.start_run("det-fail", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "boom".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Failed { .. }),
+            "a failed deterministic step must fail the run"
+        );
+    }
+
+    #[test]
+    fn deterministic_advance_step_preserves_caller_timestamps() {
+        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-ts")]);
+        let action = engine.start_run("det-ts", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let started = "2026-01-01T00:00:00Z".to_string();
+        let completed = "2026-01-01T00:00:42Z".to_string();
+        engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "step1-output".into(),
+                    started_at: started.clone(),
+                    completed_at: Some(completed.clone()),
+                },
+            )
+            .unwrap();
+
+        let recorded = engine
+            .get_run(&run_id)
+            .unwrap()
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 result recorded");
+        assert_eq!(recorded.started_at, started);
+        assert_eq!(recorded.completed_at, Some(completed));
+    }
+
+    #[test]
+    fn deterministic_checkpoint_resumes_through_approve_step() {
+        // The sop_approve tool calls approve_step. A deterministic run paused at
+        // a checkpoint must resume through it, not bail. deterministic_sop is
+        // step1=Execute, step2=Checkpoint, step3=Execute.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Advance step 1 -> pauses at the step-2 checkpoint.
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        // Approve the checkpoint via the public path -> yields step 3.
+        let action = engine.approve_step(&run_id).unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "approving a deterministic checkpoint must resume to the next step"
+        );
+
+        // Advance step 3 -> run completes.
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 3,
+                    status: SopStepStatus::Completed,
+                    output: "s3-out".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "deterministic run should complete after the post-checkpoint step"
+        );
+    }
+
+    #[test]
+    fn engine_restores_runs_from_store() {
+        use super::super::store::SqliteRunStore;
+        let path =
+            std::env::temp_dir().join(format!("zc-sop-engine-restore-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Seed a WaitingApproval run directly into a durable store.
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+        let run = SopRun {
+            run_id: "r-restore".to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now_iso8601(),
+            },
+            status: SopRunStatus::WaitingApproval,
+            current_step: 1,
+            total_steps: 2,
+            started_at: now_iso8601(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: Some(now_iso8601()),
+            llm_calls_saved: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(
+                run,
+                now_iso8601(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        // A fresh engine wired to the same store rehydrates the run on boot.
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
+        engine.restore_runs();
+        assert!(engine.active_runs().contains_key("r-restore"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn engine_persist_bumps_revision_across_active_and_terminal() {
+        use super::super::store::SqliteRunStore;
+        let path =
+            std::env::temp_dir().join(format!("zc-sop-engine-persist-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+
+        let mut run = SopRun {
+            run_id: "r-persist".to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now_iso8601(),
+            },
+            status: SopRunStatus::Running,
+            current_step: 0,
+            total_steps: 2,
+            started_at: now_iso8601(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+        engine.active_runs.insert(run.run_id.clone(), run.clone());
+
+        // First persist lands at revision 0.
+        engine.persist_active("r-persist");
+        assert_eq!(store.load_run("r-persist").unwrap().unwrap().revision, 0);
+
+        // Advancing the run and persisting again is a divergent state at the next
+        // revision. The old revision-0-always wiring would have had this rejected
+        // as a same-revision conflict and silently kept the stale snapshot.
+        run.current_step = 1;
+        engine.active_runs.insert(run.run_id.clone(), run.clone());
+        engine.persist_active("r-persist");
+        let after = store.load_run("r-persist").unwrap().unwrap();
+        assert_eq!(after.revision, 1);
+        assert_eq!(after.run.current_step, 1, "latest state persisted");
+
+        // The terminal write advances again, is accepted, and leaves no active run.
+        run.status = SopRunStatus::Completed;
+        run.completed_at = Some(now_iso8601());
+        engine.persist_terminal(&run);
+        assert!(
+            store.load_active_runs().unwrap().is_empty(),
+            "terminal excluded from active"
+        );
+        assert_eq!(store.load_run("r-persist").unwrap().unwrap().revision, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deterministic_active_run_persists_and_restores_before_terminal() {
+        use super::super::store::SqliteRunStore;
+        let path =
+            std::env::temp_dir().join(format!("zc-sop-det-restore-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![deterministic_sop("det-sop")]);
+
+        // Start: the first deterministic step (Running) must be persisted as active,
+        // not only on terminal completion.
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let active = store.load_active_runs().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "deterministic start must persist an active run"
+        );
+        assert_eq!(active[0].run.run_id, run_id);
+        assert_eq!(active[0].run.current_step, 1);
+
+        // Advance into the checkpoint: still non-terminal, must stay persisted in
+        // the shared store (not only in the deterministic state file).
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"r": 1}), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.current_step, 2);
+        assert_eq!(stored.run.status, SopRunStatus::PausedCheckpoint);
+
+        // Simulate a daemon restart mid-run: a fresh engine on the same store must
+        // rehydrate the in-flight deterministic run (the gap this fixes).
+        let mut restarted = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        restarted.restore_runs();
+        assert!(
+            restarted.active_runs().contains_key(&run_id),
+            "deterministic in-flight run must rehydrate after restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
