@@ -1719,15 +1719,14 @@ impl App {
         let has_tabs = self.alias_list_has_tabs();
 
         // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
-        // the FieldList tab bar uses. On these screens those chords no longer
-        // mean back/into; Back is the only way out to the type list.
+        // the FieldList tab bar uses. TabRight steps into Costs; TabLeft steps
+        // back toward Aliases, then on the leftmost tab walks out to the type
+        // list (the opposite of "into"), mirroring the FieldList sub-tab gesture.
         if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
             match action {
-                ConfigTabAction::TabLeft => {
-                    if self.alias_tab > 0 {
-                        self.alias_tab -= 1;
-                        self.deactivate_filter();
-                    }
+                ConfigTabAction::TabLeft if self.alias_tab > 0 => {
+                    self.alias_tab -= 1;
+                    self.deactivate_filter();
                     return Ok(());
                 }
                 ConfigTabAction::TabRight => {
@@ -1769,15 +1768,12 @@ impl App {
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
-        // With tabs present, TabLeft no longer doubles as Back.
-        let back = if has_tabs {
-            matches!(action, Some(ConfigTabAction::Back))
-        } else {
-            matches!(
-                action,
-                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
-            )
-        };
+        // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
+        // it only reaches here on the leftmost tab, where it walks out like Back.
+        let back = matches!(
+            action,
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+        );
         let into = if has_tabs {
             matches!(action, Some(ConfigTabAction::Enter))
         } else {
@@ -4695,6 +4691,53 @@ mod tests {
             keyboard_enhancement_flags()
                 .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
+    }
+
+    fn test_manager() -> App {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            shape: None,
+            cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn left_on_leftmost_alias_tab_walks_back_to_type_list() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut mgr = test_manager();
+        mgr.sections = vec![entry_with_cost("providers.models", "models")];
+        mgr.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.models.anthropic".to_string(),
+            breadcrumb: vec!["providers.models".to_string(), "anthropic".to_string()],
+        };
+        mgr.alias_tab = 0;
+
+        assert!(
+            mgr.alias_list_has_tabs(),
+            "Aliases/Costs tabs must be present for this scenario"
+        );
+
+        mgr.handle_alias_list(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
+            "Left on the leftmost alias tab walks out to the type list like Back"
         );
     }
 }
