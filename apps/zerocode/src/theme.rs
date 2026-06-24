@@ -372,6 +372,20 @@ pub(crate) fn fill_style() -> Style {
     }
 }
 
+/// Bottom bar / status bar background: dim foreground on theme background.
+/// Used by the mode tab bar, status bar, and info bar so they share a
+/// consistent muted look that grounds the chrome without competing with
+/// the content area.
+pub(crate) fn bar_style() -> Style {
+    let t = active();
+    let s = Style::default().fg(t.dim);
+    if t.background == Color::Reset {
+        s
+    } else {
+        s.bg(t.background)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

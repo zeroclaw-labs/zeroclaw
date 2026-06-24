@@ -309,6 +309,48 @@ mod tests {
     }
 
     #[test]
+    fn preserves_kept_tool_call_id_envelope_when_trimming_whole_turns() {
+        let old_big = "old ".repeat(2000);
+        let envelope = serde_json::json!({
+            "tool_call_id": "call_1",
+            "content": "raw tool output",
+        });
+        let h = vec![
+            sys("system"),
+            user(&format!("old turn {old_big}")),
+            asst("old answer"),
+            user("recent"),
+            asst("calling tool"),
+            tool(&envelope.to_string()),
+            asst("done"),
+        ];
+
+        let r = trim_to_recent_turns(h, 200);
+
+        assert!(r.trimmed, "oversized history must drop an old whole turn");
+        assert_eq!(r.dropped_turns, 1);
+        let kept_tool = r
+            .history
+            .iter()
+            .find(|msg| msg.role == "tool")
+            .expect("recent tool result should be kept");
+        let kept_envelope: serde_json::Value =
+            serde_json::from_str(&kept_tool.content).expect("tool content remains JSON");
+        assert_eq!(
+            kept_envelope
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
+            Some("call_1"),
+        );
+        assert_eq!(
+            kept_envelope
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            Some("raw tool output"),
+        );
+    }
+
+    #[test]
     fn breadcrumb_inserts_after_leading_system() {
         let big = "w".repeat(3000);
         let h = vec![

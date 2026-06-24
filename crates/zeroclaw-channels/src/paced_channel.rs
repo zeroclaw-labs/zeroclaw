@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
+    SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -469,6 +470,14 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        self.inner.create_room(options).await
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        self.inner.invite_user(room_id, user_id).await
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -549,6 +558,44 @@ mod tests {
             _text: &str,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RoomManagementChannel {
+        creates: AtomicUsize,
+        invites: AtomicUsize,
+    }
+
+    impl Attributable for RoomManagementChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "room-management"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for RoomManagementChannel {
+        fn name(&self) -> &str {
+            "room-management"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+            assert_eq!(options.name.as_deref(), Some("ops"));
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok("!ops:example.org".to_string())
+        }
+        async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+            assert_eq!(room_id, "!ops:example.org");
+            assert_eq!(user_id, "@alice:example.org");
+            self.invites.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -775,6 +822,35 @@ mod tests {
             1,
             "only the first send should reach inner.send; the finalize must not",
         );
+    }
+
+    #[tokio::test]
+    async fn room_management_forwards_to_inner_channel() {
+        let counting = Arc::new(RoomManagementChannel {
+            creates: AtomicUsize::new(0),
+            invites: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        let room_id = paced
+            .create_room(&RoomCreationOptions {
+                name: Some("ops".into()),
+                ..RoomCreationOptions::default()
+            })
+            .await
+            .unwrap();
+        paced
+            .invite_user(&room_id, "@alice:example.org")
+            .await
+            .unwrap();
+
+        assert_eq!(counting.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.invites.load(Ordering::SeqCst), 1);
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the
