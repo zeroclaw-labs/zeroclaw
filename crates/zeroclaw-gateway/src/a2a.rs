@@ -325,13 +325,7 @@ fn exposed_skills(config: &Config, alias: &str) -> Vec<AgentSkill> {
 }
 
 /// `GET /.well-known/agents-card.json` — the discovery catalog card.
-async fn handle_catalog_card(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+async fn handle_catalog_card(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     if !config.a2a.server.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -343,11 +337,7 @@ async fn handle_catalog_card(
 async fn handle_alias_card(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let config = state.config.read().clone();
     if !config.a2a.server.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -445,8 +435,8 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
 /// `message/send` call and returns a completed `Task` with the reply as an
 /// artifact. Requires a paired bearer token (a turn is tool-enabled, so it is
 /// never served unauthenticated), then gated on `[a2a.server] enabled` and the
-/// alias being published, so it shares the exact exposure posture as the
-/// discovery cards.
+/// alias being published. The discovery cards are intentionally unauthenticated
+/// so peers can read the published surface before pairing; invocation is not.
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,

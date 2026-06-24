@@ -10,19 +10,22 @@ is illustrative.
 
 ## Authentication
 
-Every A2A request is behind the gateway's pairing auth, exactly like the rest of
-the API surface. When `[gateway] require_pairing` is on (the default), pass a
-pairing-derived bearer token on every call below:
+The two discovery GETs are unauthenticated: the catalog card and the per-alias
+agent card are readable without a token so a peer can discover your published
+surface before pairing. The `message/send` POST is different. It runs a full
+tool-enabled agent turn, so it is behind the gateway's pairing auth like every
+other write surface. When `[gateway] require_pairing` is on (the default), pass
+a pairing-derived bearer token on the task POST:
 
 ```
-curl http://localhost:42617/.well-known/agents-card.json \
-  -H "Authorization: Bearer $ZEROCLAW_TOKEN"
+curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{...}}'
 ```
 
-The discovery GETs and the `message/send` POST all reject an unauthenticated
-request with `401`. The examples below omit the header for readability; add it to
-every call. A task POST runs a full tool-enabled agent turn, so it is never
-served without a token. See the gateway pairing docs for how to obtain one.
+An unauthenticated task POST gets `401`, never an agent turn. The discovery GETs
+below need no header. See the gateway pairing docs for how to obtain a token.
 
 ## The whole thing in two requests
 
@@ -348,20 +351,27 @@ published, `POST /a2a/{alias}` runs a full agent turn for that alias: it invokes
 the agent through the same path the chat surfaces use, with the agent's entire
 configured toolset (shell, file, browser, and whatever else that alias carries).
 
-That endpoint is behind the gateway's bearer/pairing auth, like every other
+That task endpoint is behind the gateway's bearer/pairing auth, like every other
 write surface. A caller needs a pairing-derived bearer token to invoke a
-published agent; an unauthenticated request gets `401`, never an agent turn. The
-discovery cards are gated the same way, so the published surface does not leak
-agent names or skills to an unauthenticated caller either.
+published agent; an unauthenticated request gets `401`, never an agent turn.
 
-Publishing is still an exposure decision: any holder of a valid token can invoke
-a published alias with its full toolset. Before you flip the switches:
+The discovery cards are not behind that auth. The catalog and per-alias cards are
+readable without a token, so a published surface advertises its agent names and
+exposed skills to any caller who can reach the listener. That is the point of
+discovery: a peer reads the card before it ever pairs. It also means publishing
+exposes that metadata to anyone who can reach the gateway, even though invoking
+the agent still requires a token.
+
+Publishing is an exposure decision on both axes: the card metadata is public, and
+any holder of a valid token can invoke a published alias with its full toolset.
+Before you flip the switches:
 
 - Scope the bind posture. Bind the gateway to a private interface, or sit it
   behind a reverse proxy, rather than exposing the listener directly to an
-  untrusted network.
+  untrusted network. This also bounds who can read the unauthenticated cards.
 - Publish only aliases whose full toolset you are willing to have invoked by any
-  token holder, and narrow `exposed_skills` to the minimum that interop needs.
+  token holder, and whose names and skills you are willing to advertise
+  unauthenticated. Narrow `exposed_skills` to the minimum that interop needs.
 - Treat a published alias as a remotely-invokable execution surface when you
   decide which tools and skill bundles that alias carries.
 - Cross-deployment interop shares a token with the peer that calls you; scope and

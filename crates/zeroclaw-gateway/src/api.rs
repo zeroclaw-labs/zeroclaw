@@ -4196,25 +4196,25 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn catalog_card_rejects_unauthenticated_request() {
+        async fn catalog_card_serves_unauthenticated_request() {
             let router = crate::a2a::a2a_routes().with_state(paired_state());
             let req = axum::http::Request::builder()
                 .method("GET")
                 .uri("/.well-known/agents-card.json")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
 
         #[tokio::test]
-        async fn alias_card_rejects_unauthenticated_request() {
+        async fn alias_card_serves_unauthenticated_request() {
             let router = crate::a2a::a2a_routes().with_state(paired_state());
             let req = axum::http::Request::builder()
                 .method("GET")
                 .uri("/a2a/maker/.well-known/agent-card.json")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
 
         #[tokio::test]
