@@ -8,6 +8,22 @@ exactly what to type and exactly what comes back.
 Every response on this page is real output from a running daemon. Nothing here
 is illustrative.
 
+## Authentication
+
+Every A2A request is behind the gateway's pairing auth, exactly like the rest of
+the API surface. When `[gateway] require_pairing` is on (the default), pass a
+pairing-derived bearer token on every call below:
+
+```
+curl http://localhost:42617/.well-known/agents-card.json \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN"
+```
+
+The discovery GETs and the `message/send` POST all reject an unauthenticated
+request with `401`. The examples below omit the header for readability; add it to
+every call. A task POST runs a full tool-enabled agent turn, so it is never
+served without a token. See the gateway pairing docs for how to obtain one.
+
 ## The whole thing in two requests
 
 You only ever need two GET requests to discover an agent.
@@ -332,26 +348,24 @@ published, `POST /a2a/{alias}` runs a full agent turn for that alias: it invokes
 the agent through the same path the chat surfaces use, with the agent's entire
 configured toolset (shell, file, browser, and whatever else that alias carries).
 
-That endpoint is not behind the gateway's bearer/pairing auth. Authentication in
-this gateway is enforced per handler, and the A2A task handler does not gate on a
-token, by design: cross-deployment interop only works if a peer can reach the
-endpoint without sharing your login. The practical consequence is direct:
-**anyone who can reach the gateway listener can invoke a published agent, tools
-and all, with no credential**, while neighboring endpoints like `/api/config`
-require a bearer token.
+That endpoint is behind the gateway's bearer/pairing auth, like every other
+write surface. A caller needs a pairing-derived bearer token to invoke a
+published agent; an unauthenticated request gets `401`, never an agent turn. The
+discovery cards are gated the same way, so the published surface does not leak
+agent names or skills to an unauthenticated caller either.
 
-This is a deliberate trade for frictionless agent-to-agent calls, not an
-oversight, but it means publishing is a real exposure decision. Before you flip
-the switches:
+Publishing is still an exposure decision: any holder of a valid token can invoke
+a published alias with its full toolset. Before you flip the switches:
 
 - Scope the bind posture. Bind the gateway to a private interface, or sit it
-  behind a reverse proxy that enforces auth, rather than exposing the listener
-  directly to an untrusted network.
+  behind a reverse proxy, rather than exposing the listener directly to an
+  untrusted network.
 - Publish only aliases whose full toolset you are willing to have invoked by any
-  reachable caller, and narrow `exposed_skills` to the minimum that interop
-  needs.
+  token holder, and narrow `exposed_skills` to the minimum that interop needs.
 - Treat a published alias as a remotely-invokable execution surface when you
   decide which tools and skill bundles that alias carries.
+- Cross-deployment interop shares a token with the peer that calls you; scope and
+  rotate that credential like any other.
 
 ## How several deployments connect
 
