@@ -4621,6 +4621,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::AssistantToolCalls {
                         text: None,
@@ -4635,6 +4636,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),

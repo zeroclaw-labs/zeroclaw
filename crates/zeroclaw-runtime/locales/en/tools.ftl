@@ -13,13 +13,36 @@ tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI fo
 
 tool-browser-open = Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping.
 
+tool-channel-room = Create rooms and invite users through an active channel. Provide a channel key such as 'matrix.default', action 'create_room' or 'invite_user', and the action-specific room fields.
+tool-channel-room-param-action = Room-management action to perform.
+tool-channel-room-param-channel = Active channel key such as 'matrix.default'.
+tool-channel-room-param-name = Optional room name for create_room.
+tool-channel-room-param-topic = Optional room topic for create_room.
+tool-channel-room-param-invites = Optional user IDs to invite while creating the room.
+tool-channel-room-param-visibility = Optional room visibility for create_room.
+tool-channel-room-param-encryption = Whether to request room encryption during create_room.
+tool-channel-room-param-room-id = Existing room ID for invite_user.
+tool-channel-room-param-user-id = User ID to invite for invite_user.
+tool-channel-room-error-security = Action blocked: { $err }
+tool-channel-room-error-invalid-action = Invalid action '{ $action }': must be 'create_room' or 'invite_user'.
+tool-channel-room-error-not-initialized = No channels available yet (channels not initialized).
+tool-channel-room-error-channel-not-found = Channel '{ $channel }' not found. Available channels: { $available }
+tool-channel-room-error-create-failed = Failed to create room: { $err }
+tool-channel-room-error-invite-failed = Failed to invite user: { $err }
+tool-channel-room-error-invites-array = 'invites' must be an array of strings.
+tool-channel-room-error-invites-item = 'invites' must be an array of non-empty strings.
+tool-channel-room-error-invalid-visibility = Invalid room visibility: { $err }
+tool-channel-room-error-missing-param = Missing '{ $param }' parameter.
+tool-channel-room-error-string-param = '{ $param }' must be a string.
+tool-channel-room-error-bool-param = '{ $param }' must be a boolean.
+
 tool-cloud-ops = Cloud transformation advisory tool. Analyzes IaC plans, assesses migration paths, reviews costs, and checks architecture against Well-Architected Framework pillars. Read-only: does not create or modify cloud resources.
 
 tool-cloud-patterns = Cloud pattern library. Given a workload description, suggests applicable cloud-native architectural patterns (containerization, serverless, database modernization, etc.).
 
 tool-composio = Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to see available actions (includes parameter names). action='execute' with action_name/tool_slug and params to run an action. If you are unsure of the exact params, pass 'text' instead with a natural-language description of what you want (Composio will resolve the correct parameters via NLP). action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts. action='connect' with app/auth_config_id to get OAuth URL. connected_account_id is auto-resolved when omitted.
 
-tool-content-search = Search file contents by regex pattern within the workspace. Supports ripgrep (rg) with grep fallback. Output modes: 'content' (matching lines with context), 'files_with_matches' (file paths only), 'count' (match counts per file). Example: pattern='fn main', include='*.rs', output_mode='content'.
+tool-content-search = Search file contents by regex pattern within the workspace. Supports ripgrep (rg) with grep or internal fallback. Output modes: 'content' (matching lines with context), 'files_with_matches' (file paths only), 'count' (match counts per file). Example: pattern='fn main', include='*.rs', output_mode='content'.
 
 tool-cron-add = Create a scheduled cron job (shell or agent) with cron/at/every schedules. Use job_type='agent' with a prompt to run the AI agent on schedule. To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set delivery={"{"}"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"{"}"}. This is the preferred tool for sending scheduled/delayed messages to users via channels.
 

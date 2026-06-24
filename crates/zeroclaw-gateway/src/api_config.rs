@@ -988,7 +988,9 @@ pub async fn handle_get_map_keys(
 }
 
 /// `DELETE /api/config/map-key?path=<section>&key=<alias>` — remove an alias
-/// from a map-keyed section. Persists on success.
+/// from a map-keyed section. Aliased config sections with executable delete
+/// support route through the same cascade engine as the delete preview;
+/// non-aliased sections keep the generic raw key removal. Persists on success.
 pub async fn handle_delete_map_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -998,12 +1000,18 @@ pub async fn handle_delete_map_key(
         return e.into_response();
     }
     let working = state.config.read().clone();
-    // Agent deletion is special: it must scrub config references (heartbeat,
-    // peer-groups, delegates, workspace.access, …) via `delete_with_cascade`
-    // and cascade owned non-config state (memory / cron / acp / session). The
-    // generic map-key delete below handles every other section unchanged.
-    if q.path == "agents" {
-        return delete_agent_cascade(&state, working, &q.key).await;
+    match parse_alias_kind(&q.path) {
+        Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
+            // Agent deletion is special: it must scrub config references
+            // (heartbeat, peer-groups, delegates, workspace.access, …) via
+            // `delete_with_cascade` and cascade owned non-config state (memory /
+            // cron / acp / session).
+            return delete_agent_cascade(&state, working, &q.key).await;
+        }
+        Some(kind) => {
+            return delete_config_cascade(&state, working, &kind, &q.path, &q.key).await;
+        }
+        None => {}
     }
     let mut working = working;
     let removed = match working.delete_map_key(&q.path, &q.key) {
@@ -1170,6 +1178,46 @@ async fn delete_agent_cascade(
     .into_response()
 }
 
+/// Config-only delete cascade for providers/channels (no owned state): refuse
+/// on hard refs, scrub soft refs, mark every touched path dirty, persist.
+async fn delete_config_cascade(
+    state: &AppState,
+    mut working: zeroclaw_config::schema::Config,
+    kind: &zeroclaw_config::alias_refs::AliasKind,
+    path: &str,
+    key: &str,
+) -> Response {
+    let report = match zeroclaw_config::alias_refs::delete_with_cascade(
+        &mut working,
+        kind,
+        key,
+        zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
+    ) {
+        Ok(r) => r,
+        Err(e) => return delete_error_response(path, key, e),
+    };
+    let dirty_paths = report.dirty_paths();
+    for dirty_path in &dirty_paths {
+        working.mark_dirty(dirty_path);
+    }
+    if let Err(e) = persist_and_swap(state, working).await {
+        return error_response(e);
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({"path": path, "key": key, "dirty_paths": dirty_paths.len()})
+        ),
+        "alias deleted with config-ref cascade"
+    );
+    axum::Json(MapKeyResponse {
+        path: path.to_string(),
+        key: key.to_string(),
+        created: false,
+    })
+    .into_response()
+}
+
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
 /// entry under a map-keyed section with default values, or append to a
 /// list-shaped one with `key` as the new entry's natural identifier.
@@ -1300,6 +1348,12 @@ pub async fn handle_delete_plan(
         })
         .into_response();
     };
+    if let Some(message) = unsupported_delete_cascade_message(&kind) {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::OpNotSupported, message)
+                .with_path(format!("{}.{}", q.path, q.key)),
+        );
+    }
     let plan = zeroclaw_config::alias_refs::plan_delete(&config, &kind, &q.key);
     let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
     // For agents the live-ACP gate also blocks; it fails closed (an error
@@ -1320,6 +1374,19 @@ pub async fn handle_delete_plan(
         cascades_owned_state: is_agent,
     })
     .into_response()
+}
+
+fn unsupported_delete_cascade_message(
+    kind: &zeroclaw_config::alias_refs::AliasKind,
+) -> Option<&'static str> {
+    use zeroclaw_config::alias_refs::{AliasKind, ProviderCategory};
+    match kind {
+        AliasKind::Provider {
+            category: ProviderCategory::Tts | ProviderCategory::Transcription,
+            ..
+        } => Some("TTS/transcription provider delete-with-cascade is not yet implemented"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1409,6 +1476,42 @@ fn rename_error_response(
         ),
     };
     error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{from}")))
+}
+
+/// Map a [`CascadeError`](zeroclaw_config::alias_refs::CascadeError) to the
+/// HTTP error response for config-only alias deletes. `Refused` and
+/// `NotImplemented` are expected operator-facing outcomes, while
+/// `PostCondition` is an internal guard failure and must not be persisted.
+fn delete_error_response(
+    path: &str,
+    key: &str,
+    err: zeroclaw_config::alias_refs::CascadeError,
+) -> Response {
+    use zeroclaw_config::alias_refs::CascadeError;
+    let (code, msg) = match err {
+        CascadeError::Refused(report) => {
+            let blockers: Vec<_> = report.blockers.iter().map(|b| b.path.as_str()).collect();
+            let detail = if blockers.is_empty() {
+                "hard references remain".to_string()
+            } else {
+                format!("hard reference(s) remain: {}", blockers.join(", "))
+            };
+            (
+                ConfigApiCode::ValidationFailed,
+                format!("cannot delete alias `{key}`: {detail}"),
+            )
+        }
+        CascadeError::NotFound(p) => (
+            ConfigApiCode::PathNotFound,
+            format!("{p} is not configured"),
+        ),
+        CascadeError::NotImplemented(m) => (ConfigApiCode::OpNotSupported, m),
+        CascadeError::PostCondition(m) => (
+            ConfigApiCode::InternalError,
+            format!("delete cascade post-condition failed: {m}"),
+        ),
+    };
+    error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{key}")))
 }
 
 /// `POST /api/config/rename-map-key` — rename an alias within a map-keyed
@@ -2397,6 +2500,15 @@ fn build_etag_for(body: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{GatewayRateLimiter, IdempotencyStore, nodes};
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use http_body_util::BodyExt;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::security::pairing::PairingGuard;
 
     // typed-value coercion tests live in zeroclaw_config::typed_value
     // — shared helper, single source of truth.
@@ -2407,6 +2519,341 @@ mod tests {
     // dirty_entry_for / CascadeReport::dirty_paths tests live in
     // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI
     // both consume the promoted helper).
+
+    #[derive(Default)]
+    struct MockModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for MockModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MockModelProvider"
+        }
+    }
+
+    fn temp_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir,
+            ..Default::default()
+        }
+    }
+
+    fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("api-config-test"));
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            model_provider: Arc::new(MockModelProvider),
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    memory,
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let json = serde_json::from_slice(&body).expect("valid json response");
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn delete_map_key_handler_cascades_model_provider_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("anthropic", "default")
+            .unwrap();
+        config
+            .providers
+            .models
+            .ensure("openai", "main")
+            .unwrap()
+            .fallback = vec!["anthropic.default".into()];
+        config.agents.insert(
+            "triage".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                classifier_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_delete_map_key(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(MapKeyQuery {
+                    path: "providers.models.anthropic".to_string(),
+                    key: "default".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"], "providers.models.anthropic");
+        assert_eq!(json["key"], "default");
+        let cfg = state.config.read();
+        assert!(cfg.providers.models.find("anthropic", "default").is_none());
+        assert!(cfg.agents["triage"].classifier_provider.is_empty());
+        assert!(
+            cfg.providers
+                .models
+                .find("openai", "main")
+                .unwrap()
+                .fallback
+                .is_empty()
+        );
+        drop(cfg);
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!written.contains("anthropic.default"));
+    }
+
+    #[tokio::test]
+    async fn delete_map_key_handler_refuses_model_provider_hard_ref_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("anthropic", "default")
+            .unwrap();
+        config.agents.insert(
+            "researcher".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_delete_map_key(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(MapKeyQuery {
+                    path: "providers.models.anthropic".to_string(),
+                    key: "default".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "validation_failed");
+        let cfg = state.config.read();
+        assert!(cfg.providers.models.find("anthropic", "default").is_some());
+        assert_eq!(
+            cfg.agents["researcher"].model_provider.as_str(),
+            "anthropic.default"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_map_key_handler_cascades_channel_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.create_map_key("channels.discord", "main").unwrap();
+        config.agents.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..Default::default()
+            },
+        );
+        config
+            .escalation
+            .alert_channels
+            .push("discord.main".to_string());
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_delete_map_key(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(MapKeyQuery {
+                    path: "channels.discord".to_string(),
+                    key: "main".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"], "channels.discord");
+        assert_eq!(json["key"], "main");
+        let cfg = state.config.read();
+        assert!(
+            !cfg.get_map_keys("channels.discord")
+                .unwrap_or_default()
+                .iter()
+                .any(|k| k == "main")
+        );
+        assert!(cfg.agents["ops"].channels.is_empty());
+        assert!(cfg.escalation.alert_channels.is_empty());
+        drop(cfg);
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!written.contains("discord.main"));
+    }
+
+    #[tokio::test]
+    async fn delete_plan_rejects_unsupported_tts_provider_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.tts.elevenlabs", "default")
+            .unwrap();
+        config.agents.insert(
+            "voice".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                tts_provider: "elevenlabs.default".into(),
+                ..Default::default()
+            },
+        );
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_delete_plan(
+                axum::extract::State(state),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(MapKeyQuery {
+                    path: "providers.tts.elevenlabs".to_string(),
+                    key: "default".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "op_not_supported");
+        assert_eq!(json["path"], "providers.tts.elevenlabs.default");
+    }
+
+    #[tokio::test]
+    async fn delete_map_key_handler_rejects_unsupported_tts_without_raw_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.tts.elevenlabs", "default")
+            .unwrap();
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_delete_map_key(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(MapKeyQuery {
+                    path: "providers.tts.elevenlabs".to_string(),
+                    key: "default".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "op_not_supported");
+        assert!(
+            state
+                .config
+                .read()
+                .get_map_keys("providers.tts.elevenlabs")
+                .unwrap_or_default()
+                .iter()
+                .any(|k| k == "default"),
+            "unsupported provider delete must not fall back to raw deletion"
+        );
+    }
 
     #[test]
     fn delete_cascade_resolves_custom_workspace_before_removing_entry() {

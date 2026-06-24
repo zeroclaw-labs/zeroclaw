@@ -69,11 +69,13 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
 /// Returns the number of channels seeded. Parameters match the return order of
 /// `all_tools_with_runtime`:
 ///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   channel_room_handle = `Option<PerToolChannelHandle>`
 ///   reaction_handle = `PerToolChannelHandle` (NOT Option)
 ///   poll_handle = `Option<PerToolChannelHandle>`
 ///   escalate_handle = `Option<PerToolChannelHandle>`
 pub(crate) fn seed_channel_handles(
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &tools::PerToolChannelHandle,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
@@ -88,6 +90,7 @@ pub(crate) fn seed_channel_handles(
 
     let handles = [
         ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
         Some(reaction_handle),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
@@ -1152,6 +1155,7 @@ pub async fn run(
         let delegate_handle = all_tools_result.delegate_handle;
         let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
         let ask_user_handle = all_tools_result.ask_user_handle;
+        let channel_room_handle = all_tools_result.channel_room_handle;
         let reaction_handle = all_tools_result.reaction_handle;
         let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
@@ -1159,6 +1163,7 @@ pub async fn run(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle,
+            &channel_room_handle,
             &reaction_handle,
             &poll_handle,
             &escalate_handle,
@@ -1579,6 +1584,10 @@ pub async fn run(
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
         tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels. Use with Matrix channel keys such as matrix.default.",
+        ));
+        tool_descs.push((
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
@@ -1673,21 +1682,8 @@ pub async fn run(
         });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
-        let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
-            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-                .map(|tracker| {
-                    let pricing: crate::agent::cost::ModelProviderPricing = config
-                        .providers
-                        .models
-                        .iter_entries()
-                        .map(|(type_k, alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
-                        .filter(|(_, p)| !p.is_empty())
-                        .collect();
-                    ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
-                        .with_agent_alias(agent_alias)
-                });
+        let cost_tracking_context =
+            crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();
@@ -2787,6 +2783,7 @@ pub async fn process_message(
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
         let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
         let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
+        let channel_room_handle_pm = all_tools_result_pm.channel_room_handle;
         let reaction_handle_pm = all_tools_result_pm.reaction_handle;
         let poll_handle_pm = all_tools_result_pm.poll_handle;
         let escalate_handle_pm = all_tools_result_pm.escalate_handle;
@@ -2794,6 +2791,7 @@ pub async fn process_message(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle_pm,
+            &channel_room_handle_pm,
             &reaction_handle_pm,
             &poll_handle_pm,
             &escalate_handle_pm,
@@ -3065,6 +3063,10 @@ pub async fn process_message(
         if config.composio.enabled {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
+        tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels.",
+        ));
         if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
             tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
             tool_descs.push((
@@ -3310,11 +3312,15 @@ mod tests {
         apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
         load_interactive_session_history, make_query_summary,
         maybe_inject_channel_delivery_defaults, save_interactive_session_history,
-        truncate_tool_result,
+        seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
@@ -3330,6 +3336,71 @@ mod tests {
         CancelsTurnTool,
         VerboseTool,
     );
+
+    struct SeedMockChannel;
+
+    impl ::zeroclaw_api::attribution::Attributable for SeedMockChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SeedMockChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── seed_channel_handles tests ───────────────────────────────
+
+    #[test]
+    fn seed_channel_handles_populates_channel_room_handle() {
+        let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
+        super::register_channel_map_fn(Box::new(move || {
+            let mut map = HashMap::new();
+            map.insert("matrix.default".to_string(), Arc::clone(&channel));
+            map
+        }));
+
+        let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
+        let channel_room_handle = Arc::new(RwLock::new(HashMap::new()));
+        let reaction = Arc::new(RwLock::new(HashMap::new()));
+        let poll_handle = Arc::new(RwLock::new(HashMap::new()));
+        let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
+
+        let count = seed_channel_handles(
+            &Some(Arc::clone(&ask_user_handle)),
+            &Some(Arc::clone(&channel_room_handle)),
+            &reaction,
+            &Some(Arc::clone(&poll_handle)),
+            &Some(Arc::clone(&escalate_handle)),
+        );
+
+        assert_eq!(count, 1);
+        assert!(ask_user_handle.read().contains_key("matrix.default"));
+        assert!(channel_room_handle.read().contains_key("matrix.default"));
+        assert!(reaction.read().contains_key("matrix.default"));
+        assert!(poll_handle.read().contains_key("matrix.default"));
+        assert!(escalate_handle.read().contains_key("matrix.default"));
+    }
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
 
@@ -3692,8 +3763,8 @@ mod tests {
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]

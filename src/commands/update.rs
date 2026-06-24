@@ -39,7 +39,7 @@ fn prebuilt_channel_note_message() -> String {
 
     #[cfg(not(feature = "agent-runtime"))]
     {
-        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.".to_string()
+        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.".to_string()
     }
 }
 

@@ -19597,10 +19597,43 @@ pub struct SopConfig {
     /// Oldest runs are evicted when over capacity. 0 = unlimited.
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
+
+    /// Persist run state durably across restarts. Default `false` keeps today's
+    /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
+    /// to `true`, `build_sop_engine` selects the configured backend and in-flight
+    /// runs survive a restart.
+    #[serde(default)]
+    pub persist_runs: bool,
+
+    /// Durable run-state backend when `persist_runs` is true: `sqlite` (default,
+    /// durable) or `memory` (explicitly non-durable, for tests/degraded).
+    #[serde(default)]
+    pub run_store_backend: SopRunStoreBackend,
+
+    /// Directory for the durable run store (created mode-0700). When omitted,
+    /// `<data_dir>/sop`. Never OS-temp.
+    #[serde(default)]
+    pub run_state_dir: Option<String>,
 }
 
 fn default_sop_execution_mode() -> String {
     "supervised".to_string()
+}
+
+/// Durable SOP run-state backend selector. A closed, compile-time-known set, so it
+/// is a serde enum rather than free text (mirrors `SandboxBackend` /
+/// `ObservabilityBackend` in this file); unknown values are rejected at parse time.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SopRunStoreBackend {
+    /// Durable WAL-mode SQLite store (default).
+    #[default]
+    Sqlite,
+    /// Ephemeral in-memory store: explicitly non-durable, for tests / degraded boot.
+    Memory,
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19623,6 +19656,9 @@ impl Default for SopConfig {
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
+            persist_runs: false,
+            run_store_backend: SopRunStoreBackend::Sqlite,
+            run_state_dir: None,
         }
     }
 }

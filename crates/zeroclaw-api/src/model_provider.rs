@@ -140,6 +140,16 @@ pub struct ChatRequest<'a> {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub content: String,
+    /// Name of the tool that produced this result, retained so downstream
+    /// media-marker canonicalization stays provenance-aware: path-listing
+    /// tools (`content_search`, `glob_search`) must not have incidental image
+    /// paths promoted to routable `[IMAGE:...]` markers (PR #7345). Empty when
+    /// the producing tool is unknown (e.g. results reconstructed from a
+    /// provider-wire `tool` message that never carried the name), in which case
+    /// the blind canonicalizer runs exactly as before (PR #6183).
+    /// `#[serde(default)]` keeps older serialized session records readable.
+    #[serde(default)]
+    pub tool_name: String,
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
