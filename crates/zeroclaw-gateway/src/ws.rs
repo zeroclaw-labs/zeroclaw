@@ -486,6 +486,7 @@ async fn handle_socket(
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
         &config,
         &ch.ask_user,
+        &ch.channel_room,
         &Some(ch.reaction.clone()),
         &ch.poll,
         &ch.escalate,

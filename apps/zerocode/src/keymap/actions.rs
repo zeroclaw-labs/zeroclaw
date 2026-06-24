@@ -140,7 +140,7 @@ keyactions! {
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::CONTROL)] => "enter browse mode",
+        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::CONTROL), Chord::ctrl('k')] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::CONTROL)] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",

@@ -52,6 +52,7 @@ pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
+pub use zeroclaw_tools::channel_room::ChannelRoomTool;
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
@@ -435,6 +436,7 @@ pub struct AllToolsResult {
     pub tools: Vec<Box<dyn Tool>>,
     pub delegate_handle: Option<DelegateParentToolsHandle>,
     pub ask_user_handle: Option<PerToolChannelHandle>,
+    pub channel_room_handle: Option<PerToolChannelHandle>,
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
@@ -1199,6 +1201,15 @@ pub fn all_tools_with_runtime(
     let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
 
+    // Channel room-management tool — always registered; owns its own late-bound channel map.
+    let channel_room_handle: Option<PerToolChannelHandle> =
+        Some(Arc::new(RwLock::new(HashMap::new())));
+    let channel_room_tool = ChannelRoomTool::new(
+        security.clone(),
+        channel_room_handle.as_ref().cloned().unwrap(),
+    );
+    tool_arcs.push(Arc::new(channel_room_tool));
+
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
     let ask_user_tool =
@@ -1248,6 +1259,7 @@ pub fn all_tools_with_runtime(
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
                     ask_user_handle,
+                    channel_room_handle,
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
@@ -1466,6 +1478,7 @@ pub fn all_tools_with_runtime(
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         ask_user_handle,
+        channel_room_handle,
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
