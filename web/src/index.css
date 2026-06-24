@@ -245,6 +245,11 @@ code, kbd, pre {
   50% { transform: translateY(-4px); }
 }
 
+@keyframes progress-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
 .animate-fade-in {
   animation: fade-in 0.3s ease-out;
 }
@@ -275,6 +280,10 @@ code, kbd, pre {
 
 .animate-float {
   animation: float 3s ease-in-out infinite;
+}
+
+.animate-progress-sweep {
+  animation: progress-sweep 1.5s ease-in-out infinite;
 }
 
 .pulse-dot {
@@ -691,7 +700,8 @@ code, kbd, pre {
   .animate-slide-in-right,
   .animate-slide-in-up,
   .animate-pulse-glow,
-  .animate-float {
+  .animate-float,
+  .animate-progress-sweep {
     animation: none;
   }
   .pulse-dot {

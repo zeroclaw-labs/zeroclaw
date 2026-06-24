@@ -47,6 +47,10 @@ const PHASE_LABELS = [
 const UPGRADE_POLL_MS = 800;
 const RESTART_POLL_MS = 2000;
 const RESTART_TIMEOUT_MS = 60_000;
+/** Delay between detecting the new version is live and reloading the SPA, so
+ *  the user sees the ✓ for a beat instead of the page yanking out from under
+ *  them. Short enough that nobody waits, long enough to register. */
+const RELOAD_AFTER_RECONCILE_MS = 800;
 
 /**
  * Upgrade dialog covering the read-only info view (Phase 1), applying an upgrade
@@ -73,6 +77,13 @@ export function UpgradeDialog({
   const [status, setStatus] = useState<UpgradeStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reconciled, setReconciled] = useState(false);
+  /** Wall-clock when the `restarting` view was first entered. Used to drive
+   *  the elapsed-time hint shown to the user while we wait for the new
+   *  process to come back up. */
+  const [restartStartedAt, setRestartStartedAt] = useState<number | null>(null);
+  /** Ticks once a second while restarting so the elapsed counter re-renders
+   *  without us having to thread state through every poll callback. */
+  const [, setRestartTick] = useState(0);
   const canAutoRestart =
     restartMode === 'supervised' || restartMode === 'self_respawn';
   const [autoRestart, setAutoRestart] = useState(true);
@@ -83,6 +94,7 @@ export function UpgradeDialog({
     setError(null);
     setReconciled(false);
     setAutoRestart(canAutoRestart);
+    setRestartStartedAt(null);
     getUpgradeStatus()
       .then((s) => {
         if (s.state === 'running') {
@@ -105,12 +117,16 @@ export function UpgradeDialog({
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        // Don't let Esc dismiss the dialog while we're waiting for the new
+        // process — closing here would stop the /api/status reconciliation
+        // poll that triggers the auto-reload.
+        if (view === 'restarting') return;
         onClose();
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [open, onClose]);
+  }, [open, view, onClose]);
 
   // Poll the upgrade endpoint while running.
   useEffect(() => {
@@ -139,9 +155,16 @@ export function UpgradeDialog({
   }, [open, view, handoffId]);
 
   // While restarting, the gateway exits and the supervisor relaunches it.
-  // Reconcile by polling /api/status until the new version reports in.
+  // Reconcile by polling /api/status until the new version reports in,
+  // then auto-reload the SPA so the user picks up the freshly-shipped
+  // bundle without having to F5 by hand.
   useEffect(() => {
     if (!open || view !== 'restarting') return;
+    // Stamp the start of the wait the first time we enter this view, and
+    // tick a 1Hz counter so the elapsed-time hint re-renders smoothly.
+    if (restartStartedAt == null) setRestartStartedAt(Date.now());
+    const tickId = window.setInterval(() => setRestartTick((n) => n + 1), 1000);
+
     let active = true;
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
     const target = status?.target_version ?? info?.latest_version ?? null;
@@ -154,6 +177,12 @@ export function UpgradeDialog({
         if (v && v !== previous && (!target || v === target)) {
           setReconciled(true);
           setView('done');
+          // The gateway is back on the new version — the new web bundle is
+          // now being served. Reload after a short pause so the user sees
+          // the success state register before the page swaps out.
+          window.setTimeout(() => {
+            if (active) window.location.reload();
+          }, RELOAD_AFTER_RECONCILE_MS);
           return;
         }
       } catch {
@@ -170,8 +199,9 @@ export function UpgradeDialog({
     return () => {
       active = false;
       window.clearInterval(id);
+      window.clearInterval(tickId);
     };
-  }, [open, view, status, info]);
+  }, [open, view, status, info, restartStartedAt]);
 
   useEffect(() => {
     if (!open) return;
@@ -202,13 +232,17 @@ export function UpgradeDialog({
     }
   };
 
+  // Backdrop dismissal is suppressed while restarting — see the Esc handler
+  // above for the same reason. The browser still has the dialog tree.
+  const handleBackdropClick = view === 'restarting' ? undefined : onClose;
+
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-labelledby={titleId}
       className="fixed inset-0 z-50 flex items-center justify-center"
-      onClick={onClose}
+      onClick={handleBackdropClick}
     >
       <div className="absolute inset-0 bg-pc-base/70 backdrop-blur-sm" />
       <div
@@ -308,17 +342,16 @@ export function UpgradeDialog({
             </div>
           )}
 
-          {/* ── Progress ── */}
-          {(view === 'progress' || view === 'restarting') && (() => {
-            // `restarting` implies every phase finished.
-            const cur = view === 'restarting' ? 7 : status?.phase ?? 0;
-            const pct = view === 'restarting' ? 100 : Math.round((Math.min(cur, 6) / 6) * 100);
+          {/* ── Progress (active upgrade) ── */}
+          {view === 'progress' && (() => {
+            const cur = status?.phase ?? 0;
+            const pct = Math.round((Math.min(cur, 6) / 6) * 100);
             const lastLine = status?.log_tail?.[status.log_tail.length - 1];
             return (
               <div className="flex flex-col gap-2.5">
                 <div className="text-xs text-pc-text flex items-center gap-2">
                   <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                  {view === 'restarting' ? t('upgrade.restarting') : t('upgrade.upgrading')}
+                  {t('upgrade.upgrading')}
                 </div>
 
                 {/* Progress bar */}
@@ -383,6 +416,50 @@ export function UpgradeDialog({
             );
           })()}
 
+          {/* ── Restarting (waiting for the new process to come back) ──
+              Dedicated waiting state: large centred spinner, elapsed counter
+              so the user can tell the wait is alive, and an explicit hint
+              that the page will reload itself the moment the new version
+              reports in via /api/status. */}
+          {view === 'restarting' && (() => {
+            const target = status?.target_version ?? info?.latest_version ?? null;
+            const elapsedSec = restartStartedAt != null
+              ? Math.max(0, Math.floor((Date.now() - restartStartedAt) / 1000))
+              : 0;
+            const deadlineSec = Math.floor(RESTART_TIMEOUT_MS / 1000);
+            return (
+              <div className="flex flex-col items-center gap-3 py-6">
+                <Loader2
+                  className="h-10 w-10 animate-spin"
+                  style={{ color: 'var(--pc-accent)' }}
+                />
+                <div className="text-sm font-medium text-pc-text text-center">
+                  {t('upgrade.restarting')}
+                </div>
+                <div className="text-xs text-pc-text-muted text-center max-w-[20rem]">
+                  {t('upgrade.restart_waiting')}
+                  {target && (
+                    <>
+                      {' '}
+                      <span className="font-mono text-pc-text">v{target}</span>
+                    </>
+                  )}
+                </div>
+                {/* Indeterminate progress bar — the wait isn't a percentage,
+                    so a sweeping bar is more honest than a fake fill. */}
+                <div className="h-1 w-full overflow-hidden rounded-full bg-pc-surface">
+                  <div
+                    className="h-full w-1/3 rounded-full animate-progress-sweep"
+                    style={{ background: 'var(--pc-accent)' }}
+                  />
+                </div>
+                <div className="text-[11px] text-pc-text-muted font-mono">
+                  {t('upgrade.restart_elapsed')} {elapsedSec}s / {deadlineSec}s
+                </div>
+              </div>
+            );
+          })()}
+
           {/* ── Done ── */}
           {view === 'done' && (
             <div className="text-xs text-pc-text flex flex-col gap-1">
@@ -396,6 +473,12 @@ export function UpgradeDialog({
                   </span>
                 )}
               </div>
+              {reconciled && (
+                <div className="text-pc-text-muted flex items-center gap-1.5">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  {t('upgrade.reloading')}
+                </div>
+              )}
               {!reconciled && (
                 <div className="text-pc-text-muted">
                   {t('upgrade.restart_to_apply')}
@@ -451,11 +534,16 @@ export function UpgradeDialog({
             </>
           )}
 
-          {(view === 'progress' || view === 'restarting') && (
+          {view === 'progress' && (
             <Button variant="ghost" onClick={onClose}>
               {t('upgrade.close')}
             </Button>
           )}
+
+          {/* During restart we keep the dialog modal — closing it would stop
+              the /api/status polling that auto-reloads when the new process
+              is live. The user can still dismiss with Esc if they really
+              need to, but no inline button invites it. */}
 
           {(view === 'done' || view === 'failed') && (
             <Button variant="primary" onClick={onClose}>
