@@ -3059,6 +3059,37 @@ fn render_session_list_overlay(
 /// `width` is the available rendering width in cells (the chat-area inner
 /// width). It only matters for tables, which compute their column budgets
 /// from it; non-table content ignores it.
+/// Builds one full-width code-block border bar: `corner_l`, an optional left
+/// label (the language), then dashes wrapping a centered `[Copy]`, then
+/// `corner_r`. Header and footer share this so their geometry can never drift.
+fn code_block_bar(
+    width: u16,
+    corner_l: char,
+    corner_r: char,
+    label: Option<&str>,
+) -> Line<'static> {
+    let label = label.unwrap_or("");
+    let copy_lbl = " [Copy] ";
+    let consumed = 2 + label.chars().count() + copy_lbl.chars().count();
+    let middle = (width as usize).saturating_sub(consumed);
+    let left = middle / 2;
+    let right = middle.saturating_sub(left);
+    Line::from(vec![
+        Span::styled(
+            format!("{corner_l}{label}{}", "\u{2500}".repeat(left)),
+            theme::dim_style(),
+        ),
+        Span::styled(
+            copy_lbl.to_string(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}{corner_r}", "\u{2500}".repeat(right)),
+            theme::dim_style(),
+        ),
+    ])
+}
+
 fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     use pulldown_cmark::{Alignment as MdAlign, HeadingLevel};
 
@@ -3181,69 +3212,26 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
 
-                // Render header bar, exactly `width` columns wide:
-                //   ┌─── lang ───── [Copy] ───────┐
+                // Header bar: ┌─ lang ──── [Copy] ────┐
                 let lang_display = code_block_lang.clone().unwrap_or_default();
-                let header_text_owned = if lang_display.is_empty() {
+                let label = if lang_display.is_empty() {
                     " code ".to_string()
                 } else {
                     format!(" {} ", lang_display.as_str())
                 };
-                let hdr_text = header_text_owned.as_str();
-                let hdr_visible = hdr_text.len();
-                let copy_lbl = " [Copy] ";
-                let copy_visible = copy_lbl.len();
-                // fixed = ┌ + ─ after ┌ + spaces around header/copy + ┐
-                let fixed = 5; // ┌ + ─ + (space) + (space) + ┐
-                let middle = (width as usize).saturating_sub(fixed + hdr_visible + copy_visible);
-                let left_dots = middle / 2;
-                let right_dots = middle.saturating_sub(left_dots);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "\u{250c}\u{2500}{}{}",
-                            hdr_text,
-                            "\u{2500}".repeat(left_dots)
-                        ),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(
-                        copy_lbl.to_string(),
-                        theme::accent_style().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{}\u{2510}", "\u{2500}".repeat(right_dots)),
-                        theme::dim_style(),
-                    ),
-                ]));
+                lines.push(code_block_bar(
+                    width,
+                    '\u{250c}',
+                    '\u{2510}',
+                    Some(&format!("\u{2500}{label}")),
+                ));
             }
             MdEvent::End(TagEnd::CodeBlock) => {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = false;
 
-                // Render footer bar, exactly `width` columns wide:
-                //   └─── [Copy] ──────────────────┘
-                let copy_lbl = " [Copy] ";
-                let copy_visible = copy_lbl.len();
-                // fixed = └ + spaces around copy + ┘
-                let fixed = 3; // └ + (space) + ┘
-                let dots = (width as usize).saturating_sub(fixed + copy_visible);
-                let left_dots = dots / 2;
-                let right_dots = dots.saturating_sub(left_dots);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("\u{2514}{}", "\u{2500}".repeat(left_dots)),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(
-                        copy_lbl.to_string(),
-                        theme::accent_style().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{}\u{2518}", "\u{2500}".repeat(right_dots)),
-                        theme::dim_style(),
-                    ),
-                ]));
+                // Footer bar: └──── [Copy] ────┘
+                lines.push(code_block_bar(width, '\u{2514}', '\u{2518}', None));
 
                 // Accumulated code text is ready for clipboard copy;
                 // the Copy action is handled by the chat pane.
@@ -5786,6 +5774,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn md_code_block_bars_span_full_width() {
+        let width: u16 = 50;
+        let out = rendered("```rust\nlet x = 1;\n```\n", width);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        let footer = out.lines().find(|l| l.starts_with('\u{2514}')).unwrap();
+        assert_eq!(header.chars().count(), width as usize, "header: {header:?}");
+        assert_eq!(
+            header.chars().count(),
+            footer.chars().count(),
+            "header and footer must match width"
+        );
     }
 
     #[test]
