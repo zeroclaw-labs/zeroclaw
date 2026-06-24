@@ -876,7 +876,7 @@ pub struct ModelProviderConfig {
     /// Whether stored assistant reasoning should be replayed on outbound
     /// assistant history messages for OpenAI-compatible providers.
     /// `Some(false)` strips `reasoning_content`/`reasoning` from outbound
-    /// history — use this when targeting a strict endpoint (e.g. Groq,
+    /// history; use this when targeting a strict endpoint (e.g. Groq,
     /// Mistral) that rejects reasoning fields on input. `None` (default)
     /// preserves the provider's built-in behaviour. Generalises the
     /// `groq`-factory shortcut to any compatible `custom` endpoint pointed
