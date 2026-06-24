@@ -391,6 +391,17 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+/// Decide which overflow arrows to show for `(up, down)` given the total
+/// content rows, the visible window, and the current scroll offset. Arrows
+/// only appear when content exceeds the window.
+fn overflow_arrows(content_rows: u16, visible_rows: u16, scroll_offset: u16) -> (bool, bool) {
+    if content_rows <= visible_rows {
+        return (false, false);
+    }
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+    (scroll_offset > 0, scroll_offset < max_scroll)
+}
+
 /// Map a byte offset within `text` to `(row, col)` in wrapped coordinates.
 /// `width` is the inner area width (excluding borders).
 fn cursor_to_visual(text: &str, cursor: usize, width: u16) -> (u16, u16) {
@@ -1451,6 +1462,13 @@ impl InputBarState {
         let visible_rows = content_rows.min(MAX_INPUT_ROWS);
         let input_height = visible_rows + 2; // +2 for top/bottom border
 
+        // Clamp scroll to the valid range unconditionally so the paragraph
+        // offset and the overflow arrows always reflect the same true state,
+        // even on frames where the cursor-follow block below does not run
+        // (e.g. an approval overlay suppresses the cursor).
+        let max_scroll = content_rows.saturating_sub(visible_rows);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+
         let mut constraints = vec![Constraint::Min(3)];
         if has_attachments {
             constraints.push(Constraint::Length(1));
@@ -1540,19 +1558,19 @@ impl InputBarState {
         }
 
         // Scroll indicators on the right border when content overflows.
-        if content_rows > MAX_INPUT_ROWS && input_area.width > 2 {
+        let (show_up, show_down) = overflow_arrows(content_rows, visible_rows, self.scroll_offset);
+        if (show_up || show_down) && input_area.width > 2 {
             let indicator_x = input_area.x + input_area.width - 1;
             let indicator_style = theme::accent_style();
 
-            if self.scroll_offset > 0 {
+            if show_up {
                 // Content above — show up arrow on top border.
                 let buf = f.buffer_mut();
                 buf[(indicator_x, input_area.y)]
                     .set_char('\u{25b2}')
                     .set_style(indicator_style);
             }
-            let max_scroll = content_rows.saturating_sub(MAX_INPUT_ROWS);
-            if self.scroll_offset < max_scroll {
+            if show_down {
                 // Content below — show down arrow on bottom border.
                 let buf = f.buffer_mut();
                 buf[(indicator_x, input_area.y + input_area.height - 1)]
@@ -2080,6 +2098,29 @@ mod tests {
     }
 
     // ── Wrap geometry tests ──────────────────────────────────
+
+    #[test]
+    fn overflow_arrows_none_when_fits() {
+        assert_eq!(overflow_arrows(3, 5, 0), (false, false));
+        assert_eq!(overflow_arrows(5, 5, 0), (false, false));
+    }
+
+    #[test]
+    fn overflow_arrows_down_only_at_top() {
+        // 10 rows, window 5, scrolled to top: more below, none above.
+        assert_eq!(overflow_arrows(10, 5, 0), (false, true));
+    }
+
+    #[test]
+    fn overflow_arrows_both_in_middle() {
+        assert_eq!(overflow_arrows(10, 5, 2), (true, true));
+    }
+
+    #[test]
+    fn overflow_arrows_up_only_at_bottom() {
+        // max_scroll = 10 - 5 = 5; at offset 5 nothing remains below.
+        assert_eq!(overflow_arrows(10, 5, 5), (true, false));
+    }
 
     #[test]
     fn wrapped_line_count_empty() {
