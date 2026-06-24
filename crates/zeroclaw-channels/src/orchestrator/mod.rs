@@ -1044,20 +1044,33 @@ fn timestamp_channel_user_content(content: &str) -> String {
 }
 
 fn channel_history_content_for_user_turn(content: &str) -> String {
-    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+    let (_cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
     if image_refs.is_empty() {
         return content.to_string();
     }
 
-    let mut cleaned = cleaned.trim().to_string();
-    while cleaned.contains("\n\n\n") {
-        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    // Only strip inline base64 data URIs from history; keep filesystem path
+    // references so they can be re-loaded on later turns. This fixes the issue
+    // where deferred image attachments lose their re-loadable reference.
+    // See issue #8151.
+    let mut result = content.to_string();
+    for ref_path in &image_refs {
+        if ref_path.starts_with("data:") {
+            // Strip inline base64 payload (too large to keep in history)
+            result = result.replace(&format!("[IMAGE:{}]", ref_path), "");
+        }
+        // Filesystem paths and URLs are kept as-is for re-loading
     }
 
-    if cleaned.is_empty() {
+    let mut result = result.trim().to_string();
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    if result.is_empty() {
         "[Image attachment processed by vision model]".to_string()
     } else {
-        cleaned
+        result
     }
 }
 
