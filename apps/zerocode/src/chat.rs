@@ -3079,6 +3079,11 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut blockquote_depth: u32 = 0;
     let mut link_url: Option<String> = None;
 
+    // Stack of enclosing lists. `Some(next)` is an ordered list whose next item
+    // renders `next.` and then increments; `None` is a bullet list. The stack
+    // depth drives per-level indentation so nested lists step inward.
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+
     // Table state. While non-`None`, text/inline events accumulate into the
     // current cell instead of the live `current_spans` line.
     struct TableBuf {
@@ -3244,10 +3249,28 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 // the Copy action is handled by the chat pane.
                 code_block_text.clear();
             }
+            MdEvent::Start(Tag::List(start)) => {
+                push_line(&mut lines, &mut current_spans);
+                list_stack.push(start);
+            }
+            MdEvent::End(TagEnd::List(_)) => {
+                push_line(&mut lines, &mut current_spans);
+                list_stack.pop();
+            }
             MdEvent::Start(Tag::Item) => {
                 push_line(&mut lines, &mut current_spans);
                 current_spans.extend(blockquote_gutter(blockquote_depth));
-                current_spans.push(Span::styled("  \u{2022} ", theme::dim_style()));
+                let depth = list_stack.len().saturating_sub(1);
+                current_spans.push(Span::styled("  ".repeat(depth + 1), theme::dim_style()));
+                let marker = match list_stack.last_mut() {
+                    Some(Some(next)) => {
+                        let label = format!("{next}. ");
+                        *next += 1;
+                        label
+                    }
+                    _ => "\u{2022} ".to_string(),
+                };
+                current_spans.push(Span::styled(marker, theme::dim_style()));
             }
             MdEvent::End(TagEnd::Item) if !current_spans.is_empty() => {
                 push_line(&mut lines, &mut current_spans);
@@ -5830,6 +5853,31 @@ mod tests {
         let out = rendered("- [x] done\n- [ ] todo\n", 80);
         assert!(out.contains('\u{2611}'), "expected checked glyph: {out}");
         assert!(out.contains('\u{2610}'), "expected unchecked glyph: {out}");
+    }
+
+    #[test]
+    fn md_ordered_list_renders_numbers_not_bullets() {
+        let out = rendered("1. first\n2. second\n3. third\n", 80);
+        assert!(out.contains("1. first"), "expected ordinal 1: {out}");
+        assert!(out.contains("2. second"), "expected ordinal 2: {out}");
+        assert!(out.contains("3. third"), "expected ordinal 3: {out}");
+        assert!(
+            !out.contains('\u{2022}'),
+            "ordered list must not render bullets: {out}"
+        );
+    }
+
+    #[test]
+    fn md_ordered_list_honors_start_offset() {
+        let out = rendered("5. five\n6. six\n", 80);
+        assert!(out.contains("5. five"), "expected start at 5: {out}");
+        assert!(out.contains("6. six"), "expected continuation 6: {out}");
+    }
+
+    #[test]
+    fn md_unordered_list_still_renders_bullets() {
+        let out = rendered("- one\n- two\n", 80);
+        assert!(out.contains('\u{2022}'), "expected bullet glyph: {out}");
     }
 
     #[test]
