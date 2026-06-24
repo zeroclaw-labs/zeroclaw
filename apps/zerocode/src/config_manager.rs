@@ -460,7 +460,7 @@ impl App {
 
         // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
             chunks[2],
         );
 

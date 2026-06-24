@@ -363,7 +363,7 @@ impl Dashboard {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
