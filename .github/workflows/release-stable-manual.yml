@@ -427,6 +427,10 @@ jobs:
     name: Publish Stable Release
     needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     environment:
       name: github-releases
       url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
@@ -487,6 +491,11 @@ jobs:
           cp install.sh release-assets/
           echo "--- Assets ---"
           ls -lh release-assets/
+
+      - name: Attach SLSA provenance attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-assets/*
 
       - name: Write release notes
         env:
