@@ -2758,6 +2758,16 @@ pub async fn run(
         done: false,
     };
 
+    // Deliver pending dream report on interactive session start.
+    if message.is_none()
+        && effective_config.dream_mode.show_report
+        && let Ok(Some(report)) =
+            crate::dream::report::DreamReport::load_pending(&effective_config.data_dir)
+    {
+        println!("{}\n", report.format_message());
+        let _ = crate::dream::report::DreamReport::mark_delivered(&effective_config.data_dir);
+    }
+
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
         println!("{response}");

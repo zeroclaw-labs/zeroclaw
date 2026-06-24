@@ -256,6 +256,8 @@ mod cron;
 mod daemon;
 #[cfg(feature = "agent-runtime")]
 mod doctor;
+#[cfg(feature = "agent-runtime")]
+mod dream;
 #[cfg(feature = "gateway")]
 mod gateway;
 #[cfg(feature = "agent-runtime")]
@@ -862,6 +864,43 @@ Examples:
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
+    },
+
+    /// Run a dream cycle (periodic memory consolidation)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Trigger a dream cycle — periodic memory consolidation.
+
+Dream mode runs in two modes:
+  - Local mode (default, no network): gathers recent memories and prunes \
+stale or low-importance entries by age and decayed-importance threshold.
+  - LLM-assisted mode (opt-in): set `dream_mode.model` in config to also \
+extract insights and identify semantically stale keys via a single LLM call.
+
+By default, proposed mutations are staged to `dream_pending.json` for review \
+(audit_mode = true). Run `zeroclaw dream promote` to apply them. Set \
+`dream_mode.audit_mode = false` in config to auto-apply.
+
+`--dry-run` is side-effect free: no memory mutations, no dream_pending.json, \
+no dream_report.json. It shows what the cycle *would* do.
+
+Examples:
+  zeroclaw dream                    # run a dream cycle (staged by default)
+  zeroclaw dream --dry-run          # preview — writes nothing
+  zeroclaw dream --verbose          # show detailed output
+  zeroclaw dream promote            # apply staged mutations from dream_pending.json
+  zeroclaw dream report             # show pending dream report")]
+    Dream {
+        #[command(subcommand)]
+        dream_command: Option<DreamCommands>,
+
+        /// Preview changes without persisting to memory
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show verbose output for each phase
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Manage configuration
@@ -2915,6 +2954,15 @@ enum MemoryCommands {
     Reindex,
 }
 
+/// Dream mode subcommands.
+#[derive(Subcommand, Debug, Clone)]
+enum DreamCommands {
+    /// Show the pending dream report (marks as delivered)
+    Report,
+    /// Apply staged dream mutations from dream_pending.json
+    Promote,
+}
+
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
     #[cfg(feature = "agent-runtime")]
     {
@@ -4652,6 +4700,16 @@ async fn main() -> Result<()> {
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await
         }
+
+        Commands::Dream {
+            dream_command,
+            dry_run,
+            verbose,
+        } => match dream_command {
+            Some(DreamCommands::Report) => dream::show_report(&config),
+            Some(DreamCommands::Promote) => dream::promote(&config).await,
+            None => dream::run_dream(&config, dry_run, verbose).await,
+        },
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
 

@@ -363,6 +363,43 @@ impl Memory for AgentScopedMemory {
         self.inner.forget_for_agent(key, agent_id).await
     }
 
+    async fn mark_superseded(&self, key: &str, superseded_by: &str) -> Result<bool> {
+        // Same boundary as `forget`: only the bound agent's own row may be
+        // superseded, never a sibling row visible through `read_memory_from`
+        // (the allowlist grants recall, never mutation). Route through the
+        // composite `(key, agent_id)` form so cross-agent rows are untouched.
+        self.inner
+            .mark_superseded_for_agent(key, &self.agent_id, superseded_by)
+            .await
+    }
+
+    async fn mark_superseded_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+        superseded_by: &str,
+    ) -> Result<bool> {
+        if agent_id != self.agent_id {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "key": key,
+                        "row_agent": agent_id,
+                        "bound_agent": self.agent_id,
+                    })),
+                "mark_superseded_for_agent refused: cross-agent supersede through wrapper"
+            );
+            anyhow::bail!(
+                "AgentScopedMemory refuses cross-agent mark_superseded_for_agent: bound agent and target agent differ"
+            );
+        }
+        self.inner
+            .mark_superseded_for_agent(key, agent_id, superseded_by)
+            .await
+    }
+
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
         // caller does not see the install-wide row total.

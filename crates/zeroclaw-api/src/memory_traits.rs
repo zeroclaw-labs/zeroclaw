@@ -218,6 +218,33 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
+    /// Mark the row(s) matching `key` as superseded by `superseded_by`, so they
+    /// are filtered out of all retrieval (`recall`/`list`/`get`) **without
+    /// being deleted**. This is the non-destructive alternative to
+    /// [`forget`](Self::forget): the data stays in the store (recoverable,
+    /// auditable) but stops surfacing. Returns `true` if at least one row was
+    /// updated.
+    ///
+    /// Default: a no-op returning `Ok(false)`. Append-only or
+    /// supersession-unaware backends (markdown, none) keep the default — for
+    /// them there is no soft-hide, and callers should treat `false` as "this
+    /// backend does not support superseding."
+    async fn mark_superseded(&self, _key: &str, _superseded_by: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Agent-scoped supersede: mark the row matching `(key, agent_id)` as
+    /// superseded. Agent-scoped wrappers route through this so sibling rows
+    /// under other agents are untouched. Default no-op (`Ok(false)`).
+    async fn mark_superseded_for_agent(
+        &self,
+        _key: &str,
+        _agent_id: &str,
+        _superseded_by: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
     /// Default: returns unsupported error. Backends that support bulk deletion override this.

@@ -1167,6 +1167,48 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn mark_superseded(&self, key: &str, superseded_by: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let superseded_by = superseded_by.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            // Non-destructive: rows stay in the table but are filtered out of
+            // every retrieval path (`WHERE superseded_by IS NULL`). Only touch
+            // rows not already superseded so the marker is stable/idempotent.
+            let affected = conn.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE key = ?2 AND superseded_by IS NULL",
+                params![superseded_by, key],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn mark_superseded_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+        superseded_by: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let agent_id = agent_id.to_string();
+        let superseded_by = superseded_by.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "UPDATE memories SET superseded_by = ?1 \
+                 WHERE key = ?2 AND agent_id = ?3 AND superseded_by IS NULL",
+                params![superseded_by, key, agent_id],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
         let namespace = namespace.to_string();
@@ -3693,6 +3735,78 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_hides_from_recall_but_keeps_row() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        mem.store(
+            "pref",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !mem.recall("Rust", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Supersede: hidden from every retrieval path, but NOT deleted.
+        assert!(mem.mark_superseded("pref", "dream:retired").await.unwrap());
+        assert!(
+            mem.recall("Rust", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "superseded entry must not surface in recall"
+        );
+
+        // The row is kept (recoverable): a direct get() by key still returns
+        // it, now carrying the supersede marker. `get` is the admin/recovery
+        // path and intentionally does not filter superseded rows.
+        let row = mem.get("pref").await.unwrap();
+        assert!(
+            row.is_some(),
+            "superseded row must remain in the store (recoverable)"
+        );
+        assert_eq!(
+            row.unwrap().superseded_by.as_deref(),
+            Some("dream:retired"),
+            "supersede marker must be persisted"
+        );
+
+        // A hard forget still finds and removes it (further proof the row was
+        // never deleted by supersede).
+        assert!(
+            mem.forget("pref").await.unwrap(),
+            "row must still exist after supersede (recoverable)"
+        );
+        assert!(
+            !mem.forget("pref").await.unwrap(),
+            "now actually deleted — nothing left to remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        mem.store("k", "some content", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        assert!(
+            mem.mark_superseded("k", "m1").await.unwrap(),
+            "first mark updates the row"
+        );
+        assert!(
+            !mem.mark_superseded("k", "m2").await.unwrap(),
+            "already superseded → no-op (WHERE superseded_by IS NULL)"
+        );
     }
 
     // Wires-crossed regression coverage. The user reported memory rows

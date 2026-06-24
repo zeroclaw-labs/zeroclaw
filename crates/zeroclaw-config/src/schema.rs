@@ -261,6 +261,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub acp: AcpConfig,
 
+    /// Dream mode configuration for periodic memory consolidation (`[dream_mode]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub dream_mode: DreamModeConfig,
+
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels]`).
     #[serde(default, alias = "channels_config")]
     #[nested]
@@ -11182,6 +11188,101 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Dream Mode ─────────────────────────────────────────────────
+
+/// Dream mode configuration for periodic memory consolidation (`[dream_mode]` section).
+///
+/// When enabled, ZeroClaw periodically consolidates daily memories, identifies
+/// patterns across interactions, prunes stale entries, and pre-computes context
+/// so the agent "wakes up smarter" each session.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dream_mode"]
+pub struct DreamModeConfig {
+    /// Enable dream mode. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cron expression for scheduled dream cycles. Default: `"0 3 * * *"` (daily at 03:00 UTC).
+    #[serde(default = "default_dream_schedule")]
+    pub schedule: String,
+    /// Model override for dream LLM calls. Uses a lightweight/cheap model to
+    /// minimize token cost. Falls back to `providers.fallback` model if unset.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Temperature for dream LLM reflection calls. Default: `0.2`.
+    #[serde(default = "default_dream_temperature")]
+    pub temperature: f64,
+    /// Maximum number of recent memories to gather per dream cycle. Default: `50`.
+    #[serde(default = "default_dream_gather_limit")]
+    pub gather_limit: usize,
+    /// Audit mode: proposed memory mutations are staged in `dream_pending.json`
+    /// for user review rather than applied directly. Use `zeroclaw dream promote`
+    /// to apply staged changes. Default: `true` (safe first-slice behavior).
+    #[serde(default = "default_true")]
+    pub audit_mode: bool,
+    /// Show a "While you were away…" report on the next user interaction
+    /// after a dream cycle completes. Default: `true`.
+    #[serde(default = "default_true")]
+    pub show_report: bool,
+    /// Prune non-Core memories whose importance score falls below this
+    /// threshold after time decay is applied. Default: `0.1`.
+    #[serde(default = "default_dream_prune_threshold")]
+    pub prune_threshold: f64,
+    /// Maximum age in days for Daily memories before they become eligible for
+    /// pruning. Default: `30`.
+    #[serde(default = "default_dream_max_daily_age_days")]
+    pub max_daily_age_days: u32,
+    /// Whether pruning **hard-deletes** entries. Default: `false` — pruning is
+    /// **non-destructive**: stale/over-age/low-importance entries are marked
+    /// `superseded` (filtered out of retrieval but kept in the store,
+    /// recoverable and auditable). Set `true` to permanently `forget()` them.
+    ///
+    /// On the default hybrid SQLite/vector backend, retrieval is bounded
+    /// top-k and time-decay already down-ranks stale entries, so deletion buys
+    /// no context-window benefit and risks destroying source-of-truth — hence
+    /// the non-destructive default. Append-only backends (markdown) ignore
+    /// both modes (nothing is removed).
+    #[serde(default)]
+    pub hard_prune: bool,
+}
+
+fn default_dream_schedule() -> String {
+    "0 3 * * *".into()
+}
+
+fn default_dream_temperature() -> f64 {
+    0.2
+}
+
+fn default_dream_gather_limit() -> usize {
+    50
+}
+
+fn default_dream_prune_threshold() -> f64 {
+    0.1
+}
+
+fn default_dream_max_daily_age_days() -> u32 {
+    30
+}
+
+impl Default for DreamModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: default_dream_schedule(),
+            model: None,
+            temperature: default_dream_temperature(),
+            gather_limit: default_dream_gather_limit(),
+            audit_mode: true,
+            show_report: true,
+            prune_threshold: default_dream_prune_threshold(),
+            max_daily_age_days: default_dream_max_daily_age_days(),
+            hard_prune: false,
+        }
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -15560,6 +15661,7 @@ impl Default for Config {
             heartbeat: HeartbeatConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
+            dream_mode: DreamModeConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -21149,6 +21251,7 @@ auto_save = true
             },
             cron: HashMap::new(),
             acp: AcpConfig::default(),
+            dream_mode: DreamModeConfig::default(),
             channels: ChannelsConfig {
                 cli: true,
                 telegram: HashMap::from([(
@@ -21874,6 +21977,7 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
+            dream_mode: DreamModeConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),

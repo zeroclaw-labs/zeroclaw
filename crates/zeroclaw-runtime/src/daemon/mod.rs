@@ -566,6 +566,26 @@ pub async fn run(
         );
     }
 
+    if config.dream_mode.enabled {
+        let dream_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "dream",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = dream_cfg.clone();
+                async move { Box::pin(run_dream_worker(cfg)).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("dream");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Dream mode disabled; dream supervisor not started"
+        );
+    }
+
     record_daemon_started(&config, &host, port);
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
@@ -1173,6 +1193,169 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             );
         } else {
             sleep_mins = base_interval;
+        }
+    }
+}
+
+/// Dream mode worker — runs periodic memory consolidation cycles.
+///
+/// Parses the cron schedule from `dream_mode.schedule`, sleeps until the next
+/// trigger time, and runs a dream cycle. Runs local-only (no network) unless
+/// `dream_mode.model` is configured, in which case LLM reflection is enabled.
+async fn run_dream_worker(config: Config) -> Result<()> {
+    use crate::dream::engine::DreamEngine;
+    use anyhow::Context;
+    use std::str::FromStr;
+
+    if !config.dream_mode.enabled {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Dream mode disabled"
+        );
+        return Ok(());
+    }
+
+    let engine = DreamEngine::new(config.dream_mode.clone(), config.data_dir.clone());
+
+    // Resolve the provider only if dream_mode.model is configured (opt-in LLM).
+    let (provider, model): (
+        Option<Box<dyn ::zeroclaw_api::model_provider::ModelProvider>>,
+        Option<String>,
+    ) =
+        if config.dream_mode.model.is_some() {
+            // Resolve the first configured model_provider as the default, using the
+            // same V3 `<family>.<alias>` reference contract as a normal agent turn
+            // (see `agent::build_session_model_provider`).
+            let (family, alias, fallback) =
+                config.providers.models.iter_entries().next().context(
+                    "dream worker: dream_mode.model set but no model_provider configured",
+                )?;
+            let provider_ref = format!("{family}.{alias}");
+            let model_name = config
+                .dream_mode
+                .model
+                .as_deref()
+                .or(fallback.model.as_deref())
+                .unwrap_or("claude-haiku-4-5-20251001")
+                .to_string();
+
+            let provider_runtime_options =
+                zeroclaw_providers::provider_runtime_options_for_alias(&config, family, alias);
+            let p = zeroclaw_providers::create_routed_model_provider_with_options(
+                &config,
+                &provider_ref,
+                fallback.api_key.as_deref(),
+                fallback.uri.as_deref(),
+                &config.reliability,
+                &config.model_routes,
+                &model_name,
+                &provider_runtime_options,
+            )?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("Dream mode: LLM reflection enabled (model='{model_name}')")
+            );
+            (Some(p), Some(model_name))
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Dream mode: local-only (no dream_mode.model configured)"
+            );
+            (None, None)
+        };
+
+    // Parse the cron schedule for cycle timing.
+    let schedule = cron::Schedule::from_str(&config.dream_mode.schedule).context(format!(
+        "dream worker: invalid cron expression '{}'",
+        config.dream_mode.schedule
+    ))?;
+
+    crate::health::mark_component_ok("dream");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "Dream mode started: schedule='{}'",
+            config.dream_mode.schedule
+        )
+    );
+
+    loop {
+        // Compute next wake time from cron schedule.
+        let sleep_duration = schedule
+            .upcoming(chrono::Utc)
+            .next()
+            .map(|t| {
+                (t - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(60))
+            })
+            .unwrap_or(Duration::from_secs(3600));
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Dream mode: sleeping for {}s until next cycle",
+                sleep_duration.as_secs()
+            )
+        );
+        tokio::time::sleep(sleep_duration).await;
+
+        // Create memory backend for this cycle.
+        let memory: Option<Box<dyn zeroclaw_memory::Memory>> = zeroclaw_memory::create_memory(
+            &config.memory,
+            &config.data_dir,
+            config
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .and_then(|(_, _, e)| e.api_key.as_deref()),
+        )
+        .ok();
+
+        let Some(ref mem) = memory else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Dream mode: memory backend unavailable, skipping cycle"
+            );
+            continue;
+        };
+
+        match engine
+            .run_cycle(
+                mem.as_ref(),
+                provider.as_ref().map(|p| p.as_ref()),
+                model.as_deref(),
+            )
+            .await
+        {
+            Ok(result) => {
+                crate::health::mark_component_ok("dream");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "Dream cycle complete: {} insights, {} pruned",
+                        result.consolidated_count, result.pruned_count
+                    )
+                );
+            }
+            Err(e) => {
+                crate::health::mark_component_error("dream", e.to_string());
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("Dream cycle failed: {e}")
+                );
+            }
         }
     }
 }

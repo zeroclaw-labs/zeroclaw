@@ -24,6 +24,28 @@ cli-hardware-about = Discover and introspect USB hardware
 cli-peripheral-about = Manage hardware peripherals
 cli-memory-about = Manage agent memory entries
 cli-config-about = Manage ZeroClaw configuration
+cli-dream-about = Run a dream cycle (periodic memory consolidation)
+cli-dream-report-about = Show the pending dream report
+cli-dream-starting = Dream cycle starting...
+    { "  " }Provider: {$provider}
+    { "  " }Model: {$model}
+    { "  " }Memory backend: {$backend}
+cli-dream-dry-run-mode = { "  " }Mode: dry-run (no changes will be persisted)
+cli-dream-complete = Dream cycle complete: {$gathered} memories gathered, {$consolidated} insights consolidated, {$pruned} pruned
+cli-dream-insights-header = Insights:
+cli-dream-summary = Summary: {$summary}
+cli-dream-dry-run-notice = [dry-run] No changes were persisted to memory.
+cli-dream-staged-notice = [audit] Proposed mutations staged to dream_pending.json. Run `zeroclaw dream promote` to apply.
+cli-dream-no-report = No pending dream report.
+cli-dream-no-pending = No pending dream mutations to promote.
+cli-dream-promote-about = Apply staged dream mutations from dream_pending.json
+cli-dream-promote-summary = Promoting {$insights} insights, pruning {$prunes} stale keys...
+cli-dream-promote-done = Done: {$stored} insights stored, {$pruned} memories pruned.
+cli-dream-promote-partial = {$failed} item(s) failed; dream_pending.json retained for retry.
+cli-dream-promote-store-error = { "  " }Failed to store insight: {$error}
+cli-dream-promote-prune-error = { "  " }Failed to prune key {$key}: {$error}
+cli-dream-report-header = While you were away... ({$timestamp})
+cli-dream-report-counts = ({$insights} insights consolidated, {$pruned} stale memories pruned)
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
