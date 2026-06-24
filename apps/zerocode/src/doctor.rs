@@ -423,21 +423,10 @@ impl Doctor {
 impl crate::widgets::HelpContext for Doctor {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
-        HelpNode::entries(vec![
-            E::key("r", crate::i18n::t("zc-doctor-help-rerun")),
-            E::new(
-                vec!["j", "k", "Up/Down"],
-                crate::i18n::t("zc-doctor-help-move"),
-            ),
-            E::key("+ / -", crate::i18n::t("zc-doctor-help-filter")),
-            E::key(
-                "PgUp / PgDn",
-                crate::i18n::t("zc-doctor-help-scroll-detail"),
-            ),
-            E::key("?", crate::i18n::t("zc-doctor-help-this-help")),
-            E::spacer(),
-            E::desc(crate::i18n::t("zc-doctor-help-mouse")),
-        ])
+        let mut entries = crate::help::help_entries::<crate::keymap::DoctorTabAction>();
+        entries.push(E::spacer());
+        entries.push(E::desc(crate::i18n::t("zc-doctor-help-mouse")));
+        HelpNode::entries(entries)
     }
 }
 

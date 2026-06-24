@@ -4269,10 +4269,11 @@ impl App {
 
 impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
-            vec!["Tab", "Shift+Tab"],
+            [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
             crate::i18n::t("zc-config-help-switch-section"),
         );
         if self.section == ConfigSection::Zerocode {
@@ -4294,8 +4295,18 @@ impl App {
         // All chords resolve from the live keymap so overrides/vim/emacs show.
         let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
         let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
-        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
-        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let help = || {
+            E::new(
+                crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+                crate::i18n::t("zc-config-help-this-help"),
+            )
+        };
+        let filter = || {
+            E::new(
+                tab_keys(A::BeginSearch),
+                crate::i18n::t("zc-config-help-filter"),
+            )
+        };
         let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
@@ -4547,12 +4558,18 @@ impl App {
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
         ));
-        entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
+        entries.push(E::new(
+            tab_keys(A::BeginSearch),
+            crate::i18n::t("zc-config-help-filter"),
+        ));
         entries.push(E::new(
             tab_keys(A::Back),
             crate::i18n::t("zc-config-help-back"),
         ));
-        entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
+        entries.push(E::new(
+            crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+            crate::i18n::t("zc-config-help-this-help"),
+        ));
         entries.push(E::spacer());
         let mouse = if has_tabs {
             crate::i18n::t("zc-config-help-mouse-tabs-edit")

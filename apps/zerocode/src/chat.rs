@@ -1991,59 +1991,124 @@ impl crate::widgets::HelpContext for Chat {
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
+                use crate::keymap::{
+                    ChatTabAction as C, GlobalAction, ModalAction, action_key_labels,
+                };
                 if *loading {
                     HelpNode::entries(vec![E::key("", crate::i18n::t("zc-chat-loading-agents"))])
                 } else {
+                    let nav = action_key_labels(C::BrowseUp)
+                        .into_iter()
+                        .chain(action_key_labels(C::BrowseDown))
+                        .chain(action_key_labels(C::BrowseUpVim))
+                        .chain(action_key_labels(C::BrowseDownVim));
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-chat-help-select-agent")),
-                        E::key("q", crate::i18n::t("zc-chat-help-quit")),
+                        E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                        E::new(
+                            action_key_labels(ModalAction::Confirm),
+                            crate::i18n::t("zc-chat-help-select-agent"),
+                        ),
+                        E::new(
+                            action_key_labels(GlobalAction::Quit),
+                            crate::i18n::t("zc-chat-help-quit"),
+                        ),
                     ])
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
             ChatPhase::Error(_) => {
-                HelpNode::entries(vec![E::key("q", crate::i18n::t("zc-chat-help-quit"))])
+                use crate::keymap::{ChatTabAction as C, GlobalAction, action_key_labels};
+                let keys = action_key_labels(C::ErrorDismiss)
+                    .into_iter()
+                    .chain(action_key_labels(GlobalAction::Quit));
+                HelpNode::entries(vec![E::new(keys, crate::i18n::t("zc-chat-help-quit"))])
             }
             ChatPhase::Active(state) => {
                 match &state.session_overlay {
                     SessionOverlay::List { .. } => {
+                        use crate::keymap::{ModalAction as M, action_key_labels};
+                        let nav = action_key_labels(M::Up)
+                            .into_iter()
+                            .chain(action_key_labels(M::Down));
                         return HelpNode::entries(vec![
-                            E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
-                            E::key("Enter", crate::i18n::t("zc-chat-help-switch-session")),
-                            E::key("Esc", crate::i18n::t("zc-chat-help-close")),
+                            E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                            E::new(
+                                action_key_labels(M::Confirm),
+                                crate::i18n::t("zc-chat-help-switch-session"),
+                            ),
+                            E::new(
+                                action_key_labels(M::Cancel),
+                                crate::i18n::t("zc-chat-help-close"),
+                            ),
                         ]);
                     }
                     SessionOverlay::None => {}
                 }
                 if state.pending_approval().is_some() {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
                     return HelpNode::entries(vec![
-                        E::key("Enter", crate::i18n::t("zc-chat-help-approve")),
-                        E::key("a", crate::i18n::t("zc-chat-help-always-approve")),
-                        E::key("Ctrl+D", crate::i18n::t("zc-chat-help-deny")),
-                        E::key("Ctrl+C", crate::i18n::t("zc-chat-help-cancel-turn")),
+                        E::new(
+                            action_key_labels(C::ApprovalApprove),
+                            crate::i18n::t("zc-chat-help-approve"),
+                        ),
+                        E::new(
+                            action_key_labels(C::ApprovalApproveAll),
+                            crate::i18n::t("zc-chat-help-always-approve"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CancelTurn),
+                            crate::i18n::t("zc-chat-help-deny"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CancelTurn),
+                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                        ),
                     ]);
                 }
                 if state.in_browse_mode() {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    let mut return_keys = action_key_labels(C::BrowseExit);
+                    return_keys.extend(action_key_labels(C::BrowseExitSelection));
                     return HelpNode::entries(vec![
-                        E::new(vec!["↑", "k"], crate::i18n::t("zc-chat-help-move-up")),
-                        E::new(vec!["↓", "j"], crate::i18n::t("zc-chat-help-move-down")),
-                        E::key("Shift+↑/↓", crate::i18n::t("zc-chat-help-extend-selection")),
-                        E::key("y", crate::i18n::t("zc-chat-help-yank-selection")),
                         E::new(
-                            vec!["Ctrl+↓", "Esc"],
-                            crate::i18n::t("zc-chat-help-return-to-input"),
+                            action_key_labels(C::BrowseUp)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseUpVim)),
+                            crate::i18n::t("zc-chat-help-move-up"),
                         ),
+                        E::new(
+                            action_key_labels(C::BrowseDown)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseDownVim)),
+                            crate::i18n::t("zc-chat-help-move-down"),
+                        ),
+                        E::new(
+                            action_key_labels(C::BrowseSelectExtend)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseSelectExtendDown)),
+                            crate::i18n::t("zc-chat-help-extend-selection"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CopySelection),
+                            crate::i18n::t("zc-chat-help-yank-selection"),
+                        ),
+                        E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
                     ]);
                 }
                 if state.turn_in_flight {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    let mut cancel_keys = action_key_labels(C::CancelTurn);
+                    cancel_keys.extend(action_key_labels(C::BrowseExitSelection));
                     let mut entries = vec![
+                        E::new(cancel_keys, crate::i18n::t("zc-chat-help-cancel-turn")),
                         E::new(
-                            vec!["Ctrl+C", "Esc"],
-                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                            action_key_labels(crate::keymap::InputBarAction::Submit),
+                            crate::i18n::t("zc-queue-help-enqueue"),
                         ),
-                        E::key("Enter", crate::i18n::t("zc-queue-help-enqueue")),
-                        E::key("Ctrl+Enter", crate::i18n::t("zc-queue-help-inject")),
+                        E::new(
+                            action_key_labels(crate::keymap::InputBarAction::Inject),
+                            crate::i18n::t("zc-queue-help-inject"),
+                        ),
                     ];
                     // Queue-management keys are only live while the sidebar is
                     // open — surface them here too so a mid-turn open queue is
@@ -2051,7 +2116,9 @@ impl crate::widgets::HelpContext for Chat {
                     if state.queue_sidebar_open() {
                         entries.extend(queue_sidebar_help_entries());
                     }
-                    return HelpNode::entries(entries);
+                    // The input box stays editable mid-turn for queuing, so its
+                    // bindings belong in help too.
+                    return HelpNode::entries(entries).with_child(state.input_bar.help_context());
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
@@ -3070,13 +3137,15 @@ fn code_block_bar(
 ) -> Line<'static> {
     let label = label.unwrap_or("");
     let copy_lbl = " [Copy] ";
-    let consumed = 2 + label.chars().count() + copy_lbl.chars().count();
-    let middle = (width as usize).saturating_sub(consumed);
-    let left = middle / 2;
-    let right = middle.saturating_sub(left);
+    let label_len = label.chars().count();
+    let copy_len = copy_lbl.chars().count();
+    let inner = (width as usize).saturating_sub(2);
+    let left_total = inner.saturating_sub(copy_len) / 2;
+    let right = inner.saturating_sub(copy_len).saturating_sub(left_total);
+    let left_dashes = left_total.saturating_sub(label_len);
     Line::from(vec![
         Span::styled(
-            format!("{corner_l}{label}{}", "\u{2500}".repeat(left)),
+            format!("{corner_l}{label}{}", "\u{2500}".repeat(left_dashes)),
             theme::dim_style(),
         ),
         Span::styled(
@@ -5787,6 +5856,12 @@ mod tests {
             header.chars().count(),
             footer.chars().count(),
             "header and footer must match width"
+        );
+        let copy_col = |l: &str| l.chars().take_while(|c| *c != '[').count();
+        assert_eq!(
+            copy_col(header),
+            copy_col(footer),
+            "[Copy] must start at the same column on header and footer\nheader: {header:?}\nfooter: {footer:?}"
         );
     }
 

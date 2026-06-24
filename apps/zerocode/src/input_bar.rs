@@ -1677,13 +1677,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(vec![
-            E::key("Enter", crate::i18n::t("zc-input-help-send")),
-            E::key("Shift+Enter", crate::i18n::t("zc-input-help-newline")),
-            E::key("Ctrl+A", crate::i18n::t("zc-input-help-file-browser")),
-            E::key("Ctrl+V", crate::i18n::t("zc-input-help-paste")),
-            E::key("/attach", crate::i18n::t("zc-input-help-attach-cmd")),
-        ])
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
     }
 }
 
