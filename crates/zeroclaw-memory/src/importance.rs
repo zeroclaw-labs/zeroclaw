@@ -104,4 +104,32 @@ mod tests {
         let score = weighted_final_score(0.5, 0.5, 0.5);
         assert!((score - 0.5).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn daily_and_custom_category_base_scores() {
+        // Daily and Custom were uncovered; a no-keyword content isolates the base.
+        assert!((compute_importance("note", &MemoryCategory::Daily) - 0.3).abs() < f64::EPSILON);
+        assert!(
+            (compute_importance("note", &MemoryCategory::Custom("x".to_string())) - 0.4).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn weighted_final_score_weights_each_signal_independently() {
+        // Symmetric inputs (as above) can't catch a weight swap; isolate each term.
+        assert!((weighted_final_score(1.0, 0.0, 0.0) - 0.7).abs() < f64::EPSILON);
+        assert!((weighted_final_score(0.0, 1.0, 0.0) - 0.2).abs() < f64::EPSILON);
+        assert!((weighted_final_score(0.0, 0.0, 1.0) - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn keyword_boost_is_case_insensitive_and_zero_without_signals() {
+        // Uppercase keywords still boost (the content is lowercased first).
+        let upper = compute_importance("CRITICAL DECISION", &MemoryCategory::Conversation);
+        assert!((upper - 0.4).abs() < f64::EPSILON); // base 0.2 + 2 keywords * 0.1
+        // No high-signal keywords -> pure base score.
+        let plain = compute_importance("just a casual note", &MemoryCategory::Daily);
+        assert!((plain - 0.3).abs() < f64::EPSILON);
+    }
 }
