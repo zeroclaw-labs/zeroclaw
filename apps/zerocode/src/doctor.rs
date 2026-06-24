@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -264,39 +264,38 @@ impl Doctor {
     }
 
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char('r') => {
+        use crate::keymap::DoctorTabAction;
+        match DoctorTabAction::from_chord(&key) {
+            Some(DoctorTabAction::Refresh) => {
                 self.start_refresh();
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            Some(DoctorTabAction::FilterNext) => {
                 self.cycle_filter_next();
             }
-            KeyCode::Char('-') => {
+            Some(DoctorTabAction::FilterPrev) => {
                 self.filter = self.filter.previous();
                 self.sync_selection();
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::PageDown => {
+            Some(DoctorTabAction::Down) => self.move_selection(1),
+            Some(DoctorTabAction::Up) => self.move_selection(-1),
+            Some(DoctorTabAction::PageDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(10);
             }
-            KeyCode::PageUp => {
+            Some(DoctorTabAction::PageUp) => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(10);
             }
-            KeyCode::Home | KeyCode::Char('g') => {
-                if !self.visible_indices().is_empty() {
-                    self.list_state.select(Some(0));
-                    self.detail_scroll = 0;
-                }
+            Some(DoctorTabAction::JumpStart) if !self.visible_indices().is_empty() => {
+                self.list_state.select(Some(0));
+                self.detail_scroll = 0;
             }
-            KeyCode::End | KeyCode::Char('G') => {
+            Some(DoctorTabAction::JumpEnd) => {
                 let len = self.visible_indices().len();
                 if len > 0 {
                     self.list_state.select(Some(len - 1));
                     self.detail_scroll = 0;
                 }
             }
-            _ => {}
+            Some(DoctorTabAction::JumpStart) | None => {}
         }
         false
     }

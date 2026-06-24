@@ -891,15 +891,18 @@ impl ZerocodePane {
 
     // ── Key handling ─────────────────────────────────────────────
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+    /// Returns `true` when the key was consumed. Left/Back at the section
+    /// level is intentionally *not* consumed so the outer config pane can
+    /// cross back to the left (zeroclaw) pane instead of dead-ending here.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.status = None;
         if self.capture.is_some() {
             self.handle_capture_key(key);
-            return;
+            return true;
         }
         if self.conn_edit.is_some() {
             self.handle_conn_edit_key(key);
-            return;
+            return true;
         }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
@@ -916,17 +919,28 @@ impl ZerocodePane {
             // Right enters the detail pane; at the detail level it is a no-op
             // (deepest level — cross-tab nav stays on the global PaneNav chord).
             Some(ConfigTabAction::TabRight) => self.enter_detail(),
-            // Left walks back to the section list; at the section level it is a
-            // no-op ("home").
-            Some(ConfigTabAction::TabLeft) => self.leave_detail(),
+            // Left walks back to the section list; at the section level it does
+            // not consume so the outer pane crosses to the left (zeroclaw) pane.
+            Some(ConfigTabAction::TabLeft) => {
+                if self.cursor == PaneCursor::Sections {
+                    return false;
+                }
+                self.leave_detail();
+            }
             // Enter: from Sections steps into the detail; from Detail activates
             // the highlighted row.
             Some(ConfigTabAction::Enter) => match self.cursor {
                 PaneCursor::Sections => self.enter_detail(),
                 PaneCursor::Detail => self.activate(),
             },
-            // Back walks one level toward home: Detail -> Sections, then stays.
-            Some(ConfigTabAction::Back) => self.leave_detail(),
+            // Back walks one level toward home: Detail -> Sections; at Sections
+            // it does not consume so the outer pane can cross left.
+            Some(ConfigTabAction::Back) => {
+                if self.cursor == PaneCursor::Sections {
+                    return false;
+                }
+                self.leave_detail();
+            }
             Some(ConfigTabAction::DeleteRow)
                 if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
             {
@@ -937,6 +951,7 @@ impl ZerocodePane {
             }
             _ => {}
         }
+        true
     }
 
     /// Begin assigning a theme to the highlighted agent: point the reusable
@@ -1252,13 +1267,17 @@ impl ZerocodePane {
     }
 
     fn handle_capture_key(&mut self, key: KeyEvent) {
-        // Esc with no modifiers cancels the capture itself.
-        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        // Cancel resolves through its own single-binding event so the
+        // capture widget never tests a raw keycode. The widget still
+        // records any other chord verbatim below.
+        if crate::keymap::CaptureAction::from_chord(&key)
+            == Some(crate::keymap::CaptureAction::Cancel)
+        {
             self.capture = None;
             return;
         }
         let chord = Chord {
-            code: key.code,
+            code: key.code, // keyguard: capture widget records the pressed chord verbatim
             modifiers: key.modifiers,
         };
         if let Some(reason) = reserved_reason(&chord) {
@@ -1555,8 +1574,8 @@ fn theme_swatch_roles(name: &str) -> Option<[ratatui::style::Color; SWATCH_ROLE_
 /// per `(tag, variant)`, chords grouped.
 fn collect_binding_rows() -> Vec<BindingRow> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, FileExplorerAction, GlobalAction,
-        InputBarAction, LogsTabAction, QuickstartTabAction,
+        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
 
     let mut rows = Vec::new();
@@ -1565,6 +1584,7 @@ fn collect_binding_rows() -> Vec<BindingRow> {
     rows_from::<LogsTabAction>(&mut rows);
     rows_from::<DashboardTabAction>(&mut rows);
     rows_from::<ConfigTabAction>(&mut rows);
+    rows_from::<DoctorTabAction>(&mut rows);
     rows_from::<QuickstartTabAction>(&mut rows);
     rows_from::<InputBarAction>(&mut rows);
     rows_from::<FileExplorerAction>(&mut rows);
@@ -1587,8 +1607,8 @@ fn rows_from<A: crate::keymap::RebindableActions>(out: &mut Vec<BindingRow>) {
 /// by walking the enums for a matching action key.
 fn default_chords_for(action_key: &str) -> Vec<Chord> {
     use crate::keymap::{
-        ChatTabAction, ConfigTabAction, DashboardTabAction, FileExplorerAction, GlobalAction,
-        InputBarAction, LogsTabAction, QuickstartTabAction,
+        ChatTabAction, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+        GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction,
     };
     let mut found = None;
     defaults_in::<GlobalAction>(action_key, &mut found);
@@ -1596,6 +1616,7 @@ fn default_chords_for(action_key: &str) -> Vec<Chord> {
     defaults_in::<LogsTabAction>(action_key, &mut found);
     defaults_in::<DashboardTabAction>(action_key, &mut found);
     defaults_in::<ConfigTabAction>(action_key, &mut found);
+    defaults_in::<DoctorTabAction>(action_key, &mut found);
     defaults_in::<QuickstartTabAction>(action_key, &mut found);
     defaults_in::<InputBarAction>(action_key, &mut found);
     defaults_in::<FileExplorerAction>(action_key, &mut found);
@@ -1764,15 +1785,19 @@ mod tests {
         let mut pane = ZerocodePane::new(dir.path());
         assert_eq!(pane.cursor, PaneCursor::Sections);
         let start = pane.focus;
-        pane.handle_key(key(KeyCode::Right));
+        assert!(pane.handle_key(key(KeyCode::Right)));
         assert_eq!(pane.cursor, PaneCursor::Detail);
         assert_eq!(pane.focus, start);
-        pane.handle_key(key(KeyCode::Left));
+        assert!(pane.handle_key(key(KeyCode::Left)));
         assert_eq!(pane.cursor, PaneCursor::Sections);
-        // Left at the section list is a no-op (home), no cross-tab jump.
-        pane.handle_key(key(KeyCode::Left));
+        // Left at the section list does not consume: the cursor stays home
+        // and the unconsumed key lets the outer pane cross left.
+        assert!(!pane.handle_key(key(KeyCode::Left)));
         assert_eq!(pane.cursor, PaneCursor::Sections);
         assert_eq!(pane.focus, start);
+        // Back (Esc/q) behaves identically at the section level.
+        assert!(!pane.handle_key(key(KeyCode::Esc)));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
     }
 
     #[test]

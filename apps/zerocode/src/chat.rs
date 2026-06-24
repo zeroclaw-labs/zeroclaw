@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -768,9 +768,9 @@ impl Chat {
                 return false;
             }
             ChatPhase::Error(_) => {
-                use crate::keymap::GlobalAction;
+                use crate::keymap::{ChatTabAction, GlobalAction};
                 return GlobalAction::from_chord(&key) == Some(GlobalAction::Quit)
-                    || crate::keymap::Chord::char('q').matches(&key);
+                    || ChatTabAction::from_chord(&key) == Some(ChatTabAction::ErrorDismiss);
             }
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
@@ -783,12 +783,11 @@ impl Chat {
         // ── Model / model_provider picker overlay key handling ───
         // Takes priority over all other Active-phase keys while open.
         if state.model_picker.is_open() {
-            use crate::keymap::{Chord, ModalAction};
-            use crossterm::event::KeyCode;
+            use crate::keymap::ModalAction;
 
-            let up = Chord::key(KeyCode::Up).matches(&key);
-            let down = Chord::key(KeyCode::Down).matches(&key);
-            let modal = ModalAction::from_chord(&key);
+            let action = ModalAction::from_chord(&key);
+            let up = action == Some(ModalAction::Up);
+            let down = action == Some(ModalAction::Down);
 
             // Movement first.
             if up || down {
@@ -807,7 +806,7 @@ impl Chat {
                 return false;
             }
 
-            match modal {
+            match action {
                 Some(ModalAction::Cancel) => {
                     state.model_picker = ModelPickerOverlay::None;
                     state.mark_dirty_full();
@@ -832,7 +831,7 @@ impl Chat {
                 sessions,
                 list_state,
             } => {
-                use crate::keymap::{Chord, ModalAction};
+                use crate::keymap::ModalAction;
                 match ModalAction::from_chord(&key) {
                     Some(ModalAction::Cancel) => {
                         state.session_overlay = SessionOverlay::None;
@@ -873,17 +872,17 @@ impl Chat {
                             }
                         }
                     }
-                    _ => {
-                        if Chord::key(crossterm::event::KeyCode::Up).matches(&key) {
-                            let i = list_state.selected().unwrap_or(0);
-                            list_state.select(Some(i.saturating_sub(1)));
-                        } else if Chord::key(crossterm::event::KeyCode::Down).matches(&key) {
-                            let i = list_state.selected().unwrap_or(0);
-                            if i + 1 < sessions.len() {
-                                list_state.select(Some(i + 1));
-                            }
+                    Some(ModalAction::Up) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    Some(ModalAction::Down) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < sessions.len() {
+                            list_state.select(Some(i + 1));
                         }
                     }
+                    _ => {}
                 }
                 return false;
             }
@@ -999,10 +998,6 @@ impl Chat {
                 }
                 return false;
             }
-        }
-
-        if state.in_browse_mode() && key.code == KeyCode::Enter {
-            state.exit_browse_mode();
         }
 
         // Enter (slash commands + submit), text input, cursor, backspace.

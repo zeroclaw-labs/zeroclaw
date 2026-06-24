@@ -575,19 +575,26 @@ impl App {
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-            self.cycle_section(1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
-        }
-        if key.code == KeyCode::BackTab {
-            self.cycle_section(-1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
+        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+            use crate::keymap::ConfigTabAction;
+            if action == ConfigTabAction::SectionNext {
+                self.cycle_section(1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
+            if action == ConfigTabAction::SectionPrev {
+                self.cycle_section(-1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
         }
 
         if self.section == ConfigSection::Zerocode {
-            self.zerocode.handle_key(key);
+            if !self.zerocode.handle_key(key) {
+                // Left/Back at the zerocode section level was not consumed:
+                // cross back to the outer left (zeroclaw) pane.
+                self.cycle_section(-1);
+            }
             self.sync_zerocode_locales().await;
             return Ok(false);
         }
@@ -2919,28 +2926,21 @@ impl App {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
-        use crate::keymap::Chord;
+        use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
-            return match key.code {
-                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.activate_filter();
-                    FilterAction::Consumed
-                }
-                _ => FilterAction::Passthrough,
-            };
+            if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
+                self.activate_filter();
+                return FilterAction::Consumed;
+            }
+            return FilterAction::Passthrough;
         }
-        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
-            Some(FilterEditAction::Cancel)
-        } else if Chord::key(KeyCode::Enter).matches(&key) {
-            Some(FilterEditAction::Accept)
-        } else if Chord::key(KeyCode::Backspace).matches(&key) {
-            Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) {
-            Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) {
-            Some(FilterEditAction::CursorDown)
-        } else {
-            None
+        let editor_chord = match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Cancel) => Some(FilterEditAction::Cancel),
+            Some(SearchBoxAction::Accept) => Some(FilterEditAction::Accept),
+            Some(SearchBoxAction::Backspace) => Some(FilterEditAction::Backspace),
+            Some(SearchBoxAction::Up) => Some(FilterEditAction::CursorUp),
+            Some(SearchBoxAction::Down) => Some(FilterEditAction::CursorDown),
+            None => None,
         };
         match editor_chord {
             Some(FilterEditAction::Cancel) => {

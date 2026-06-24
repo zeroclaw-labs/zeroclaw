@@ -198,7 +198,7 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
 }
 
 fn synth_enter() -> KeyEvent {
-    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE) // keyguard: bridges a mouse click to the canonical submit key for replay
 }
 
 fn queue_apply_handoff(

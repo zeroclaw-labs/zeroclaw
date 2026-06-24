@@ -1001,21 +1001,20 @@ impl InputBarState {
                 self.move_cursor_down();
                 return InputBarAction::Consumed;
             }
+            Some(IbWidgetAction::OpenFileBrowser) => {
+                let start = UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) {
+                            PathBuf::from("C:\\")
+                        } else {
+                            PathBuf::from("/")
+                        }
+                    });
+                self.file_explorer = Some(FileExplorerState::new(start));
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::CursorStart) => {
-                let was_ctrl_a = crate::keymap::Chord::ctrl('a').matches(&key);
-                if was_ctrl_a {
-                    let start = UserDirs::new()
-                        .map(|u| u.home_dir().to_path_buf())
-                        .unwrap_or_else(|| {
-                            if cfg!(windows) {
-                                PathBuf::from("C:\\")
-                            } else {
-                                PathBuf::from("/")
-                            }
-                        });
-                    self.file_explorer = Some(FileExplorerState::new(start));
-                    return InputBarAction::Consumed;
-                }
                 let width = self.last_inner_width;
                 if width > 0 {
                     let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
