@@ -873,6 +873,17 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+    /// Whether stored assistant reasoning should be replayed on outbound
+    /// assistant history messages for OpenAI-compatible providers.
+    /// `Some(false)` strips `reasoning_content`/`reasoning` from outbound
+    /// history — use this when targeting a strict endpoint (e.g. Groq,
+    /// Mistral) that rejects reasoning fields on input. `None` (default)
+    /// preserves the provider's built-in behaviour. Generalises the
+    /// `groq`-factory shortcut to any compatible `custom` endpoint pointed
+    /// at a strict backend. See #8219.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────

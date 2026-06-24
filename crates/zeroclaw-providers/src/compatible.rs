@@ -1990,6 +1990,12 @@ impl OpenAiCompatibleModelProvider {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
+        // Tracks the normalized ids of the most recent assistant message's
+        // `tool_calls` in iteration order, used as a fallback when a
+        // subsequent role=tool message loses its `tool_call_id` field
+        // (regression observed on Groq `gpt-oss-120b` second-turn history
+        // reconstruction). See #8219.
+        let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
 
         messages
             .iter()
@@ -2000,6 +2006,7 @@ impl OpenAiCompatibleModelProvider {
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
                 {
+                    let mut normalized_ids = Vec::with_capacity(parsed_calls.len());
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| ToolCall {
@@ -2010,6 +2017,7 @@ impl OpenAiCompatibleModelProvider {
                                     &mut used_tool_call_ids,
                                 );
                                 tool_call_id_map.insert(tc.id, normalized_id.clone());
+                                normalized_ids.push(normalized_id.clone());
                                 normalized_id
                             }),
                             kind: Some("function".to_string()),
@@ -2025,6 +2033,8 @@ impl OpenAiCompatibleModelProvider {
                             extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
+
+                    last_assistant_tool_call_ids = normalized_ids;
 
                     let content = value
                         .get("content")
@@ -2088,7 +2098,7 @@ impl OpenAiCompatibleModelProvider {
                 if message.role == "tool"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                 {
-                    let tool_call_id = value
+                    let mut tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
                         .map(|raw_id| {
@@ -2102,6 +2112,18 @@ impl OpenAiCompatibleModelProvider {
                                 normalized_id
                             })
                         });
+                    // When history reconstruction drops the `tool_call_id`
+                    // field on role=tool messages, strict backends (e.g.
+                    // Groq `gpt-oss-120b`) reject a `null` id with HTTP
+                    // 400.  Fall back to the first id from the most recent
+                    // assistant `tool_calls` so the message always carries
+                    // a non-null id.  See #8219.
+                    if tool_call_id.is_none()
+                        && let Some(fallback_id) =
+                            last_assistant_tool_call_ids.first().cloned()
+                    {
+                        tool_call_id = Some(fallback_id);
+                    }
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)

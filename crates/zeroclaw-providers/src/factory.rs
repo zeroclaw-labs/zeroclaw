@@ -217,6 +217,13 @@ pub fn apply_compat_options(
             );
         }
     }
+    // Generalises the Groq-specific shortcut so any OpenAI-compatible
+    // `custom` endpoint pointed at a strict backend (Groq, Mistral, ...)
+    // can opt out of reasoning replay without a dedicated family factory.
+    // See #8219.
+    if opts.replay_assistant_reasoning == Some(false) {
+        p = p.without_assistant_reasoning_replay();
+    }
     Box::new(p)
 }
 
