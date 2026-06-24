@@ -2150,11 +2150,13 @@ mod tests {
                 channel_type: "telegram".into(),
                 alias: "tg".into(),
                 token: Some("tok-a".into()),
+                port: None,
             }),
             SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "discord".into(),
                 alias: "dc".into(),
                 token: Some("tok-b".into()),
+                port: None,
             }),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
@@ -2179,6 +2181,7 @@ mod tests {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            port: None,
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),
