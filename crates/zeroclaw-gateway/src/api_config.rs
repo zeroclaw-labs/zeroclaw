@@ -637,7 +637,17 @@ pub async fn handle_prop_put(
     }
 
     let mut new_config = state.config.read().clone();
-    new_config.ensure_map_key_for_path(&body.path);
+    if new_config.ensure_map_key_for_path(&body.path) {
+        // Refused to vivify the reserved `default` agent: surface the same
+        // reserved error the explicit create surfaces do, not a generic 404.
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                "alias `default` is reserved and cannot be created",
+            )
+            .with_path(&body.path),
+        );
+    }
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&body.path)),
@@ -1241,14 +1251,28 @@ pub async fn handle_map_key(
     let path = q.path.clone();
     let key = q.key.clone();
 
-    let created = match working.create_map_key(&path, &key) {
-        Ok(b) => b,
-        Err(msg) => {
-            return error_response(
-                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
-            );
-        }
-    };
+    // Create through the shared guarded boundary so the reserved-agent rule (the
+    // `default` runtime fallback) is enforced once for every surface. Reserved ->
+    // 400 (validation_failed), symmetric with the rename guard; an unknown
+    // section or invalid key stays 404 (path_not_found) as before.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &path, &key) {
+            Ok(b) => b,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
+                return error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::ValidationFailed,
+                        format!("alias `{a}` is reserved and cannot be created"),
+                    )
+                    .with_path(format!("{path}.{key}")),
+                );
+            }
+            Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
+                );
+            }
+        };
 
     if created {
         // skill-bundles: materialize the bundle's resolved directory so
@@ -1902,8 +1926,17 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") {
-            working.ensure_map_key_for_path(&path);
+        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
+            // Refused to vivify the reserved `default` agent: surface the same
+            // reserved error the explicit create surfaces do, not a generic 404.
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    "alias `default` is reserved and cannot be created",
+                )
+                .with_path(&path)
+                .with_op_index(idx),
+            );
         }
         let info = lookup_prop_field(&working, &path);
         let is_sensitive = info

@@ -729,6 +729,7 @@ cli-alias-delete-refused-hint = 删除被拒绝——请先解决硬引用问题
 cli-alias-not-configured = {$path} 未配置
 cli-alias-delete-failed = 删除失败：{$error}
 cli-alias-delete-reserved-default = `default` agent 为保留项，无法删除
+cli-alias-create-reserved-default = `default` agent 为保留项，无法创建
 cli-alias-renamed = 已重命名 {$section}.{$from} → {$section}.{$to}（重写了 {$count} 个引用路径）
 cli-alias-rename-invalid = 新别名无效：{$message}
 cli-alias-rename-reserved = 别名 `{$alias}` 为保留项，无法重命名

@@ -733,6 +733,7 @@ cli-alias-delete-refused-hint = suppression refusée — résolvez d'abord les r
 cli-alias-not-configured = {$path} n'est pas configuré
 cli-alias-delete-failed = échec de la suppression : {$error}
 cli-alias-delete-reserved-default = l'agent `default` est réservé et ne peut pas être supprimé
+cli-alias-create-reserved-default = l'agent `default` est réservé et ne peut pas être créé
 cli-alias-renamed = {$section}.{$from} → {$section}.{$to} renommé ({$count} chemin(s) de référence réécrit(s))
 cli-alias-rename-invalid = nouvel alias invalide : {$message}
 cli-alias-rename-reserved = l'alias `{$alias}` est réservé et ne peut pas être renommé

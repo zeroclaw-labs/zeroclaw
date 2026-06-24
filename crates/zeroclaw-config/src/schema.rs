@@ -18435,7 +18435,17 @@ impl Config {
         self.dirty_paths.insert(path.to_string());
     }
 
-    pub fn ensure_map_key_for_path(&mut self, path: &str) {
+    /// Auto-create the parent map key for a dotted set-prop `path` when it does
+    /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
+    /// the entry first.
+    ///
+    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
+    /// set-prop surface should then surface a reserved-name error rather than the
+    /// generic "not configured" that the still-missing entry would otherwise
+    /// produce. Returns `false` in every other case (created, already existed, or
+    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
+    /// that do not distinguish the reserved case may ignore it.
+    pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -18451,19 +18461,44 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return;
+            return false;
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return;
+            return false;
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return;
+            return false;
+        }
+        // Never auto-vivify the reserved `default` agent from a set-prop path: a
+        // prop write under a nonexistent `agents.default` must not materialize the
+        // reserved runtime fallback (the operator would get an agent the rename
+        // guard then traps). This is the set-prop analogue of the create guard in
+        // `create_map_key_checked`. The migration that legitimately synthesizes
+        // `agents.default` calls `create_map_key` directly, not this path, and an
+        // already-present `default` is left untouched by the existence check above.
+        if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
+            // Make the refusal observable: callers that check the return surface a
+            // reserved-name error, and this WARN with a stable `error_key` lets an
+            // operator see why a set-prop on a fresh `agents.default` was dropped.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.reserved_agent_vivify_refused",
+                        "alias": alias,
+                        "path": path,
+                    })),
+                "refused to auto-create the reserved `default` agent from a set-prop path"
+            );
+            return true;
         }
         let _ = self.create_map_key(section, alias);
+        false
     }
 
     pub fn clear_dirty(&mut self) {
