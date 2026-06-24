@@ -738,6 +738,13 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
+    /// Drive a full JSON-RPC request line through the dispatcher from an
+    /// external integration test, including notification emission on the
+    /// outbound channel. Mirrors the transport `process_line` path.
+    pub async fn process_line_for_test(&mut self, line: &str) {
+        self.process_line(line).await;
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
@@ -3201,6 +3208,11 @@ impl RpcDispatcher {
                         .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
+                    cost_category: zeroclaw_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
                     label,
                     key,
                 }
@@ -3603,6 +3615,16 @@ fn notification_for_turn_event(
             tool_name: tool_name.clone(),
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
+        },
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => SessionUpdateEvent::HistoryTrimmed {
+            session_id: session_id.to_string(),
+            dropped_messages: *dropped_messages,
+            kept_turns: *kept_turns,
+            reason: reason.clone(),
         },
         TurnEvent::Usage {
             input_tokens,
@@ -4180,6 +4202,23 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_notification() {
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "history_trimmed");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["kept_turns"], 1);
+        assert_eq!(v["params"]["reason"], "context token budget exceeded");
+    }
+
+    #[test]
     fn usage_event_emits_context_usage_notification() {
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
@@ -4582,6 +4621,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::AssistantToolCalls {
                         text: None,
@@ -4596,6 +4636,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),

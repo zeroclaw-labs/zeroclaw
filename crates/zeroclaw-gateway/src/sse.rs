@@ -291,6 +291,27 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
+            zeroclaw_runtime::observability::ObserverEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let mut json = serde_json::json!({
+                    "type": "history_trimmed",
+                    "source": "observability",
+                    "dropped_messages": dropped_messages,
+                    "kept_turns": kept_turns,
+                    "reason": reason,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -369,6 +390,31 @@ mod tests {
         let value = rx.try_recv().expect("event should be broadcast");
         assert_eq!(value["type"], "tool_call_start");
         assert_eq!(value["tool"], "mcp_filesystem__read_file");
+    }
+
+    #[test]
+    fn history_trimmed_event_is_broadcast_with_cut_accounting() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("trimtest".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let value = rx.try_recv().expect("history_trimmed must broadcast");
+        assert_eq!(value["type"], "history_trimmed");
+        assert_eq!(value["source"], "observability");
+        assert_eq!(value["dropped_messages"], 12);
+        assert_eq!(value["kept_turns"], 1);
+        assert_eq!(value["reason"], "context token budget exceeded");
+        assert_eq!(value["channel"], "wss");
+        assert_eq!(value["agent_alias"], "trimtest");
+        assert_eq!(value["turn_id"], "turn-1");
+        assert!(is_public_sse_event(&value));
     }
 
     #[test]
