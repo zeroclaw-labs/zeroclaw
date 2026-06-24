@@ -2119,8 +2119,7 @@ impl OpenAiCompatibleModelProvider {
                     // assistant `tool_calls` so the message always carries
                     // a non-null id.  See #8219.
                     if tool_call_id.is_none()
-                        && let Some(fallback_id) =
-                            last_assistant_tool_call_ids.first().cloned()
+                        && let Some(fallback_id) = last_assistant_tool_call_ids.first().cloned()
                     {
                         tool_call_id = Some(fallback_id);
                     }
