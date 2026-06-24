@@ -2421,7 +2421,14 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
-            config.ensure_map_key_for_path(&req.prop);
+            if config.ensure_map_key_for_path(&req.prop) {
+                // Refused to vivify the reserved `default` agent: return a
+                // reserved error rather than a downstream "Unknown property".
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "alias `default` is reserved and cannot be created",
+                ));
+            }
             let info = config
                 .prop_fields()
                 .into_iter()
@@ -2701,9 +2708,15 @@ impl RpcDispatcher {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let created = {
             let mut config = self.ctx.config.write();
-            let created = config
-                .create_map_key(&req.path, &req.key)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            // Shared guarded boundary: enforces the reserved-agent rule (the
+            // `default` runtime fallback) on this surface too, so the RPC create
+            // path cannot author an `agents.default` the rename guard then traps.
+            let created = zeroclaw_config::alias_refs::create_map_key_checked(
+                &mut config,
+                &req.path,
+                &req.key,
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }

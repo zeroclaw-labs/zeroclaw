@@ -828,6 +828,7 @@ cli-alias-delete-refused-hint = delete refused — resolve the hard references f
 cli-alias-not-configured = {$path} is not configured
 cli-alias-delete-failed = delete failed: {$error}
 cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-create-reserved-default = the `default` agent is reserved and cannot be created
 cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
 cli-alias-rename-invalid = invalid new alias: {$message}
 cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
