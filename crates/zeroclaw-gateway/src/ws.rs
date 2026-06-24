@@ -71,6 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_runtime::sop::approval::{
+    ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
+};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -598,6 +601,60 @@ async fn handle_socket(
 
                 // ── approval_response (operator answered a tool prompt) ──
                 if msg_type == "approval_response" {
+                    // EPIC C: a SOP-kind frame resolves a SOP gate via the shared
+                    // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
+                    // pending_approvals map (keyed by request_id). The principal is
+                    // transport-derived (ws + session id), never from the frame.
+                    if parsed["kind"].as_str() == Some("sop") {
+                        let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+                        let decision = match parsed["decision"].as_str().unwrap_or("") {
+                            "approve" => Some(SopApprovalDecision::Approve),
+                            "deny" => Some(SopApprovalDecision::Deny { reason: None }),
+                            _ => None,
+                        };
+                        if run_id.is_empty() || decision.is_none() {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": "sop approval_response requires run_id and decision in {approve,deny}",
+                                "code": "INVALID_APPROVAL_RESPONSE"
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            continue;
+                        }
+                        let frame = if let Some(engine) = state.sop_engine.as_ref() {
+                            let principal = SopApprovalPrincipal::ws(session_id.clone(), None);
+                            match engine.lock() {
+                                Ok(mut g) => {
+                                    match g.resolve_gate(&run_id, decision.expect("checked"), principal)
+                                    {
+                                        Ok(outcome) => serde_json::json!({
+                                            "type": "sop_approval_result",
+                                            "run_id": run_id,
+                                            "outcome": outcome.label(),
+                                        }),
+                                        Err(e) => serde_json::json!({
+                                            "type": "error",
+                                            "message": format!("sop resolve failed: {e}"),
+                                            "code": "SOP_RESOLVE_FAILED"
+                                        }),
+                                    }
+                                }
+                                Err(_) => serde_json::json!({
+                                    "type": "error",
+                                    "message": "SOP engine lock poisoned",
+                                    "code": "SOP_LOCK_POISONED"
+                                }),
+                            }
+                        } else {
+                            serde_json::json!({
+                                "type": "error",
+                                "message": "SOP subsystem not enabled",
+                                "code": "SOP_DISABLED"
+                            })
+                        };
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        continue;
+                    }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
                     let decision_str = parsed["decision"].as_str().unwrap_or("");
                     let decision = match decision_str {
