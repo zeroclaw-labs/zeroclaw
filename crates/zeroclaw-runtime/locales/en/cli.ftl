@@ -850,3 +850,11 @@ cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
 cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Web dashboard restart hints — RestartInfo.hint shown after an in-app upgrade (PR #8173) ──
+# The first four are shell command templates shown verbatim; they are not translated.
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process

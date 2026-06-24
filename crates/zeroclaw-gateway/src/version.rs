@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use zeroclaw_runtime::i18n::get_required_cli_string;
 
 /// How long a successful version check is reused before re-querying GitHub.
 const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -95,27 +96,27 @@ fn detect_restart_uncached() -> RestartInfo {
     // Container first — default to manual since we can't see a restart policy.
     if is_container() {
         let hint = if env_present("KUBERNETES_SERVICE_HOST") {
-            "kubectl rollout restart deployment/zeroclaw"
+            get_required_cli_string("cli-gateway-restart-hint-kubernetes")
         } else {
-            "docker compose restart"
+            get_required_cli_string("cli-gateway-restart-hint-container")
         };
         return RestartInfo {
             mode: RestartMode::Manual,
-            hint: hint.to_string(),
+            hint,
         };
     }
     // systemd: a clean exit is relaunched when the unit sets Restart=on-success.
     if env_present("INVOCATION_ID") || env_present("JOURNAL_STREAM") {
         return RestartInfo {
             mode: RestartMode::Supervised,
-            hint: "systemctl restart zeroclaw".to_string(),
+            hint: get_required_cli_string("cli-gateway-restart-hint-systemd"),
         };
     }
     // launchd (macOS): KeepAlive relaunches on exit.
     if cfg!(target_os = "macos") && env_present("XPC_SERVICE_NAME") {
         return RestartInfo {
             mode: RestartMode::Supervised,
-            hint: "launchctl kickstart -k <your-zeroclaw-label>".to_string(),
+            hint: get_required_cli_string("cli-gateway-restart-hint-launchd"),
         };
     }
     // Bare process. On unix/windows we can relaunch ourselves (detached respawn
@@ -123,12 +124,12 @@ fn detect_restart_uncached() -> RestartInfo {
     if cfg!(unix) || cfg!(windows) {
         RestartInfo {
             mode: RestartMode::SelfRespawn,
-            hint: "restart the `zeroclaw daemon` process".to_string(),
+            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
         }
     } else {
         RestartInfo {
             mode: RestartMode::Manual,
-            hint: "restart the `zeroclaw daemon` process".to_string(),
+            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
         }
     }
 }
@@ -636,6 +637,27 @@ mod tests {
     fn detect_restart_returns_a_nonempty_hint() {
         let info = detect_restart();
         assert!(!info.hint.is_empty());
+    }
+
+    #[test]
+    fn restart_hint_keys_resolve_via_fluent() {
+        // Every restart hint shown to operators must come from the localization
+        // pipeline, not a bare literal. A missing key resolves to the `{key}`
+        // sentinel, so assert each one is backed by a real Fluent entry — this
+        // guards against a typo drifting between `version.rs` and `cli.ftl`.
+        for key in [
+            "cli-gateway-restart-hint-kubernetes",
+            "cli-gateway-restart-hint-container",
+            "cli-gateway-restart-hint-systemd",
+            "cli-gateway-restart-hint-launchd",
+            "cli-gateway-restart-hint-process",
+        ] {
+            let resolved = get_required_cli_string(key);
+            assert!(
+                !resolved.is_empty() && !resolved.starts_with('{'),
+                "missing Fluent string for {key}: {resolved}"
+            );
+        }
     }
 
     #[test]

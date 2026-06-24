@@ -773,3 +773,11 @@ cli-secret-long-about =
     zeroclaw secret update OPENAI_API_KEY
     zeroclaw secret delete OPENAI_API_KEY
     zeroclaw secret encrypt "chiffrer ce message"
+
+# ── Indications de redémarrage du tableau de bord web — RestartInfo.hint (PR #8173) ──
+# Les quatre premières sont des modèles de commande shell affichés tels quels ; non traduits.
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`

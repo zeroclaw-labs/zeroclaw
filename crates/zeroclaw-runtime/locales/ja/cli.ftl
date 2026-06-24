@@ -751,3 +751,11 @@ cli-bundle-deleted = skill_bundles.{$alias} を削除しました（{$count} 件
 cli-bundle-warn-move = 警告: バンドルディレクトリの移動に失敗しました: {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} にリネームしました
 cli-onboard-about = ワークスペースと設定を初期化
+
+# ── Web ダッシュボードの再起動ヒント — アプリ内アップグレード後に表示される RestartInfo.hint (PR #8173) ──
+# 最初の 4 つはそのまま表示されるシェルコマンドのテンプレートのため翻訳しません。
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動してください
