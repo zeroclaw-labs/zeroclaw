@@ -4,6 +4,7 @@
 //! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
 //! plumbing the daemon uses for bidirectional calls.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -330,6 +331,71 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+/// The TUI and daemon are built from the same package version and do not
+/// promise cross-version wire compatibility.
+#[derive(Debug)]
+pub struct DaemonVersionMismatch {
+    client_version: &'static str,
+    server_version: String,
+}
+
+impl DaemonVersionMismatch {
+    fn new(server_version: impl Into<String>) -> Self {
+        Self {
+            client_version: env!("CARGO_PKG_VERSION"),
+            server_version: server_version.into(),
+        }
+    }
+
+    pub fn client_version(&self) -> &'static str {
+        self.client_version
+    }
+
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+}
+
+impl fmt::Display for DaemonVersionMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Version mismatch: zerocode is {} but the daemon is {}. \
+             Rebuild and restart the daemon from the same checkout as zerocode.",
+            self.client_version, self.server_version
+        )
+    }
+}
+
+impl std::error::Error for DaemonVersionMismatch {}
+
+#[derive(Debug)]
+struct InitializeResponse {
+    server_version: String,
+    tui_id: Option<String>,
+    tui_sig: Option<String>,
+}
+
+fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+    let server_version = resp
+        .get("server_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(DaemonVersionMismatch::new(server_version).into());
+    }
+
+    Ok(InitializeResponse {
+        server_version,
+        tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
+        tui_sig: resp
+            .get("tui_sig")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
+}
+
 // ── Client ───────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -441,22 +507,24 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -466,11 +534,11 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Local,
         })
     }
@@ -590,22 +658,24 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -615,11 +685,11 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Wss,
         })
     }
@@ -1292,6 +1362,52 @@ pub struct ConfigListResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigSetResult {}
+
+#[cfg(test)]
+mod initialize_version_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_response_accepts_matching_server_version() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "tui_id": "tui_1",
+            "tui_sig": "sig_1"
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
+        assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_mismatched_server_version() {
+        let err = parse_initialize_response(&json!({
+            "server_version": "0.0.0-test"
+        }))
+        .unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("mismatched daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "0.0.0-test");
+        assert!(err.to_string().contains("Version mismatch"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_missing_server_version_as_unknown() {
+        let err = parse_initialize_response(&json!({})).unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("missing daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "unknown");
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

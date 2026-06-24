@@ -69,11 +69,13 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
 /// Returns the number of channels seeded. Parameters match the return order of
 /// `all_tools_with_runtime`:
 ///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   channel_room_handle = `Option<PerToolChannelHandle>`
 ///   reaction_handle = `PerToolChannelHandle` (NOT Option)
 ///   poll_handle = `Option<PerToolChannelHandle>`
 ///   escalate_handle = `Option<PerToolChannelHandle>`
 pub(crate) fn seed_channel_handles(
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &tools::PerToolChannelHandle,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
@@ -88,6 +90,7 @@ pub(crate) fn seed_channel_handles(
 
     let handles = [
         ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
         Some(reaction_handle),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
@@ -136,10 +139,9 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -992,142 +994,6 @@ fn api_key_and_uri_for_provider(
     )
 }
 
-/// Resolve the agent's effective context-compression summary provider to a
-/// freshly-built `(provider, model)` pair (the cross-provider fix for #7964).
-///
-/// Mirrors the channel orchestrator's `resolve_classifier_route` fail-open
-/// contract exactly: `effective_summary_provider` is `None`, OR the ref is
-/// unparseable, OR the alias is missing from `[providers.models]`, OR it has no
-/// `.model`, OR the provider build fails ⇒ WARN once and return `None`. The
-/// caller then falls back to the agent's own provider + model (with the
-/// deprecated `summary_model` swap still honored for un-migrated configs), so
-/// compression never becomes a turn-killing hard error.
-fn resolve_summary_provider(
-    config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-) -> Option<(Box<dyn ModelProvider>, String)> {
-    let provider_ref = config.effective_summary_provider(agent_alias)?;
-    let provider_str = provider_ref.as_str().trim();
-    if provider_str.is_empty() {
-        return None;
-    }
-
-    let (type_key, alias_key) = match provider_str.split_once('.') {
-        Some(parts) => parts,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "summary_provider must be dotted `<type>.<alias>`; falling back to agent provider"
-            );
-            return None;
-        }
-    };
-
-    let model_cfg = match config.providers.models.find(type_key, alias_key) {
-        Some(cfg) => cfg,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to agent provider"
-            );
-            return None;
-        }
-    };
-
-    let model = model_cfg.model.clone().unwrap_or_default();
-    if model.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"provider": provider_str})),
-            "summary_provider points to a [providers.models] entry without a `model` field; falling back to agent provider"
-        );
-        return None;
-    }
-
-    let options = zeroclaw_providers::options_for_provider_ref(
-        config,
-        provider_str,
-        &zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias),
-    );
-    match zeroclaw_providers::create_resilient_model_provider_from_ref(
-        config,
-        provider_str,
-        model_cfg.api_key.as_deref(),
-        model_cfg.uri.as_deref(),
-        &config.reliability,
-        &options,
-    ) {
-        Ok(provider) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(
-                        ::serde_json::json!({"provider": provider_str, "model": model.as_str()})
-                    ),
-                "summary_provider override active"
-            );
-            Some((provider, model))
-        }
-        Err(e) => {
-            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
-                "Failed to initialize summary_provider; falling back to agent provider"
-            );
-            None
-        }
-    }
-}
-
-/// Runtime deprecation nudge for the legacy `context_compression.summary_model`
-/// fallback path (#7964). When no `summary_provider` is resolved and the
-/// deprecated bare `summary_model` is dispatched on the agent's OWN provider,
-/// WARN once per agent per process that this can silently mismatch for a
-/// runtime profile shared across providers, and recommend migrating to
-/// `summary_provider`. The config-time `cross_provider_summary_model`
-/// diagnostic carries the precise cross-provider detection; this is the
-/// belt-and-suspenders signal on the hot path, deduped so it does not spam
-/// every turn. Mirrors the warn-once pattern in `agent::cost`.
-///
-/// `pub` so the channel orchestrator's proactive-compression fallback (the third
-/// dispatch site, in `zeroclaw-channels`) shares this same process-global
-/// warn-once set, keeping the signal one-per-agent across every fallback path.
-pub fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
-    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-    let first = {
-        let mut seen = SEEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.insert(agent_alias.to_string())
-    };
-    if !first {
-        return;
-    }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(
-                ::serde_json::json!({"agent": agent_alias, "summary_model": summary_model})
-            ),
-        "Deprecated context_compression.summary_model is being dispatched on this agent's own \
-         provider. A bare summary_model shared by a runtime profile across providers can \
-         silently summarize on the wrong provider (#7964). Migrate to summary_provider. \
-         This warning fires once per agent per process."
-    );
-}
-
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1289,6 +1155,7 @@ pub async fn run(
         let delegate_handle = all_tools_result.delegate_handle;
         let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
         let ask_user_handle = all_tools_result.ask_user_handle;
+        let channel_room_handle = all_tools_result.channel_room_handle;
         let reaction_handle = all_tools_result.reaction_handle;
         let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
@@ -1296,6 +1163,7 @@ pub async fn run(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle,
+            &channel_room_handle,
             &reaction_handle,
             &poll_handle,
             &escalate_handle,
@@ -1716,6 +1584,10 @@ pub async fn run(
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
         tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels. Use with Matrix channel keys such as matrix.default.",
+        ));
+        tool_descs.push((
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
@@ -1810,21 +1682,8 @@ pub async fn run(
         });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
-        let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
-            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-                .map(|tracker| {
-                    let pricing: crate::agent::cost::ModelProviderPricing = config
-                        .providers
-                        .models
-                        .iter_entries()
-                        .map(|(type_k, alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
-                        .filter(|(_, p)| !p.is_empty())
-                        .collect();
-                    ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
-                        .with_agent_alias(agent_alias)
-                });
+        let cost_tracking_context =
+            crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();
@@ -1908,6 +1767,7 @@ pub async fn run(
                 &skills,
                 &runtime_capability_names,
                 &config.data_dir,
+                &config.skills.extra_registries,
                 config.skills.install_suggestions.enabled,
             ) {
                 final_output = suggestion;
@@ -1976,13 +1836,12 @@ pub async fn run(
                 ChatMessage::user(&enriched),
             ];
 
-            // Prune history for token efficiency (when enabled).
-            if agent.resolved.history_pruning.enabled {
-                let _stats = crate::agent::history_pruner::prune_history(
-                    &mut history,
-                    &agent.resolved.history_pruning,
-                );
-            }
+            // Compute per-turn excluded MCP tools from tool_filter_groups.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &agent.resolved.tool_filter_groups,
+                &effective_msg,
+            );
 
             #[allow(unused_assignments)]
             let mut response = String::new();
@@ -2044,7 +1903,9 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent.resolved.max_context_tokens,
+                                        context_token_budget: agent
+                                            .resolved
+                                            .effective_context_budget(),
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -2374,6 +2235,7 @@ pub async fn run(
                     &skills,
                     &runtime_capability_names,
                     &config.data_dir,
+                    &config.skills.extra_registries,
                     config.skills.install_suggestions.enabled,
                 ) {
                     final_output = suggestion;
@@ -2559,7 +2421,9 @@ pub async fn run(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
-                                            context_token_budget: agent.resolved.max_context_tokens,
+                                            context_token_budget: agent
+                                                .resolved
+                                                .effective_context_budget(),
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2644,7 +2508,8 @@ pub async fn run(
 
                                 continue;
                             }
-                            // Context overflow recovery: compress and retry
+                            // Context overflow recovery: drop oldest whole
+                            // turns and retry. No summarization, no splicing.
                             if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -2655,66 +2520,28 @@ pub async fn run(
                                     .with_category(::zeroclaw_log::EventCategory::Agent),
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
-                                let mut compressor =
-                                    crate::agent::context_compressor::ContextCompressor::new(
-                                        agent.resolved.context_compression.clone(),
-                                        eff_max_context_tokens,
-                                    )
-                                    .with_memory(mem.clone());
-                                let error_msg = format!("{e}");
-                                // Resolve the agent's effective summary provider
-                                // (#7964). On any failure we fall back to the
-                                // agent's own provider + model (with the
-                                // deprecated `summary_model` swap), and only the
-                                // agent-provider path may preserve media markers.
-                                let resolved_summary =
-                                    resolve_summary_provider(&config, agent_alias);
-                                let summary_target = match resolved_summary {
-                                    Some((ref provider, ref model)) => {
-                                        crate::agent::context_compressor::SummaryTarget {
-                                            provider: provider.as_ref(),
-                                            model: model.as_str(),
-                                            preserve_media_markers: false,
-                                        }
-                                    }
-                                    None => {
-                                        if let Some(legacy) = agent
-                                            .resolved
-                                            .context_compression
-                                            .summary_model
-                                            .as_deref()
-                                            .filter(|m| !m.trim().is_empty())
-                                        {
-                                            warn_deprecated_summary_model_fallback(
-                                                agent_alias,
-                                                legacy,
-                                            );
-                                        }
-                                        crate::agent::context_compressor::SummaryTarget {
-                                            provider: model_provider.as_ref(),
-                                            model: agent
-                                                .resolved
-                                                .context_compression
-                                                .summary_model
-                                                .as_deref()
-                                                .unwrap_or(&model_name),
-                                            preserve_media_markers: model_provider
-                                                .supports_vision(),
-                                        }
-                                    }
-                                };
-                                match compressor
-                                    .compress_on_error(
-                                        &mut history,
-                                        model_provider.as_ref(),
-                                        &model_name,
-                                        temperature,
-                                        &error_msg,
-                                        summary_target,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {
+                                let taken = std::mem::take(&mut history);
+                                let result = crate::agent::history_trim::trim_to_recent_turns(
+                                    taken,
+                                    eff_max_context_tokens,
+                                );
+                                if result.trimmed {
+                                    let mut trimmed = result.history;
+                                    let system_count =
+                                        trimmed.iter().take_while(|m| m.role == "system").count();
+                                    trimmed.insert(
+                                        system_count,
+                                        crate::agent::history_trim::breadcrumb(),
+                                    );
+                                    history = trimmed;
+                                    {
+                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                            target: "zeroclaw_log_internal_scope",
+                                            "zeroclaw_scope",
+                                            model = %model_name,
+                                            model_provider = %provider_name,
+                                        );
+                                        let _zc_trim_guard = __zc_trim_span.entered();
                                         ::zeroclaw_log::record!(
                                             INFO,
                                             ::zeroclaw_log::Event::new(
@@ -2722,26 +2549,36 @@ pub async fn run(
                                                 ::zeroclaw_log::Action::Retry
                                             )
                                             .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                                            "Context recovered via compression, retrying turn"
-                                        );
-                                        continue;
-                                    }
-                                    Ok(false) => {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "Compression ran but couldn't reduce enough"
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                            .with_attrs(::serde_json::json!({
+                                                "dropped_messages": result.dropped_messages,
+                                                "dropped_turns": result.dropped_turns,
+                                                "kept_turns": result.kept_turns,
+                                            })),
+                                            "Context recovered via whole-turn trim, retrying turn"
                                         );
                                     }
-                                    Err(compress_err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
-                                    }
+                                    continue;
+                                }
+                                history = result.history;
+                                {
+                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                        target: "zeroclaw_log_internal_scope",
+                                        "zeroclaw_scope",
+                                        model = %model_name,
+                                        model_provider = %provider_name,
+                                    );
+                                    let _zc_trim_guard = __zc_trim_span.entered();
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                        "Context overflow but only one turn remains; cannot trim further"
+                                    );
                                 }
                             }
 
@@ -2768,78 +2605,6 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
-
-                // Context compression before hard trimming to preserve long-context signal.
-                {
-                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                        agent.resolved.context_compression.clone(),
-                        eff_max_context_tokens,
-                    )
-                    .with_memory(mem.clone());
-                    // Resolve the agent's effective summary provider (#7964);
-                    // fall back to the agent's own provider + model on any
-                    // failure, preserving media markers only on that path.
-                    let resolved_summary = resolve_summary_provider(&config, agent_alias);
-                    let summary_target = match resolved_summary {
-                        Some((ref provider, ref model)) => {
-                            crate::agent::context_compressor::SummaryTarget {
-                                provider: provider.as_ref(),
-                                model: model.as_str(),
-                                preserve_media_markers: false,
-                            }
-                        }
-                        None => {
-                            if let Some(legacy) = agent
-                                .resolved
-                                .context_compression
-                                .summary_model
-                                .as_deref()
-                                .filter(|m| !m.trim().is_empty())
-                            {
-                                warn_deprecated_summary_model_fallback(agent_alias, legacy);
-                            }
-                            crate::agent::context_compressor::SummaryTarget {
-                                provider: model_provider.as_ref(),
-                                model: agent
-                                    .resolved
-                                    .context_compression
-                                    .summary_model
-                                    .as_deref()
-                                    .unwrap_or(&model_name),
-                                preserve_media_markers: model_provider.supports_vision(),
-                            }
-                        }
-                    };
-                    match compressor
-                        .compress_if_needed(
-                            &mut history,
-                            model_provider.as_ref(),
-                            &model_name,
-                            temperature,
-                            summary_target,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.compressed => {
-                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Success).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
-                        }
-                        Ok(_) => {} // No compression needed
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Context compression failed, falling back to history trim"
-                            );
-                            trim_history(&mut history, eff_max_history_messages / 2);
-                        }
-                    }
-                }
 
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
@@ -3018,6 +2783,7 @@ pub async fn process_message(
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
         let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
         let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
+        let channel_room_handle_pm = all_tools_result_pm.channel_room_handle;
         let reaction_handle_pm = all_tools_result_pm.reaction_handle;
         let poll_handle_pm = all_tools_result_pm.poll_handle;
         let escalate_handle_pm = all_tools_result_pm.escalate_handle;
@@ -3025,6 +2791,7 @@ pub async fn process_message(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle_pm,
+            &channel_room_handle_pm,
             &reaction_handle_pm,
             &poll_handle_pm,
             &escalate_handle_pm,
@@ -3296,6 +3063,10 @@ pub async fn process_message(
         if config.composio.enabled {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
+        tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels.",
+        ));
         if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
             tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
             tool_descs.push((
@@ -3450,6 +3221,7 @@ pub async fn process_message(
             &skills,
             &runtime_capability_names,
             &config.data_dir,
+            &config.skills.extra_registries,
             config.skills.install_suggestions.enabled,
         ) {
             return Ok(suggestion);
@@ -3537,14 +3309,20 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, build_context, emergency_history_trim,
-        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
+        load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
@@ -3560,6 +3338,71 @@ mod tests {
         CancelsTurnTool,
         VerboseTool,
     );
+
+    struct SeedMockChannel;
+
+    impl ::zeroclaw_api::attribution::Attributable for SeedMockChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SeedMockChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── seed_channel_handles tests ───────────────────────────────
+
+    #[test]
+    fn seed_channel_handles_populates_channel_room_handle() {
+        let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
+        super::register_channel_map_fn(Box::new(move || {
+            let mut map = HashMap::new();
+            map.insert("matrix.default".to_string(), Arc::clone(&channel));
+            map
+        }));
+
+        let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
+        let channel_room_handle = Arc::new(RwLock::new(HashMap::new()));
+        let reaction = Arc::new(RwLock::new(HashMap::new()));
+        let poll_handle = Arc::new(RwLock::new(HashMap::new()));
+        let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
+
+        let count = seed_channel_handles(
+            &Some(Arc::clone(&ask_user_handle)),
+            &Some(Arc::clone(&channel_room_handle)),
+            &reaction,
+            &Some(Arc::clone(&poll_handle)),
+            &Some(Arc::clone(&escalate_handle)),
+        );
+
+        assert_eq!(count, 1);
+        assert!(ask_user_handle.read().contains_key("matrix.default"));
+        assert!(channel_room_handle.read().contains_key("matrix.default"));
+        assert!(reaction.read().contains_key("matrix.default"));
+        assert!(poll_handle.read().contains_key("matrix.default"));
+        assert!(escalate_handle.read().contains_key("matrix.default"));
+    }
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
 
@@ -3711,102 +3554,6 @@ mod tests {
         use crate::agent::history::truncate_tool_message;
         let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
         assert_eq!(truncate_tool_message(msg, 2000), msg);
-    }
-
-    // ── fast_trim_tool_results tests ────────────────────────────
-
-    #[test]
-    fn fast_trim_protects_recent_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("a".repeat(5000)),
-            ChatMessage::tool("b".repeat(5000)),
-            ChatMessage::user("recent user msg"),
-            ChatMessage::tool("c".repeat(5000)), // recent, should be protected
-        ];
-        // protect_last_n = 2 → last 2 messages protected
-        let saved = fast_trim_tool_results(&mut history, 2);
-        assert!(saved > 0);
-        // First two tool messages should be trimmed
-        assert!(history[1].content.len() <= 2100);
-        assert!(history[2].content.len() <= 2100);
-        // Last tool message (protected) should be unchanged
-        assert_eq!(history[4].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_skips_non_tool_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("a".repeat(5000)),
-            ChatMessage::assistant("b".repeat(5000)),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content.len(), 5000);
-        assert_eq!(history[2].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_small_tool_results_unchanged() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("short result"),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content, "short result");
-    }
-
-    // ── emergency_history_trim tests ──────────────────────────────
-
-    #[test]
-    fn emergency_trim_preserves_system() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("msg1"),
-            ChatMessage::assistant("resp1"),
-            ChatMessage::user("msg2"),
-            ChatMessage::assistant("resp2"),
-            ChatMessage::user("msg3"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // System message should always be preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "sys");
-        // Last 2 messages should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "msg3");
-    }
-
-    #[test]
-    fn emergency_trim_preserves_recent() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old1"),
-            ChatMessage::user("old2"),
-            ChatMessage::user("recent1"),
-            ChatMessage::user("recent2"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // Last 2 should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "recent2");
-        assert_eq!(history[len - 2].content, "recent1");
-    }
-
-    #[test]
-    fn emergency_trim_nothing_to_drop() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("only user msg"),
-        ];
-        // protect_last = 1, system is protected → only 1 droppable
-        // target_drop = 2/3 = 0 → nothing dropped
-        let dropped = emergency_history_trim(&mut history, 1);
-        assert_eq!(dropped, 0);
     }
 
     // ── estimate_history_tokens tests ─────────────────────────────
@@ -4018,8 +3765,8 @@ mod tests {
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -4881,6 +4628,55 @@ mod tests {
                 output: format!("counted:{value}"),
                 error: None,
             })
+        }
+    }
+
+    struct ApprovingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl ApprovingChannel {
+        fn new(approval_requests: Arc<AtomicUsize>) -> Self {
+            Self { approval_requests }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ApprovingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "approving-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approving-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
         }
     }
 
@@ -6919,6 +6715,286 @@ mod tests {
             .expect("tool results message should be present");
         assert!(tool_results.content.contains("hello"));
         assert!(!tool_results.content.contains("Denied by user."));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell"),
+        ];
+        let observer = NoopObserver;
+        let knobs = LoopKnobs {
+            dedup_enabled: false,
+            ..LoopKnobs::default()
+        };
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect_err("identical prompt-required shell call should abort before another prompt");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not execute a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_skips_same_round_prompt_required_shell_duplicate_without_reprompting()
+     {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell in one response"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("same-round prompt-required duplicate should use duplicate result path");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not execute a second time"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(tool_results.content.contains("counted:"));
+        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_prompt_guard_ignores_same_round_dedup_exempt_tools() {
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat dedup-exempt shell"),
+        ];
+        let observer = NoopObserver;
+        let dedup_exempt = vec!["shell".to_string()];
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &dedup_exempt,
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect_err("dedup-exempt prompt-required repeats should still abort before reprompting");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not execute a second time"
+        );
     }
 
     #[tokio::test]
@@ -12785,7 +12861,120 @@ Let me check the result."#;
         assert_eq!(result, "ok");
     }
 
-    // ── Skill review fork cost-accounting tests ──
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn trim_record_carries_model_attribution() {
+        use super::{ToolLoop, run_tool_call_loop};
+        use crate::observability::noop::NoopObserver;
+        use ::zeroclaw_log::Instrument;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+
+        let big = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("turn3 short"),
+        ];
+
+        let _ = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "anthropic.personal",
+                    model: "claude-opus-4-8",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &[],
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 1,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 50,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .instrument(zeroclaw_log::attribution_span!(
+            &crate::agent::AgentAttribution("trimtest")
+        ))
+        .await
+        .expect("loop should succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut trim_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.starts_with("History trimmed:"))
+                    {
+                        trim_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = trim_event.expect("trim record must be emitted when history exceeds budget");
+        assert_eq!(
+            value["zeroclaw"]["model"], "claude-opus-4-8",
+            "trim record must carry model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider"], "anthropic.personal",
+            "trim record must carry model_provider attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "trimtest",
+            "trim record must inherit agent_alias from the agent attribution span, got: {value}"
+        );
+    }
     //
     // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
     // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`

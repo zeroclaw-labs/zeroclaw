@@ -21,6 +21,7 @@ zc-app-quit-prompt = zerocodeを終了しますか？
 zc-app-quit-explainer = TUIが閉じます。デーモンは稼働し続け、いつでも再接続できます。
 zc-app-reload-status-signalled = デーモンの再読み込みを通知しました — 再接続中…
 zc-app-reload-confirm-row = { $confirm_chord } = 再読み込み   { $cancel_chord } = キャンセル
+zc-error-daemon-version-mismatch = バージョンが一致しません: zerocode は { $client_version } ですが、デーモンは { $server_version } です。同じチェックアウトからデーモンを再ビルドして再起動してください。
 zc-zerocode-tab-theme = テーマ
 zc-zerocode-tab-agent-theme = エージェントテーマ
 zc-zerocode-tab-presets = プリセット
@@ -216,7 +217,7 @@ zc-dashboard-detail-schedule = スケジュール
 zc-dashboard-detail-next-run = 次回の実行
 zc-dashboard-detail-last-run = 前回の実行
 zc-dashboard-detail-last-status = 前回のステータス
-zc-dashboard-detail-live-sessions = ライブセッション
+zc-dashboard-detail-sessions = セッション
 zc-dashboard-detail-persisted-sessions = 永続セッション
 zc-dashboard-cost-not-available = コスト追跡は利用できません。使用状況データを表示するには、コストバックエンドを構成してください。
 zc-dashboard-message-history = メッセージ履歴 ({ $count })

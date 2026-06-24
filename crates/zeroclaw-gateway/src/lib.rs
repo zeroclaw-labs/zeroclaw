@@ -868,6 +868,7 @@ pub async fn run_gateway(
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
+                &all_tools_result.channel_room_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
