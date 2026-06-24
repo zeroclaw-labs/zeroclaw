@@ -356,20 +356,13 @@ export function getHealth(): Promise<HealthSnapshot> {
   ).then((data) => unwrapField(data, "health"));
 }
 
-// ── Version check (version.rs) ───────────────────────────────────────
+// ── Version check / self-upgrade (version.rs) ────────────────────────
+// Types are derived from the generated OpenAPI client (`components`) so the
+// dashboard contract stays in lock-step with `openapi::build_spec()`. Editing
+// a request/response shape in Rust and running `cargo web check` will fail the
+// typecheck here on drift, instead of silently disagreeing at runtime.
 
-export interface VersionCheckResponse {
-  current_version: string;
-  /** Latest release version, or null when the check could not complete. */
-  latest_version: string | null;
-  is_newer: boolean;
-  release_url?: string | null;
-  /** Release notes body (Markdown). */
-  release_notes?: string | null;
-  published_at?: string | null;
-  /** Set when the check failed; the dashboard degrades gracefully. */
-  error?: string;
-}
+export type VersionCheckResponse = components["schemas"]["VersionCheckResponse"];
 
 /**
  * GET /api/version/check — is a newer release available?
@@ -390,25 +383,12 @@ export function checkVersion(opts?: {
   );
 }
 
-export type UpgradeState =
-  | "idle"
-  | "running"
-  | "done"
-  | "restarting"
-  | "failed";
-
-export interface UpgradeStatusResponse {
-  handoff_id?: string;
-  state: UpgradeState;
-  /** 0 before the first `Phase N/6` marker, else 1..6. */
-  phase?: number;
-  log_tail?: string[];
-  previous_version?: string;
-  target_version?: string | null;
-  restart_mode?: "supervised" | "manual";
-  restart_hint?: string;
-  error?: string;
-}
+export type UpgradeState = components["schemas"]["UpgradeStatusState"];
+export type UpgradeStatusResponse =
+  components["schemas"]["UpgradeStatusResponse"];
+export type UpgradeRequest = components["schemas"]["UpgradeRequest"];
+export type UpgradeAcceptedResponse =
+  components["schemas"]["UpgradeAcceptedResponse"];
 
 /**
  * POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
@@ -417,11 +397,10 @@ export interface UpgradeStatusResponse {
  * `gateway.allow_self_upgrade`. `auto_restart` is only honoured under a
  * supervisor (systemd/launchd).
  */
-export function startUpgrade(opts?: {
-  version?: string;
-  auto_restart?: boolean;
-}): Promise<{ handoff_id: string }> {
-  return apiFetch<{ handoff_id: string }>("/api/version/upgrade", {
+export function startUpgrade(
+  opts?: UpgradeRequest,
+): Promise<UpgradeAcceptedResponse> {
+  return apiFetch<UpgradeAcceptedResponse>("/api/version/upgrade", {
     method: "POST",
     body: JSON.stringify(opts ?? {}),
   });

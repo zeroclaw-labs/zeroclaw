@@ -184,7 +184,7 @@ export function UpgradeDialog({
     setError(null);
     try {
       const res = await startUpgrade({
-        version: info?.latest_version ?? undefined,
+        version: info?.latest_version ?? null,
         auto_restart: autoRestart && canAutoRestart,
       });
       setHandoffId(res.handoff_id);

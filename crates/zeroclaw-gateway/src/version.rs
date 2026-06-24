@@ -19,7 +19,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -161,15 +161,42 @@ pub struct CheckQuery {
 /// Cache for the latest-version check. Specific-version queries are not cached.
 static CHECK_CACHE: Mutex<Option<(Instant, CliCheck)>> = Mutex::new(None);
 
-fn check_to_json(info: &CliCheck) -> serde_json::Value {
-    serde_json::json!({
-        "current_version": info.current_version,
-        "latest_version": info.latest_version,
-        "is_newer": info.is_newer,
-        "release_url": info.release_url,
-        "release_notes": info.release_notes,
-        "published_at": info.published_at,
-    })
+/// Response body for `GET /api/version/check`. On success every field except
+/// `error` is populated; on a soft failure the handler returns
+/// `{ current_version, latest_version: null, is_newer: false, error }` so the
+/// dashboard version badge degrades gracefully. This is the single source of
+/// truth the generated web client derives from — see [`crate::openapi`].
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VersionCheckResponse {
+    pub current_version: String,
+    /// Latest release version, or `null` when the check could not complete.
+    pub latest_version: Option<String>,
+    pub is_newer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
+    /// Release notes body (Markdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// Set only when the check failed; absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&CliCheck> for VersionCheckResponse {
+    fn from(info: &CliCheck) -> Self {
+        Self {
+            current_version: info.current_version.clone(),
+            latest_version: Some(info.latest_version.clone()),
+            is_newer: info.is_newer,
+            release_url: info.release_url.clone(),
+            release_notes: info.release_notes.clone(),
+            published_at: info.published_at.clone(),
+            error: None,
+        }
+    }
 }
 
 async fn run_cli_check(version: Option<&str>) -> anyhow::Result<CliCheck> {
@@ -213,7 +240,7 @@ pub async fn handle_version_check(
     if use_cache {
         if let Some((ts, cached)) = CHECK_CACHE.lock().unwrap().as_ref() {
             if ts.elapsed() < CHECK_CACHE_TTL {
-                return Json(check_to_json(cached)).into_response();
+                return Json(VersionCheckResponse::from(cached)).into_response();
             }
         }
     }
@@ -223,14 +250,17 @@ pub async fn handle_version_check(
             if use_cache {
                 *CHECK_CACHE.lock().unwrap() = Some((Instant::now(), info.clone()));
             }
-            Json(check_to_json(&info)).into_response()
+            Json(VersionCheckResponse::from(&info)).into_response()
         }
-        Err(e) => Json(serde_json::json!({
-            "current_version": env!("CARGO_PKG_VERSION"),
-            "latest_version": serde_json::Value::Null,
-            "is_newer": false,
-            "error": e.to_string(),
-        }))
+        Err(e) => Json(VersionCheckResponse {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: None,
+            is_newer: false,
+            release_url: None,
+            release_notes: None,
+            published_at: None,
+            error: Some(e.to_string()),
+        })
         .into_response(),
     }
 }
@@ -248,17 +278,33 @@ enum UpgradeState {
 }
 
 impl UpgradeState {
-    fn as_str(self) -> &'static str {
-        match self {
-            UpgradeState::Running => "running",
-            UpgradeState::Done => "done",
-            UpgradeState::Restarting => "restarting",
-            UpgradeState::Failed => "failed",
-        }
-    }
-
     fn is_terminal(self) -> bool {
         matches!(self, UpgradeState::Done | UpgradeState::Failed)
+    }
+}
+
+/// Wire-format lifecycle state for `GET /api/version/upgrade/status`. Mirrors
+/// [`UpgradeState`] plus `Idle` (no upgrade started this process), and is the
+/// serializable enum the OpenAPI schema and generated web client derive from.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeStatusState {
+    Idle,
+    Running,
+    Done,
+    Restarting,
+    Failed,
+}
+
+impl From<UpgradeState> for UpgradeStatusState {
+    fn from(s: UpgradeState) -> Self {
+        match s {
+            UpgradeState::Running => Self::Running,
+            UpgradeState::Done => Self::Done,
+            UpgradeState::Restarting => Self::Restarting,
+            UpgradeState::Failed => Self::Failed,
+        }
     }
 }
 
@@ -288,6 +334,7 @@ const UPGRADE_TIMEOUT: Duration = Duration::from_secs(900);
 static UPGRADE: Mutex<Option<Arc<Mutex<UpgradeProgress>>>> = Mutex::new(None);
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct UpgradeRequest {
     /// Target release tag; defaults to latest.
     #[serde(default)]
@@ -298,8 +345,28 @@ pub struct UpgradeRequest {
     pub auto_restart: bool,
 }
 
+/// 202 body for `POST /api/version/upgrade`: the id to poll status with.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct UpgradeAcceptedResponse {
+    pub handoff_id: String,
+}
+
+/// Error envelope for the `/api/version/*` endpoints (`4xx`).
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VersionErrorResponse {
+    pub error: String,
+}
+
 fn json_error(code: StatusCode, msg: &str) -> axum::response::Response {
-    (code, Json(serde_json::json!({ "error": msg }))).into_response()
+    (
+        code,
+        Json(VersionErrorResponse {
+            error: msg.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
@@ -376,7 +443,7 @@ pub async fn handle_version_upgrade(
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "handoff_id": handoff_id })),
+        Json(UpgradeAcceptedResponse { handoff_id }),
     )
         .into_response()
 }
@@ -385,6 +452,33 @@ pub async fn handle_version_upgrade(
 pub struct UpgradeStatusQuery {
     #[serde(default)]
     pub handoff_id: Option<String>,
+}
+
+/// Response body for `GET /api/version/upgrade/status`. When no upgrade has run
+/// this process only `state: "idle"` is set; during/after a run the remaining
+/// fields carry the live phase, log tail, and restart metadata. Single source
+/// of truth for the generated web client — see [`crate::openapi`].
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct UpgradeStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
+    pub state: UpgradeStatusState,
+    /// 0 before the first `Phase N/6` marker, else 1..=6.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_tail: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// GET /api/version/upgrade/status[?handoff_id=X]
@@ -399,7 +493,18 @@ pub async fn handle_version_upgrade_status(
 
     let slot = UPGRADE.lock().unwrap();
     let Some(progress) = slot.as_ref() else {
-        return Json(serde_json::json!({ "state": "idle" })).into_response();
+        return Json(UpgradeStatusResponse {
+            handoff_id: None,
+            state: UpgradeStatusState::Idle,
+            phase: None,
+            log_tail: None,
+            previous_version: None,
+            target_version: None,
+            restart_mode: None,
+            restart_hint: None,
+            error: None,
+        })
+        .into_response();
     };
     let p = progress.lock().unwrap();
     if let Some(id) = q.handoff_id.as_deref() {
@@ -407,17 +512,17 @@ pub async fn handle_version_upgrade_status(
             return json_error(StatusCode::NOT_FOUND, "unknown handoff_id");
         }
     }
-    Json(serde_json::json!({
-        "handoff_id": p.handoff_id,
-        "state": p.state.as_str(),
-        "phase": p.phase,
-        "log_tail": p.log_tail,
-        "previous_version": p.previous_version,
-        "target_version": p.target_version,
-        "restart_mode": p.restart_mode,
-        "restart_hint": p.restart_hint,
-        "error": p.error,
-    }))
+    Json(UpgradeStatusResponse {
+        handoff_id: Some(p.handoff_id.clone()),
+        state: p.state.into(),
+        phase: Some(p.phase),
+        log_tail: Some(p.log_tail.iter().cloned().collect()),
+        previous_version: Some(p.previous_version.clone()),
+        target_version: p.target_version.clone(),
+        restart_mode: Some(p.restart_mode.to_string()),
+        restart_hint: Some(p.restart_hint.clone()),
+        error: p.error.clone(),
+    })
     .into_response()
 }
 
@@ -673,15 +778,35 @@ mod tests {
         let parsed: CliCheck = serde_json::from_str(json).unwrap();
         assert!(parsed.is_newer);
         assert_eq!(parsed.latest_version, "0.7.4");
-        let out = check_to_json(&parsed);
+        let resp = VersionCheckResponse::from(&parsed);
+        assert_eq!(resp.latest_version.as_deref(), Some("0.7.4"));
+        assert!(resp.is_newer);
+        let out = serde_json::to_value(&resp).unwrap();
         assert_eq!(out["latest_version"], "0.7.4");
         assert_eq!(out["is_newer"], true);
+        // `error` is skipped on the success path, never serialized as null.
+        assert!(out.get("error").is_none());
     }
 
     #[test]
     fn upgrade_state_strings_and_terminality() {
-        assert_eq!(UpgradeState::Running.as_str(), "running");
-        assert_eq!(UpgradeState::Restarting.as_str(), "restarting");
+        // The wire enum drives the OpenAPI schema / generated web client.
+        assert_eq!(
+            serde_json::to_value(UpgradeStatusState::Running).unwrap(),
+            "running"
+        );
+        assert_eq!(
+            serde_json::to_value(UpgradeStatusState::Restarting).unwrap(),
+            "restarting"
+        );
+        assert_eq!(
+            serde_json::to_value(UpgradeStatusState::Idle).unwrap(),
+            "idle"
+        );
+        assert_eq!(
+            serde_json::to_value(UpgradeStatusState::from(UpgradeState::Done)).unwrap(),
+            "done"
+        );
         assert!(UpgradeState::Done.is_terminal());
         assert!(UpgradeState::Failed.is_terminal());
         assert!(!UpgradeState::Running.is_terminal());
