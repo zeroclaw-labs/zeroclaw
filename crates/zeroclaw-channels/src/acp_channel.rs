@@ -39,6 +39,7 @@ use std::time::Duration;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::elicitation::ElicitationCapabilities;
 
 use crate::orchestrator::acp_server::RpcOutbound;
 
@@ -53,6 +54,13 @@ pub struct AcpChannel {
     /// network drop, user closes IDE) would otherwise park `execute_tool_call`
     /// forever and hold the session slot against `max_sessions`.
     approval_timeout: Duration,
+    /// Parsed from the client's `initialize.clientCapabilities.elicitation`
+    /// block. Drives the capability gate in `request_choice`: if
+    /// `client_caps.form` is true we emit `elicitation/create`; otherwise
+    /// we fall back to the legacy `session/request_permission` path.
+    /// See `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+    #[allow(dead_code)] // consumed by Task 5 (request_choice rewrite)
+    client_caps: ElicitationCapabilities,
 }
 
 impl AcpChannel {
@@ -67,12 +75,14 @@ impl AcpChannel {
         session_id: impl Into<String>,
         rpc: Arc<RpcOutbound>,
         approval_timeout: Duration,
+        client_caps: ElicitationCapabilities,
     ) -> Self {
         Self {
             name: name.into(),
             session_id: session_id.into(),
             rpc,
             approval_timeout,
+            client_caps,
         }
     }
 }
@@ -458,21 +468,39 @@ mod tests {
     #[tokio::test]
     async fn name_returns_provided_name() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         assert_eq!(ch.name(), "acp");
     }
 
     #[tokio::test]
     async fn supports_free_form_ask_is_false() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         assert!(!ch.supports_free_form_ask());
     }
 
     #[tokio::test]
     async fn send_emits_agent_message_chunk_notification() {
         let (rpc, mut rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
 
         ch.send(&SendMessage::new("hello", "")).await.unwrap();
 
@@ -493,7 +521,13 @@ mod tests {
     #[tokio::test]
     async fn add_reaction_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let res = ch.add_reaction("chan", "msg", "👍").await;
         assert!(res.is_err());
     }
@@ -501,7 +535,13 @@ mod tests {
     #[tokio::test]
     async fn remove_reaction_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let res = ch.remove_reaction("chan", "msg", "👍").await;
         assert!(res.is_err());
     }
@@ -509,7 +549,13 @@ mod tests {
     #[tokio::test]
     async fn listen_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let (tx, _) = mpsc::channel(1);
         let res = ch.listen(tx).await;
         assert!(res.is_err());
@@ -518,7 +564,13 @@ mod tests {
     #[tokio::test]
     async fn request_choice_rejects_empty_choices() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let res = ch
             .request_choice("Pick one", &[], Duration::from_secs(1))
             .await;
@@ -529,7 +581,13 @@ mod tests {
     async fn request_choice_emits_request_permission_and_resolves_selection() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
 
         let choices = vec![
             "Option A".to_string(),
@@ -567,7 +625,13 @@ mod tests {
     async fn request_choice_handles_cancel_outcome() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
 
         let choices = vec!["Yes".to_string(), "No".to_string()];
 
@@ -593,7 +657,13 @@ mod tests {
     #[tokio::test]
     async fn request_choice_times_out_when_no_response() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let choices = vec!["Yes".to_string(), "No".to_string()];
         let res = ch
             .request_choice("Confirm?", &choices, Duration::from_millis(50))
@@ -607,7 +677,13 @@ mod tests {
     async fn request_approval_emits_request_permission_and_resolves_approve() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git status --short".to_string(),
@@ -645,7 +721,13 @@ mod tests {
     async fn request_approval_maps_always_and_cancel() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git commit".to_string(),
@@ -669,7 +751,13 @@ mod tests {
 
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git push".to_string(),
@@ -694,7 +782,13 @@ mod tests {
     async fn file_edit_approval_emits_diff_content_item() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
             arguments_summary: "old_string: let x = 1;, new_string: let x = 2;".to_string(),
@@ -763,7 +857,13 @@ mod tests {
     async fn request_approval_maps_reject_with_edit_to_deny_with_edit() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
             arguments_summary: "edit foo.rs".to_string(),
@@ -805,7 +905,13 @@ mod tests {
     async fn file_edit_approval_includes_reject_with_edit_option() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
             arguments_summary: "edit foo.rs".to_string(),
@@ -841,7 +947,13 @@ mod tests {
     async fn reject_with_edit_missing_replacement_defaults_to_empty() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "file_edit".to_string(),
             arguments_summary: "edit foo.rs".to_string(),
@@ -877,7 +989,13 @@ mod tests {
     async fn file_write_approval_includes_reject_with_edit_option() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
         let request = ChannelApprovalRequest {
             tool_name: "file_write".to_string(),
             arguments_summary: "write bar.rs".to_string(),
