@@ -147,10 +147,23 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("zerocode: {e:#}");
+            eprintln!("zerocode: {}", format_startup_error(&e));
             ExitCode::FAILURE
         }
     }
+}
+
+fn format_startup_error(err: &anyhow::Error) -> String {
+    if let Some(mismatch) = err.downcast_ref::<client::DaemonVersionMismatch>() {
+        return i18n::t_args(
+            "zc-error-daemon-version-mismatch",
+            &[
+                ("client_version", mismatch.client_version()),
+                ("server_version", mismatch.server_version()),
+            ],
+        );
+    }
+    format!("{err:#}")
 }
 
 /// Install a panic hook that restores the terminal before printing the
@@ -276,6 +289,7 @@ async fn run() -> anyhow::Result<()> {
         ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
                 Ok(c) => c,
+                Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     spawn_ephemeral_daemon(&config_dir)?;
@@ -409,9 +423,15 @@ async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::
         }
         match client::RpcClient::connect(socket, None, None).await {
             Ok(c) => return Ok(c),
+            Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
             Err(_) => tokio::time::sleep(DAEMON_CONNECT_INTERVAL).await,
         }
     }
+}
+
+fn is_daemon_version_mismatch(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<client::DaemonVersionMismatch>()
+        .is_some()
 }
 
 #[cfg(test)]

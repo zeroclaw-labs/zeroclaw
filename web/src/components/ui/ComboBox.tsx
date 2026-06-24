@@ -25,6 +25,13 @@ export interface ComboBoxProps {
   emptyText?: string;
   /** Extra classes for the root wrapper. */
   className?: string;
+  /**
+   * Open the list as soon as the input is focused/clicked (not just via the
+   * caret). Makes the field behave like a click-anywhere dropdown — handy when
+   * the options ARE the expected input (e.g. an alias picker) rather than rare
+   * suggestions over mostly-free text.
+   */
+  openOnFocus?: boolean;
   "aria-label"?: string;
 }
 
@@ -36,6 +43,7 @@ export function ComboBox({
   placeholder,
   emptyText = t("combobox.no_matches"),
   className = "",
+  openOnFocus = false,
   "aria-label": ariaLabel,
 }: ComboBoxProps) {
   const [open, setOpen] = useState(false);
@@ -136,6 +144,9 @@ export function ComboBox({
             setOpen(true);
           }}
           onKeyDown={onKeyDown}
+          onFocus={openOnFocus ? () => setOpen(true) : undefined}
+          // Re-open if the user clicks an already-focused input after closing it.
+          onClick={openOnFocus ? () => setOpen(true) : undefined}
           className="input-electric w-full px-3 py-2 pr-9 text-sm"
         />
         <button
