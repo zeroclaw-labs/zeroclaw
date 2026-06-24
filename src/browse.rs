@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use zeroclaw_runtime::browse::list_directory;
-use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_browse(path: String, config: &crate::config::Config) -> Result<()> {
     let result = list_directory(config, &path)?;
@@ -15,39 +14,21 @@ pub fn handle_browse(path: String, config: &crate::config::Config) -> Result<()>
         &result.path
     };
     println!(
-        "{}",
-        get_required_cli_string_with_args(
-            "cli-browse-header",
-            &[
-                (
-                    "path",
-                    &console::style(format!("shared/{display_path}"))
-                        .white()
-                        .bold()
-                        .to_string(),
-                ),
-                ("count", &result.entries.len().to_string()),
-            ],
-        )
+        "{} ({} entries)",
+        console::style(format!("shared/{display_path}"))
+            .white()
+            .bold(),
+        result.entries.len(),
     );
     if result.entries.is_empty() {
-        println!("  {}", get_required_cli_string("cli-browse-empty"));
+        println!("  (empty)");
         return Ok(());
     }
     for entry in result.entries {
         match entry.kind {
             "dir" => println!("  {}/", console::style(&entry.name).cyan().bold()),
             _ => match entry.size {
-                Some(s) => println!(
-                    "  {}",
-                    get_required_cli_string_with_args(
-                        "cli-browse-file-bytes",
-                        &[
-                            ("name", &console::style(&entry.name).dim().to_string()),
-                            ("bytes", &s.to_string()),
-                        ],
-                    )
-                ),
+                Some(s) => println!("  {} ({} bytes)", console::style(&entry.name).dim(), s),
                 None => println!("  {}", console::style(&entry.name).dim()),
             },
         }

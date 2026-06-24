@@ -4,19 +4,14 @@ pub use zeroclaw_hardware::*;
 
 use crate::config::Config;
 use anyhow::Result;
-#[allow(unused_imports)]
-use zeroclaw_runtime::i18n::get_required_cli_string;
 
 #[allow(dead_code)]
 pub fn handle_command(cmd: crate::HardwareCommands, _config: &Config) -> Result<()> {
     #[cfg(not(feature = "hardware"))]
     {
         let _ = &cmd;
-        println!(
-            "{}",
-            get_required_cli_string("cli-hardware-feature-required")
-        );
-        println!("{}", get_required_cli_string("cli-hardware-feature-build"));
+        println!("Hardware discovery requires the 'hardware' feature.");
+        println!("Build with: cargo build --features hardware");
         Ok(())
     }
 
@@ -26,14 +21,8 @@ pub fn handle_command(cmd: crate::HardwareCommands, _config: &Config) -> Result<
     ))]
     {
         let _ = &cmd;
-        println!(
-            "{}",
-            get_required_cli_string("cli-hardware-unsupported-platform")
-        );
-        println!(
-            "{}",
-            get_required_cli_string("cli-hardware-supported-platforms")
-        );
+        println!("Hardware USB discovery is not supported on this platform.");
+        println!("Supported platforms: Linux, macOS, Windows.");
         return Ok(());
     }
 

@@ -244,7 +244,6 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
             agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
             external_peers: vec![PeerUsername::from("operator")],
             ignore: vec![],
-            ..Default::default()
         },
     );
 
@@ -340,7 +339,6 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
             agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
             external_peers: vec![],
             ignore: vec![],
-            ..Default::default()
         },
     );
 

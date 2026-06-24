@@ -62,9 +62,9 @@ export interface CronDeliveryConfig {
 }
 
 export type CronSchedule =
-  | { kind: "cron"; expr: string; tz?: string | null }
-  | { kind: "at"; at: string }
-  | { kind: "every"; every_ms: number };
+  | { kind: 'cron'; expr: string; tz?: string | null }
+  | { kind: 'at'; at: string }
+  | { kind: 'every'; every_ms: number };
 
 export interface CronJob {
   id: string;
@@ -103,11 +103,11 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: "Available" | "Active";
+  status: 'Available' | 'Active';
 }
 
 export interface DiagResult {
-  severity: "ok" | "warn" | "error";
+  severity: 'ok' | 'warn' | 'error';
   category: string;
   message: string;
 }
@@ -207,11 +207,10 @@ export interface ChannelDetail {
    * when the block is orphaned. */
   owning_agent: string | null;
   enabled: boolean;
-  status: "active" | "inactive" | "error";
+  status: 'active' | 'inactive' | 'error' | 'unknown';
   message_count: number;
   last_message_at: string | null;
-  health: "healthy" | "degraded" | "down";
-  /** Per-alias readiness breakdown (present when the gateway computes it). */
+  health: 'healthy' | 'degraded' | 'down';
   readiness?: ChannelReadiness;
 }
 
@@ -223,19 +222,19 @@ export interface SSEEvent {
 
 export interface WsMessage {
   type:
-    | "message"
-    | "chunk"
-    | "chunk_reset"
-    | "thinking"
-    | "tool_call"
-    | "tool_result"
-    | "done"
-    | "error"
-    | "session_start"
-    | "connected"
-    | "cron_result"
-    | "approval_request"
-    | "aborted";
+    | 'message'
+    | 'chunk'
+    | 'chunk_reset'
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'done'
+    | 'error'
+    | 'session_start'
+    | 'connected'
+    | 'cron_result'
+    | 'approval_request'
+    | 'aborted';
   content?: string;
   full_response?: string;
   name?: string;
@@ -256,7 +255,7 @@ export interface WsMessage {
   timeout_secs?: number;
 }
 
-export type ApprovalDecision = "approve" | "deny" | "always";
+export type ApprovalDecision = 'approve' | 'deny' | 'always';
 
 export interface PendingApproval {
   requestId: string;
@@ -280,11 +279,4 @@ export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
-}
-
-export interface TuiEntry {
-  tui_id: string;
-  connected_at: string;
-  peer_label: string;
-  transport: string;
 }

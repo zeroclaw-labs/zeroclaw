@@ -2,10 +2,10 @@ import type { CronSettings } from '@/lib/api';
 import {
   addCronJob,
   deleteCronJob,
+  getAgentOptions,
   getCronJobs,
   getCronRuns,
   getCronSettings,
-  getQuickstartState,
   patchCronJob,
   patchCronSettings,
   triggerCronJob,
@@ -292,7 +292,7 @@ export default function Cron() {
   useEffect(() => {
     fetchJobs();
     fetchSettings();
-    void getQuickstartState()
+    void getAgentOptions()
       .then((opts) => {
         setAgentOptions(opts.agents);
         // Pre-seed the agent field with the first option so the

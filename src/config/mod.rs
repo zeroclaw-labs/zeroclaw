@@ -102,6 +102,7 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            default_target: None,
         };
 
         let discord = DiscordConfig {
@@ -120,6 +121,7 @@ mod tests {
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
 
         let lark = LarkConfig {
@@ -134,6 +136,7 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            default_target: None,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,

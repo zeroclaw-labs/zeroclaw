@@ -7,8 +7,6 @@
   - [Quick start](./getting-started/quick-start.md)
   - [YOLO mode](./getting-started/yolo.md)
   - [Multi-model setup](./getting-started/multi-model-setup.md)
-  - [zerocode](./getting-started/tui.md)
-  - [Language & translations](./getting-started/language.md)
 
 - [Installation]()
   - [Linux](./setup/linux.md)
@@ -24,7 +22,6 @@
   - [Logging](./architecture/logging.md)
   - [Multi-agent runtime](./architecture/multi-agent.md)
   - [SubAgents](./architecture/subagents.md)
-  - [RPC socket transport](./architecture/rpc-socket.md)
 
 - [Reference]()
   - [CLI](./reference/cli.md)

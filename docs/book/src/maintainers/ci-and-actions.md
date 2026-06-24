@@ -8,8 +8,7 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 
-- **fmt** — `cargo fmt --all -- --check`
-- **lint** — `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
+- **lint** — `cargo fmt --check`, `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
 - **build** — matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check** — all features + no-default-features
 - **check-32bit** — `i686-unknown-linux-gnu` with no default features
@@ -17,7 +16,7 @@ Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 - **test** — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security** — `cargo deny check`
 
-`fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green.
+`CI Required Gate` is the composite job branch protection pins. A PR cannot merge until this is green.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -73,7 +72,7 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `fmt` job and the Windows build leg do not. These behaviors are worth knowing when triaging cache-related flakes:
+Every job in `ci.yml` uses `Swatinem/rust-cache@v2`. Three behaviors are worth knowing when triaging cache-related flakes:
 
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
@@ -85,7 +84,7 @@ Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `
 
 | Symptom | First thing to check |
 |---|---|
-| `CI Required Gate` red | Start with `fmt`, then `lint`, then `test`, then `build` |
+| `CI Required Gate` red | Start with `lint` (fmt/clippy is the most common cause), then `test`, then `build` |
 | Release `validate` failed | `Cargo.toml` version doesn't match the workflow input, or the tag already exists |
 | Release build leg failed | The specific target's job log. Android is `experimental` and runs with `continue-on-error` |
 | Environment gate timed out | Re-run only the timed-out job from the workflow run page |

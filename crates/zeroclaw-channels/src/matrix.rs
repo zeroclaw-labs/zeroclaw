@@ -4588,6 +4588,7 @@ mod tests {
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             }
         }
 

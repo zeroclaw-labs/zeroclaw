@@ -143,6 +143,20 @@ mod tests {
     }
 
     #[test]
+    fn including_memory_renders_memory_md() {
+        let ctx = TemplateContext {
+            include_memory: true,
+            ..TemplateContext::default()
+        };
+        let rendered = render_preset_default(&ctx);
+
+        assert!(
+            rendered.iter().any(|(n, _)| *n == "MEMORY.md"),
+            "MEMORY.md should be available for full per-agent template renders"
+        );
+    }
+
+    #[test]
     fn excluding_memory_picks_no_memory_agents_variant() {
         let on = render(
             "AGENTS.md",

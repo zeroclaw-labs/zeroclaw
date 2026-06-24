@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { getDrift, getReloadStatus, type DriftEntry } from '@/lib/api';
-import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
+import ReloadDaemonButton from '@/components/onboard/ReloadDaemonButton';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -59,8 +59,8 @@ export default function ReloadBanner() {
 
   const { pendingReload, drifted } = state;
   const driftedCount = drifted.length;
-  const isQuickstart = location.pathname.startsWith('/quickstart');
-  if (isQuickstart && pendingReload && driftedCount === 0) {
+  const isOnboarding = location.pathname.startsWith('/onboard');
+  if (isOnboarding && pendingReload && driftedCount === 0) {
     return (
       <div
         className="px-4 py-3 border-b flex items-start gap-3"
@@ -77,7 +77,7 @@ export default function ReloadBanner() {
           className="text-sm font-medium"
           style={{ color: 'var(--pc-text-primary)' }}
         >
-          Changes saved. Continue setup.
+          Changes saved. Continue onboarding.
         </p>
       </div>
     );

@@ -12,10 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
-use zeroclaw_runtime::rpc::types::{
-    SkillBundleEntry, SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
-};
+use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::skills::{
     RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillsService,
 };
@@ -23,7 +20,41 @@ use zeroclaw_runtime::skills::{
 use super::AppState;
 use super::api::require_auth;
 
-// ── HTTP-specific request shapes (not shared) ───────────────────────
+// ── Request / response shapes ───────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct BundleEntry {
+    pub alias: String,
+    pub directory: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BundlesResponse {
+    pub bundles: Vec<BundleEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillEntry {
+    pub bundle: String,
+    pub name: String,
+    pub directory: String,
+    pub frontmatter: SkillFrontmatter,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillsListResponse {
+    pub skills: Vec<SkillEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillReadResponse {
+    pub bundle: String,
+    pub name: String,
+    pub frontmatter: SkillFrontmatter,
+    pub body: String,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SkillCreateBody {
@@ -66,10 +97,10 @@ pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderM
     let service = SkillsService::new(&config, install_root);
 
     match service.list_bundles() {
-        Ok(bundles) => Json(SkillsBundlesResult {
+        Ok(bundles) => Json(BundlesResponse {
             bundles: bundles
                 .into_iter()
-                .map(|b| SkillBundleEntry {
+                .map(|b| BundleEntry {
                     alias: b.alias,
                     directory: b.directory.display().to_string(),
                     include: b.include,
@@ -96,10 +127,10 @@ pub async fn handle_list_skills(
     let service = SkillsService::new(&config, install_root);
 
     match service.list_skills(Some(&alias)) {
-        Ok(skills) => Json(SkillsListResult {
+        Ok(skills) => Json(SkillsListResponse {
             skills: skills
                 .into_iter()
-                .map(|s| SkillListEntry {
+                .map(|s| SkillEntry {
                     bundle: s.r#ref.bundle().to_string(),
                     name: s.r#ref.name().to_string(),
                     directory: s.directory.display().to_string(),
@@ -169,7 +200,7 @@ pub async fn handle_read_skill(
         Err(e) => return service_error_response(e),
     };
     match service.read_skill(&target) {
-        Ok(doc) => Json(SkillsReadResult {
+        Ok(doc) => Json(SkillReadResponse {
             bundle: target.bundle().to_string(),
             name: target.name().to_string(),
             frontmatter: doc.frontmatter,

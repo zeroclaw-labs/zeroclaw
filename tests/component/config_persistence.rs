@@ -7,7 +7,7 @@
 //! and config file round-trips to verify workspace discovery and persistence.
 
 use std::fs;
-use zeroclaw::config::{Config, MemoryConfig};
+use zeroclaw::config::{AliasedAgentConfig, Config, MemoryConfig};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config default construction
@@ -29,19 +29,11 @@ fn config_default_has_expected_model() {
     // Default config has no model until configured
     assert!(
         config
-            .providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(_, _, e)| e)
+            .first_model_provider()
             .and_then(|e| e.model.as_deref())
             .is_none()
             || config
-                .providers
-                .models
-                .iter_entries()
-                .next()
-                .map(|(_, _, e)| e)
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref())
                 .is_some(),
         "default config should be constructible"
@@ -52,11 +44,7 @@ fn config_default_has_expected_model() {
 fn config_default_temperature_positive() {
     let config = Config::default();
     let temp = config
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(_, _, e)| e)
+        .first_model_provider()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     assert!(temp > 0.0, "default temperature should be positive");
@@ -65,6 +53,42 @@ fn config_default_temperature_positive() {
 // ─────────────────────────────────────────────────────────────────────────────
 // AliasedAgentConfig defaults
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn agent_config_default_max_tool_iterations() {
+    let agent = AliasedAgentConfig::default();
+    assert_eq!(
+        agent.max_tool_iterations, 10,
+        "default max_tool_iterations should be 10"
+    );
+}
+
+#[test]
+fn agent_config_default_max_history_messages() {
+    let agent = AliasedAgentConfig::default();
+    assert_eq!(
+        agent.max_history_messages, 50,
+        "default max_history_messages should be 50"
+    );
+}
+
+#[test]
+fn agent_config_default_tool_dispatcher() {
+    let agent = AliasedAgentConfig::default();
+    assert_eq!(
+        agent.tool_dispatcher, "auto",
+        "default tool_dispatcher should be 'auto'"
+    );
+}
+
+#[test]
+fn agent_config_default_compact_context_on() {
+    let agent = AliasedAgentConfig::default();
+    assert!(
+        agent.compact_context,
+        "compact_context should default to true"
+    );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MemoryConfig defaults
@@ -122,27 +146,16 @@ fn config_toml_roundtrip_preserves_provider() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&toml_str)
         .expect("TOML should round-trip through migration");
 
-    assert!(
-        parsed
-            .providers
-            .models
-            .find("deepseek", "default")
-            .is_some(),
-        "deepseek.default entry should survive round-trip"
-    );
+    assert_eq!(parsed.first_model_provider_type(), Some("deepseek"));
     assert_eq!(
         parsed
-            .providers
-            .models
-            .find("deepseek", "default")
+            .first_model_provider()
             .and_then(|e| e.model.as_deref()),
         Some("deepseek-chat")
     );
     assert!(
         (parsed
-            .providers
-            .models
-            .find("deepseek", "default")
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -155,9 +168,9 @@ fn config_toml_roundtrip_preserves_provider() {
 fn config_toml_roundtrip_preserves_agent_config() {
     let mut config = Config::default();
     let agent = config.agents.entry("default".into()).or_default();
-    agent.risk_profile = "tight".into();
-    agent.runtime_profile = "fast".into();
-    agent.enabled = false;
+    agent.max_tool_iterations = 5;
+    agent.max_history_messages = 25;
+    agent.compact_context = true;
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
@@ -166,9 +179,9 @@ fn config_toml_roundtrip_preserves_agent_config() {
         .agents
         .get("default")
         .expect("default agent survived round-trip");
-    assert_eq!(agent.risk_profile, "tight");
-    assert_eq!(agent.runtime_profile, "fast");
-    assert!(!agent.enabled);
+    assert_eq!(agent.max_tool_iterations, 5);
+    assert_eq!(agent.max_history_messages, 25);
+    assert!(agent.compact_context);
 }
 
 #[test]
@@ -212,7 +225,7 @@ fn config_file_write_read_roundtrip() {
         .agents
         .entry("default".into())
         .or_default()
-        .risk_profile = "tight".into();
+        .max_tool_iterations = 15;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
     fs::write(&config_path, &toml_str).expect("config file write should succeed");
@@ -221,15 +234,10 @@ fn config_file_write_read_roundtrip() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&read_back)
         .expect("TOML should round-trip through migration");
 
-    assert!(
-        parsed.providers.models.find("mistral", "default").is_some(),
-        "mistral.default entry should survive round-trip"
-    );
+    assert_eq!(parsed.first_model_provider_type(), Some("mistral"));
     assert_eq!(
         parsed
-            .providers
-            .models
-            .find("mistral", "default")
+            .first_model_provider()
             .and_then(|e| e.model.as_deref()),
         Some("mistral-large")
     );
@@ -237,9 +245,9 @@ fn config_file_write_read_roundtrip() {
         parsed
             .agents
             .get("default")
-            .map(|a| a.risk_profile.as_str())
-            .unwrap_or(""),
-        "tight"
+            .map(|a| a.max_tool_iterations)
+            .unwrap_or(0),
+        15
     );
 }
 
@@ -258,6 +266,12 @@ default_temperature = 0.7
         parsed.agents.is_empty(),
         "minimal TOML should not synthesize any agent"
     );
+    // The AliasedAgentConfig defaults still apply when an agent IS
+    // configured but omits a tunable.
+    let default_agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+    assert_eq!(default_agent_cfg.max_tool_iterations, 10);
+    assert_eq!(default_agent_cfg.max_history_messages, 50);
+    assert!(default_agent_cfg.compact_context);
 }
 
 #[test]
@@ -267,17 +281,17 @@ fn config_file_with_custom_agent_section() {
 default_temperature = 0.7
 
 [agents.default]
-risk_profile = "tight"
-enabled = true
+max_tool_iterations = 3
+compact_context = true
 "#;
     let parsed: Config =
         toml::from_str(toml_with_agent).expect("TOML with [agents.default] should parse");
 
     let agent = parsed.agents.get("default").expect("default agent parsed");
-    assert_eq!(agent.risk_profile, "tight");
-    assert!(agent.enabled);
-    // runtime_profile is omitted, so it stays the empty default.
-    assert_eq!(agent.runtime_profile, "");
+    assert_eq!(agent.max_tool_iterations, 3);
+    assert!(agent.compact_context);
+    // max_history_messages should still use default
+    assert_eq!(agent.max_history_messages, 50);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

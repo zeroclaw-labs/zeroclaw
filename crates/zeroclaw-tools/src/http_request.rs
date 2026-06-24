@@ -15,7 +15,6 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     allow_private_hosts: bool,
-    allowed_private_hosts: Vec<String>,
 }
 
 impl HttpRequestTool {
@@ -25,7 +24,6 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         allow_private_hosts: bool,
-        allowed_private_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -33,7 +31,6 @@ impl HttpRequestTool {
             max_response_size,
             timeout_secs,
             allow_private_hosts,
-            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts)?,
         })
     }
 
@@ -59,16 +56,9 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
-        let private_host = is_private_or_local_host(&host);
-        let private_host_explicitly_allowed =
-            private_host && host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if private_host && !private_host_explicitly_allowed && !self.allow_private_hosts {
+        if !self.allow_private_hosts && is_private_or_local_host(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if private_host_explicitly_allowed {
-            return Ok(url.to_string());
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -192,7 +182,7 @@ impl Tool for HttpRequestTool {
 
     fn description(&self) -> &str {
         "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
-        Security constraints: allowlist-only domains, local/private hosts blocked unless explicitly configured, configurable timeout and response size limits."
+        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -536,14 +526,6 @@ mod tests {
         allowed_domains: Vec<&str>,
         allow_private_hosts: bool,
     ) -> HttpRequestTool {
-        test_tool_with_private_allowlist(allowed_domains, allow_private_hosts, Vec::new())
-    }
-
-    fn test_tool_with_private_allowlist(
-        allowed_domains: Vec<&str>,
-        allow_private_hosts: bool,
-        allowed_private_hosts: Vec<&str>,
-    ) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -554,10 +536,6 @@ mod tests {
             1_000_000,
             30,
             allow_private_hosts,
-            allowed_private_hosts
-                .into_iter()
-                .map(String::from)
-                .collect(),
         )
         .unwrap()
     }
@@ -720,8 +698,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new()).unwrap();
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false).unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -837,15 +814,8 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(
-            security,
-            vec!["example.com".into()],
-            1_000_000,
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false)
+            .unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -869,7 +839,6 @@ mod tests {
             10,
             30,
             false,
-            Vec::new(),
         )
         .unwrap();
         let text = "hello world this is long";
@@ -886,7 +855,6 @@ mod tests {
             0, // max_response_size = 0 means no limit
             30,
             false,
-            Vec::new(),
         )
         .unwrap();
         let text = "a".repeat(10_000_000);
@@ -901,7 +869,6 @@ mod tests {
             5,
             30,
             false,
-            Vec::new(),
         )
         .unwrap();
         let text = "hello world";
@@ -1182,52 +1149,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allowed_private_hosts_permits_localhost_without_broad_private_opt_in() {
-        let tool = test_tool_with_private_allowlist(vec!["example.com"], false, vec!["localhost"]);
-        assert!(tool.validate_url("https://localhost:8080").is_ok());
-    }
-
-    #[test]
-    fn allowed_private_hosts_permits_private_ipv4_without_allowed_domains_match() {
-        let tool =
-            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["192.168.1.5"]);
-        assert!(tool.validate_url("https://192.168.1.5").is_ok());
-    }
-
-    #[test]
-    fn allowed_private_hosts_still_requires_non_empty_allowed_domains() {
-        let tool = test_tool_with_private_allowlist(vec![], false, vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn allowed_private_hosts_still_blocks_unlisted_private_host() {
-        let tool =
-            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.6")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn allowed_private_hosts_wildcard_only_bypasses_private_hosts() {
-        let tool = test_tool_with_private_allowlist(vec!["example.com"], false, vec!["*"]);
-        assert!(tool.validate_url("https://10.0.0.1").is_ok());
-
-        let err = tool
-            .validate_url("https://news.ycombinator.com")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("allowed_domains"));
-    }
-
     // ── IPv6 end-to-end coverage ──────────────────────────────
 
     #[test]
@@ -1281,7 +1202,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         // Spawn a minimal HTTP server that responds with a known body.
-        let server_handle = zeroclaw_spawn::spawn!(async move {
+        let server_handle = tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 use tokio::io::AsyncWriteExt;
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from ipv6!";
@@ -1302,7 +1223,6 @@ mod tests {
             1_000_000, // max_response_size
             5,         // timeout_secs
             true,      // allow_private_hosts
-            Vec::new(),
         )
         .unwrap();
 

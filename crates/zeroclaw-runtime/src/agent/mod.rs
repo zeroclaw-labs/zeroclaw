@@ -2,12 +2,12 @@
 pub mod agent;
 pub mod classifier;
 pub mod context_analyzer;
-pub mod context_compressor;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
 pub mod history;
 pub mod history_pruner;
+pub mod history_trim;
 pub mod loop_;
 pub mod loop_detector;
 pub mod memory_loader;
@@ -19,6 +19,7 @@ pub mod system_prompt;
 pub mod thinking;
 pub mod tool_execution;
 pub mod tool_receipts;
+pub(crate) mod turn;
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(

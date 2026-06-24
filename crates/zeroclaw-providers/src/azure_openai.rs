@@ -24,8 +24,7 @@ pub struct AzureOpenAiModelProvider {
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,8 +63,7 @@ impl ResponseMessage {
 #[derive(Debug, Serialize)]
 struct NativeChatRequest {
     messages: Vec<NativeMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,6 +363,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -433,6 +432,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -498,6 +498,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -697,7 +698,7 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: Some(0.7),
+            temperature: 0.7,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -713,7 +714,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: Some(0.0),
+            temperature: 0.0,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));

@@ -196,8 +196,7 @@ fn build_parts(content: &str) -> Vec<Part> {
 
 #[derive(Debug, Serialize, Clone)]
 struct GenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    temperature: f64,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
 }
@@ -1086,6 +1085,7 @@ impl GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (contents, system_instruction) = Self::build_chat_contents(messages, None);
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
@@ -1107,7 +1107,7 @@ impl GeminiModelProvider {
         contents: Vec<Content>,
         system_instruction: Option<Content>,
         model: &str,
-        temperature: Option<f64>,
+        temperature: f64,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1388,6 +1388,7 @@ impl ModelProvider for GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part::text(sys)],
@@ -1437,6 +1438,8 @@ impl ModelProvider for GeminiModelProvider {
         } else {
             None
         };
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (contents, system_instruction) =
             Self::build_chat_contents(request.messages, tool_instructions.as_deref());
         let (text, usage) = self
@@ -1759,7 +1762,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: Some(0.7),
+                temperature: 0.7,
                 max_output_tokens: 8192,
             },
         };
@@ -1798,7 +1801,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: Some(0.7),
+                temperature: 0.7,
                 max_output_tokens: 8192,
             },
         };
@@ -1841,7 +1844,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: Some(0.7),
+                temperature: 0.7,
                 max_output_tokens: 8192,
             },
         };
@@ -1874,7 +1877,7 @@ mod tests {
                 parts: vec![Part::text("You are helpful")],
             }),
             generation_config: GenerationConfig {
-                temperature: Some(0.7),
+                temperature: 0.7,
                 max_output_tokens: 8192,
             },
         };
@@ -1901,7 +1904,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: Some(GenerationConfig {
-                    temperature: Some(0.7),
+                    temperature: 0.7,
                     max_output_tokens: 8192,
                 }),
             },

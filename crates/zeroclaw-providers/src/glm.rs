@@ -22,8 +22,7 @@ pub struct GlmModelProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +158,7 @@ impl ModelProvider for GlmModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let mut messages = Vec::new();
@@ -220,6 +220,7 @@ impl ModelProvider for GlmModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let api_messages: Vec<Message> = messages

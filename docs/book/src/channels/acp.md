@@ -76,11 +76,6 @@ The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins
 
 Send a prompt. The response is a sequence of `session/update` notifications streaming back, terminated by the `session/prompt` result.
 
-The `prompt` parameter accepts either a plain string or an array of content parts:
-
-- **String:** `"prompt": "Summarise the changes in the last commit."`
-- **Array:** each element is a text part `{"text": "..."}` or an ACP resource block `{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "<file contents>"}}`. Resource blocks carry `@`-notation file attachments from the editor. Parts are joined with double newlines in the order they appear.
-
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
     "sessionId": "s-ab12cd",
@@ -98,7 +93,7 @@ The `prompt` parameter accepts either a plain string or an array of content part
 ← {"jsonrpc":"2.0","method":"session/update","params":{
     "sessionId": "s-ab12cd",
     "update": {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
-               "status": "completed", "rawOutput": "..."}
+               "status": "finished", "rawOutput": "..."}
   }}
 ← {"jsonrpc":"2.0","id":3,"result":{
     "sessionId": "s-ab12cd",
@@ -107,16 +102,7 @@ The `prompt` parameter accepts either a plain string or an array of content part
   }}
 ```
 
-`stopReason` is `"end_turn"` on normal completion and `"cancelled"` when the turn was interrupted by `session/cancel`. The ACP completion signal is `stopReason`; ZeroClaw also includes the current final `content` string for existing clients.
-
-Errors:
-
-| Code | Meaning |
-|---|---|
-| `-32000` `SESSION_NOT_FOUND` | No active session with the given `sessionId` |
-| `-32002` `SESSION_BUSY` | A prompt turn is already in flight for this session — wait for it to complete or cancel it first |
-| `-32602` `INVALID_PARAMS` | Missing or malformed `sessionId` / `prompt` |
-| `-32603` `INTERNAL_ERROR` | Agent task panicked or turn failed |
+`stopReason` is `"end_turn"` on normal completion. The ACP completion signal is `stopReason`; ZeroClaw also includes the current final `content` string for existing clients.
 
 ### `session/update` notifications (agent → client)
 
@@ -127,7 +113,7 @@ ZeroClaw sends four kinds of `session/update` notification during a prompt turn.
 | `agent_message_chunk` | Each streaming text token | `content.type = "text"`, `content.text` |
 | `agent_thought_chunk` | Internal reasoning tokens (when enabled) | `content.type = "text"`, `content.text` |
 | `tool_call` | Tool call initiated | `toolCallId`, `title`, `kind`, `status: "pending"`, `rawInput` |
-| `tool_call_update` | Tool call completed | `toolCallId`, `status: "completed"`, `rawOutput`, `content[]` |
+| `tool_call_update` | Tool call completed | `toolCallId`, `status: "finished"`, `rawOutput`, `content[]` |
 
 `toolCallId` on `tool_call` and `tool_call_update` are stable and correlated — the update completing a call carries the same `toolCallId` as the one that opened it.
 
@@ -192,6 +178,8 @@ The canonical parameter is `sessionId`; `session_id` is accepted as a compatibil
   }}
 ```
 
+Only one `session/prompt` may be active for a session at a time. A second prompt for the same session is rejected until the active turn completes or is cancelled.
+
 If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors.
 
 ### `session/stop` _(ZeroClaw extension)_
@@ -200,7 +188,7 @@ Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a futu
 
 ```json
 → {"jsonrpc":"2.0","id":4,"method":"session/stop","params":{"sessionId":"s-ab12cd"}}
-← {"jsonrpc":"2.0","id":4,"result":{"sessionId": "s-ab12cd", "stopped":true}}
+← {"jsonrpc":"2.0","id":4,"result":{"stopped":true}}
 ```
 
 ### `session/update` (client → server) _(ZeroClaw extension)_
@@ -333,22 +321,6 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel — a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
 
 The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. Note: the agent's system prompt currently reflects the daemon's global `workspace_dir` rather than the session `cwd` — this does not affect enforcement, only the directory the model believes it is working in.
-
-## Memory
-
-ACP sessions do not interact with the agent's persistent memory system. This is a deliberate design choice: ACP is for IDE-driven coding tasks, not long-term relationship building.
-
-**What ACP sessions inherit** from the agent config: personality, skills, risk profile, runtime profile, model provider, and all non-memory tools.
-
-**What ACP sessions exclude:**
-
-- Memory tools (`memory_recall`, `memory_store`, `memory_forget`, `memory_export`, `memory_purge`) are not available
-- Automatic memory recall (the context preamble built from long-term memory at each turn) is disabled
-- Automatic conversation auto-save to the agent's memory store is disabled
-
-**Session context** comes from the persisted conversation history in `acp-sessions.db`. Sessions are persistent, resumable, and deleteable — the session history serves as the working context, not the agent's long-term memory.
-
-This separation ensures that ephemeral coding-assist conversations do not pollute the agent's long-term memory, and that unrelated knowledge from chat channels does not bleed into ACP sessions.
 
 ## Code reference
 

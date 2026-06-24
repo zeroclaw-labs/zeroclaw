@@ -4,7 +4,6 @@ pub use zeroclaw_hardware::peripherals::*;
 
 use crate::config::{Config, PeripheralBoardConfig};
 use anyhow::Result;
-use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result<()> {
     match cmd {
@@ -15,21 +14,21 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
                 Vec::new()
             };
             if boards.is_empty() {
-                println!("{}", get_required_cli_string("cli-peripherals-none"));
+                println!("No peripherals configured.");
                 println!();
-                println!("{}", get_required_cli_string("cli-peripherals-add-hint"));
-                println!("{}", get_required_cli_string("cli-peripherals-add-example"));
+                println!("Add one with: zeroclaw peripheral add <board> <path>");
+                println!("  Example: zeroclaw peripheral add nucleo-f401re /dev/ttyACM0");
                 println!();
-                println!("{}", get_required_cli_string("cli-peripherals-config-hint"));
-                println!("  [peripherals]"); // i18n-exempt: literal config.toml snippet
-                println!("  enabled = true"); // i18n-exempt: literal config.toml snippet
+                println!("Or add to config.toml:");
+                println!("  [peripherals]");
+                println!("  enabled = true");
                 println!();
-                println!("  [[peripherals.boards]]"); // i18n-exempt: literal config.toml snippet
-                println!("  board = \"nucleo-f401re\""); // i18n-exempt: literal config.toml snippet
-                println!("  transport = \"serial\""); // i18n-exempt: literal config.toml snippet
-                println!("  path = \"/dev/ttyACM0\""); // i18n-exempt: literal config.toml snippet
+                println!("  [[peripherals.boards]]");
+                println!("  board = \"nucleo-f401re\"");
+                println!("  transport = \"serial\"");
+                println!("  path = \"/dev/ttyACM0\"");
             } else {
-                println!("{}", get_required_cli_string("cli-peripherals-configured"));
+                println!("Configured peripherals:");
                 for b in boards {
                     let path = b.path.as_deref().unwrap_or("(native)");
                     println!("  {}  {}  {}", b.board, b.transport, path);
@@ -53,13 +52,7 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
                 .iter()
                 .any(|b| b.board == board && b.path.as_deref() == path_opt.as_deref())
             {
-                println!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-peripherals-already-configured",
-                        &[("board", &board), ("path", &format!("{path_opt:?}"))],
-                    )
-                );
+                println!("Board {} at {:?} already configured.", board, path_opt);
                 return Ok(());
             }
 
@@ -70,13 +63,7 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
                 baud: 115_200,
             });
             Box::pin(cfg.save()).await?;
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-peripherals-added",
-                    &[("board", &board), ("path", &path)],
-                )
-            );
+            println!("Added {} at {}. Restart daemon to apply.", board, path);
         }
         #[cfg(feature = "hardware")]
         crate::PeripheralCommands::Flash { port } => {
@@ -97,11 +84,8 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
         }
         #[cfg(not(feature = "hardware"))]
         crate::PeripheralCommands::Flash { .. } => {
-            println!(
-                "{}",
-                get_required_cli_string("cli-peripherals-flash-needs-hardware")
-            );
-            println!("{}", get_required_cli_string("cli-hardware-feature-build"));
+            println!("Arduino flash requires the 'hardware' feature.");
+            println!("Build with: cargo build --features hardware");
         }
         #[cfg(feature = "hardware")]
         crate::PeripheralCommands::SetupUnoQ { host } => {
@@ -109,11 +93,8 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
         }
         #[cfg(not(feature = "hardware"))]
         crate::PeripheralCommands::SetupUnoQ { .. } => {
-            println!(
-                "{}",
-                get_required_cli_string("cli-peripherals-unoq-needs-hardware")
-            );
-            println!("{}", get_required_cli_string("cli-hardware-feature-build"));
+            println!("Uno Q setup requires the 'hardware' feature.");
+            println!("Build with: cargo build --features hardware");
         }
         #[cfg(feature = "hardware")]
         crate::PeripheralCommands::FlashNucleo => {
@@ -121,11 +102,8 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
         }
         #[cfg(not(feature = "hardware"))]
         crate::PeripheralCommands::FlashNucleo => {
-            println!(
-                "{}",
-                get_required_cli_string("cli-peripherals-nucleo-needs-hardware")
-            );
-            println!("{}", get_required_cli_string("cli-hardware-feature-build"));
+            println!("Nucleo flash requires the 'hardware' feature.");
+            println!("Build with: cargo build --features hardware");
         }
     }
     Ok(())

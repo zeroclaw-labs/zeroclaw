@@ -95,8 +95,6 @@ fn field(
         enum_variants: None,
         description,
         derived_from_secret: false,
-        credential_class: None,
-        tab: zeroclaw_config::config::ConfigTab::None,
     }
 }
 

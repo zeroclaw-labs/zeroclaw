@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Clock,
   Globe,
@@ -23,8 +23,7 @@ import {
   MemoryStick,
   Brain,
   Search,
-  Monitor,
-} from "lucide-react";
+} from 'lucide-react';
 import type {
   StatusResponse,
   CostSummary,
@@ -33,8 +32,7 @@ import type {
   ChannelReadinessState,
   SessionMessageRow,
   ProcessStats,
-  TuiEntry,
-} from "@/types/api";
+} from '@/types/api';
 import {
   getStatus,
   getCost,
@@ -46,62 +44,51 @@ import {
   storeMemory,
   deleteMemory,
   getMapKeys,
-  getQuickstartState,
-  getTuis,
-} from "@/lib/api";
-import { resolveModelToProviderType } from "@/lib/configuredModels";
+  getOnboardStatus,
+} from '@/lib/api';
+import { resolveModelToProviderType } from '@/lib/configuredModels';
 
-type CostWindow = "today" | "7d" | "30d" | "month" | "all";
+type CostWindow = 'today' | '7d' | '30d' | 'month' | 'all';
 
 function costWindowBounds(window: CostWindow): { from?: Date; to?: Date } {
   const now = new Date();
   switch (window) {
-    case "today": {
+    case 'today': {
       const start = new Date(now);
       start.setHours(0, 0, 0, 0);
       const end = new Date(start);
       end.setDate(end.getDate() + 1);
       return { from: start, to: end };
     }
-    case "7d": {
+    case '7d': {
       const from = new Date(now);
       from.setDate(from.getDate() - 7);
       return { from };
     }
-    case "30d": {
+    case '30d': {
       const from = new Date(now);
       from.setDate(from.getDate() - 30);
       return { from };
     }
-    case "month": {
+    case 'month': {
       const from = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
       const to = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
       return { from, to };
     }
-    case "all":
+    case 'all':
     default:
       return {};
   }
 }
-import type { MemoryEntry } from "@/types/api";
-import {
-  loadAgentSummaries,
-  toggleAgentEnabled,
-  type AgentSummary,
-} from "@/lib/agents";
-import AgentCard from "@/components/AgentCard";
-import EntityLink from "@/components/EntityLink";
-import EntityEnabledToggle from "@/components/EntityEnabledToggle";
-import { useSSE } from "@/hooks/useSSE";
-import { t } from "@/lib/i18n";
+import type { MemoryEntry } from '@/types/api';
+import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
+import AgentCard from '@/components/AgentCard';
+import EntityLink from '@/components/EntityLink';
+import EntityEnabledToggle from '@/components/EntityEnabledToggle';
+import { useSSE } from '@/hooks/useSSE';
+import { t } from '@/lib/i18n';
 
-type TabId =
-  | "overview"
-  | "sessions"
-  | "channels"
-  | "memories"
-  | "health"
-  | "cost";
+type TabId = 'overview' | 'sessions' | 'channels' | 'memories' | 'health' | 'cost';
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -117,8 +104,8 @@ function formatUSD(value: number): string {
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  if (!Number.isFinite(bytes) || bytes <= 0) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let v = bytes;
   let i = 0;
   while (v >= 1024 && i < units.length - 1) {
@@ -139,32 +126,29 @@ function ProcessRamCard({ process }: { process?: ProcessStats }) {
       <div className="flex items-center gap-3 mb-3">
         <div
           className="p-2 rounded-2xl"
-          style={{
-            background: "rgba(var(--pc-accent-rgb), 0.08)",
-            color: "#fbbf24",
-          }}
+          style={{ background: 'rgba(var(--pc-accent-rgb), 0.08)', color: '#fbbf24' }}
         >
           <MemoryStick className="h-5 w-5" />
         </div>
         <span
           className="text-xs uppercase tracking-wider font-medium"
-          style={{ color: "var(--pc-text-muted)" }}
+          style={{ color: 'var(--pc-text-muted)' }}
         >
           RAM
         </span>
       </div>
       <p
         className="text-lg font-semibold truncate"
-        style={{ color: "var(--pc-text-primary)" }}
+        style={{ color: 'var(--pc-text-primary)' }}
       >
-        {supported ? formatBytes(process!.rss_bytes) : "—"}
+        {supported ? formatBytes(process!.rss_bytes) : '—'}
       </p>
-      <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
+      <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
         {pct !== null
           ? `${pct.toFixed(pct < 1 ? 2 : 1)}% of ${formatBytes(process!.system_ram_total_bytes)}`
           : supported
-            ? "resident (zeroclaw)"
-            : "not supported on this platform"}
+            ? 'resident (zeroclaw)'
+            : 'not supported on this platform'}
       </p>
     </div>
   );
@@ -179,32 +163,29 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
       <div className="flex items-center gap-3 mb-3">
         <div
           className="p-2 rounded-2xl"
-          style={{
-            background: "rgba(var(--pc-accent-rgb), 0.08)",
-            color: "#a78bfa",
-          }}
+          style={{ background: 'rgba(var(--pc-accent-rgb), 0.08)', color: '#a78bfa' }}
         >
           <Cpu className="h-5 w-5" />
         </div>
         <span
           className="text-xs uppercase tracking-wider font-medium"
-          style={{ color: "var(--pc-text-muted)" }}
+          style={{ color: 'var(--pc-text-muted)' }}
         >
           CPU
         </span>
       </div>
       <p
         className="text-lg font-semibold truncate"
-        style={{ color: "var(--pc-text-primary)" }}
+        style={{ color: 'var(--pc-text-primary)' }}
       >
-        {supported ? `${pct.toFixed(1)}%` : "—"}
+        {supported ? `${pct.toFixed(1)}%` : '—'}
       </p>
-      <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
+      <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
         {supported
           ? ncpu > 0
             ? `${ncpu} cores · ${(pct / ncpu).toFixed(1)}% normalized`
-            : "across all cores"
-          : "not supported on this platform"}
+            : 'across all cores'
+          : 'not supported on this platform'}
       </p>
     </div>
   );
@@ -215,12 +196,12 @@ function formatLocalDateTime(iso: string): string {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
     return d.toLocaleString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
     });
   } catch {
     return iso;
@@ -245,43 +226,43 @@ function formatRelative(iso: string): string {
 
 function healthColor(status: string): string {
   switch (status.toLowerCase()) {
-    case "ok":
-    case "healthy":
-      return "var(--color-status-success)";
-    case "warn":
-    case "warning":
-    case "degraded":
-      return "var(--color-status-warning)";
+    case 'ok':
+    case 'healthy':
+      return 'var(--color-status-success)';
+    case 'warn':
+    case 'warning':
+    case 'degraded':
+      return 'var(--color-status-warning)';
     default:
-      return "var(--color-status-error)";
+      return 'var(--color-status-error)';
   }
 }
 
 function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
-    case "ok":
-    case "healthy":
-      return "rgba(0, 230, 138, 0.2)";
-    case "warn":
-    case "warning":
-    case "degraded":
-      return "rgba(255, 170, 0, 0.2)";
+    case 'ok':
+    case 'healthy':
+      return 'rgba(0, 230, 138, 0.2)';
+    case 'warn':
+    case 'warning':
+    case 'degraded':
+      return 'rgba(255, 170, 0, 0.2)';
     default:
-      return "rgba(255, 68, 102, 0.2)";
+      return 'rgba(255, 68, 102, 0.2)';
   }
 }
 
 function healthBg(status: string): string {
   switch (status.toLowerCase()) {
-    case "ok":
-    case "healthy":
-      return "rgba(0, 230, 138, 0.05)";
-    case "warn":
-    case "warning":
-    case "degraded":
-      return "rgba(255, 170, 0, 0.05)";
+    case 'ok':
+    case 'healthy':
+      return 'rgba(0, 230, 138, 0.05)';
+    case 'warn':
+    case 'warning':
+    case 'degraded':
+      return 'rgba(255, 170, 0, 0.05)';
     default:
-      return "rgba(255, 68, 102, 0.05)";
+      return 'rgba(255, 68, 102, 0.05)';
   }
 }
 
@@ -339,12 +320,12 @@ const STATUS_CARDS = [
 ];
 
 const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
-  { id: "overview", labelKey: "dashboard.tab_overview", icon: LayoutDashboard },
-  { id: "sessions", labelKey: "dashboard.tab_sessions", icon: Users },
-  { id: "channels", labelKey: "dashboard.tab_channels", icon: Wifi },
-  { id: "memories", labelKey: "dashboard.tab_memories", icon: Brain },
-  { id: "health", labelKey: "dashboard.tab_health", icon: Heart },
-  { id: "cost", labelKey: "dashboard.tab_cost", icon: DollarSign },
+  { id: 'overview', labelKey: 'dashboard.tab_overview', icon: LayoutDashboard },
+  { id: 'sessions', labelKey: 'dashboard.tab_sessions', icon: Users },
+  { id: 'channels', labelKey: 'dashboard.tab_channels', icon: Wifi },
+  { id: 'memories', labelKey: 'dashboard.tab_memories', icon: Brain },
+  { id: 'health', labelKey: 'dashboard.tab_health', icon: Heart },
+  { id: 'cost', labelKey: 'dashboard.tab_cost', icon: DollarSign },
 ];
 
 // ---------------------------------------------------------------------------
@@ -354,13 +335,11 @@ const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
 function OverviewTab({
   status,
   cost,
-  tuis,
   showAllChannels,
   setShowAllChannels,
 }: {
   status: StatusResponse;
   cost: CostSummary;
-  tuis: TuiEntry[];
   showAllChannels: boolean;
   setShowAllChannels: (fn: (v: boolean) => boolean) => void;
 }) {
@@ -368,48 +347,25 @@ function OverviewTab({
     cost.session_cost_usd,
     cost.daily_cost_usd,
     cost.monthly_cost_usd,
-    0.001,
+    0.001
   );
 
   return (
     <>
       {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {STATUS_CARDS.map(
-          ({ icon: Icon, accent, labelKey, getValue, getSub }) => (
-            <div key={labelKey} className="card p-5 animate-slide-in-up">
-              <div className="flex items-center gap-3 mb-3">
-                <div
-                  className="p-2 rounded-2xl"
-                  style={{
-                    background: `rgba(var(--pc-accent-rgb), 0.08)`,
-                    color: accent,
-                  }}
-                >
-                  <Icon className="h-5 w-5" />
-                </div>
-                <span
-                  className="text-xs uppercase tracking-wider font-medium"
-                  style={{ color: "var(--pc-text-muted)" }}
-                >
-                  {t(labelKey)}
-                </span>
+        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
+          <div key={labelKey} className="card p-5 animate-slide-in-up">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent, }}>
+                <Icon className="h-5 w-5" />
               </div>
-              <p
-                className="text-lg font-semibold truncate"
-                style={{ color: "var(--pc-text-primary)" }}
-              >
-                {getValue(status)}
-              </p>
-              <p
-                className="text-sm truncate"
-                style={{ color: "var(--pc-text-muted)" }}
-              >
-                {getSub(status)}
-              </p>
+              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
             </div>
-          ),
-        )}
+            <p className="text-lg font-semibold truncate" style={{ color: "var(--pc-text-primary)" }}>{getValue(status)}</p>
+            <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>{getSub(status)}</p>
+          </div>
+        ))}
         <ProcessRamCard process={status.process} />
         <ProcessCpuCard process={status.process} />
       </div>
@@ -418,16 +374,8 @@ function OverviewTab({
         {/* Cost Widget */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign
-              className="h-5 w-5"
-              style={{ color: "var(--pc-accent)" }}
-            />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
-              {t("dashboard.cost_overview")}
-            </h2>
+            <DollarSign className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--pc-text-primary)" }}>{t("dashboard.cost_overview")}</h2>
           </div>
           <div className="space-y-4">
             {[
@@ -479,10 +427,7 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.total_tokens_label")}
             </span>
-            <span
-              className="font-mono"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
+            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
               {cost.total_tokens.toLocaleString()}
             </span>
           </div>
@@ -490,10 +435,7 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.requests_label")}
             </span>
-            <span
-              className="font-mono"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
+            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
               {cost.request_count.toLocaleString()}
             </span>
           </div>
@@ -541,71 +483,57 @@ function OverviewTab({
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
               </p>
-            ) : (
-              (() => {
-                const entries = Object.entries(status.channels).filter(
-                  ([, active]) => showAllChannels || active,
+            ) : (() => {
+              const entries = Object.entries(status.channels).filter(
+                ([, active]) => showAllChannels || active
+              );
+              if (entries.length === 0) {
+                return (
+                  <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+                    {t("dashboard.no_active_channels")}
+                  </p>
                 );
-                if (entries.length === 0) {
-                  return (
-                    <p
-                      className="text-sm"
-                      style={{ color: "var(--pc-text-faint)" }}
-                    >
-                      {t("dashboard.no_active_channels")}
-                    </p>
-                  );
-                }
-                return entries.map(([name, active]) => (
-                  <EntityLink
-                    key={name}
-                    kind="channel"
-                    id={name}
-                    className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
-                    style={{ background: "var(--pc-bg-elevated)" }}
-                    title={`Open channels.${name} config`}
+              }
+              return entries.map(([name, active]) => (
+                <EntityLink
+                  key={name}
+                  kind="channel"
+                  id={name}
+                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
+                  style={{ background: 'var(--pc-bg-elevated)' }}
+                  title={`Open channels.${name} config`}
+                >
+                  <span
+                    className="text-sm font-mono font-medium"
+                    style={{ color: 'var(--pc-text-primary)' }}
                   >
+                    {name}
+                  </span>
+                  <span className="flex items-center gap-2">
                     <span
-                      className="text-sm font-mono font-medium"
-                      style={{ color: "var(--pc-text-primary)" }}
-                    >
-                      {name}
+                      className="status-dot"
+                      style={
+                        active
+                          ? {
+                              background: 'var(--color-status-success)',
+                              boxShadow: '0 0 6px var(--color-status-success)',
+                            }
+                          : { background: 'var(--pc-text-faint)' }
+                      }
+                    />
+                    <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                      {active ? t('dashboard.active') : t('dashboard.inactive')}
                     </span>
-                    <span className="flex items-center gap-2">
-                      <span
-                        className="status-dot"
-                        style={
-                          active
-                            ? {
-                                background: "var(--color-status-success)",
-                                boxShadow:
-                                  "0 0 6px var(--color-status-success)",
-                              }
-                            : { background: "var(--pc-text-faint)" }
-                        }
-                      />
-                      <span
-                        className="text-xs"
-                        style={{ color: "var(--pc-text-muted)" }}
-                      >
-                        {active
-                          ? t("dashboard.active")
-                          : t("dashboard.inactive")}
-                      </span>
-                    </span>
-                  </EntityLink>
-                ));
-              })()
-            )}
+                  </span>
+                </EntityLink>
+              ));
+            })()}
           </div>
         </div>
 
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity
-              className="h-5 w-5"
-              style={{ color: "var(--pc-accent)" }}
-            />
+            <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
             <h2
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
@@ -620,21 +548,16 @@ function OverviewTab({
             // Component Health is for process-level supervisors only
             // (gateway, daemon, scheduler, ...).
             const entries = Object.entries(components).filter(
-              ([name]) => !name.startsWith("channel:"),
+              ([name]) => !name.startsWith('channel:'),
             );
             if (entries.length === 0) {
               return (
-                <p
-                  className="text-sm"
-                  style={{ color: "var(--pc-text-faint)" }}
-                >
+                <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                   {t("dashboard.no_components")}
                 </p>
               );
             }
-            const sorted = entries
-              .slice()
-              .sort((a, b) => a[0].localeCompare(b[0]));
+            const sorted = entries.slice().sort((a, b) => a[0].localeCompare(b[0]));
             return (
               <div className="space-y-2">
                 {sorted.map(([name, comp]) => {
@@ -668,7 +591,7 @@ function OverviewTab({
                           className="ml-auto text-[10px] uppercase font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
                           style={{
                             color: healthColor(comp.status),
-                            background: "transparent",
+                            background: 'transparent',
                             border: `1px solid ${healthBorder(comp.status)}`,
                           }}
                         >
@@ -678,28 +601,20 @@ function OverviewTab({
                       {lastErr ? (
                         <p
                           className="text-[11px] mt-1 font-mono break-words"
-                          style={{ color: "var(--color-status-error)" }}
+                          style={{ color: 'var(--color-status-error)' }}
                           title={lastErr}
                         >
-                          ⚠{" "}
-                          {lastErr.length > 120
-                            ? lastErr.slice(0, 117) + "…"
-                            : lastErr}
+                          ⚠ {lastErr.length > 120 ? lastErr.slice(0, 117) + '…' : lastErr}
                         </p>
                       ) : null}
-                      <div
-                        className="flex items-center gap-3 text-[11px] mt-0.5"
-                        style={{ color: "var(--pc-text-muted)" }}
-                      >
+                      <div className="flex items-center gap-3 text-[11px] mt-0.5" style={{ color: "var(--pc-text-muted)" }}>
                         {lastOk && (
                           <span title={`last ok: ${lastOk}`}>
                             ok {formatRelative(lastOk)}
                           </span>
                         )}
                         {comp.restart_count > 0 && (
-                          <span
-                            style={{ color: "var(--color-status-warning)" }}
-                          >
+                          <span style={{ color: "var(--color-status-warning)" }}>
                             {t("dashboard.restarts")}: {comp.restart_count}
                           </span>
                         )}
@@ -712,74 +627,6 @@ function OverviewTab({
           })()}
         </div>
       </div>
-
-      {/* Connected TUIs */}
-      {tuis.length > 0 && (
-        <div className="card p-5 animate-slide-in-up">
-          <div className="flex items-center gap-2 mb-5">
-            <Monitor
-              className="h-5 w-5"
-              style={{ color: "var(--pc-accent)" }}
-            />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
-              Connected TUIs
-            </h2>
-            <span
-              className="text-xs font-mono px-2 py-0.5 rounded-full"
-              style={{
-                background: "rgba(var(--pc-accent-rgb), 0.1)",
-                color: "var(--pc-accent)",
-              }}
-            >
-              {tuis.length}
-            </span>
-          </div>
-          <div className="space-y-2 overflow-y-auto max-h-48 pr-1">
-            {tuis.map((tui) => (
-              <div
-                key={tui.tui_id}
-                className="flex items-center justify-between py-2.5 px-3 rounded-xl"
-                style={{ background: "var(--pc-bg-elevated)" }}
-              >
-                <div className="flex items-center gap-2">
-                  <span
-                    className="status-dot flex-shrink-0"
-                    style={{
-                      background: "var(--color-status-success)",
-                      boxShadow: "0 0 6px var(--color-status-success)",
-                    }}
-                  />
-                  <span
-                    className="text-sm font-mono font-medium"
-                    style={{ color: "var(--pc-text-primary)" }}
-                  >
-                    {tui.tui_id}
-                  </span>
-                  <span
-                    className="text-xs font-mono px-1.5 py-0.5 rounded"
-                    style={{
-                      background: "rgba(var(--pc-accent-rgb), 0.08)",
-                      color: "var(--pc-text-muted)",
-                    }}
-                  >
-                    {tui.peer_label || tui.transport || "unknown"}
-                  </span>
-                </div>
-                <span
-                  className="text-xs"
-                  style={{ color: "var(--pc-text-muted)" }}
-                  title={tui.connected_at}
-                >
-                  {formatRelative(tui.connected_at)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </>
   );
 }
@@ -789,20 +636,20 @@ function OverviewTab({
 // ---------------------------------------------------------------------------
 
 type SessionSort =
-  | "activity-desc"
-  | "activity-asc"
-  | "created-desc"
-  | "created-asc"
-  | "messages-desc"
-  | "messages-asc";
+  | 'activity-desc'
+  | 'activity-asc'
+  | 'created-desc'
+  | 'created-asc'
+  | 'messages-desc'
+  | 'messages-asc';
 
 const SESSION_SORT_OPTIONS: { value: SessionSort; label: string }[] = [
-  { value: "activity-desc", label: "Recent activity" },
-  { value: "activity-asc", label: "Oldest activity" },
-  { value: "created-desc", label: "Newest first" },
-  { value: "created-asc", label: "Oldest first" },
-  { value: "messages-desc", label: "Busiest" },
-  { value: "messages-asc", label: "Quietest" },
+  { value: 'activity-desc', label: 'Recent activity' },
+  { value: 'activity-asc', label: 'Oldest activity' },
+  { value: 'created-desc', label: 'Newest first' },
+  { value: 'created-asc', label: 'Oldest first' },
+  { value: 'messages-desc', label: 'Busiest' },
+  { value: 'messages-asc', label: 'Quietest' },
 ];
 
 function isSessionSort(v: string): v is SessionSort {
@@ -814,14 +661,12 @@ function SessionsTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
-  const agentFilter = searchParams.get("agent") ?? "";
-  const channelFilter = searchParams.get("channel") ?? "";
-  const searchQuery = searchParams.get("q") ?? "";
-  const sortRaw = searchParams.get("sort") ?? "";
-  const sortBy: SessionSort = isSessionSort(sortRaw)
-    ? sortRaw
-    : "activity-desc";
-  const setFilter = (key: "agent" | "channel" | "q" | "sort", value: string) =>
+  const agentFilter = searchParams.get('agent') ?? '';
+  const channelFilter = searchParams.get('channel') ?? '';
+  const searchQuery = searchParams.get('q') ?? '';
+  const sortRaw = searchParams.get('sort') ?? '';
+  const sortBy: SessionSort = isSessionSort(sortRaw) ? sortRaw : 'activity-desc';
+  const setFilter = (key: 'agent' | 'channel' | 'q' | 'sort', value: string) =>
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -831,11 +676,11 @@ function SessionsTab() {
       },
       { replace: true },
     );
-  const setAgentFilter = (v: string) => setFilter("agent", v);
-  const setChannelFilter = (v: string) => setFilter("channel", v);
-  const setSearchQuery = (v: string) => setFilter("q", v);
+  const setAgentFilter = (v: string) => setFilter('agent', v);
+  const setChannelFilter = (v: string) => setFilter('channel', v);
+  const setSearchQuery = (v: string) => setFilter('q', v);
   const setSortBy = (v: SessionSort) =>
-    setFilter("sort", v === "activity-desc" ? "" : v);
+    setFilter('sort', v === 'activity-desc' ? '' : v);
   const [inspect, setInspect] = useState<{
     session: Session;
     messages: SessionMessageRow[] | null;
@@ -845,7 +690,7 @@ function SessionsTab() {
   const [deleting, setDeleting] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ["session_update", "session_created", "session_closed"],
+    filterTypes: ['session_update', 'session_created', 'session_closed'],
     autoConnect: true,
   });
 
@@ -891,11 +736,11 @@ function SessionsTab() {
         const haystack = [
           s.session_id,
           s.session_key,
-          s.name ?? "",
-          s.agent_alias ?? "",
-          s.channel_id ?? "",
+          s.name ?? '',
+          s.agent_alias ?? '',
+          s.channel_id ?? '',
         ]
-          .join(" ")
+          .join(' ')
           .toLowerCase();
         if (!haystack.includes(needle)) return false;
       }
@@ -904,17 +749,17 @@ function SessionsTab() {
     const sorted = [...filtered];
     sorted.sort((a, b) => {
       switch (sortBy) {
-        case "activity-asc":
+        case 'activity-asc':
           return a.last_activity.localeCompare(b.last_activity);
-        case "created-desc":
+        case 'created-desc':
           return b.created_at.localeCompare(a.created_at);
-        case "created-asc":
+        case 'created-asc':
           return a.created_at.localeCompare(b.created_at);
-        case "messages-desc":
+        case 'messages-desc':
           return b.message_count - a.message_count;
-        case "messages-asc":
+        case 'messages-asc':
           return a.message_count - b.message_count;
-        case "activity-desc":
+        case 'activity-desc':
         default:
           return b.last_activity.localeCompare(a.last_activity);
       }
@@ -943,21 +788,14 @@ function SessionsTab() {
 
   const handleDelete = async (session: Session) => {
     if (deleting) return;
-    if (
-      !window.confirm(
-        `Delete session ${session.session_id}? This cannot be undone.`,
-      )
-    ) {
+    if (!window.confirm(`Delete session ${session.session_id}? This cannot be undone.`)) {
       return;
     }
     setDeleting(session.session_key);
     try {
       await deleteSession(session.session_key);
-      setSessions((prev) =>
-        prev.filter((s) => s.session_key !== session.session_key),
-      );
-      if (inspect?.session.session_key === session.session_key)
-        setInspect(null);
+      setSessions((prev) => prev.filter((s) => s.session_key !== session.session_key));
+      if (inspect?.session.session_key === session.session_key) setInspect(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -971,13 +809,10 @@ function SessionsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{
-              borderColor: "var(--pc-border)",
-              borderTopColor: "var(--pc-accent)",
-            }}
+            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
           />
-          <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-            {t("dashboard.loading_sessions")}
+          <span className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+            {t('dashboard.loading_sessions')}
           </span>
         </div>
       </div>
@@ -989,12 +824,12 @@ function SessionsTab() {
       <div
         className="rounded-2xl border p-4"
         style={{
-          background: "var(--color-status-error-alpha-08)",
-          borderColor: "var(--color-status-error-alpha-20)",
-          color: "var(--color-status-error)",
+          background: 'var(--color-status-error-alpha-08)',
+          borderColor: 'var(--color-status-error-alpha-20)',
+          color: 'var(--color-status-error)',
         }}
       >
-        {t("dashboard.load_sessions_error")}: {error}
+        {t('dashboard.load_sessions_error')}: {error}
       </div>
     );
   }
@@ -1002,29 +837,26 @@ function SessionsTab() {
   return (
     <div className="card p-5 animate-slide-in-up space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Users className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+        <Users className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: "var(--pc-text-primary)" }}
+          style={{ color: 'var(--pc-text-primary)' }}
         >
-          {t("dashboard.sessions_title")}
+          {t('dashboard.sessions_title')}
         </h2>
         <span
           className="text-xs font-mono px-2 py-0.5 rounded-full"
-          style={{
-            background: "rgba(var(--pc-accent-rgb), 0.1)",
-            color: "var(--pc-accent)",
-          }}
+          style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
         >
           {visible.length}
-          {visible.length !== sessions.length ? ` / ${sessions.length}` : ""}
+          {visible.length !== sessions.length ? ` / ${sessions.length}` : ''}
         </span>
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <div className="relative">
             <Search
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <input
               type="search"
@@ -1039,11 +871,13 @@ function SessionsTab() {
           <div className="relative">
             <ArrowUpDown
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as SessionSort)}
+              onChange={(e) =>
+                setSortBy(e.target.value as SessionSort)
+              }
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
               title="Sort sessions"
               aria-label="Sort sessions"
@@ -1058,7 +892,7 @@ function SessionsTab() {
           <div className="relative">
             <Bot
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={agentFilter}
@@ -1077,7 +911,7 @@ function SessionsTab() {
           <div className="relative">
             <Filter
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={channelFilter}
@@ -1097,13 +931,10 @@ function SessionsTab() {
       </div>
 
       {visible.length === 0 ? (
-        <p
-          className="text-sm py-8 text-center"
-          style={{ color: "var(--pc-text-faint)" }}
-        >
+        <p className="text-sm py-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>
           {sessions.length === 0
-            ? t("dashboard.no_sessions")
-            : "No sessions match the current search and filters"}
+            ? t('dashboard.no_sessions')
+            : 'No sessions match the current search and filters'}
         </p>
       ) : (
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
@@ -1111,16 +942,13 @@ function SessionsTab() {
             <div
               key={session.session_key}
               className="flex items-center justify-between py-3 px-4 rounded-xl"
-              style={{
-                background: "var(--pc-bg-elevated)",
-                border: "1px solid transparent",
-              }}
+              style={{ background: 'var(--pc-bg-elevated)', border: '1px solid transparent' }}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
                   <span
                     className="text-sm font-medium font-mono break-all"
-                    style={{ color: "var(--pc-text-primary)" }}
+                    style={{ color: 'var(--pc-text-primary)' }}
                   >
                     {session.session_id}
                   </span>
@@ -1130,8 +958,8 @@ function SessionsTab() {
                       id={session.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: "rgba(var(--pc-accent-rgb), 0.10)",
-                        color: "var(--pc-accent-light)",
+                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
+                        color: 'var(--pc-accent-light)',
                       }}
                       title={`Open agents.${session.agent_alias} config`}
                     >
@@ -1144,8 +972,8 @@ function SessionsTab() {
                       id={session.channel_id}
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: "rgba(167, 139, 250, 0.10)",
-                        color: "#a78bfa",
+                        background: 'rgba(167, 139, 250, 0.10)',
+                        color: '#a78bfa',
                       }}
                       title={`Open channels.${session.channel_id} config`}
                     >
@@ -1155,7 +983,7 @@ function SessionsTab() {
                 </div>
                 <div
                   className="flex items-center gap-3 text-xs"
-                  style={{ color: "var(--pc-text-muted)" }}
+                  style={{ color: 'var(--pc-text-muted)' }}
                 >
                   <span className="flex items-center gap-1">
                     <MessageSquare className="h-3 w-3" />
@@ -1170,7 +998,7 @@ function SessionsTab() {
                   onClick={() => openInspect(session)}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
                   title="View messages"
-                  style={{ color: "var(--pc-text-muted)" }}
+                  style={{ color: 'var(--pc-text-muted)' }}
                 >
                   <Eye className="h-4 w-4" />
                 </button>
@@ -1180,7 +1008,7 @@ function SessionsTab() {
                   disabled={deleting === session.session_key}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
                   title="Delete session"
-                  style={{ color: "var(--color-status-error)" }}
+                  style={{ color: 'var(--color-status-error)' }}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
@@ -1193,7 +1021,7 @@ function SessionsTab() {
       {inspect && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: "rgba(0,0,0,0.5)" }}
+          style={{ background: 'rgba(0,0,0,0.5)' }}
           onClick={() => setInspect(null)}
         >
           <div
@@ -1204,13 +1032,13 @@ function SessionsTab() {
               <div className="min-w-0">
                 <p
                   className="text-xs uppercase tracking-wider mb-1"
-                  style={{ color: "var(--pc-text-faint)" }}
+                  style={{ color: 'var(--pc-text-faint)' }}
                 >
                   Session
                 </p>
                 <p
                   className="text-sm font-mono break-all"
-                  style={{ color: "var(--pc-text-primary)" }}
+                  style={{ color: 'var(--pc-text-primary)' }}
                 >
                   {inspect.session.session_id}
                 </p>
@@ -1221,8 +1049,8 @@ function SessionsTab() {
                       id={inspect.session.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full hover:underline"
                       style={{
-                        background: "rgba(var(--pc-accent-rgb), 0.10)",
-                        color: "var(--pc-accent-light)",
+                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
+                        color: 'var(--pc-accent-light)',
                       }}
                     >
                       {inspect.session.agent_alias}
@@ -1234,8 +1062,8 @@ function SessionsTab() {
                       id={inspect.session.channel_id}
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full hover:underline"
                       style={{
-                        background: "rgba(167, 139, 250, 0.10)",
-                        color: "#a78bfa",
+                        background: 'rgba(167, 139, 250, 0.10)',
+                        color: '#a78bfa',
                       }}
                     >
                       {inspect.session.channel_id}
@@ -1250,19 +1078,19 @@ function SessionsTab() {
                     onClick={() => setInspectNewestFirst((v) => !v)}
                     className="text-[10px] font-medium px-2 py-1 rounded-lg hover:bg-[var(--pc-hover)] border"
                     style={{
-                      color: "var(--pc-text-muted)",
-                      borderColor: "var(--pc-border)",
+                      color: 'var(--pc-text-muted)',
+                      borderColor: 'var(--pc-border)',
                     }}
                     title="Flip transcript order"
                   >
-                    {inspectNewestFirst ? "newest first" : "oldest first"}
+                    {inspectNewestFirst ? 'newest first' : 'oldest first'}
                   </button>
                 )}
                 <button
                   type="button"
                   onClick={() => setInspect(null)}
                   className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
-                  style={{ color: "var(--pc-text-muted)" }}
+                  style={{ color: 'var(--pc-text-muted)' }}
                   title="Close"
                 >
                   <X className="h-4 w-4" />
@@ -1271,24 +1099,15 @@ function SessionsTab() {
             </div>
             <div className="flex-1 overflow-y-auto space-y-3 pr-1">
               {inspect.error ? (
-                <p
-                  className="text-sm"
-                  style={{ color: "var(--color-status-error)" }}
-                >
+                <p className="text-sm" style={{ color: 'var(--color-status-error)' }}>
                   {inspect.error}
                 </p>
               ) : inspect.messages === null ? (
-                <p
-                  className="text-sm"
-                  style={{ color: "var(--pc-text-muted)" }}
-                >
+                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
                   Loading transcript…
                 </p>
               ) : inspect.messages.length === 0 ? (
-                <p
-                  className="text-sm"
-                  style={{ color: "var(--pc-text-faint)" }}
-                >
+                <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
                   No persisted messages for this session.
                 </p>
               ) : (
@@ -1299,19 +1118,19 @@ function SessionsTab() {
                   <div
                     key={i}
                     className="rounded-xl px-3 py-2"
-                    style={{ background: "var(--pc-bg-elevated)" }}
+                    style={{ background: 'var(--pc-bg-elevated)' }}
                   >
                     <div className="flex items-baseline justify-between gap-3 mb-1">
                       <p
                         className="text-[10px] uppercase tracking-wider font-mono"
-                        style={{ color: "var(--pc-text-faint)" }}
+                        style={{ color: 'var(--pc-text-faint)' }}
                       >
                         {m.role}
                       </p>
                       {m.created_at && (
                         <p
                           className="text-[10px] font-mono whitespace-nowrap"
-                          style={{ color: "var(--pc-text-faint)" }}
+                          style={{ color: 'var(--pc-text-faint)' }}
                           title={m.created_at}
                         >
                           {formatLocalDateTime(m.created_at)}
@@ -1320,7 +1139,7 @@ function SessionsTab() {
                     </div>
                     <p
                       className="text-sm whitespace-pre-wrap break-words"
-                      style={{ color: "var(--pc-text-primary)" }}
+                      style={{ color: 'var(--pc-text-primary)' }}
                     >
                       {m.content}
                     </p>
@@ -1345,7 +1164,7 @@ function ChannelsTab() {
   const [error, setError] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ["channel_update", "channel_status"],
+    filterTypes: ['channel_update', 'channel_status'],
     autoConnect: true,
   });
 
@@ -1377,10 +1196,7 @@ function ChannelsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{
-              borderColor: "var(--pc-border)",
-              borderTopColor: "var(--pc-accent)",
-            }}
+            style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)" }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
             {t("dashboard.loading_channels")}
@@ -1394,11 +1210,7 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{
-          background: "var(--color-status-error-alpha-08)",
-          borderColor: "var(--color-status-error-alpha-20)",
-          color: "var(--color-status-error)",
-        }}
+        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -1408,10 +1220,7 @@ function ChannelsTab() {
   if (channels.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p
-          className="text-sm py-8 text-center"
-          style={{ color: "var(--pc-text-faint)" }}
-        >
+        <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
           {t("dashboard.no_channels_detail")}
         </p>
       </div>
@@ -1442,10 +1251,7 @@ function ChannelsTab() {
             <div className="flex items-center gap-3 min-w-0">
               <div
                 className="p-2 rounded-2xl flex-shrink-0"
-                style={{
-                  background: `rgba(var(--pc-accent-rgb), 0.08)`,
-                  color: "var(--pc-accent)",
-                }}
+                style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: "var(--pc-accent)" }}
               >
                 <Radio className="h-5 w-5" />
               </div>
@@ -1456,17 +1262,12 @@ function ChannelsTab() {
                   className="text-sm font-semibold font-mono break-all hover:underline"
                   title={`Open channels.${channel.name} config`}
                 >
-                  <span style={{ color: "var(--pc-text-primary)" }}>
-                    {channel.name}
-                  </span>
+                  <span style={{ color: 'var(--pc-text-primary)' }}>{channel.name}</span>
                 </EntityLink>
-                <span
-                  className="text-xs block"
-                  style={{ color: "var(--pc-text-muted)" }}
-                >
+                <span className="text-xs block" style={{ color: 'var(--pc-text-muted)' }}>
                   {channel.owning_agent ? (
                     <>
-                      owned by{" "}
+                      owned by{' '}
                       <EntityLink
                         kind="agent"
                         id={channel.owning_agent}
@@ -1477,7 +1278,7 @@ function ChannelsTab() {
                       </EntityLink>
                     </>
                   ) : (
-                    "no owning agent"
+                    'no owning agent'
                   )}
                 </span>
               </div>
@@ -1523,9 +1324,7 @@ function ChannelsTab() {
               </>
             ) : null}
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>
-                {t("dashboard.health")}
-              </span>
+              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.health")}</span>
               <span style={{ color: healthColor(channel.health) }}>
                 {channel.health}
               </span>
@@ -1567,45 +1366,37 @@ function ChannelsTab() {
 // Main Dashboard Component
 // ---------------------------------------------------------------------------
 
-const TAB_IDS: TabId[] = [
-  "overview",
-  "sessions",
-  "channels",
-  "memories",
-  "health",
-  "cost",
-];
+const TAB_IDS: TabId[] = ['overview', 'sessions', 'channels', 'memories', 'health', 'cost'];
 
 function parseTab(raw: string | null): TabId {
   if (raw && (TAB_IDS as string[]).includes(raw)) return raw as TabId;
-  return "overview";
+  return 'overview';
 }
 
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
-  const [tuis, setTuis] = useState<TuiEntry[]>([]);
-  const [costWindow, setCostWindow] = useState<CostWindow>("today");
+  const [costWindow, setCostWindow] = useState<CostWindow>('today');
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = parseTab(searchParams.get("tab"));
+  const activeTab = parseTab(searchParams.get('tab'));
   const setActiveTab = (id: TabId) => {
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (id === "overview") next.delete("tab");
-        else next.set("tab", id);
+        if (id === 'overview') next.delete('tab');
+        else next.set('tab', id);
         // Filters belong to specific tabs; drop them when leaving so deep
         // links don't drag a stale agent= into the wrong tab.
-        if (id !== "sessions" && id !== "memories") {
-          next.delete("agent");
+        if (id !== 'sessions' && id !== 'memories') {
+          next.delete('agent');
         }
-        if (id !== "sessions") {
-          next.delete("channel");
+        if (id !== 'sessions') {
+          next.delete('channel');
         }
-        if (id !== "memories") {
-          next.delete("category");
+        if (id !== 'memories') {
+          next.delete('category');
         }
         return next;
       },
@@ -1617,12 +1408,11 @@ export default function Dashboard() {
     let cancelled = false;
     const refresh = () => {
       const { from, to } = costWindowBounds(costWindow);
-      Promise.all([getStatus(), getCost(from, to), getTuis()])
-        .then(([s, c, t]) => {
+      Promise.all([getStatus(), getCost(from, to)])
+        .then(([s, c]) => {
           if (cancelled) return;
           setStatus(s);
           setCost(c);
-          setTuis(t);
         })
         .catch((err) => {
           if (!cancelled) setError(err.message);
@@ -1641,14 +1431,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div
-          className="rounded-2xl border p-4"
-          style={{
-            background: "var(--color-status-error-alpha-08)",
-            borderColor: "var(--color-status-error-alpha-20)",
-            color: "var(--color-status-error)",
-          }}
-        >
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t("dashboard.load_error")}: {error}
         </div>
       </div>
@@ -1658,13 +1441,7 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div
-          className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{
-            borderColor: "var(--pc-border)",
-            borderTopColor: "var(--pc-accent)",
-          }}
-        />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)", }}/>
       </div>
     );
   }
@@ -1713,25 +1490,20 @@ export default function Dashboard() {
       </div>
 
       {/* Tab Content */}
-      {activeTab === "overview" && (
+      {activeTab === 'overview' && (
         <OverviewTab
           status={status}
           cost={cost}
-          tuis={tuis}
           showAllChannels={showAllChannels}
           setShowAllChannels={setShowAllChannels}
         />
       )}
-      {activeTab === "sessions" && <SessionsTab />}
-      {activeTab === "channels" && <ChannelsTab />}
-      {activeTab === "memories" && <MemoriesTab />}
-      {activeTab === "health" && <HealthTab status={status} />}
-      {activeTab === "cost" && (
-        <CostTab
-          cost={cost}
-          window={costWindow}
-          onWindowChange={setCostWindow}
-        />
+      {activeTab === 'sessions' && <SessionsTab />}
+      {activeTab === 'channels' && <ChannelsTab />}
+      {activeTab === 'memories' && <MemoriesTab />}
+      {activeTab === 'health' && <HealthTab status={status} />}
+      {activeTab === 'cost' && (
+        <CostTab cost={cost} window={costWindow} onWindowChange={setCostWindow} />
       )}
     </div>
   );
@@ -1744,13 +1516,13 @@ export default function Dashboard() {
 function HealthTab({ status }: { status: StatusResponse }) {
   const components = status.health?.components ?? {};
   const entries = Object.entries(components).filter(
-    ([name]) => !name.startsWith("channel:"),
+    ([name]) => !name.startsWith('channel:'),
   );
   if (entries.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-          {t("dashboard.no_components")}
+        <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
+          {t('dashboard.no_components')}
         </p>
       </div>
     );
@@ -1759,12 +1531,12 @@ function HealthTab({ status }: { status: StatusResponse }) {
   return (
     <div className="card p-5 animate-slide-in-up">
       <div className="flex items-center gap-2 mb-5">
-        <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+        <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: "var(--pc-text-primary)" }}
+          style={{ color: 'var(--pc-text-primary)' }}
         >
-          {t("dashboard.component_health")}
+          {t('dashboard.component_health')}
         </h2>
       </div>
       <div className="space-y-2">
@@ -1790,7 +1562,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
                 />
                 <span
                   className="text-sm font-medium font-mono break-all"
-                  style={{ color: "var(--pc-text-primary)" }}
+                  style={{ color: 'var(--pc-text-primary)' }}
                 >
                   {name}
                 </span>
@@ -1798,7 +1570,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
                   className="ml-auto text-[10px] uppercase font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
                   style={{
                     color: healthColor(comp.status),
-                    background: "transparent",
+                    background: 'transparent',
                     border: `1px solid ${healthBorder(comp.status)}`,
                   }}
                 >
@@ -1808,7 +1580,7 @@ function HealthTab({ status }: { status: StatusResponse }) {
               {lastErr && (
                 <p
                   className="text-[11px] mt-1 font-mono break-words"
-                  style={{ color: "var(--color-status-error)" }}
+                  style={{ color: 'var(--color-status-error)' }}
                   title={lastErr}
                 >
                   ⚠ {lastErr}
@@ -1816,16 +1588,12 @@ function HealthTab({ status }: { status: StatusResponse }) {
               )}
               <div
                 className="flex items-center gap-3 text-[11px] mt-0.5"
-                style={{ color: "var(--pc-text-muted)" }}
+                style={{ color: 'var(--pc-text-muted)' }}
               >
-                {lastOk && (
-                  <span title={`last ok: ${lastOk}`}>
-                    ok {formatRelative(lastOk)}
-                  </span>
-                )}
+                {lastOk && <span title={`last ok: ${lastOk}`}>ok {formatRelative(lastOk)}</span>}
                 {comp.restart_count > 0 && (
-                  <span style={{ color: "var(--color-status-warning)" }}>
-                    {t("dashboard.restarts")}: {comp.restart_count}
+                  <span style={{ color: 'var(--color-status-warning)' }}>
+                    {t('dashboard.restarts')}: {comp.restart_count}
                   </span>
                 )}
               </div>
@@ -1844,11 +1612,11 @@ function HealthTab({ status }: { status: StatusResponse }) {
 // Cost dashboard: per-day totals plus per-agent and per-model rollups
 // with input / output / cached token splits. Both rollups are daily-scoped
 const COST_WINDOW_OPTIONS: { value: CostWindow; label: string }[] = [
-  { value: "today", label: "Today" },
-  { value: "7d", label: "Last 7 days" },
-  { value: "30d", label: "Last 30 days" },
-  { value: "month", label: "This month" },
-  { value: "all", label: "All time" },
+  { value: 'today', label: 'Today' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+  { value: 'month', label: 'This month' },
+  { value: 'all', label: 'All time' },
 ];
 
 function CostTab({
@@ -1864,24 +1632,21 @@ function CostTab({
   const byAgent = Object.values(cost.by_agent);
   const navigate = useNavigate();
   const windowLabel =
-    COST_WINDOW_OPTIONS.find(
-      (o) => o.value === costWindow,
-    )?.label.toLowerCase() ?? costWindow;
+    COST_WINDOW_OPTIONS.find((o) => o.value === costWindow)?.label.toLowerCase() ?? costWindow;
 
   const openModelRates = async (modelId: string) => {
-    const map = await resolveModelToProviderType("models").catch(() => null);
+    const map = await resolveModelToProviderType('models').catch(() => null);
     const type = map?.[modelId];
     if (!type) return;
-    navigate(`/config/providers.models/${encodeURIComponent(type)}?tab=costs`);
+    navigate(
+      `/config/providers.models/${encodeURIComponent(type)}?tab=costs`,
+    );
   };
 
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center gap-2">
-        <label
-          className="text-xs uppercase tracking-wider"
-          style={{ color: "var(--pc-text-secondary)" }}
-        >
+        <label className="text-xs uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
           Window
         </label>
         <select
@@ -1897,140 +1662,116 @@ function CostTab({
         </select>
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="card p-5 animate-slide-in-up">
-          <div className="flex items-center gap-2 mb-5">
-            <Bot className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
-              Spend by agent · {windowLabel}
-            </h2>
-          </div>
-          {byAgent.length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-              No per-agent tracking. Enable <code>[cost].track_per_agent</code>.
-            </p>
-          ) : (
-            <ul className="space-y-2 text-sm">
-              {byAgent
-                .slice()
-                .sort((a, b) => b.cost_usd - a.cost_usd)
-                .map((row) => (
-                  <li
-                    key={row.agent_alias}
-                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
-                    style={{ background: "var(--pc-bg-elevated)" }}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <EntityLink
-                        kind="agent"
-                        id={row.agent_alias}
-                        className="font-mono hover:underline"
-                        title={`agents.${row.agent_alias}`}
-                      >
-                        agents.{row.agent_alias}
-                      </EntityLink>
-                      <span
-                        className="font-mono"
-                        style={{ color: "var(--pc-text-primary)" }}
-                      >
-                        {formatUSD(row.cost_usd)}
-                      </span>
-                    </div>
-                    <div
-                      className="flex items-center gap-3 text-xs flex-wrap"
-                      style={{ color: "var(--pc-text-muted)" }}
-                    >
-                      <span>{row.request_count} exchanges</span>
-                      <span>
-                        {row.input_tokens.toLocaleString()} input tokens
-                      </span>
-                      {row.cached_input_tokens > 0 && (
-                        <span>
-                          {row.cached_input_tokens.toLocaleString()} cached
-                        </span>
-                      )}
-                      <span>
-                        {row.output_tokens.toLocaleString()} output tokens
-                      </span>
-                    </div>
-                  </li>
-                ))}
-            </ul>
-          )}
+      <div className="card p-5 animate-slide-in-up">
+        <div className="flex items-center gap-2 mb-5">
+          <Bot className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2
+            className="text-sm font-semibold uppercase tracking-wider"
+            style={{ color: 'var(--pc-text-primary)' }}
+          >
+            Spend by agent · {windowLabel}
+          </h2>
         </div>
+        {byAgent.length === 0 ? (
+          <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
+            No per-agent tracking. Enable <code>[cost].track_per_agent</code>.
+          </p>
+        ) : (
+          <ul className="space-y-2 text-sm">
+            {byAgent
+              .slice()
+              .sort((a, b) => b.cost_usd - a.cost_usd)
+              .map((row) => (
+                <li
+                  key={row.agent_alias}
+                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                  style={{ background: 'var(--pc-bg-elevated)' }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <EntityLink
+                      kind="agent"
+                      id={row.agent_alias}
+                      className="font-mono hover:underline"
+                      title={`agents.${row.agent_alias}`}
+                    >
+                      agents.{row.agent_alias}
+                    </EntityLink>
+                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+                      {formatUSD(row.cost_usd)}
+                    </span>
+                  </div>
+                  <div
+                    className="flex items-center gap-3 text-xs flex-wrap"
+                    style={{ color: 'var(--pc-text-muted)' }}
+                  >
+                    <span>{row.request_count} exchanges</span>
+                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
+                    {row.cached_input_tokens > 0 && (
+                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
+                    )}
+                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
+                  </div>
+                </li>
+              ))}
+          </ul>
+        )}
+      </div>
 
-        <div className="card p-5 lg:col-span-2 animate-slide-in-up">
-          <div className="flex items-center gap-2 mb-5">
-            <DollarSign
-              className="h-5 w-5"
-              style={{ color: "var(--pc-accent)" }}
-            />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
-              Spend by model · {windowLabel}
-            </h2>
-          </div>
-          {byModel.length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-              No model usage recorded in this window.
-            </p>
-          ) : (
-            <ul className="space-y-2 text-sm">
-              {byModel
-                .slice()
-                .sort((a, b) => b.cost_usd - a.cost_usd)
-                .map((row) => (
-                  <li
-                    key={row.model}
-                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
-                    style={{ background: "var(--pc-bg-elevated)" }}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <button
-                        type="button"
-                        onClick={() => void openModelRates(row.model)}
-                        className="font-mono break-all hover:underline text-left"
-                        style={{
-                          color: "var(--pc-text-primary)",
-                          background: "transparent",
-                        }}
-                        title={`Open the rate sheet entry for ${row.model}`}
-                      >
-                        {row.model}
-                      </button>
-                      <span
-                        className="font-mono"
-                        style={{ color: "var(--pc-text-primary)" }}
-                      >
-                        {formatUSD(row.cost_usd)}
-                      </span>
-                    </div>
-                    <div
-                      className="flex items-center gap-3 text-xs flex-wrap"
-                      style={{ color: "var(--pc-text-muted)" }}
-                    >
-                      <span>{row.request_count} exchanges</span>
-                      <span>
-                        {row.input_tokens.toLocaleString()} input tokens
-                      </span>
-                      {row.cached_input_tokens > 0 && (
-                        <span>
-                          {row.cached_input_tokens.toLocaleString()} cached
-                        </span>
-                      )}
-                      <span>
-                        {row.output_tokens.toLocaleString()} output tokens
-                      </span>
-                    </div>
-                  </li>
-                ))}
-            </ul>
-          )}
+      <div className="card p-5 lg:col-span-2 animate-slide-in-up">
+        <div className="flex items-center gap-2 mb-5">
+          <DollarSign className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2
+            className="text-sm font-semibold uppercase tracking-wider"
+            style={{ color: 'var(--pc-text-primary)' }}
+          >
+            Spend by model · {windowLabel}
+          </h2>
         </div>
+        {byModel.length === 0 ? (
+          <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
+            No model usage recorded in this window.
+          </p>
+        ) : (
+          <ul className="space-y-2 text-sm">
+            {byModel
+              .slice()
+              .sort((a, b) => b.cost_usd - a.cost_usd)
+              .map((row) => (
+                <li
+                  key={row.model}
+                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                  style={{ background: 'var(--pc-bg-elevated)' }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void openModelRates(row.model)}
+                      className="font-mono break-all hover:underline text-left"
+                      style={{ color: 'var(--pc-text-primary)', background: 'transparent' }}
+                      title={`Open the rate sheet entry for ${row.model}`}
+                    >
+                      {row.model}
+                    </button>
+                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+                      {formatUSD(row.cost_usd)}
+                    </span>
+                  </div>
+                  <div
+                    className="flex items-center gap-3 text-xs flex-wrap"
+                    style={{ color: 'var(--pc-text-muted)' }}
+                  >
+                    <span>{row.request_count} exchanges</span>
+                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
+                    {row.cached_input_tokens > 0 && (
+                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
+                    )}
+                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
+                  </div>
+                </li>
+              ))}
+          </ul>
+        )}
+      </div>
       </div>
     </div>
   );
@@ -2043,13 +1784,13 @@ function CostTab({
 // for creating new rows; this tab is the cross-agent inspection surface.
 // ---------------------------------------------------------------------------
 
-type MemorySort = "newest" | "oldest" | "key-asc" | "key-desc";
+type MemorySort = 'newest' | 'oldest' | 'key-asc' | 'key-desc';
 
 const MEMORY_SORT_OPTIONS: { value: MemorySort; label: string }[] = [
-  { value: "newest", label: "Newest first" },
-  { value: "oldest", label: "Oldest first" },
-  { value: "key-asc", label: "Key A → Z" },
-  { value: "key-desc", label: "Key Z → A" },
+  { value: 'newest', label: 'Newest first' },
+  { value: 'oldest', label: 'Oldest first' },
+  { value: 'key-asc', label: 'Key A → Z' },
+  { value: 'key-desc', label: 'Key Z → A' },
 ];
 
 function isMemorySort(v: string): v is MemorySort {
@@ -2061,11 +1802,11 @@ function MemoriesTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
-  const agentFilter = searchParams.get("agent") ?? "";
-  const categoryFilter = searchParams.get("category") ?? "";
-  const searchQuery = searchParams.get("q") ?? "";
-  const sortRaw = searchParams.get("sort") ?? "";
-  const sortBy: MemorySort = isMemorySort(sortRaw) ? sortRaw : "newest";
+  const agentFilter = searchParams.get('agent') ?? '';
+  const categoryFilter = searchParams.get('category') ?? '';
+  const searchQuery = searchParams.get('q') ?? '';
+  const sortRaw = searchParams.get('sort') ?? '';
+  const sortBy: MemorySort = isMemorySort(sortRaw) ? sortRaw : 'newest';
   // Debounced query so each keystroke doesn't fire a recall request to the
   // backend (which then hits the configured memory store — markdown read,
   // sqlite scan, qdrant vector search, etc.).
@@ -2078,10 +1819,10 @@ function MemoriesTab() {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAddForm, setShowAddForm] = useState(false);
-  const [formKey, setFormKey] = useState("");
-  const [formContent, setFormContent] = useState("");
-  const [formCategory, setFormCategory] = useState("");
-  const [formAgent, setFormAgent] = useState("");
+  const [formKey, setFormKey] = useState('');
+  const [formContent, setFormContent] = useState('');
+  const [formCategory, setFormCategory] = useState('');
+  const [formAgent, setFormAgent] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -2093,7 +1834,7 @@ function MemoriesTab() {
       return next;
     });
 
-  const setFilter = (key: "agent" | "category" | "q" | "sort", value: string) =>
+  const setFilter = (key: 'agent' | 'category' | 'q' | 'sort', value: string) =>
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -2103,9 +1844,9 @@ function MemoriesTab() {
       },
       { replace: true },
     );
-  const setSearchQuery = (v: string) => setFilter("q", v);
+  const setSearchQuery = (v: string) => setFilter('q', v);
   const setSortBy = (v: MemorySort) =>
-    setFilter("sort", v === "newest" ? "" : v);
+    setFilter('sort', v === 'newest' ? '' : v);
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -2129,7 +1870,7 @@ function MemoriesTab() {
   }, [reload]);
 
   useEffect(() => {
-    getMapKeys("agents")
+    getMapKeys('agents')
       .then((r) => setKnownAgents(r.keys))
       .catch(() => {
         /* dropdown stays empty; filter still works as a typed value */
@@ -2146,13 +1887,13 @@ function MemoriesTab() {
     const sorted = [...entries];
     sorted.sort((a, b) => {
       switch (sortBy) {
-        case "oldest":
+        case 'oldest':
           return a.timestamp.localeCompare(b.timestamp);
-        case "key-asc":
+        case 'key-asc':
           return a.key.localeCompare(b.key);
-        case "key-desc":
+        case 'key-desc':
           return b.key.localeCompare(a.key);
-        case "newest":
+        case 'newest':
         default:
           return b.timestamp.localeCompare(a.timestamp);
       }
@@ -2162,8 +1903,7 @@ function MemoriesTab() {
 
   const handleDelete = async (entry: MemoryEntry) => {
     if (deleting) return;
-    if (!window.confirm(`Delete memory ${entry.key}? This cannot be undone.`))
-      return;
+    if (!window.confirm(`Delete memory ${entry.key}? This cannot be undone.`)) return;
     setDeleting(entry.id);
     try {
       // Per-agent rows resolve through the agent's own memory backend; the
@@ -2181,7 +1921,7 @@ function MemoriesTab() {
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
-      setFormError("Key and content are required");
+      setFormError('Key and content are required');
       return;
     }
     setSubmitting(true);
@@ -2194,10 +1934,10 @@ function MemoriesTab() {
         formAgent.trim() || undefined,
       );
       setShowAddForm(false);
-      setFormKey("");
-      setFormContent("");
-      setFormCategory("");
-      setFormAgent("");
+      setFormKey('');
+      setFormContent('');
+      setFormCategory('');
+      setFormAgent('');
       reload();
     } catch (e) {
       setFormError(e instanceof Error ? e.message : String(e));
@@ -2212,12 +1952,9 @@ function MemoriesTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{
-              borderColor: "var(--pc-border)",
-              borderTopColor: "var(--pc-accent)",
-            }}
+            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
           />
-          <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+          <span className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
             Loading memories…
           </span>
         </div>
@@ -2230,9 +1967,9 @@ function MemoriesTab() {
       <div
         className="rounded-2xl border p-4"
         style={{
-          background: "var(--color-status-error-alpha-08)",
-          borderColor: "var(--color-status-error-alpha-20)",
-          color: "var(--color-status-error)",
+          background: 'var(--color-status-error-alpha-08)',
+          borderColor: 'var(--color-status-error-alpha-20)',
+          color: 'var(--color-status-error)',
         }}
       >
         {error}
@@ -2243,24 +1980,19 @@ function MemoriesTab() {
   return (
     <div className="card p-5 animate-slide-in-up space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Brain className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+        <Brain className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
         <h2
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: "var(--pc-text-primary)" }}
+          style={{ color: 'var(--pc-text-primary)' }}
         >
           Memories
         </h2>
         <span
           className="text-xs font-mono px-2 py-0.5 rounded-full"
-          style={{
-            background: "rgba(var(--pc-accent-rgb), 0.1)",
-            color: "var(--pc-accent)",
-          }}
+          style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
         >
           {visibleEntries.length}
-          {visibleEntries.length !== entries.length
-            ? ` / ${entries.length}`
-            : ""}
+          {visibleEntries.length !== entries.length ? ` / ${entries.length}` : ''}
         </span>
         <button
           type="button"
@@ -2278,14 +2010,14 @@ function MemoriesTab() {
           title="Add a memory entry"
         >
           <Plus className="h-3 w-3" />
-          {t("dashboard.add_memory")}
+          {t('dashboard.add_memory')}
         </button>
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <div className="relative">
             <Search
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <input
               type="search"
@@ -2300,7 +2032,7 @@ function MemoriesTab() {
           <div className="relative">
             <ArrowUpDown
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={sortBy}
@@ -2319,11 +2051,11 @@ function MemoriesTab() {
           <div className="relative">
             <Bot
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={agentFilter}
-              onChange={(e) => setFilter("agent", e.target.value)}
+              onChange={(e) => setFilter('agent', e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
               title="Filter by owning agent"
             >
@@ -2338,11 +2070,11 @@ function MemoriesTab() {
           <div className="relative">
             <Filter
               className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5"
-              style={{ color: "var(--pc-text-faint)" }}
+              style={{ color: 'var(--pc-text-faint)' }}
             />
             <select
               value={categoryFilter}
-              onChange={(e) => setFilter("category", e.target.value)}
+              onChange={(e) => setFilter('category', e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
               title="Filter by category"
             >
@@ -2358,10 +2090,7 @@ function MemoriesTab() {
       </div>
 
       {visibleEntries.length === 0 ? (
-        <p
-          className="text-sm py-8 text-center"
-          style={{ color: "var(--pc-text-faint)" }}
-        >
+        <p className="text-sm py-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>
           No memories match the current search and filters
         </p>
       ) : (
@@ -2370,13 +2099,13 @@ function MemoriesTab() {
             <div
               key={entry.id}
               className="flex items-center justify-between gap-3 py-3 px-4 rounded-xl"
-              style={{ background: "var(--pc-bg-elevated)" }}
+              style={{ background: 'var(--pc-bg-elevated)' }}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
                   <span
                     className="text-sm font-medium font-mono break-all"
-                    style={{ color: "var(--pc-text-primary)" }}
+                    style={{ color: 'var(--pc-text-primary)' }}
                   >
                     {entry.key}
                   </span>
@@ -2386,8 +2115,8 @@ function MemoriesTab() {
                       id={entry.agent_alias}
                       className="text-[10px] font-medium px-2 py-0.5 rounded-full flex-shrink-0 hover:underline"
                       style={{
-                        background: "rgba(var(--pc-accent-rgb), 0.10)",
-                        color: "var(--pc-accent-light)",
+                        background: 'rgba(var(--pc-accent-rgb), 0.10)',
+                        color: 'var(--pc-accent-light)',
                       }}
                       title={`Open agents.${entry.agent_alias} config`}
                     >
@@ -2398,8 +2127,8 @@ function MemoriesTab() {
                     <span
                       className="text-[10px] font-mono px-2 py-0.5 rounded-full flex-shrink-0"
                       style={{
-                        background: "rgba(167, 139, 250, 0.10)",
-                        color: "#a78bfa",
+                        background: 'rgba(167, 139, 250, 0.10)',
+                        color: '#a78bfa',
                       }}
                     >
                       {entry.category}
@@ -2413,7 +2142,7 @@ function MemoriesTab() {
                 />
                 <p
                   className="text-[10px] font-mono mt-1"
-                  style={{ color: "var(--pc-text-faint)" }}
+                  style={{ color: 'var(--pc-text-faint)' }}
                   title={entry.timestamp}
                 >
                   {formatLocalDateTime(entry.timestamp)}
@@ -2425,7 +2154,7 @@ function MemoriesTab() {
                 disabled={deleting === entry.id}
                 className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50 flex-shrink-0"
                 title="Delete memory"
-                style={{ color: "var(--color-status-error)" }}
+                style={{ color: 'var(--color-status-error)' }}
               >
                 <Trash2 className="h-4 w-4" />
               </button>
@@ -2437,7 +2166,7 @@ function MemoriesTab() {
       {showAddForm && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: "rgba(0,0,0,0.5)" }}
+          style={{ background: 'rgba(0,0,0,0.5)' }}
           onClick={() => setShowAddForm(false)}
         >
           <div
@@ -2447,15 +2176,15 @@ function MemoriesTab() {
             <div className="flex items-center justify-between mb-4">
               <h3
                 className="text-lg font-semibold"
-                style={{ color: "var(--pc-text-primary)" }}
+                style={{ color: 'var(--pc-text-primary)' }}
               >
-                {t("dashboard.add_memory")}
+                {t('dashboard.add_memory')}
               </h3>
               <button
                 type="button"
                 onClick={() => setShowAddForm(false)}
                 className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
-                style={{ color: "var(--pc-text-muted)" }}
+                style={{ color: 'var(--pc-text-muted)' }}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -2464,9 +2193,9 @@ function MemoriesTab() {
               <div
                 className="mb-4 rounded-xl border p-3 text-sm"
                 style={{
-                  background: "var(--color-status-error-alpha-08)",
-                  borderColor: "var(--color-status-error-alpha-20)",
-                  color: "var(--color-status-error)",
+                  background: 'var(--color-status-error-alpha-08)',
+                  borderColor: 'var(--color-status-error-alpha-20)',
+                  color: 'var(--color-status-error)',
                 }}
               >
                 {formError}
@@ -2476,10 +2205,9 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: "var(--pc-text-secondary)" }}
+                  style={{ color: 'var(--pc-text-secondary)' }}
                 >
-                  Key{" "}
-                  <span style={{ color: "var(--color-status-error)" }}>*</span>
+                  Key <span style={{ color: 'var(--color-status-error)' }}>*</span>
                 </label>
                 <input
                   type="text"
@@ -2492,10 +2220,9 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: "var(--pc-text-secondary)" }}
+                  style={{ color: 'var(--pc-text-secondary)' }}
                 >
-                  Content{" "}
-                  <span style={{ color: "var(--color-status-error)" }}>*</span>
+                  Content <span style={{ color: 'var(--color-status-error)' }}>*</span>
                 </label>
                 <textarea
                   value={formContent}
@@ -2508,7 +2235,7 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: "var(--pc-text-secondary)" }}
+                  style={{ color: 'var(--pc-text-secondary)' }}
                 >
                   Category (optional)
                 </label>
@@ -2523,7 +2250,7 @@ function MemoriesTab() {
               <div>
                 <label
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
-                  style={{ color: "var(--pc-text-secondary)" }}
+                  style={{ color: 'var(--pc-text-secondary)' }}
                 >
                   Agent (optional)
                 </label>
@@ -2541,7 +2268,7 @@ function MemoriesTab() {
                 </select>
                 <p
                   className="text-[11px] mt-1"
-                  style={{ color: "var(--pc-text-faint)" }}
+                  style={{ color: 'var(--pc-text-faint)' }}
                 >
                   Picks which agent's memory backend the row lands in. Leave
                   blank to write to the gateway's default backend.
@@ -2562,7 +2289,7 @@ function MemoriesTab() {
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium disabled:opacity-50"
               >
-                {submitting ? "Saving…" : "Save"}
+                {submitting ? 'Saving…' : 'Save'}
               </button>
             </div>
           </div>
@@ -2598,7 +2325,7 @@ function MemoryContent({
     <>
       <p
         className="text-sm whitespace-pre-wrap break-words"
-        style={{ color: "var(--pc-text-secondary)" }}
+        style={{ color: 'var(--pc-text-secondary)' }}
       >
         {display}
       </p>
@@ -2607,10 +2334,10 @@ function MemoryContent({
           type="button"
           onClick={onToggle}
           className="text-[11px] mt-1 hover:underline"
-          style={{ color: "var(--pc-accent)" }}
+          style={{ color: 'var(--pc-accent)' }}
         >
           {expanded
-            ? "Collapse"
+            ? 'Collapse'
             : `Expand (${content.length.toLocaleString()} chars, ${newlines + 1} lines)`}
         </button>
       )}
@@ -2623,10 +2350,10 @@ function truncateForPreview(content: string): string {
   // dropped lines, the `…` reflects real omission. Then char-limit if the
   // newline slice is still too wide; the slice + `…` always means there's
   // more behind the cut.
-  const lines = content.split("\n");
+  const lines = content.split('\n');
   const slicedByNewline = lines.length > MEMORY_PREVIEW_NEWLINES;
   const byNewline = slicedByNewline
-    ? lines.slice(0, MEMORY_PREVIEW_NEWLINES).join("\n")
+    ? lines.slice(0, MEMORY_PREVIEW_NEWLINES).join('\n')
     : content;
   if (byNewline.length > MEMORY_PREVIEW_CHARS) {
     return `${byNewline.slice(0, MEMORY_PREVIEW_CHARS).trimEnd()}…`;
@@ -2642,7 +2369,7 @@ function truncateForPreview(content: string): string {
 
 function AgentsSection() {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
-  const [quickstartLabel, setQuickstartLabel] = useState("Start Quickstart");
+  const [onboardButtonLabel, setOnboardButtonLabel] = useState('Start onboarding');
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
 
@@ -2650,36 +2377,35 @@ function AgentsSection() {
     loadAgentSummaries()
       .then(setAgents)
       .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : "Failed to load agents"),
+        setError(err instanceof Error ? err.message : 'Failed to load agents'),
       );
   }, []);
 
   useEffect(() => {
-    getQuickstartState()
-      .then((state) => {
-        if (state.agents.length > 0) {
-          setQuickstartLabel("Create another agent");
+    getOnboardStatus()
+      .then((status) => {
+        if (status.reason === 'has_dispatchable_agent') {
+          setOnboardButtonLabel('Run onboarding again');
+        } else if (status.has_partial_state || status.reason === 'incomplete_agent') {
+          setOnboardButtonLabel('Continue onboarding');
         } else {
-          setQuickstartLabel("Start Quickstart");
+          setOnboardButtonLabel('Start onboarding');
         }
       })
-      .catch(() => setQuickstartLabel("Start Quickstart"));
+      .catch(() => setOnboardButtonLabel('Start onboarding'));
   }, []);
 
   const handleToggle = useCallback(async (agent: AgentSummary) => {
     setToggling((prev) => new Set(prev).add(agent.alias));
     try {
       await toggleAgentEnabled(agent.alias, !agent.enabled);
-      setAgents(
-        (prev) =>
-          prev?.map((a) =>
-            a.alias === agent.alias ? { ...a, enabled: !a.enabled } : a,
-          ) ?? null,
+      setAgents((prev) =>
+        prev?.map((a) =>
+          a.alias === agent.alias ? { ...a, enabled: !a.enabled } : a,
+        ) ?? null,
       );
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`,
-      );
+      setError(err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`);
     } finally {
       setToggling((prev) => {
         const next = new Set(prev);
@@ -2700,12 +2426,8 @@ function AgentsSection() {
         return a.alias.localeCompare(b.alias);
       })
     : null;
-  const visibleAgents = sortedAgents
-    ? sortedAgents.slice(0, AGENT_GLANCE_LIMIT)
-    : null;
-  const hiddenCount = sortedAgents
-    ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT)
-    : 0;
+  const visibleAgents = sortedAgents ? sortedAgents.slice(0, AGENT_GLANCE_LIMIT) : null;
+  const hiddenCount = sortedAgents ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT) : 0;
 
   return (
     <section>
@@ -2713,17 +2435,14 @@ function AgentsSection() {
         <div className="flex items-center gap-2">
           <h2
             className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: "var(--pc-text-primary)" }}
+            style={{ color: 'var(--pc-text-primary)' }}
           >
             Agents
           </h2>
           {sortedAgents && sortedAgents.length > 0 && (
             <span
               className="text-xs font-mono px-2 py-0.5 rounded-full"
-              style={{
-                background: "rgba(var(--pc-accent-rgb), 0.1)",
-                color: "var(--pc-accent)",
-              }}
+              style={{ background: 'rgba(var(--pc-accent-rgb), 0.1)', color: 'var(--pc-accent)' }}
             >
               {sortedAgents.length}
             </span>
@@ -2732,9 +2451,9 @@ function AgentsSection() {
         <Link
           to="/agents"
           className="text-xs flex items-center gap-1 hover:underline"
-          style={{ color: "var(--pc-text-muted)" }}
+          style={{ color: 'var(--pc-text-muted)' }}
         >
-          {hiddenCount > 0 ? `View all (${sortedAgents!.length})` : "View all"}
+          {hiddenCount > 0 ? `View all (${sortedAgents!.length})` : 'View all'}
           <ChevronRight className="h-3 w-3" />
         </Link>
       </header>
@@ -2743,9 +2462,9 @@ function AgentsSection() {
         <div
           className="mb-3 px-3 py-2 rounded-xl border text-xs"
           style={{
-            background: "var(--color-status-error-alpha-08)",
-            borderColor: "var(--color-status-error-alpha-20)",
-            color: "var(--color-status-error)",
+            background: 'var(--color-status-error-alpha-08)',
+            borderColor: 'var(--color-status-error-alpha-20)',
+            color: 'var(--color-status-error)',
           }}
         >
           {error}
@@ -2755,30 +2474,27 @@ function AgentsSection() {
       {agents === null ? (
         <div
           className="rounded-2xl border p-6 text-center text-sm"
-          style={{
-            borderColor: "var(--pc-border)",
-            color: "var(--pc-text-muted)",
-          }}
+          style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
         >
           Loading agents...
         </div>
       ) : agents.length === 0 ? (
         <div
           className="rounded-2xl border-2 border-dashed p-6 text-center"
-          style={{ borderColor: "var(--pc-border)" }}
+          style={{ borderColor: 'var(--pc-border)' }}
         >
           <p
             className="text-sm font-medium mb-2"
-            style={{ color: "var(--pc-text-primary)" }}
+            style={{ color: 'var(--pc-text-primary)' }}
           >
             No agents configured yet.
           </p>
           <Link
-            to="/quickstart"
+            to="/onboard"
             className="btn-electric inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs"
           >
             <Plus className="h-3.5 w-3.5" />
-            {quickstartLabel}
+            {onboardButtonLabel}
           </Link>
         </div>
       ) : (
@@ -2796,21 +2512,15 @@ function AgentsSection() {
               to="/agents"
               className="rounded-2xl border p-5 flex flex-col items-center justify-center text-center transition-colors hover:opacity-90"
               style={{
-                background: "var(--pc-bg-surface)",
-                borderColor: "var(--pc-border)",
-                borderStyle: "dashed",
-                color: "var(--pc-text-muted)",
+                background: 'var(--pc-bg-surface)',
+                borderColor: 'var(--pc-border)',
+                borderStyle: 'dashed',
+                color: 'var(--pc-text-muted)',
               }}
             >
-              <Plus
-                className="h-6 w-6 mb-2"
-                style={{ color: "var(--pc-accent)" }}
-              />
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--pc-text-primary)" }}
-              >
-                {hiddenCount} more {hiddenCount === 1 ? "agent" : "agents"}
+              <Plus className="h-6 w-6 mb-2" style={{ color: 'var(--pc-accent)' }} />
+              <p className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
+                {hiddenCount} more {hiddenCount === 1 ? 'agent' : 'agents'}
               </p>
               <p className="text-xs mt-1">View all on /agents</p>
             </Link>

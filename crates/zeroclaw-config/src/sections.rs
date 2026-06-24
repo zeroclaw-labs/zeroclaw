@@ -1,4 +1,4 @@
-//! Curated sections surface — a flat ordered set of [`Section`]s the
+//! Onboarding sections surface — a flat ordered set of [`Section`]s the
 //! operator walks (new install) or scans (returning user) to configure
 //! a working ZeroClaw deployment.
 //!
@@ -6,7 +6,7 @@
 //! its UI shape, its help blurb, its canonical position) lives in ONE
 //! table — the [`sections!`] invocation below. The macro expands that
 //! table into the [`Section`] enum, every per-variant `match` helper,
-//! and the [`QUICKSTART_SECTIONS`] const, so adding a section is exactly
+//! and the [`ONBOARDING_SECTIONS`] const, so adding a section is exactly
 //! one row, no hand-listed variant set anywhere else.
 //!
 //! Consumers (CLI runtime, gateway, dashboard) dispatch off this enum;
@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 /// UI rendering shape for a section. Drives picker / form dispatch on
-/// the `/config` curated section explorer and the Quickstart flow.
+/// both the `/onboard` step-through and the `/config` explorer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -37,7 +37,7 @@ pub enum SectionShape {
 
 /// Single source of truth for every pickable config section. Each row
 /// maps 1:1 to a dashboard `/config/<key>` page, a CLI
-/// `zeroclaw quickstart` flow and the gateway section picker handler.
+/// `zeroclaw onboard <key>` subcommand, and the gateway picker handler.
 /// Adding/removing a section is one row here and every consumer's
 /// `match` either compiles cleanly or fails with an exhaustiveness
 /// error pointing at exactly what needs an arm.
@@ -62,7 +62,7 @@ macro_rules! sections {
         /// `sections!` macro invocation.
         ///
         /// With the `clap` feature on, this enum doubles as the
-        /// `zeroclaw quickstart` and curated-section endpoints — no separate
+        /// `zeroclaw onboard <section>` clap subcommand — no separate
         /// mirror enum in the binary crate.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -82,7 +82,7 @@ macro_rules! sections {
         impl Section {
             /// Stable on-the-wire key. Also serves as the TOML
             /// top-level prefix (e.g. `providers.models.<type>.<alias>`),
-            /// the curated section URL segment, and the
+            /// the `/onboard/<key>` URL segment, and the
             /// `SectionInfo.key` field returned by the gateway.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
@@ -148,11 +148,11 @@ macro_rules! sections {
             }
         }
 
-        /// Canonical ordering of sections enumerated by
-        /// the Quickstart flow and the curated section explorer. The
+        /// Canonical ordering of onboarding sections, walked by
+        /// `/onboard` and the `zeroclaw onboard` CLI in order. The
         /// dashboard renders Next/Finish navigation against this list.
         /// Every consumer that needs section ordering reads from here.
-        pub const QUICKSTART_SECTIONS: &[Section] = &[ $( Section::$var ),+ ];
+        pub const ONBOARDING_SECTIONS: &[Section] = &[ $( Section::$var ),+ ];
     };
 }
 
@@ -171,13 +171,13 @@ sections! {
     // .runtime_profile are required alias refs; both must exist before
     // an Agent that points at them can resolve.
     RiskProfiles => {
-        key:   "risk_profiles",
+        key:   "risk-profiles",
         shape: OneTierAliasMap,
         help:  "Named risk profiles binding allowlists, denylists, and approval \
                 thresholds. Agents reference one via `agents.<alias>.risk_profile`.",
     },
     RuntimeProfiles => {
-        key:   "runtime_profiles",
+        key:   "runtime-profiles",
         shape: OneTierAliasMap,
         help:  "Named runtime tuning profiles (token limits, retry policy, timeouts). \
                 Agents reference one via `agents.<alias>.runtime_profile`.",
@@ -211,7 +211,7 @@ sections! {
                 repositories. Add skill BUNDLES under `skill-bundles` below.",
     },
     SkillBundles => {
-        key:   "skill_bundles",
+        key:   "skill-bundles",
         shape: OneTierAliasMap,
         help:  "Named bundles of skill files. Agents reference a bundle to load a \
                 set of capabilities at startup.",
@@ -223,13 +223,13 @@ sections! {
                 or eager loading. Individual MCP servers live under `mcp.servers[]`.",
     },
     McpBundles => {
-        key:   "mcp_bundles",
+        key:   "mcp-bundles",
         shape: OneTierAliasMap,
         help:  "Named bundles of MCP servers. Agents reference a bundle to pull in \
                 a set of MCP tools as one unit.",
     },
     KnowledgeBundles => {
-        key:   "knowledge_bundles",
+        key:   "knowledge-bundles",
         shape: OneTierAliasMap,
         help:  "Named bundles of knowledge sources (RAG indexes, doc folders). Agents \
                 reference a bundle to surface relevant snippets at inference time.",
@@ -267,7 +267,7 @@ sections! {
 
     // Tier 7 — Bind. Pulls tiers 1–6 together. Every alias ref an
     // Agent carries exists by this point.
-    // Personality is intentionally NOT a top-level section —
+    // Personality is intentionally NOT a top-level section in v0.8.0 —
     // markdown personality files live per-agent and surface inside the
     // agent edit form.
     Agents => {
@@ -281,7 +281,7 @@ sections! {
     // Tier 8 — Topology. Multi-agent relationships and scheduled
     // invocations; both reference agents and must follow Agents.
     PeerGroups => {
-        key:   "peer_groups",
+        key:   "peer-groups",
         shape: OneTierAliasMap,
         help:  "Named groups binding a channel, member agents, and external peers. \
                 Mutual opt-in: two agents become peers only when both appear in the \
@@ -302,22 +302,6 @@ sections! {
         help:  "Optional: expose your gateway over the public internet via Cloudflare \
                 or ngrok. Pick `none` to keep it localhost-only.",
     },
-
-    // Tier 10 — Lifecycle state. Not part of any agent dependency
-    // chain. Tracks whether the Quickstart has completed on this
-    // install; surfaces dispatch on it to decide whether to auto-open
-    // the Quickstart on launch. The on-disk TOML key stays
-    // `onboard_state` for backwards compatibility with installs that
-    // already wrote against it; only the in-code symbol is renamed.
-    QuickstartState => {
-        key:   "onboard_state",
-        shape: DirectForm,
-        help:  "Quickstart lifecycle state. `quickstart_completed` flips to true \
-                once the Quickstart finishes a successful run; while false, the \
-                web gateway and TUI auto-launch the Quickstart on startup. \
-                `completed_sections` is a legacy per-section ledger retained for \
-                backwards compatibility with prior data.",
-    },
 }
 
 impl std::fmt::Display for Section {
@@ -326,13 +310,13 @@ impl std::fmt::Display for Section {
     }
 }
 
-/// Canonical-order index of `section` in [`QUICKSTART_SECTIONS`].
+/// Canonical-order index of `section` in [`ONBOARDING_SECTIONS`].
 /// Always `Some` for any valid `Section` variant — the const includes
 /// every variant by construction. Returns `Option` for API symmetry
 /// with [`section_index_for_key`], which can fail on unknown keys.
 #[must_use]
 pub fn section_index(section: Section) -> Option<usize> {
-    QUICKSTART_SECTIONS.iter().position(|s| *s == section)
+    ONBOARDING_SECTIONS.iter().position(|s| *s == section)
 }
 
 /// Canonical-order index for a wire key, or `None` if the key isn't a
@@ -353,7 +337,7 @@ pub fn is_known_section(key: &str) -> bool {
 /// the long tail of top-level `Config` fields the dashboard / TUI config
 /// editor surface (gateway, scheduler, observability, …). Single source
 /// of truth shared by every surface — the gateway sidebar, the CLI
-/// Quickstart flow, and the future TUI config editor all call this rather
+/// onboard flow, and the future TUI config editor all call this rather
 /// than maintaining parallel tables.
 ///
 /// Resolution order:
@@ -375,74 +359,22 @@ pub fn section_help(key: &str) -> &'static str {
     crate::schema::Config::nested_section_help(key).unwrap_or("")
 }
 
-/// First segment of a dotted property path mapped back to the section
-/// it lives under, or `None` for non-section paths
-/// (`onboard_state.completed_sections`, etc.).
-#[must_use]
-pub fn section_for_path(path: &str) -> Option<Section> {
-    Section::from_key(path.split('.').next()?)
-}
-
-/// Does this section show any signal of having been touched on this
-/// install? Used by callers (RPC config-list filtering, lifecycle
-/// dispatch) to decide whether to surface a section as "untouched".
-///
-/// Each variant decides what counts as a real signal vs a default
-/// value that round-trips identically across a fresh install.
-pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool {
-    match section {
-        Section::ModelProviders => !cfg.providers.models.is_empty(),
-        // `channels.cli: bool` is a default-true scalar that lives directly
-        // under `channels.*`, so a bare `starts_with("channels.")` check
-        // fires on every fresh install. Require a nested channel config
-        // (e.g. `channels.telegram.bot-token`) — anything with a second dot
-        // segment — to count as user-driven signal.
-        Section::Channels => cfg.prop_fields().iter().any(|f| {
-            f.name
-                .strip_prefix("channels.")
-                .is_some_and(|rest| rest.contains('.'))
-        }),
-        Section::Hardware => cfg.hardware.enabled,
-        // Memory's default backend is "sqlite" and Tunnel's is "none" —
-        // both are valid user choices indistinguishable from untouched
-        // defaults. TTS / transcription providers and agents start
-        // empty; their existence in the typed family map IS the signal,
-        // not a derivable default-divergence. Marker-only for these.
-        Section::TtsProviders
-        | Section::TranscriptionProviders
-        | Section::Memory
-        | Section::Tunnel
-        | Section::Agents
-        | Section::Skills
-        | Section::SkillBundles
-        | Section::RiskProfiles
-        | Section::RuntimeProfiles
-        | Section::PeerGroups
-        | Section::Storage
-        | Section::Cron
-        | Section::Mcp
-        | Section::McpBundles
-        | Section::KnowledgeBundles
-        | Section::QuickstartState => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Round-trip every entry in the canonical list. `from_key`,
-    /// `as_str`, `section_index`, and `QUICKSTART_SECTIONS` are all
+    /// `as_str`, `section_index`, and `ONBOARDING_SECTIONS` are all
     /// generated from the same `sections!` row, so this test exercises
     /// the table — adding a row that breaks any of them fails here
     /// without listing variants by hand.
     #[test]
     fn sections_round_trip() {
-        for s in QUICKSTART_SECTIONS {
+        for s in ONBOARDING_SECTIONS {
             assert_eq!(Section::from_key(s.as_str()), Some(*s), "{s} round-trip");
             assert_eq!(
                 section_index(*s),
-                Some(QUICKSTART_SECTIONS.iter().position(|x| x == s).unwrap()),
+                Some(ONBOARDING_SECTIONS.iter().position(|x| x == s).unwrap()),
             );
         }
         assert_eq!(Section::from_key("gateway"), None);
@@ -486,8 +418,8 @@ mod tests {
                 "snake `{snake}` should resolve to {expected:?}",
             );
             assert!(
-                QUICKSTART_SECTIONS.contains(expected),
-                "{expected:?} must be in QUICKSTART_SECTIONS",
+                ONBOARDING_SECTIONS.contains(expected),
+                "{expected:?} must be in ONBOARDING_SECTIONS",
             );
         }
     }
@@ -523,15 +455,15 @@ mod tests {
     /// Canonical order is dependency-correct: every Section that
     /// `AliasedAgentConfig` references through an alias field appears
     /// earlier in the list than `Section::Agents`. Walking
-    /// `QUICKSTART_SECTIONS` top-to-bottom never asks the operator to
+    /// `ONBOARDING_SECTIONS` top-to-bottom never asks the operator to
     /// configure an Agent before the things it has to bind to exist.
     #[test]
     fn ordering_respects_agent_dependency_tiers() {
         let idx = |s: Section| {
-            QUICKSTART_SECTIONS
+            ONBOARDING_SECTIONS
                 .iter()
                 .position(|x| *x == s)
-                .unwrap_or_else(|| panic!("{s:?} missing from QUICKSTART_SECTIONS"))
+                .unwrap_or_else(|| panic!("{s:?} missing from ONBOARDING_SECTIONS"))
         };
 
         // Brain + behavior shape + bundles + channels all precede Agents.
