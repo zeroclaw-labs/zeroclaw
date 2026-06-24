@@ -437,7 +437,7 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    use super::{check_sqlite, check_workspace, format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
@@ -584,5 +584,38 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[test]
+    fn check_sqlite_with_nonexistent_workspace_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Pass a nonexistent subdirectory as workspace_dir; the function appends "memory.db"
+        let workspace_dir = temp_dir.path().join("nonexistent_workspace");
+        let result = check_sqlite(&workspace_dir);
+        // The parent dir does not exist, so SQLite cannot create the file
+        assert!(!result.passed, "nonexistent workspace directory should fail; got: {}", result.detail);
+        assert!(
+            result.detail.contains("cannot open"),
+            "detail should mention open failure, got: {}",
+            result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn check_workspace_with_valid_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = check_workspace(temp_dir.path()).await;
+        assert!(result.passed, "valid writable directory should pass");
+        assert!(result.detail.contains("writable"));
+    }
+
+    #[tokio::test]
+    async fn check_workspace_with_file_instead_of_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, "test").unwrap();
+        let result = check_workspace(&file_path).await;
+        assert!(!result.passed, "file instead of directory should fail");
+        assert!(result.detail.contains("is not a directory"));
     }
 }
