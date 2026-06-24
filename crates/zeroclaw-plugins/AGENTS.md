@@ -25,9 +25,11 @@ schemas. This crate knows how to run plugins, not what they do.
 
 ## Extension points
 
-- **New host functions:** Add to `runtime.rs` alongside `zc_http_request` and
-  `zc_env_read`. Register in `create_plugin()`. Gate on a `PluginPermission`
-  variant (add to `lib.rs` if needed).
+- **New host functions:** Add to `runtime.rs` alongside `zc_http_request`.
+  Register in `create_plugin()`. Gate on a `PluginPermission` variant (add to
+  `lib.rs` if needed). Plugins receive their own resolved config section in the
+  `execute` input under `__config`; there is no host call for reading raw
+  process environment.
 - **New capability bridges:** Add alongside `wasm_tool.rs` and
   `wasm_channel.rs` (e.g., `wasm_memory.rs` for memory backend plugins).
 - **New permissions:** Add variants to `PluginPermission` in `lib.rs`.

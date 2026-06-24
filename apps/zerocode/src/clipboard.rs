@@ -1,8 +1,8 @@
-//! Platform clipboard image reading.
+//! Platform clipboard image reading and text reading.
 //!
 //! Shells out to system clipboard tools to read image data from the
-//! clipboard. Gracefully degrades — returns `None` if no tool is
-//! available or no image is present.
+//! clipboard and read text from the clipboard. Gracefully degrades —
+//! returns `None` if no tool is available or no image/text is present.
 
 use std::path::PathBuf;
 use std::process::Command;

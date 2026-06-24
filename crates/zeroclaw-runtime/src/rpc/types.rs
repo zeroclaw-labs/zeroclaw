@@ -1056,6 +1056,8 @@ rpc_type! {
         /// backend picker).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
     }
 }
 
@@ -1307,6 +1309,17 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+    },
+    /// Emitted whenever older whole turns were dropped from the context window
+    /// to fit the token budget. Surfaces a user-visible "context was cut here"
+    /// marker so trimming is never silent. `dropped_messages` is the count of
+    /// conversation messages removed; `kept_turns` is how many whole turns
+    /// remained after the cut.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
     },
 }
 
