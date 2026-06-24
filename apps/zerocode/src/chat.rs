@@ -1012,10 +1012,6 @@ impl Chat {
             match action {
                 InputBarAction::Submit { text, attachments } => {
                     state.clear_info_notice();
-                    // Enter always resumes: a deliberate keystroke in the
-                    // input box is an unambiguous send intent, so a silently
-                    // paused queue must never swallow it — even if the queue
-                    // or the submitted text is empty.
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
                     let enq = state.enqueue_message(prompt, attachments);
@@ -1082,8 +1078,6 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::ResumeQueue => {
-                    // Empty Enter: no message to enqueue, but still resume a
-                    // paused queue and pump so any backlog dispatches.
                     state.clear_info_notice();
                     if state.resume_queue() {
                         self.pump_queue();
@@ -4543,10 +4537,8 @@ impl ChatState {
                 status: QueueItemStatus::Injected,
             },
         );
-        // Ctrl+Enter is an explicit "send now" — the strongest deliberate
-        // intent the input box offers. Resume the whole queue so pending
-        // items flow behind the inject and the paused ghost-text clears,
-        // matching the same rationale resume_queue() documents for Enter.
+        // An inject is the force-send-now intent: resume the queue and let it
+        // survive a cancel auto-pause, unlike a plain queued submission.
         self.queue_paused = false;
         if self.turn_in_flight {
             self.resume_override = true;
@@ -4594,16 +4586,12 @@ impl ChatState {
         self.queue_paused
     }
 
-    /// Force the queue out of the paused state. Returns true if it was paused.
-    /// Enter (Submit) always resumes — a deliberate keystroke in the input box
-    /// is an unambiguous "I want this to go," and a silently-paused queue
-    /// swallowing it is the failure mode this guards against.
+    /// Clear an explicit pause without bypassing the cancel auto-pause: a
+    /// cancelled turn settles into the paused state and the backlog waits for a
+    /// deliberate resume. Returns true if the queue was paused.
     pub fn resume_queue(&mut self) -> bool {
         let was_paused = self.queue_paused;
         self.queue_paused = false;
-        if self.turn_in_flight {
-            self.resume_override = true;
-        }
         was_paused
     }
 
@@ -6107,35 +6095,45 @@ mod tests {
         // Turn cancelled/failed mid-flight -> auto-pause.
         s.commit_turn(String::new(), false);
         assert!(s.take_next_dispatchable().is_none(), "paused: no dispatch");
-        // Enter resumes; backlog now dispatches.
         s.resume_queue();
         assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
     }
 
     #[test]
-    fn enter_during_cancel_survives_non_clean_commit() {
+    fn enter_during_cancel_pauses_queue() {
         let mut s = state();
         s.turn_in_flight = true;
         s.resume_queue();
         s.enqueue_message("hello".to_string(), Vec::new()).unwrap();
         s.commit_turn(String::new(), false);
         assert!(
-            !s.queue_paused(),
-            "explicit Enter-resume mid-turn must survive the cancel auto-pause"
+            s.queue_paused(),
+            "a plain-Enter submission mid-turn must not bypass the cancel auto-pause"
         );
-        assert_eq!(
-            s.take_next_dispatchable().unwrap().text,
-            "hello",
-            "the just-submitted message must dispatch, not sit re-paused"
+        assert!(
+            s.take_next_dispatchable().is_none(),
+            "the cancelled turn pauses the queue; the backlog waits for a deliberate resume"
         );
     }
 
     #[test]
-    fn resume_override_is_one_shot() {
+    fn inject_survives_cancel_auto_pause() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.resume_queue();
-        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.inject_message("now".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert_eq!(
+            s.take_next_dispatchable().unwrap().text,
+            "now",
+            "an inject is the only intent that survives a cancel"
+        );
+    }
+
+    #[test]
+    fn inject_resume_override_is_one_shot() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("a".to_string(), Vec::new()).unwrap();
         s.commit_turn(String::new(), false);
         assert_eq!(s.take_next_dispatchable().unwrap().text, "a");
         s.turn_in_flight = true;
@@ -6143,7 +6141,7 @@ mod tests {
         s.commit_turn(String::new(), false);
         assert!(
             s.queue_paused(),
-            "a stale resume must not leak into the next cancelled turn"
+            "a stale inject override must not leak into the next cancelled turn"
         );
     }
 
