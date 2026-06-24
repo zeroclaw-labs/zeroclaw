@@ -287,6 +287,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
+        ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",
         HistoryPrev        [Chord::key(KeyCode::Up)] => "history prev",

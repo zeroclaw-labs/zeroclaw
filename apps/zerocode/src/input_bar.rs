@@ -890,6 +890,16 @@ impl InputBarState {
         self.cleanup_temps();
     }
 
+    /// Clear the typed text without disturbing pending attachments, history,
+    /// or clipboard temps. Bound to the ClearInput action.
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.clear_selection();
+        self.dismiss_autocomplete();
+    }
+
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
@@ -1043,6 +1053,10 @@ impl InputBarState {
             }
             Some(IbWidgetAction::Backspace) => {
                 self.pop_input_char();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::ClearInput) => {
+                self.clear_input();
                 return InputBarAction::Consumed;
             }
             _ => {}
@@ -1668,6 +1682,26 @@ mod tests {
         assert_eq!(taken, "hi");
         assert_eq!(bar.input(), "");
         assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn clear_input_empties_text_and_resets_cursor() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        assert_eq!(bar.cursor(), 11);
+        bar.clear_input();
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_u_clears_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("scratch this");
+        let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(matches!(act, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "");
     }
 
     #[test]
