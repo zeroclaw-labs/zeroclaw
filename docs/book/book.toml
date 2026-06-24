@@ -25,6 +25,9 @@ enable = true
 limit-results = 30
 use-boolean-and = true
 
+[output.html.print]
+enable = false
+
 [output.html.fold]
 enable = true
 level = 0

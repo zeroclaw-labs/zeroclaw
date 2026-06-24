@@ -223,6 +223,15 @@ mod tests {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
         assert!(map.contains_key("zc-pane-chat"));
+        let mismatch = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-error-daemon-version-mismatch",
+            &[("client_version", "0.8.1"), ("server_version", "0.8.0")],
+        )
+        .unwrap();
+        assert!(mismatch.contains("0.8.1"));
+        assert!(mismatch.contains("0.8.0"));
     }
 
     #[test]
