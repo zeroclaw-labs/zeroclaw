@@ -201,6 +201,65 @@ fn build_approval_content(
     }])
 }
 
+/// Property names we refuse to put into a form-mode elicitation schema.
+///
+/// Per the ACP RFD and MCP's parent spec, form-mode elicitation MUST NOT
+/// be used for sensitive data (credentials, API keys, etc.). All Phase 1
+/// callers ship a fixed `"choice"` / `"choices"` property name, so a
+/// match against this list is a contract violation by an in-tree caller,
+/// not user-controlled input. We `debug_assert!` rather than `bail!` so
+/// production builds aren't degraded by a string scan.
+const SENSITIVE_PROPERTY_NAMES: &[&str] = &[
+    "password",
+    "token",
+    "secret",
+    "api_key",
+    "apiKey",
+    "credential",
+    "credentials",
+    "auth",
+    "authorization",
+    "private_key",
+    "privateKey",
+];
+
+/// Build the restricted JSON Schema for a single-select enum elicitation.
+///
+/// `choices` is the user-visible list. The wire-format `const` values
+/// are index-based (`choice-0`, `choice-1`, …) so the response → text
+/// round-trip survives non-unique or empty display strings.
+#[allow(dead_code)] // consumed by Task 5 (request_choice rewrite)
+fn single_select_schema(choices: &[String]) -> serde_json::Value {
+    single_select_schema_with_property_name("choice", choices)
+}
+
+/// Internal — exposed for the sensitive-name trip-wire test.
+fn single_select_schema_with_property_name(
+    property: &str,
+    choices: &[String],
+) -> serde_json::Value {
+    debug_assert!(
+        !SENSITIVE_PROPERTY_NAMES.contains(&property),
+        "sensitive property name '{property}' in form-mode elicitation schema"
+    );
+    let one_of: Vec<serde_json::Value> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| json!({ "const": format!("choice-{i}"), "title": text }))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": {
+            property: {
+                "type": "string",
+                "title": "Choice",
+                "oneOf": one_of,
+            }
+        },
+        "required": [property],
+    })
+}
+
 #[async_trait]
 impl Channel for AcpChannel {
     fn name(&self) -> &str {
@@ -1021,5 +1080,43 @@ mod tests {
             None,
         );
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn single_select_schema_has_object_shape() {
+        let schema = single_select_schema(&[
+            "Conservative".to_string(),
+            "Balanced".to_string(),
+            "Aggressive".to_string(),
+        ]);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["choice"]));
+        let choice = &schema["properties"]["choice"];
+        assert_eq!(choice["type"], "string");
+        let one_of = choice["oneOf"].as_array().expect("oneOf array");
+        assert_eq!(one_of.len(), 3);
+        assert_eq!(one_of[0]["const"], "choice-0");
+        assert_eq!(one_of[0]["title"], "Conservative");
+        assert_eq!(one_of[2]["const"], "choice-2");
+        assert_eq!(one_of[2]["title"], "Aggressive");
+    }
+
+    #[test]
+    fn single_select_schema_preserves_choice_text_via_index() {
+        // Empty / duplicate display strings must not collide because the
+        // wire-format `const` is index-based.
+        let schema = single_select_schema(&["".to_string(), "".to_string()]);
+        let one_of = schema["properties"]["choice"]["oneOf"].as_array().unwrap();
+        assert_eq!(one_of[0]["const"], "choice-0");
+        assert_eq!(one_of[1]["const"], "choice-1");
+    }
+
+    #[test]
+    #[should_panic(expected = "sensitive")]
+    fn single_select_schema_rejects_sensitive_property_names_in_debug() {
+        // The trip-wire is debug-only — production builds skip the assert.
+        // This test exists so a future caller renaming "choice" to "password"
+        // (or building a schema with such a property) fails loudly in CI.
+        let _ = single_select_schema_with_property_name("password", &["x".to_string()]);
     }
 }
