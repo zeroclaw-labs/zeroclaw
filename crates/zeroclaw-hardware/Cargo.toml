@@ -11,7 +11,8 @@ zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tools.workspace = true
-aardvark-sys.workspace = true
+# Only used behind the `hardware` feature (the aardvark module + boot() discovery).
+aardvark-sys = { workspace = true, optional = true }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -38,7 +39,7 @@ rppal = { version = "0.22", optional = true }
 
 [features]
 default = []
-hardware = ["dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
+hardware = ["dep:aardvark-sys", "dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
 peripheral-rpi = ["rppal"]
 probe = ["dep:probe-rs"]
 # Extends the serial peripheral allow-list with `/tmp/zc-sim-*` for hardware-free

@@ -916,7 +916,7 @@ Examples:
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Skip confirmation prompt
+        /// Install even if the target is not newer (reinstall or downgrade/pin to --version)
         #[arg(long)]
         force: bool,
         /// Target version (default: latest)
@@ -2730,9 +2730,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2742,13 +2742,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2782,9 +2782,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -3914,7 +3914,7 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -3924,7 +3924,7 @@ async fn main() -> Result<()> {
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
                                 sop_engine,
@@ -4866,15 +4866,22 @@ async fn main() -> Result<()> {
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(
@@ -4888,7 +4895,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                commands::update::run(version.as_deref(), force).await
             }
         }
 
@@ -6519,6 +6526,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6533,6 +6542,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6551,6 +6561,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6647,6 +6658,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
