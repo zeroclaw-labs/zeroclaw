@@ -88,6 +88,13 @@ impl ApprovalPrincipal {
         self.source != ApprovalSource::Agent
     }
 
+    /// True for the synthetic timeout principal. A `system` approval is metered as
+    /// a timeout auto-approval rather than a human approval (matches the ledger
+    /// `source == "system"` reconstruction in `rebuild_from_persistence`).
+    pub fn is_system(&self) -> bool {
+        self.source == ApprovalSource::System
+    }
+
     /// Ledger actor string: prefer the identity, fall back to the source label.
     pub fn actor_label(&self) -> String {
         self.identity

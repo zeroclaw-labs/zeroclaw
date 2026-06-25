@@ -3,15 +3,14 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::sop::SopEngine;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::SopRunAction;
-use crate::sop::{SopEngine, SopMetricsCollector};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
-    collector: Option<Arc<SopMetricsCollector>>,
     agent_alias: String,
 }
 
@@ -19,14 +18,8 @@ impl SopApproveTool {
     pub fn new(engine: Arc<Mutex<SopEngine>>) -> Self {
         Self {
             engine,
-            collector: None,
             agent_alias: "agent".to_string(),
         }
-    }
-
-    pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
-        self.collector = Some(collector);
-        self
     }
 
     /// Set the agent alias recorded as the approval principal (default `"agent"`).
@@ -72,8 +65,13 @@ impl Tool for SopApproveTool {
             anyhow::Error::msg("Missing 'run_id' parameter")
         })?;
 
-        // Lock engine, approve, snapshot run for audit, then drop lock
-        let (result, run_snapshot) = {
+        // Lock the engine, route through the chokepoint, then drop the lock.
+        // resolve_gate records both the append-only ledger row and the approval
+        // completion metric (every principal meters identically there); the tool
+        // no longer writes a legacy Memory audit key nor a separate metric. Under
+        // approval_mode=out_of_band_required this returns RejectedSelfApproval (the
+        // gate stays open for a CLI/gateway approver).
+        let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -86,35 +84,12 @@ impl Tool for SopApproveTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            // Route through the single chokepoint as the agent principal. Under
-            // approval_mode=out_of_band_required this returns RejectedSelfApproval
-            // (the gate stays open for a CLI/gateway approver); the ledger row is
-            // recorded inside resolve_gate (no fire-and-forget lost-write).
-            let outcome = engine.resolve_gate(
+            engine.resolve_gate(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),
-            );
-            match outcome {
-                Ok(o) => {
-                    let snapshot = engine.get_run(run_id).cloned();
-                    (Ok(o), snapshot)
-                }
-                Err(e) => (Err(e), None),
-            }
+            )
         };
-
-        // Only a genuine approval (Resumed) records the completion metric. The
-        // audit of record is the append-only store ledger written inside
-        // resolve_gate (with the principal); the tool no longer dual-writes a
-        // legacy last-write-wins Memory audit key.
-        let approved = matches!(result, Ok(ResolveOutcome::Resumed(_)));
-        if approved
-            && let Some(ref collector) = self.collector
-            && let Some(ref run) = run_snapshot
-        {
-            collector.record_approval(&run.sop_name, &run.run_id);
-        }
 
         match result {
             Ok(ResolveOutcome::Resumed(action)) => {

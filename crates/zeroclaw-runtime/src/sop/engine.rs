@@ -1026,6 +1026,23 @@ impl SopEngine {
         self.store.list_events(run_id)
     }
 
+    /// Record the approval completion metric at the gate-clearing chokepoint, so
+    /// every principal (agent tool, CLI, gateway, WS, timeout) meters identically
+    /// and the live counters agree with `SopMetricsCollector::rebuild_from_persistence`.
+    /// `is_system` (the timeout principal) is metered as a timeout auto-approval;
+    /// any other principal is a human approval. No-op if the run is gone.
+    pub(crate) fn record_approval_metric(&self, run_id: &str, is_system: bool) {
+        let Some(run) = self.get_run(run_id) else {
+            return;
+        };
+        if is_system {
+            self.metrics
+                .record_timeout_auto_approve(&run.sop_name, &run.run_id);
+        } else {
+            self.metrics.record_approval(&run.sop_name, &run.run_id);
+        }
+    }
+
     /// The single out-of-band gate-clearing entry point (EPIC C). All four
     /// principals (agent tool, CLI, gateway, timeout tick) funnel through here.
     /// Sibling of `approve_step` (which keeps the deterministic-checkpoint resume

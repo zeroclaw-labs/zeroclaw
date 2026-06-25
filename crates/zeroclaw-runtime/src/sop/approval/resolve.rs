@@ -49,6 +49,11 @@ pub fn resolve_gate(
     let (outcome, kind) = match &decision {
         ApprovalDecision::Approve => {
             let action = engine.clear_waiting_gate(run_id)?;
+            // Meter the approval at the chokepoint (every principal, exactly once):
+            // a `system` principal is a timeout auto-approval, any other a human
+            // approval. Keeps the live counters in lockstep with the ledger-sourced
+            // `rebuild_from_persistence`.
+            engine.record_approval_metric(run_id, principal.is_system());
             (ResolveOutcome::Resumed(action), GateEventKind::Resolved)
         }
         ApprovalDecision::Deny { reason } => {
@@ -256,5 +261,68 @@ mod tests {
             .expect("a gate_resolved ledger row");
         assert_eq!(resolved.actor.as_deref(), Some("alice"));
         assert_eq!(resolved.payload["source"], "cli");
+    }
+
+    // Build an engine with a known collector injected, driven to one waiting gate.
+    fn engine_metered() -> (SopEngine, Arc<crate::sop::SopMetricsCollector>, String) {
+        let collector = Arc::new(crate::sop::SopMetricsCollector::new());
+        let cfg = SopConfig {
+            approval_mode: ApprovalMode::Both,
+            ..Default::default()
+        };
+        let mut e = SopEngine::new(cfg).with_metrics(Arc::clone(&collector));
+        e.set_sops_for_test(vec![supervised_sop("deploy")]);
+        let id = start_waiting(&mut e);
+        (e, collector, id)
+    }
+
+    #[test]
+    fn out_of_band_approval_metered_as_human_at_chokepoint() {
+        use serde_json::json;
+        // The metric is recorded at the chokepoint, so an out-of-band (CLI)
+        // approval - not just the agent tool - increments the human counter.
+        let (mut e, collector, id) = engine_metered();
+        resolve_gate(
+            &mut e,
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("alice".into())),
+        )
+        .unwrap();
+        assert_eq!(
+            collector.get_metric_value("sop.human_intervention_count"),
+            Some(json!(1u64)),
+            "an out-of-band CLI approval is metered as a human approval"
+        );
+        assert_eq!(
+            collector.get_metric_value("sop.timeout_auto_approvals"),
+            Some(json!(0u64)),
+            "a human approval is not a timeout auto-approval"
+        );
+    }
+
+    #[test]
+    fn system_approval_metered_as_timeout_auto_approve() {
+        use serde_json::json;
+        // The synthetic `system` principal (the timeout AutoApprove path) is
+        // metered as a timeout auto-approval, never a human approval.
+        let (mut e, collector, id) = engine_metered();
+        resolve_gate(
+            &mut e,
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::system(),
+        )
+        .unwrap();
+        assert_eq!(
+            collector.get_metric_value("sop.timeout_auto_approvals"),
+            Some(json!(1u64)),
+            "a system-principal approval is metered as a timeout auto-approval"
+        );
+        assert_eq!(
+            collector.get_metric_value("sop.human_intervention_count"),
+            Some(json!(0u64)),
+            "a system approval does not inflate the human counter"
+        );
     }
 }
