@@ -79,6 +79,57 @@ pub fn build_server_config(params: &ServerConfigParams) -> Result<rustls::Server
     Ok(server_config)
 }
 
+/// Build a [`TlsAcceptor`] for a remote, mutually-authenticated transport plane.
+///
+/// This is the secure-by-construction entrypoint for the daemon's remote WSS
+/// plane: the returned acceptor is **TLS 1.3 only** and **always** requires and
+/// verifies a client certificate against `ca_cert_path` (optionally pinned to
+/// `pinned_certs`). There is deliberately **no** no-client-auth / server-only
+/// code path on this function, so the remote plane cannot be weakened by
+/// configuration (threat model A11). `ca_cert_path` is mandatory.
+pub fn build_mtls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+) -> Result<TlsAcceptor> {
+    let server_config = build_mtls_server_config(cert_path, key_path, ca_cert_path, pinned_certs)?;
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+/// Build a TLS 1.3-only [`rustls::ServerConfig`] that always requires and
+/// verifies a client certificate. See [`build_mtls_acceptor`]; this is the
+/// inner config builder. There is no no-client-auth branch here by design.
+pub fn build_mtls_server_config(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+) -> Result<rustls::ServerConfig> {
+    let certs = load_certs(cert_path)
+        .with_context(|| format!("failed to load server certificate from {cert_path}"))?;
+    let key = load_private_key(key_path)
+        .with_context(|| format!("failed to load private key from {key_path}"))?;
+
+    // Mandatory client-certificate verification: require_client_cert is forced
+    // true so this builder can never produce an unauthenticated acceptor.
+    let verifier = build_client_verifier(&ClientAuthParams {
+        ca_cert_path: ca_cert_path.to_string(),
+        require_client_cert: true,
+        pinned_certs: pinned_certs.to_vec(),
+    })
+    .context("failed to build client certificate verifier")?;
+
+    // Pin the protocol to TLS 1.3 only (no TLS 1.2 downgrade) for the remote plane.
+    let server_config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .context("invalid server certificate or key")?;
+
+    Ok(server_config)
+}
+
 /// Build a client certificate verifier from the client-auth parameters.
 pub fn build_client_verifier(params: &ClientAuthParams) -> Result<Arc<dyn ClientCertVerifier>> {
     let ca_certs = load_certs(&params.ca_cert_path)
@@ -440,6 +491,337 @@ mod tests {
         assert!(
             msg.contains("no certificates found"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // ---- mandatory-mTLS end-to-end handshake matrix (build_mtls_server_config) ----
+    //
+    // These drive a real in-memory rustls handshake between a server built from
+    // build_mtls_server_config() and a client, asserting the security invariants:
+    // mandatory client auth, CA chaining, pinning, and TLS 1.3 negotiation.
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+    fn gen_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = p.self_signed(&key).unwrap();
+        (cert, key)
+    }
+
+    fn gen_leaf(
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        name: &str,
+        client: bool,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+        p.is_ca = rcgen::IsCa::NoCa;
+        p.extended_key_usages = vec![if client {
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth
+        } else {
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth
+        }];
+        let cert = p.signed_by(&key, ca, ca_key).unwrap();
+        (cert, key)
+    }
+
+    fn key_der(key: &rcgen::KeyPair) -> PrivateKeyDer<'static> {
+        PrivateKeyDer::Pkcs8(key.serialize_der().into())
+    }
+
+    fn client_config(
+        trusted_ca: &CertificateDer<'static>,
+        client_identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+    ) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted_ca.clone()).unwrap();
+        let builder =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots);
+        match client_identity {
+            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).unwrap(),
+            None => builder.with_no_client_auth(),
+        }
+    }
+
+    /// Drive an in-memory rustls handshake; returns the negotiated protocol
+    /// version on success, or the rustls error that aborted it.
+    fn do_handshake(
+        server: rustls::ServerConfig,
+        client: rustls::ClientConfig,
+    ) -> std::result::Result<rustls::ProtocolVersion, rustls::Error> {
+        let mut srv = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        let name = ServerName::try_from("localhost".to_string()).unwrap();
+        let mut cli = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+
+        for _ in 0..40 {
+            let mut to_srv = Vec::new();
+            while cli.wants_write() {
+                cli.write_tls(&mut to_srv).unwrap();
+            }
+            if !to_srv.is_empty() {
+                let mut cur = &to_srv[..];
+                while !cur.is_empty() {
+                    srv.read_tls(&mut cur).unwrap();
+                }
+                srv.process_new_packets()?;
+            }
+
+            let mut to_cli = Vec::new();
+            while srv.wants_write() {
+                srv.write_tls(&mut to_cli).unwrap();
+            }
+            if !to_cli.is_empty() {
+                let mut cur = &to_cli[..];
+                while !cur.is_empty() {
+                    cli.read_tls(&mut cur).unwrap();
+                }
+                cli.process_new_packets()?;
+            }
+
+            if !cli.is_handshaking() && !srv.is_handshaking() {
+                return Ok(srv.protocol_version().expect("negotiated version"));
+            }
+        }
+        Err(rustls::Error::General("handshake did not complete".into()))
+    }
+
+    /// Build a server via the PUBLIC build_mtls_server_config() API (file paths),
+    /// keeping the temp files alive for the duration of the test.
+    fn mtls_server(
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        pinned: &[String],
+    ) -> (
+        rustls::ServerConfig,
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+    ) {
+        let (server_cert, server_key) = gen_leaf(ca, ca_key, "localhost", false);
+        let cert_f = write_temp_file(&server_cert.pem());
+        let key_f = write_temp_file(&server_key.serialize_pem());
+        let ca_f = write_temp_file(&ca.pem());
+        let cfg = build_mtls_server_config(
+            cert_f.path().to_str().unwrap(),
+            key_f.path().to_str().unwrap(),
+            ca_f.path().to_str().unwrap(),
+            pinned,
+        )
+        .unwrap();
+        (cfg, cert_f, key_f, ca_f)
+    }
+
+    #[test]
+    fn mtls_valid_client_cert_accepted_negotiates_tls13() {
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        let (client_cert, client_key) = gen_leaf(&ca, &ca_key, "client", true);
+        let cli = client_config(
+            ca.der(),
+            Some((client_cert.der().clone(), key_der(&client_key))),
+        );
+        let version = do_handshake(srv_cfg, cli).expect("handshake should succeed");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+    }
+
+    /// Assert a handshake was ACTIVELY rejected for an expected reason. Critically
+    /// this fails if the handshake merely stalled (the do_handshake non-completion
+    /// sentinel), so a regression that broke client-auth in a way that aborts the
+    /// handshake early cannot pass as a "rejection" (review finding: stall masking).
+    fn expect_rejected(
+        result: std::result::Result<rustls::ProtocolVersion, rustls::Error>,
+        any_of: &[&str],
+    ) {
+        let err = result.expect_err("handshake must be rejected, but it succeeded");
+        let dbg = format!("{err:?}");
+        assert!(
+            !dbg.contains("handshake did not complete"),
+            "handshake STALLED rather than being actively rejected (this would mask a \
+             dropped-client-auth regression): {dbg}"
+        );
+        assert!(
+            any_of.iter().any(|s| dbg.contains(s)),
+            "rejection reason {dbg} did not match any expected cause in {any_of:?}"
+        );
+    }
+
+    /// Generate a client leaf with explicit validity bounds (for expiry tests).
+    fn gen_client_leaf_validity(
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec!["client".into()]).unwrap();
+        p.is_ca = rcgen::IsCa::NoCa;
+        p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        p.not_before = not_before;
+        p.not_after = not_after;
+        let cert = p.signed_by(&key, ca, ca_key).unwrap();
+        (cert, key)
+    }
+
+    /// A client config restricted to a specific protocol version, presenting a cert.
+    fn client_config_versions(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        trusted_ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted_ca.clone()).unwrap();
+        rustls::ClientConfig::builder_with_protocol_versions(versions)
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![cert], key)
+            .unwrap()
+    }
+
+    #[test]
+    fn mtls_missing_client_cert_rejected() {
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        // Client presents NO certificate; the mandatory verifier must reject it,
+        // and it must be the cert requirement (not an unrelated abort) that does so.
+        let cli = client_config(ca.der(), None);
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &[
+                "NoCertificatesPresented",
+                "CertificateRequired",
+                "certificate required",
+            ],
+        );
+    }
+
+    #[test]
+    fn mtls_client_cert_from_wrong_ca_rejected() {
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (other_ca, other_ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        // Client trusts the server CA but presents a cert signed by a DIFFERENT CA.
+        let (rogue_cert, rogue_key) = gen_leaf(&other_ca, &other_ca_key, "client", true);
+        let cli = client_config(
+            ca.der(),
+            Some((rogue_cert.der().clone(), key_der(&rogue_key))),
+        );
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &["UnknownIssuer", "InvalidCertificate"],
+        );
+    }
+
+    #[test]
+    fn mtls_pinned_mismatch_rejected_but_pinned_match_accepted() {
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (client_cert, client_key) = gen_leaf(&ca, &ca_key, "client", true);
+        let client_fp = cert_sha256_fingerprint(client_cert.der().as_ref());
+
+        // Pinned to a bogus fingerprint: a valid CA-signed client is still rejected,
+        // and specifically by the PINNING layer (its unique error string), not webpki.
+        let (srv_bad, _c1, _k1, _a1) = mtls_server(&ca, &ca_key, &["deadbeef".to_string()]);
+        let cli_bad = client_config(
+            ca.der(),
+            Some((client_cert.der().clone(), key_der(&client_key))),
+        );
+        expect_rejected(do_handshake(srv_bad, cli_bad), &["not in the pinned set"]);
+
+        // Pinned to the real client fingerprint: accepted.
+        let (srv_ok, _c2, _k2, _a2) = mtls_server(&ca, &ca_key, &[client_fp]);
+        let cli_ok = client_config(
+            ca.der(),
+            Some((client_cert.der().clone(), key_der(&client_key))),
+        );
+        do_handshake(srv_ok, cli_ok).expect("pinned client cert must be accepted");
+    }
+
+    #[test]
+    fn mtls_tls12_client_rejected_no_downgrade() {
+        // Threat A11: the remote plane is TLS 1.3 only; a TLS-1.2 client (even with a
+        // valid cert) must be refused. tls12 is a compiled-in rustls feature, so this
+        // guards the protocol-version pin against a silent widening regression.
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        let (client_cert, client_key) = gen_leaf(&ca, &ca_key, "client", true);
+        let cli = client_config_versions(
+            &[&rustls::version::TLS12],
+            ca.der(),
+            client_cert.der().clone(),
+            key_der(&client_key),
+        );
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &[
+                "PeerIncompatible",
+                "NoSupportedVersions",
+                "protocol version",
+            ],
+        );
+    }
+
+    #[test]
+    fn mtls_wrong_eku_server_cert_as_client_rejected() {
+        // Threat A7: a serverAuth-only leaf presented as a client cert must be rejected.
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        let (server_eku_cert, key) = gen_leaf(&ca, &ca_key, "client", false); // serverAuth EKU
+        let cli = client_config(
+            ca.der(),
+            Some((server_eku_cert.der().clone(), key_der(&key))),
+        );
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &["InvalidPurpose", "InvalidCertificate", "purpose"],
+        );
+    }
+
+    #[test]
+    fn mtls_expired_client_cert_rejected() {
+        // Threat A5: an expired client cert must be rejected (validity-window enforced).
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        let now = time::OffsetDateTime::now_utc();
+        let (expired, key) = gen_client_leaf_validity(
+            &ca,
+            &ca_key,
+            now - time::Duration::days(30),
+            now - time::Duration::days(1),
+        );
+        let cli = client_config(ca.der(), Some((expired.der().clone(), key_der(&key))));
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &["Expired", "InvalidCertificate"],
+        );
+    }
+
+    #[test]
+    fn mtls_not_yet_valid_client_cert_rejected() {
+        // Threat A5: a not-yet-valid client cert must be rejected.
+        ensure_crypto_provider();
+        let (ca, ca_key) = gen_ca();
+        let (srv_cfg, _c, _k, _a) = mtls_server(&ca, &ca_key, &[]);
+        let now = time::OffsetDateTime::now_utc();
+        let (future, key) = gen_client_leaf_validity(
+            &ca,
+            &ca_key,
+            now + time::Duration::days(1),
+            now + time::Duration::days(30),
+        );
+        let cli = client_config(ca.der(), Some((future.der().clone(), key_der(&key))));
+        expect_rejected(
+            do_handshake(srv_cfg, cli),
+            &["NotValidYet", "InvalidCertificate"],
         );
     }
 }

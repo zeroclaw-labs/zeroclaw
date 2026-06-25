@@ -159,31 +159,20 @@ impl RpcTransport for WssTransport {
 
 // ── TLS acceptor ─────────────────────────────────────────────────
 
-/// Build a `TlsAcceptor` from PEM-encoded cert and key files.
-pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    use rustls::ServerConfig;
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let cert_file =
-        File::open(cert_path).with_context(|| format!("opening TLS cert: {cert_path}"))?;
-    let key_file = File::open(key_path).with_context(|| format!("opening TLS key: {key_path}"))?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing TLS certificates")?;
-
-    let key = private_key(&mut BufReader::new(key_file))
-        .context("parsing TLS private key")?
-        .context("no private key found in key file")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building TLS server config")?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// Build a [`TlsAcceptor`] for the remote WSS RPC plane.
+///
+/// The remote plane is ALWAYS mutually authenticated and TLS 1.3 only: every
+/// client certificate is verified against `ca_cert_path` (optionally pinned to
+/// `pinned_certs`). There is deliberately no server-only / no-client-auth path
+/// here (threat model A11); the secure-by-construction builder lives in
+/// [`zeroclaw_tls::build_mtls_acceptor`].
+pub fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+) -> Result<TlsAcceptor> {
+    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs)
 }
 
 // ── Listener ─────────────────────────────────────────────────────

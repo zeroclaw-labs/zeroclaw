@@ -3994,9 +3994,33 @@ async fn main() -> Result<()> {
                             cancel.cancelled().await;
                             return Ok(());
                         }
+                        // The remote WSS plane is always mutually authenticated;
+                        // there is no server-only / plaintext fallback. Require the
+                        // [wss.client_auth] section (CA + optional pinning).
+                        let client_auth = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .filter(|ca| ca.enabled)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "[wss] is enabled but [wss.client_auth] is not configured. The \
+                                     remote WSS plane requires mutual TLS: set \
+                                     wss.client_auth.enabled = true and wss.client_auth.ca_cert_path. \
+                                     There is no server-only-TLS fallback."
+                                )
+                            })?;
+                        if client_auth.ca_cert_path.is_empty() {
+                            return Err(anyhow::anyhow!(
+                                "[wss.client_auth] is enabled but ca_cert_path is empty. Set \
+                                 wss.client_auth.ca_cert_path to the PEM CA certificate that signs \
+                                 client certificates."
+                            ));
+                        }
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
                             &wss_cfg.cert_path,
                             &wss_cfg.key_path,
+                            &client_auth.ca_cert_path,
+                            &client_auth.pinned_certs,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;

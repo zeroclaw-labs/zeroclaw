@@ -20,3 +20,4 @@ zeroclaw-log.workspace = true
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3.26"
+time = "0.3"

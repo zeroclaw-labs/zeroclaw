@@ -6477,6 +6477,42 @@ impl Default for GatewayClientAuthConfig {
     }
 }
 
+/// Client certificate authentication (mTLS) for the remote WSS transport
+/// (`[wss.client_auth]`).
+///
+/// This mirrors [`GatewayClientAuthConfig`]; the two are distinct structs only
+/// because the `Configurable` derive binds the section prefix into the type. The
+/// verification logic itself is single-sourced in the `zeroclaw-tls` crate.
+///
+/// Unlike the gateway's variant there is no `require_client_cert` knob: the
+/// remote WSS plane is *always* mutually authenticated (there is no
+/// server-only-TLS path), so a client certificate is unconditionally required.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "wss.client_auth"]
+pub struct WssClientAuthConfig {
+    /// Enable client certificate verification for the WSS plane (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded CA certificate used to verify client certificates.
+    #[serde(default)]
+    pub ca_cert_path: String,
+    /// Optional SHA-256 fingerprints for certificate pinning. When non-empty,
+    /// only client certs matching one of these fingerprints are accepted.
+    #[serde(default)]
+    pub pinned_certs: Vec<String>,
+}
+
+impl Default for WssClientAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_cert_path: String::new(),
+            pinned_certs: Vec::new(),
+        }
+    }
+}
+
 /// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).
 ///
 /// When enabled, the daemon listens for TLS-encrypted WebSocket connections
@@ -6501,6 +6537,12 @@ pub struct WssConfig {
     /// Path to the PEM-encoded server private key file.
     #[serde(default)]
     pub key_path: String,
+    /// Client certificate authentication (mutual TLS) for the remote WSS plane.
+    /// When the listener is enabled, the remote plane is always mutually
+    /// authenticated; this section supplies the CA and pinning policy.
+    #[serde(default)]
+    #[nested]
+    pub client_auth: Option<WssClientAuthConfig>,
 }
 
 impl Default for WssConfig {
@@ -6511,6 +6553,7 @@ impl Default for WssConfig {
             port: default_wss_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            client_auth: None,
         }
     }
 }
