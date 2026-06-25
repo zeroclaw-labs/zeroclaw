@@ -403,6 +403,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub google_workspace: GoogleWorkspaceConfig,
 
+    /// Herdr agent status reporting (`[herdr]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub herdr: HerdrConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     #[nested]
@@ -7562,6 +7568,35 @@ impl Default for GoogleWorkspaceConfig {
             timeout_secs: default_gws_timeout_secs(),
             audit_log: false,
         }
+    }
+}
+
+/// Herdr agent status reporting configuration (`[herdr]`).
+///
+/// When enabled and running inside a Herdr pane (detected via `HERDR_ENV=1`),
+/// the agent reports its lifecycle state (working/idle/released) to the
+/// Herdr daemon so the sidebar shows the current agent status.
+///
+/// Requires running inside a Herdr pane — environment variables
+/// `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID` must be present.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "herdr"]
+#[integration(
+    category = "Platform",
+    display_name = "Herdr",
+    description = "Agent status reporting to Herdr panes",
+    status_field = "enabled"
+)]
+pub struct HerdrConfig {
+    /// Enable Herdr agent status reporting. Default: `true` (auto-detected via env).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -15581,6 +15616,7 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
+            herdr: HerdrConfig::default(),
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),

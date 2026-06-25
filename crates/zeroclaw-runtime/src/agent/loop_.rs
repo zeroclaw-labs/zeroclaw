@@ -1056,7 +1056,7 @@ pub async fn run(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
-        let _herdr_guard = crate::integrations::herdr::try_install_hook();
+        let _herdr_guard = crate::integrations::herdr::try_install_hook(&config.herdr);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;

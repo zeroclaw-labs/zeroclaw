@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroclaw_api::observability_traits::ObserverMetric;
+use zeroclaw_config::schema::HerdrConfig;
 
 use crate::observability::{
     BroadcastHookGuard, Observer, ObserverEvent, set_scoped_broadcast_hook,
@@ -17,8 +18,11 @@ const AGENT: &str = "zeroclaw";
 
 /// Try to install a HerdrObserver via the broadcast hook. Returns a guard
 /// that uninstalls it on drop, or `None` if the herdr environment isn't
-/// active (not running inside a herdr pane).
-pub fn try_install_hook() -> Option<BroadcastHookGuard> {
+/// active (not running inside a herdr pane) or if disabled in config.
+pub fn try_install_hook(config: &HerdrConfig) -> Option<BroadcastHookGuard> {
+    if !config.enabled {
+        return None;
+    }
     if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
         return None;
     }
@@ -47,14 +51,32 @@ pub fn update_session_id(sid: &str) {
 /// Low-level client that sends JSON-RPC requests to the herdr daemon over a
 /// Unix domain socket. Connects, writes, reads response (fire-and-forget),
 /// and disconnects per message.
-struct HerdrClient {
+pub(crate) struct HerdrClient {
     socket_path: String,
     pane_id: String,
+    #[cfg(test)]
+    spy: Option<Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>>,
 }
 
 impl HerdrClient {
-    fn new(socket_path: String, pane_id: String) -> Self {
-        Self { socket_path, pane_id }
+    pub(crate) fn new(socket_path: String, pane_id: String) -> Self {
+        Self { socket_path, pane_id, #[cfg(test)] spy: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_spy<F>(
+        socket_path: String,
+        pane_id: String,
+        spy: F,
+    ) -> Self
+    where
+        F: Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync + 'static,
+    {
+        Self {
+            socket_path,
+            pane_id,
+            spy: Some(Arc::new(spy)),
+        }
     }
 
     fn next_seq(&self) -> u64 {
@@ -73,6 +95,12 @@ impl HerdrClient {
     }
 
     fn send(&self, method: &str, params: &serde_json::Map<String, serde_json::Value>) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        if let Some(spy) = &self.spy {
+            spy(method, params);
+            return Ok(());
+        }
+
         let mut params_map = serde_json::Map::new();
         params_map.insert("pane_id".into(), serde_json::Value::String(self.pane_id.clone()));
         params_map.insert("source".into(), serde_json::Value::String(SOURCE.into()));
@@ -108,37 +136,41 @@ impl HerdrClient {
         if let Some(sid) = session_id {
             params.insert("agent_session_id".into(), serde_json::Value::String(sid.into()));
         }
-    let _ = self.send("pane.report_agent", &params);
-}
+        let _ = self.send("pane.report_agent", &params);
+    }
 
-fn report_released(&self) {
-    let _ = self.send("pane.release_agent", &serde_json::Map::new());
-}
-
+    fn report_released(&self) {
+        let _ = self.send("pane.release_agent", &serde_json::Map::new());
+    }
 }
 
 // ── DebouncedReporter ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HerdrState {
+pub(crate) enum HerdrState {
     Idle,
     Working,
+    Blocked,
     Released,
 }
 
 /// Debounces status changes so the herdr socket is only contacted on actual
 /// state transitions, not on every ObserverEvent.
-struct DebouncedReporter {
-    client: HerdrClient,
+pub(crate) struct DebouncedReporter {
+    pub(crate) client: HerdrClient,
     state: HerdrState,
 }
 
 impl DebouncedReporter {
-    fn new(client: HerdrClient) -> Self {
+    pub(crate) fn new(client: HerdrClient) -> Self {
         Self {
             client,
             state: HerdrState::Idle,
         }
+    }
+
+    pub(crate) fn state(&self) -> HerdrState {
+        self.state
     }
 
     fn report_working(&mut self, session_id: Option<&str>) {
@@ -165,6 +197,14 @@ impl DebouncedReporter {
         self.client.report_state("idle", None);
         self.client.report_released();
     }
+
+    fn report_blocked(&mut self) {
+        if self.state == HerdrState::Blocked {
+            return;
+        }
+        self.state = HerdrState::Blocked;
+        self.client.report_state("blocked", None);
+    }
 }
 
 // ── Session ID slot (thread_local) ───────────────────────────────────────────
@@ -187,10 +227,16 @@ pub struct HerdrObserver {
 }
 
 impl HerdrObserver {
-    fn new(reporter: DebouncedReporter) -> Self {
+    pub(crate) fn new(reporter: DebouncedReporter) -> Self {
         Self {
             reporter: Mutex::new(reporter),
         }
+    }
+
+    /// Test-only constructor that accepts a pre-built reporter.
+    #[cfg(test)]
+    pub(crate) fn new_with_reporter(reporter: DebouncedReporter) -> Self {
+        Self::new(reporter)
     }
 }
 
@@ -215,6 +261,20 @@ impl Observer for HerdrObserver {
                     reporter.report_released();
                 }
             }
+            ObserverEvent::AuthorizationRequested { .. } => {
+                if let Ok(mut reporter) = self.reporter.lock() {
+                    reporter.report_blocked();
+                }
+            }
+            ObserverEvent::AuthorizationResponded { granted, .. } => {
+                if let Ok(mut reporter) = self.reporter.lock() {
+                    if *granted {
+                        reporter.report_working(None);
+                    } else {
+                        reporter.report_idle();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -229,5 +289,59 @@ impl Observer for HerdrObserver {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use parking_lot::Mutex;
+
+    /// A spy that captures all `pane.report_agent` / `pane.release_agent`
+    /// calls instead of sending them over UDS.
+    #[derive(Clone, Default)]
+    pub(crate) struct HerdrSpy {
+        calls: Arc<Mutex<Vec<HerdrSpyCall>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct HerdrSpyCall {
+        pub method: String,
+        pub params: serde_json::Value,
+    }
+
+    impl HerdrSpy {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(crate) fn drain(&self) -> Vec<HerdrSpyCall> {
+            self.calls.lock().drain(..).collect()
+        }
+
+        pub(crate) fn into_inner(self) -> Arc<Mutex<Vec<HerdrSpyCall>>> {
+            self.calls
+        }
+    }
+
+    /// Build a `DebouncedReporter` with a `HerdrClient` that uses the spy
+    /// instead of connecting to a real UDS socket.
+    pub(crate) fn make_spy_reporter(
+        spy: HerdrSpy,
+    ) -> (DebouncedReporter, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+        let calls = spy.into_inner();
+        let client = HerdrClient::new_with_spy(
+            "/tmp/test-herdr.sock".into(),
+            "test-pane".into(),
+            move |method, params| {
+                calls.lock().push(HerdrSpyCall {
+                    method: method.to_string(),
+                    params: serde_json::Value::Object(params.clone()),
+                });
+            },
+        );
+        let reporter = DebouncedReporter::new(client);
+        (reporter, calls)
     }
 }
