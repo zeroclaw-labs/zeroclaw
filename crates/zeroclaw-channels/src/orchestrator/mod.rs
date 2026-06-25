@@ -9844,9 +9844,9 @@ pub async fn start_channels(
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_config(&config.hooks),
-                ))
+                Some(Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+                    &config.hooks,
+                )))
             } else {
                 None
             },
