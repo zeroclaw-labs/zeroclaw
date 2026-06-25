@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
@@ -47,6 +48,11 @@ pub struct RelayConfig {
     pub allow: HashSet<String>,
     /// Relay tokens always rejected.
     pub deny: HashSet<String>,
+    /// Drop a parked client socket if no daemon data connection pairs it within
+    /// this window (prevents unbounded FD/memory accumulation).
+    pub pending_timeout: Duration,
+    /// Cap on simultaneously parked (unpaired) client sockets.
+    pub max_pending: usize,
 }
 
 impl Default for RelayConfig {
@@ -55,6 +61,8 @@ impl Default for RelayConfig {
             registration_mode: Admission::Open,
             allow: HashSet::new(),
             deny: HashSet::new(),
+            pending_timeout: Duration::from_secs(30),
+            max_pending: 1024,
         }
     }
 }
@@ -62,6 +70,10 @@ impl Default for RelayConfig {
 struct DaemonLink {
     /// Send a `conn_id` here to push an `Open` frame to the daemon control link.
     open_tx: mpsc::Sender<u64>,
+    /// Unique registration epoch. Teardown only removes the map entry if it still
+    /// carries this epoch, so a superseded (stale) connection can never evict the
+    /// daemon that replaced it on reconnect.
+    epoch: u64,
 }
 
 struct Inner {
@@ -69,6 +81,7 @@ struct Inner {
     daemons: Mutex<HashMap<String, DaemonLink>>,
     pending: Mutex<HashMap<u64, TcpStream>>,
     next_conn: AtomicU64,
+    next_epoch: AtomicU64,
 }
 
 /// A running relay. Cheap to clone (`Arc` inside).
@@ -85,6 +98,7 @@ impl RelayServer {
                 daemons: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
+                next_epoch: AtomicU64::new(1),
             }),
         }
     }
@@ -181,12 +195,18 @@ async fn handle_register(
         return Ok(());
     }
 
+    // Last-writer-wins registration, tagged with a unique epoch. A reconnect
+    // (same node-id) replaces the stale link; the stale connection's teardown
+    // below only removes the entry if it still carries its own epoch, so it can
+    // never evict the daemon that superseded it. (Cross-daemon node-id hijack is
+    // separately gated by the deferred signed-registration / pubkey binding.)
+    let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
     let (open_tx, mut open_rx) = mpsc::channel::<u64>(64);
     inner
         .daemons
         .lock()
         .await
-        .insert(node_id.clone(), DaemonLink { open_tx });
+        .insert(node_id.clone(), DaemonLink { open_tx, epoch });
 
     write_frame(
         &mut sock,
@@ -213,7 +233,12 @@ async fn handle_register(
         }
     }
 
-    inner.daemons.lock().await.remove(&node_id);
+    // Only deregister if we are still the registered link (epoch match); a newer
+    // reconnection that replaced us must not be evicted by our teardown.
+    let mut daemons = inner.daemons.lock().await;
+    if daemons.get(&node_id).map(|link| link.epoch) == Some(epoch) {
+        daemons.remove(&node_id);
+    }
     Ok(())
 }
 
@@ -245,12 +270,33 @@ async fn handle_connect(inner: Arc<Inner>, mut sock: TcpStream, node_id: String)
     // Tell the client the route is open before parking it; the bytes it sends now
     // buffer in the kernel until the daemon's data connection pairs and drains.
     write_frame(&mut sock, &Frame::Opened { conn_id }).await?;
-    inner.pending.lock().await.insert(conn_id, sock);
+    {
+        // Cap simultaneously-parked client sockets so a slow/absent daemon (or a
+        // flood of clients) cannot exhaust file descriptors / memory.
+        let mut pending = inner.pending.lock().await;
+        if pending.len() >= inner.cfg.max_pending {
+            drop(pending);
+            let _ = write_frame(&mut sock, &Frame::error("busy", "relay at capacity")).await;
+            return Ok(());
+        }
+        pending.insert(conn_id, sock);
+    }
 
     if open_tx.send(conn_id).await.is_err() {
         // Daemon vanished between lookup and notify.
         inner.pending.lock().await.remove(&conn_id);
+        return Ok(());
     }
+
+    // Reap the parked socket if no daemon data connection pairs it in time
+    // (daemon crash, slow/hostile daemon, or a failed bridge dial). Dropping the
+    // entry closes the socket and bounds the relay's outstanding state.
+    let reaper = inner.clone();
+    let timeout = inner.cfg.pending_timeout;
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        reaper.pending.lock().await.remove(&conn_id);
+    });
     Ok(())
 }
 

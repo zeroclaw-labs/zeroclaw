@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         registration_mode,
         allow: cli.allow.into_iter().collect::<HashSet<_>>(),
         deny: cli.deny.into_iter().collect::<HashSet<_>>(),
+        ..Default::default()
     };
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)

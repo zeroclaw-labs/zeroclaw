@@ -235,7 +235,7 @@ async fn allowlist_rejects_unlisted_daemon() {
     let relay = start_relay(RelayConfig {
         registration_mode: Admission::Allowlist,
         allow: HashSet::from(["good-token".to_string()]),
-        deny: HashSet::new(),
+        ..Default::default()
     })
     .await;
 
@@ -254,4 +254,95 @@ async fn allowlist_rejects_unlisted_daemon() {
         Frame::Error { code, .. } => assert_eq!(code, "forbidden"),
         other => panic!("expected forbidden, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn reconnect_does_not_self_evict() {
+    // An honest daemon whose connection drops and reconnects (re-registering the
+    // same node-id) must remain reachable: the stale connection's teardown must
+    // not evict the live reconnection.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let relay = start_relay(RelayConfig::default()).await;
+
+    let mut a = TcpStream::connect(relay).await.unwrap();
+    write_frame(
+        &mut a,
+        &Frame::Register {
+            node_id: "node-1".into(),
+            relay_token: String::new(),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut a).await, Frame::Registered { .. }));
+
+    // Reconnect (same node-id) wins via last-writer-wins.
+    let mut b = TcpStream::connect(relay).await.unwrap();
+    write_frame(
+        &mut b,
+        &Frame::Register {
+            node_id: "node-1".into(),
+            relay_token: String::new(),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut b).await, Frame::Registered { .. }));
+
+    // The stale connection goes away; its teardown must NOT remove node-1.
+    drop(a);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut c = TcpStream::connect(relay).await.unwrap();
+    write_frame(
+        &mut c,
+        &Frame::Connect {
+            node_id: "node-1".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(read_frame(&mut c).await, Frame::Opened { .. }),
+        "live reconnection was self-evicted by the stale connection's teardown"
+    );
+}
+
+#[tokio::test]
+async fn pending_client_is_reaped_when_unpaired() {
+    // A client parked for a daemon that never opens a data connection must be
+    // reaped (its socket dropped) within the configured window, not leaked.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let relay = start_relay(RelayConfig {
+        pending_timeout: std::time::Duration::from_millis(200),
+        ..Default::default()
+    })
+    .await;
+
+    // Daemon registers but will never send Accept.
+    let mut d = TcpStream::connect(relay).await.unwrap();
+    write_frame(
+        &mut d,
+        &Frame::Register {
+            node_id: "n".into(),
+            relay_token: String::new(),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut d).await, Frame::Registered { .. }));
+
+    let mut c = TcpStream::connect(relay).await.unwrap();
+    write_frame(
+        &mut c,
+        &Frame::Connect {
+            node_id: "n".into(),
+        },
+    )
+    .await;
+    assert!(matches!(read_frame(&mut c).await, Frame::Opened { .. }));
+
+    // After the reap window the relay drops the parked socket -> client sees EOF.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), c.read(&mut buf))
+        .await
+        .expect("reaper should close the unpaired parked socket")
+        .unwrap();
+    assert_eq!(n, 0, "parked client socket was not reaped");
 }
