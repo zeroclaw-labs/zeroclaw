@@ -519,7 +519,7 @@ async fn append_scoped_mcp_tools(
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
+                                "Gateway MCP deferred_loading: {} tool stub(s) from {} server(s)",
                                 deferred_set.len(),
                                 registry.server_count()
                             )
