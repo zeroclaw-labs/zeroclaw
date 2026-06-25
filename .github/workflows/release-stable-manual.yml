@@ -618,9 +618,11 @@ jobs:
     # Non-blocking for the first release cycle — make blocking once the provenance
     # format is verified downstream. SLSA L2: GitHub-hosted runner + OIDC-signed
     # provenance written to Rekor by slsa-github-generator's trusted builder.
+    #
+    # Note: job-level `continue-on-error` is not supported for reusable workflow
+    # calls. The SLSA generator exposes its own `continue-on-error` input instead.
     name: SLSA Provenance (non-blocking)
     needs: [validate, hash-artifacts]
-    continue-on-error: true
     permissions:
       actions: read
       id-token: write
@@ -630,6 +632,7 @@ jobs:
       base64-subjects: "${{ needs.hash-artifacts.outputs.hashes }}"
       upload-assets: true
       upload-tag-name: ${{ needs.validate.outputs.tag }}
+      continue-on-error: true
 
   sign-and-sbom:
     name: Sign Release Assets & Publish SBOM
