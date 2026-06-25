@@ -2705,6 +2705,66 @@ enum SecurityCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Issue a client certificate from the daemon's mTLS CA for connecting over WSS.
+    ///
+    /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
+    /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
+    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// WSS plane.
+    IssueClientCert {
+        /// Subject/device identity stamped into the certificate (CN).
+        #[arg(long, default_value = "zerocode")]
+        name: String,
+
+        /// Directory to write client.crt / client.key. Defaults to `<data_dir>/tls`.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+}
+
+/// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
+fn issue_wss_client_cert(config: &Config, name: &str, out_dir: Option<PathBuf>) -> Result<()> {
+    let tls_dir = config.data_dir.join("tls");
+    let ca_cert = tls_dir.join("ca.crt");
+    let ca_key = tls_dir.join("ca.key");
+    if !ca_cert.exists() || !ca_key.exists() {
+        anyhow::bail!(
+            "no daemon mTLS CA found at {}. Start the daemon once with [wss] enabled to \
+             auto-generate it, or configure a bring-your-own CA.",
+            tls_dir.display()
+        );
+    }
+
+    let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
+    let ca_key_pem = std::fs::read_to_string(&ca_key)?;
+    let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
+
+    let dest = out_dir.unwrap_or(tls_dir);
+    std::fs::create_dir_all(&dest)?;
+    let cert_path = dest.join("client.crt");
+    let key_path = dest.join("client.key");
+    std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
+    std::fs::write(&key_path, issued.key_pem.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    println!("Issued client certificate for '{name}':");
+    println!("  cert: {}", cert_path.display());
+    println!("  key:  {}", key_path.display());
+    println!("  CA:   {}", ca_cert.display());
+    println!();
+    println!("Connect with zerocode:");
+    println!(
+        "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+        ca_cert.display(),
+        cert_path.display(),
+        key_path.display()
+    );
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -4016,12 +4076,12 @@ async fn main() -> Result<()> {
                         let (cert_path, key_path, ca_cert_path) = match byo_ca {
                             Some(ca_cert_path) => {
                                 if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {
-                                    return Err(anyhow::anyhow!(
+                                    anyhow::bail!(
                                         "[wss.client_auth].ca_cert_path is set (bring-your-own mTLS) \
                                          but [wss].cert_path/key_path are not. Provide the server \
                                          certificate and key, or clear ca_cert_path to auto-generate \
                                          the CA and server certificate."
-                                    ));
+                                    );
                                 }
                                 (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
                             }
@@ -4537,17 +4597,20 @@ async fn main() -> Result<()> {
         }
 
         #[cfg(feature = "agent-runtime")]
-        Commands::Security {
-            security_command: SecurityCommands::Status { agent, json },
-        } => {
-            let report = security_status::build_report(&config, &agent)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                security_status::print_report(&report);
+        Commands::Security { security_command } => match security_command {
+            SecurityCommands::Status { agent, json } => {
+                let report = security_status::build_report(&config, &agent)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    security_status::print_report(&report);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            SecurityCommands::IssueClientCert { name, out_dir } => {
+                issue_wss_client_cert(&config, &name, out_dir)
+            }
+        },
 
         Commands::Estop {
             estop_command,
