@@ -1045,7 +1045,9 @@ impl ModelEndpoint for MoonshotEndpoint {
         match self {
             Self::Cn => "https://api.moonshot.cn/v1",
             Self::Intl => "https://api.moonshot.ai/v1",
-            Self::Code => "https://api.moonshot.cn/coder/v1",
+            // Kimi Code (Kimi For Coding) moved to api.kimi.com — the old api.moonshot.cn/coder/v1 returns 404.
+            // See issue #8154: https://github.com/zeroclaw-labs/zeroclaw/issues/8154
+            Self::Code => "https://api.kimi.com/coding/v1",
         }
     }
 }
