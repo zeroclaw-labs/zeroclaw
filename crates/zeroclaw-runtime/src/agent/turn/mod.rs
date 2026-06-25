@@ -72,7 +72,7 @@ pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
-pub(crate) use context::TurnCtx;
+pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
@@ -119,7 +119,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -190,6 +189,10 @@ pub struct ToolLoop<'a> {
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// Observer metadata: agent alias and turn id, stamped onto every
+    /// turn-level observer event so OTel spans correlate across the loop.
+    pub agent_alias: Option<&'a str>,
+    pub turn_id: &'a str,
 }
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
@@ -208,6 +211,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         mut image_cache,
         ingress,
+        agent_alias,
+        turn_id,
     } = p;
     let ResolvedAgentExecution {
         model_access:
@@ -277,7 +282,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         max_tool_iterations
     };
 
-    let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
     let loop_ignore_tools: HashSet<&str> = pacing
         .loop_ignore_tools
@@ -319,7 +323,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
-        turn_id: &turn_id,
+        turn_id,
+        agent_alias,
     };
 
     for iteration in 0..max_iterations {
@@ -610,15 +615,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(
-                    observer,
-                    provider_name,
-                    model,
-                    llm_started_at,
-                    iteration,
-                    &turn_id,
-                    &e,
-                );
+                record_llm_failure(&ctx, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     history,
                     &e,
@@ -841,10 +838,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
+            let meta = ctx.meta();
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,
                 activated_tools,
+                &meta,
                 observer,
                 cancellation_token.as_ref(),
                 receipt_generator,
@@ -852,10 +851,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             )
             .await
         } else {
+            let meta = ctx.meta();
             execute_tools_sequential(
                 &executable_calls,
                 tools_registry,
                 activated_tools,
+                &meta,
                 observer,
                 cancellation_token.as_ref(),
                 receipt_generator,
@@ -956,7 +957,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             collected_receipts,
             model,
             iteration,
-            &turn_id,
+            turn_id,
         )?;
 
         if !cancelled_mid_batch {
@@ -968,7 +969,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &mut last_tool_output_hash,
                 model,
                 iteration,
-                &turn_id,
+                turn_id,
             )?;
         }
 
@@ -1000,7 +1001,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         cancellation_token.as_ref(),
         max_iterations,
         accumulated_display_text,
-        &turn_id,
+        turn_id,
         knobs,
         new_messages_out,
     )

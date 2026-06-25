@@ -31,6 +31,7 @@ mod diff;
 mod doctor;
 mod editor;
 mod file_explorer;
+mod help;
 mod i18n;
 mod input_bar;
 mod jsonrpc;

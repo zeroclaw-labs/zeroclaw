@@ -239,6 +239,10 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
             continue;
         };
 
+        if !is_legacy_session_artifact(filename) {
+            continue;
+        }
+
         let is_old = if let Some(date) = date_prefix(filename) {
             date < cutoff_date
         } else {
@@ -252,6 +256,12 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
     }
 
     Ok(moved)
+}
+
+fn is_legacy_session_artifact(filename: &str) -> bool {
+    date_prefix(filename).is_some()
+        || filename.ends_with(".jsonl")
+        || filename.ends_with(".jsonl.migrated")
 }
 
 fn purge_memory_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
@@ -321,6 +331,10 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
         let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
             continue;
         };
+
+        if !is_legacy_session_artifact(filename) {
+            continue;
+        }
 
         let is_old = if let Some(date) = date_prefix(filename) {
             date < cutoff_date
@@ -487,10 +501,19 @@ mod tests {
     use super::*;
     use crate::sqlite::SqliteMemory;
     use crate::traits::{Memory, MemoryCategory};
+    use filetime::{FileTime, set_file_mtime};
     use tempfile::TempDir;
 
     fn default_cfg() -> MemoryConfig {
         MemoryConfig::default()
+    }
+
+    fn set_old_mtime(path: &Path, days_old: i64) {
+        let old = FileTime::from_system_time(
+            (SystemTime::now() - StdDuration::from_secs(days_old as u64 * 24 * 60 * 60))
+                .max(SystemTime::UNIX_EPOCH),
+        );
+        set_file_mtime(path, old).unwrap();
     }
 
     #[test]
@@ -547,6 +570,92 @@ mod tests {
                 .exists(),
             "archived session file should exist"
         );
+    }
+
+    #[test]
+    fn keeps_sqlite_session_artifacts_out_of_archives() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let protected = ["sessions.db", "sessions.db-wal", "sessions.db-shm"];
+        for filename in protected {
+            let path = sessions_dir.join(filename);
+            fs::write(&path, "sqlite artifact").unwrap();
+            set_old_mtime(&path, 10);
+        }
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        for filename in protected {
+            assert!(
+                sessions_dir.join(filename).exists(),
+                "{filename} should remain in the hot sessions directory"
+            );
+            assert!(
+                !sessions_dir.join("archive").join(filename).exists(),
+                "{filename} must not be moved into the session archive"
+            );
+        }
+    }
+
+    #[test]
+    fn archives_old_legacy_jsonl_session_files() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let legacy_file = sessions_dir.join("legacy_session.jsonl");
+        fs::write(&legacy_file, "legacy session").unwrap();
+        set_old_mtime(&legacy_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            !legacy_file.exists(),
+            "old legacy JSONL session file should be archived"
+        );
+        assert!(
+            sessions_dir
+                .join("archive")
+                .join("legacy_session.jsonl")
+                .exists(),
+            "archived legacy JSONL session file should exist"
+        );
+    }
+
+    #[test]
+    fn purges_old_legacy_session_archives_but_keeps_sqlite_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let archive_dir = workspace.join("sessions").join("archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let protected = ["sessions.db", "sessions.db-wal", "sessions.db-shm"];
+        for filename in protected {
+            let path = archive_dir.join(filename);
+            fs::write(&path, "sqlite artifact").unwrap();
+            set_old_mtime(&path, 40);
+        }
+
+        let legacy_file = archive_dir.join("legacy_session.jsonl");
+        fs::write(&legacy_file, "legacy session").unwrap();
+        set_old_mtime(&legacy_file, 40);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            !legacy_file.exists(),
+            "old archived legacy session file should be purged"
+        );
+        for filename in protected {
+            assert!(
+                archive_dir.join(filename).exists(),
+                "{filename} should remain in the session archive"
+            );
+        }
     }
 
     #[test]
