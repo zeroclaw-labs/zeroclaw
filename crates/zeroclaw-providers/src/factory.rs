@@ -743,11 +743,50 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
     }
 }
 
-impl CompatFamilySpec for XaiModelProviderConfig {
-    const DISPLAY: &'static str = "xAI";
-    const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
-    const AUTH: AuthStyle = AuthStyle::Bearer;
-    const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
+impl FamilyProviderFactory for XaiModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url.or(Some("https://api.x.ai/v1")),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
+
+        let mut p = OpenAiCompatibleModelProvider::new(
+            alias,
+            "xAI",
+            api_url.unwrap_or("https://api.x.ai/v1"),
+            key,
+            AuthStyle::Bearer,
+        )
+        .with_models_dev_key("xai");
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            p = p.with_auth_profile("xai", auth_service, opts.auth_profile_override.clone());
+        }
+
+        Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
