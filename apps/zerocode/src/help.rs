@@ -76,6 +76,9 @@ mod source_guard {
     ];
 
     /// A reviewed, non-key descriptor row may opt out with this marker.
+    /// The reason text is unconstrained on purpose: each waiver is audited by a
+    /// human at PR-review time, not validated at compile time, so the commit that
+    /// adds one must justify it in review.
     const WAIVER: &str = "// helpguard: ";
 
     /// `E::key(` / `HelpEntry::key(` first-arg, or the `vec![...]` /
