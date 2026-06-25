@@ -1884,7 +1884,9 @@ impl DelegateTool {
             model_name,
             tools: prompt_tools,
             skills: &skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            // Deprecated/ignored — skills always render compactly. See
+            // `skills_to_prompt_with_mode`.
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),

@@ -5419,10 +5419,18 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions and tool metadata into the system prompt.
-    #[default]
+    /// DEPRECATED and inert. Formerly inlined every skill body into the system
+    /// prompt; this blew up the context window and diverged from the
+    /// progressive-disclosure model used by Claude Code and OpenClaw. Setting
+    /// `full` now behaves exactly like `compact` and emits a startup warning.
+    /// Retained only for back-compat parsing during the deprecation window;
+    /// removal of this variant and the `prompt_injection_mode` key is tracked
+    /// in #8310.
     Full,
-    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    /// The only live behavior: inline compact skill metadata
+    /// (name/description/location + callable tool specs) and load instructions
+    /// on demand via `read_skill`.
+    #[default]
     Compact,
 }
 
@@ -5543,8 +5551,10 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt.
-    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    /// DEPRECATED and ignored. Skills always render as compact summaries that
+    /// load instructions on demand via `read_skill`. The key is still parsed
+    /// for back-compat (setting `full` only logs a deprecation warning) and is
+    /// slated for removal — see #8310.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -17047,6 +17057,23 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        // Deprecation: skills.prompt_injection_mode is ignored — skills always
+        // render compactly and load on demand via `read_skill`. Warn (once, at
+        // startup) when `full` is set so users who relied on eager inlining
+        // learn why behavior changed. Key removal is tracked in #8310.
+        if matches!(
+            self.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "skills.prompt_injection_mode = \"full\" is deprecated and ignored; \
+                 skills now always load on demand (compact). Remove the key from your config."
+            );
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -20243,7 +20270,7 @@ api_token = "Bearer test-token"
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));

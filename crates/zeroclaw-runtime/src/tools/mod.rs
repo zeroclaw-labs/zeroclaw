@@ -708,12 +708,12 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
-        root_config.skills.prompt_injection_mode,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-    ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+    {
+        // Skills always render as compact summaries (the `prompt_injection_mode`
+        // setting is deprecated and ignored), so `read_skill` is always
+        // registered to load instructions on demand. ReadSkillTool holds full
+        // config to support all skill sources: workspace skills, open-skills,
+        // agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -2367,7 +2367,9 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_registers_read_skill_even_with_deprecated_full() {
+        // `prompt_injection_mode = full` is deprecated and inert: skills always
+        // render compactly, so `read_skill` must be registered regardless.
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2403,7 +2405,7 @@ mod tests {
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"read_skill"));
+        assert!(names.contains(&"read_skill"));
     }
 
     fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {

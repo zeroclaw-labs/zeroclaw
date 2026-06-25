@@ -466,7 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
+    fn skills_section_ignores_deprecated_full_mode() {
+        // `Full` is deprecated and inert: instructions are never inlined,
+        // regardless of the requested mode. Only tool metadata is rendered.
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -496,6 +498,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
+            // Explicitly request the deprecated mode to prove it is ignored.
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
@@ -508,7 +511,10 @@ mod tests {
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        // Instructions are not inlined — they load on demand via `read_skill`.
+        assert!(output.contains("loaded on demand"));
+        assert!(!output.contains("<instructions>"));
+        assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
         assert!(output.contains("<name>deploy__release_checklist</name>"));
@@ -597,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_builder_inlines_and_escapes_skills() {
+    fn prompt_builder_escapes_skill_metadata() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
@@ -645,9 +651,8 @@ mod tests {
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        // Instructions are no longer inlined (loaded on demand), so the prompt
+        // body is not asserted here.
     }
 
     #[test]
