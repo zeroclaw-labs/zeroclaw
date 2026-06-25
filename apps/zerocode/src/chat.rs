@@ -2854,6 +2854,28 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
     None
 }
 
+/// Recover the fence language token from a code-fence header bar line. The
+/// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
+/// empty info string both yield `None` so the rebuilt fence stays unlabelled.
+fn header_fence_lang(line: &Line<'static>) -> Option<String> {
+    let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+    let token = first
+        .trim_start_matches('\u{250c}')
+        .trim_matches('\u{2500}')
+        .trim();
+    if token.is_empty() || token == "code" {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Wrap recovered fence body text in its Markdown fence so a copied fence round-
+/// trips to the same source the model emitted, language tag included.
+fn fenced_text(lang: Option<&str>, body: &str) -> String {
+    format!("```{}\n{body}\n```", lang.unwrap_or(""))
+}
+
 /// Wrapped screen-row count for a single cached line at the given width.
 fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
     Paragraph::new(vec![borrow_line(line)])
@@ -4305,28 +4327,25 @@ impl ChatState {
     /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
     /// tracking its wrapped screen-row offset, and for each code fence records
     /// the `[Copy]` label cells on both the header and footer bars plus the
-    /// fence's exact text (recovered from the indented body lines between
-    /// them). `scroll` and `body` translate global wrapped rows into on-screen
-    /// cells; labels scrolled out of view are dropped.
-    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
-    /// tracking its wrapped screen-row offset, and for each code fence records
-    /// the `[Copy]` label cells on both the header and footer bars plus the
-    /// fence's exact text (recovered from the indented body lines between
-    /// them). `scroll` and `body` map global wrapped rows onto screen cells;
-    /// labels scrolled out of view are dropped.
+    /// fence's source text, re-wrapped in its Markdown fence (language tag and
+    /// backticks) from the recovered body lines so a copied fence round-trips.
+    /// `scroll` and `body` map global wrapped rows onto screen cells; labels
+    /// scrolled out of view are dropped.
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let mut screen_cursor = 0u16;
-        // (header_row, header_label_col, header_label_cells, accumulated_text)
-        let mut pending: Option<(u16, u16, u16, String)> = None;
+        // (header_row, header_label_col, header_label_cells, lang, accumulated_body)
+        let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
         for line in &self.cached_lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
+                let lang = header_fence_lang(line);
                 pending = label_cells(line, copy_lbl)
-                    .map(|(col, cells)| (screen_cursor, col, cells, String::new()));
+                    .map(|(col, cells)| (screen_cursor, col, cells, lang, String::new()));
             } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, text)) = pending.take() {
+                if let Some((header_row, header_col, header_cells, lang, acc)) = pending.take() {
+                    let text = fenced_text(lang.as_deref(), &acc);
                     if let Some(r) =
                         copy_region(header_row, header_col, header_cells, scroll, body, &text)
                     {
@@ -4345,13 +4364,13 @@ impl ChatState {
                         regions.push(r);
                     }
                 }
-            } else if let Some((_, _, _, text)) = pending.as_mut() {
+            } else if let Some((_, _, _, _, acc)) = pending.as_mut() {
                 let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
-                if !text.is_empty() {
-                    text.push('\n');
+                if !acc.is_empty() {
+                    acc.push('\n');
                 }
-                text.push_str(&body_text);
+                acc.push_str(&body_text);
             }
 
             screen_cursor += wrapped_rows(line, width);
@@ -6161,9 +6180,30 @@ mod tests {
             "a highlighted fence must still register copy regions"
         );
         assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
-            "copy text recovers the full multi-span highlighted body"
+            state.copy_hit_regions[0].text, "```rust\nfn main() {}\nlet y = 2;\n```",
+            "copy text re-wraps the body in its fence with the language tag"
         );
+    }
+
+    #[test]
+    fn copy_region_unlabeled_fence_omits_language() {
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
+        let body = Rect::new(0, 0, 60, 20);
+        state.rebuild_copy_regions(60, 0, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```\nplain text\n```",
+            "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+        );
+    }
+
+    #[test]
+    fn fenced_text_round_trips_language_and_backticks() {
+        assert_eq!(
+            fenced_text(Some("python"), "x = 1"),
+            "```python\nx = 1\n```"
+        );
+        assert_eq!(fenced_text(None, "x = 1"), "```\nx = 1\n```");
     }
 
     #[test]
