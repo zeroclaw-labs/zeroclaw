@@ -297,6 +297,10 @@ pub async fn handle_api_status(
         "memory_backend": memory_backend,
         "paired": state.pairing.is_paired(),
         "channels": channels,
+        "nodes": {
+            "connected": state.node_registry.node_ids(),
+            "mdns_peers": state.mdns_peer_registry.snapshots(),
+        },
         "health": health,
         "agent_alias": agent_alias,
         "process": process,
@@ -2113,6 +2117,7 @@ mod tests {
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
