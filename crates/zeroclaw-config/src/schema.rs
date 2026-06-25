@@ -6851,8 +6851,11 @@ pub struct BrowserConfig {
     /// Private/internal hosts allowed to bypass SSRF protection.
     /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
     /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
-    /// Listed hosts also bypass `allowed_domains` and (for `browser_open`) the
-    /// HTTPS-only restriction — internal services frequently lack a public TLS cert.
+    /// Listed hosts also bypass `allowed_domains`. The `browser` tool accepts `http://`
+    /// for listed hosts (internal services frequently lack a public TLS cert); `browser_open`
+    /// stays HTTPS-only regardless of this list.
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }

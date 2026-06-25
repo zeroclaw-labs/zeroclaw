@@ -566,4 +566,18 @@ mod tests {
         let tool = test_tool_with_private(vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5").is_ok());
     }
+
+    #[test]
+    fn listed_private_host_still_rejects_http_scheme() {
+        // browser_open stays HTTPS-only regardless of allowed_private_hosts: the
+        // scheme guard runs before the private-host bypass, so `http://` to a listed
+        // host is rejected by the scheme check, not the allowlist. (The `browser`
+        // tool, by contrast, accepts http:// for listed hosts.)
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https://"));
+    }
 }
