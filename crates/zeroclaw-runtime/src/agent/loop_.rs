@@ -13987,7 +13987,6 @@ Let me check the result."#;
         );
     }
 
-<<<<<<< ours
     // ── Observer metadata regression tests ──
 
     #[derive(Default)]
@@ -14196,6 +14195,8 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
     // ── filter_channel_builtin_tools safe-default bypass ─────────
     //
     // At non-Full autonomy the known read-only defaults
@@ -14331,6 +14332,5 @@ Let me check the result."#;
             filtered.contains(&"file_read"),
             "file_read in allowed_tools must survive, got {filtered:?}"
         );
->>>>>>> theirs
     }
 }
