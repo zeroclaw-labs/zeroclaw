@@ -39,7 +39,9 @@ use std::time::Duration;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
-use zeroclaw_api::elicitation::ElicitationCapabilities;
+use zeroclaw_api::elicitation::{
+    ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
+};
 
 use crate::orchestrator::acp_server::RpcOutbound;
 
@@ -59,7 +61,6 @@ pub struct AcpChannel {
     /// `client_caps.form` is true we emit `elicitation/create`; otherwise
     /// we fall back to the legacy `session/request_permission` path.
     /// See `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
-    #[allow(dead_code)] // consumed by Task 5 (request_choice rewrite)
     client_caps: ElicitationCapabilities,
 }
 
@@ -83,6 +84,137 @@ impl AcpChannel {
             rpc,
             approval_timeout,
             client_caps,
+        }
+    }
+
+    /// Legacy multiple-choice path — overloads `session/request_permission`
+    /// with synthetic `optionId`s. Kept for two minor releases as the
+    /// fallback for clients that do not yet advertise `elicitation.form`.
+    /// Removal is tracked in the spec under "Backward Compatibility".
+    async fn request_choice_via_permission(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        // Build permission options. Each choice becomes its own option with a
+        // synthetic id; we map the response id back to the choice text.
+        // `kind` mirrors how Toad/Zed render: `allow_once` looks like a
+        // primary action; `reject_once` is the cancel-style fallback.
+        let mut options = Vec::with_capacity(choices.len());
+        for (i, choice) in choices.iter().enumerate() {
+            let kind = if i == choices.len() - 1 && choices.len() > 1 {
+                "reject_once"
+            } else {
+                "allow_once"
+            };
+            options.push(json!({
+                "optionId": format!("choice-{i}"),
+                "name": choice,
+                "kind": kind,
+            }));
+        }
+
+        let params = json!({
+            "sessionId": self.session_id,
+            "options": options,
+            // `toolCall` is required by the ACP schema. We use a synthetic
+            // ask_user tool call so the client surfaces the prompt with a
+            // sensible title.
+            "toolCall": {
+                "toolCallId": format!("ask-user-{}", uuid::Uuid::new_v4()),
+                "title": question,
+                "kind": "other",
+                "status": "pending",
+            }
+        });
+
+        let call = self.rpc.request("session/request_permission", params);
+        let response = match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                anyhow::bail!("ACP request_permission failed: {} ({})", e.message, e.code)
+            }
+            Err(_) => anyhow::bail!("ACP request_permission timed out after {timeout:?}"),
+        };
+
+        // Response shape: { outcome: { outcome: "selected", optionId: "..." } | { outcome: "cancelled" } }
+        let outcome = response.get("outcome");
+        let kind = outcome
+            .and_then(|o| o.get("outcome"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        match kind {
+            "selected" => {
+                let option_id = outcome
+                    .and_then(|o| o.get("optionId"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let idx = option_id
+                    .strip_prefix("choice-")
+                    .and_then(|s| s.parse::<usize>().ok());
+                match idx.and_then(|i| choices.get(i)) {
+                    Some(text) => Ok(Some(text.clone())),
+                    None => anyhow::bail!("ACP returned unknown optionId: {option_id}"),
+                }
+            }
+            "cancelled" => Ok(None),
+            other => anyhow::bail!("ACP returned unexpected outcome: {other}"),
+        }
+    }
+
+    /// Form-mode elicitation path — issues `elicitation/create` with a
+    /// single-select schema. Used when the client advertises
+    /// `clientCapabilities.elicitation.form`.
+    async fn request_choice_via_elicitation(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let req = ElicitationRequest {
+            session_id: self.session_id.clone(),
+            mode: ElicitationMode::Form,
+            message: question.to_string(),
+            requested_schema: single_select_schema(choices),
+        };
+        debug_assert!(
+            matches!(req.mode, ElicitationMode::Form),
+            "Phase 1 must not emit URL-mode elicitation"
+        );
+
+        let params = serde_json::to_value(&req)?;
+        let call = self.rpc.request("elicitation/create", params);
+        let response_value = match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                anyhow::bail!("ACP elicitation/create failed: {} ({})", e.message, e.code)
+            }
+            Err(_) => anyhow::bail!("ACP elicitation/create timed out after {timeout:?}"),
+        };
+
+        let parsed: ElicitationResponse = serde_json::from_value(response_value)
+            .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
+        match parsed {
+            ElicitationResponse::Accept { content } => {
+                let const_value =
+                    content
+                        .get("choice")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("elicitation accept missing content.choice string")
+                        })?;
+                let idx = const_value
+                    .strip_prefix("choice-")
+                    .and_then(|s| s.parse::<usize>().ok());
+                match idx.and_then(|i| choices.get(i)) {
+                    Some(text) => Ok(Some(text.clone())),
+                    None => {
+                        anyhow::bail!("elicitation returned unknown choice const: {const_value}")
+                    }
+                }
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
     }
 }
@@ -228,7 +360,6 @@ const SENSITIVE_PROPERTY_NAMES: &[&str] = &[
 /// `choices` is the user-visible list. The wire-format `const` values
 /// are index-based (`choice-0`, `choice-1`, …) so the response → text
 /// round-trip survives non-unique or empty display strings.
-#[allow(dead_code)] // consumed by Task 5 (request_choice rewrite)
 fn single_select_schema(choices: &[String]) -> serde_json::Value {
     single_select_schema_with_property_name("choice", choices)
 }
@@ -333,74 +464,16 @@ impl Channel for AcpChannel {
     ) -> anyhow::Result<Option<String>> {
         if choices.is_empty() {
             // Caller should already gate on this via supports_free_form_ask,
-            // but be defensive — no choices means no permission options to
-            // present, and `session/request_permission` requires at least one.
+            // but be defensive — both downstream paths require at least one
+            // option to present.
             anyhow::bail!("AcpChannel.request_choice requires at least one choice")
         }
-
-        // Build permission options. Each choice becomes its own option with a
-        // synthetic id; we map the response id back to the choice text.
-        // `kind` mirrors how Toad/Zed render: `allow_once` looks like a
-        // primary action; `reject_once` is the cancel-style fallback.
-        let mut options = Vec::with_capacity(choices.len());
-        for (i, choice) in choices.iter().enumerate() {
-            let kind = if i == choices.len() - 1 && choices.len() > 1 {
-                "reject_once"
-            } else {
-                "allow_once"
-            };
-            options.push(json!({
-                "optionId": format!("choice-{i}"),
-                "name": choice,
-                "kind": kind,
-            }));
-        }
-
-        let params = json!({
-            "sessionId": self.session_id,
-            "options": options,
-            // `toolCall` is required by the ACP schema. We use a synthetic
-            // ask_user tool call so the client surfaces the prompt with a
-            // sensible title.
-            "toolCall": {
-                "toolCallId": format!("ask-user-{}", uuid::Uuid::new_v4()),
-                "title": question,
-                "kind": "other",
-                "status": "pending",
-            }
-        });
-
-        let call = self.rpc.request("session/request_permission", params);
-        let response = match tokio::time::timeout(timeout, call).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => {
-                anyhow::bail!("ACP request_permission failed: {} ({})", e.message, e.code)
-            }
-            Err(_) => anyhow::bail!("ACP request_permission timed out after {timeout:?}"),
-        };
-
-        // Response shape: { outcome: { outcome: "selected", optionId: "..." } | { outcome: "cancelled" } }
-        let outcome = response.get("outcome");
-        let kind = outcome
-            .and_then(|o| o.get("outcome"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        match kind {
-            "selected" => {
-                let option_id = outcome
-                    .and_then(|o| o.get("optionId"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let idx = option_id
-                    .strip_prefix("choice-")
-                    .and_then(|s| s.parse::<usize>().ok());
-                match idx.and_then(|i| choices.get(i)) {
-                    Some(text) => Ok(Some(text.clone())),
-                    None => anyhow::bail!("ACP returned unknown optionId: {option_id}"),
-                }
-            }
-            "cancelled" => Ok(None),
-            other => anyhow::bail!("ACP returned unexpected outcome: {other}"),
+        if self.client_caps.form {
+            self.request_choice_via_elicitation(question, choices, timeout)
+                .await
+        } else {
+            self.request_choice_via_permission(question, choices, timeout)
+                .await
         }
     }
 
@@ -621,22 +694,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_choice_rejects_empty_choices() {
-        let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new(
-            "acp",
-            "sess-1",
-            rpc,
-            Duration::from_secs(30),
-            ElicitationCapabilities::default(),
-        );
-        let res = ch
-            .request_choice("Pick one", &[], Duration::from_secs(1))
-            .await;
-        assert!(res.is_err());
-    }
-
-    #[tokio::test]
     async fn request_choice_emits_request_permission_and_resolves_selection() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
@@ -731,6 +788,242 @@ mod tests {
         let msg = format!("{}", res.unwrap_err());
         assert!(msg.contains("timed out"), "unexpected error: {msg}");
     }
+
+    // -- Elicitation-path tests (Task 5) ---------------------------------
+
+    fn form_caps() -> ElicitationCapabilities {
+        ElicitationCapabilities {
+            form: true,
+            url: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_choice_uses_elicitation_when_capability_present() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["Alpha".to_string(), "Beta".to_string()];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_choice("Pick one", &choices, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(req["method"], "elicitation/create");
+        assert_eq!(req["params"]["sessionId"], "sess-1");
+        assert_eq!(req["params"]["mode"], "form");
+        assert_eq!(req["params"]["message"], "Pick one");
+
+        // Schema is a single-select form with const-indexed options.
+        let schema = &req["params"]["requestedSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"][0], "choice");
+        let one_of = schema["properties"]["choice"]["oneOf"]
+            .as_array()
+            .expect("oneOf array");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(one_of[0]["const"], "choice-0");
+        assert_eq!(one_of[0]["title"], "Alpha");
+        assert_eq!(one_of[1]["const"], "choice-1");
+        assert_eq!(one_of[1]["title"], "Beta");
+
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"action": "accept", "content": {"choice": "choice-1"}})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some("Beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_choice_falls_back_to_permission_when_capability_absent() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+
+        let choices = vec!["First".to_string(), "Second".to_string()];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_choice("Confirm?", &choices, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        // Backward-compatibility contract: legacy clients must still see
+        // session/request_permission, NOT elicitation/create.
+        assert_eq!(req["method"], "session/request_permission");
+        assert_ne!(req["method"], "elicitation/create");
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "choice-0"}})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some("First".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_choice_decline_returns_none() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_choice("Q?", &choices, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "elicitation/create");
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(&id, Some(json!({"action": "decline"})), None);
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn request_choice_cancel_returns_none() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_choice("Q?", &choices, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "elicitation/create");
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(&id, Some(json!({"action": "cancel"})), None);
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn request_choice_accept_with_unknown_const_is_error() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_choice("Q?", &choices, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"action": "accept", "content": {"choice": "choice-99"}})),
+            None,
+        );
+
+        let res = task.await.unwrap();
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("unknown") || msg.contains("choice-99"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_choice_empty_choices_is_error() {
+        // Both paths must enforce the no-empty-choices invariant.
+        let (rpc, _rx) = make_rpc();
+        let ch_form = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+        let res = ch_form
+            .request_choice("Q?", &[], Duration::from_secs(1))
+            .await;
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("at least one choice"),
+            "unexpected error: {msg}"
+        );
+
+        let ch_legacy = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+        let res = ch_legacy
+            .request_choice("Q?", &[], Duration::from_secs(1))
+            .await;
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("at least one choice"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // -- End elicitation-path tests --------------------------------------
 
     #[tokio::test]
     async fn request_approval_emits_request_permission_and_resolves_approve() {
