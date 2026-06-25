@@ -14576,6 +14576,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-relay-proto"
+version = "0.8.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "zeroclaw-robot-kit"
 version = "0.1.0"
 dependencies = [
@@ -14957,6 +14965,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zerorelay"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "zeroclaw-relay-proto",
+ "zeroclaw-tls",
 ]
 
 [[package]]
