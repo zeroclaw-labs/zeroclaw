@@ -3402,7 +3402,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     for code_line in owned.split('\n') {
                         push_line(&mut lines, &mut current_spans);
                         current_spans.push(Span::styled(
-                            format!("\u{2502} {code_line}"),
+                            format!("  {code_line}"),
                             theme::code_block_style(),
                         ));
                     }
