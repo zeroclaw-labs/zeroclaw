@@ -598,14 +598,13 @@ pub async fn run(
             }
         };
 
-        let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> =
-            if config.hooks.enabled {
-                Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                    &config.hooks,
-                )))
-            } else {
-                None
-            };
+        let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
+                &config.hooks,
+            )))
+        } else {
+            None
+        };
 
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
