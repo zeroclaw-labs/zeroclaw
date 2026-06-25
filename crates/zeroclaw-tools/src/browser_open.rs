@@ -361,6 +361,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_http_for_wildcard_allowlist() {
+        // Explicit pin of the default posture: with the shipped default
+        // `browser.allowed_domains = ["*"]`, browser_open accepts plain http://
+        // to any public host. This is the same default that web_fetch,
+        // http_request, and the `browser` tool already ship (all default to
+        // `["*"]` and already accept http://); this test makes the
+        // default-posture change for browser_open conscious and reviewable.
+        let tool = test_tool(vec!["*"]);
+        let got = tool.validate_url("http://example.com/page").unwrap();
+        assert_eq!(got, "http://example.com/page");
+    }
+
+    #[test]
     fn validate_rejects_unsupported_scheme() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool

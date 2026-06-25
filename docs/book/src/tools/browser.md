@@ -57,6 +57,14 @@ zeroclaw config set browser.enabled false
 
 {{#config-where browser}}
 
+> **URL scheme policy.** `browser_open` accepts both `http://` and `https://` URLs
+> (matching `web_fetch`, `http_request`, and the `browser` tool, which already accept
+> plaintext HTTP). The local/private-host block and the `allowed_domains` allowlist apply
+> to `http://` exactly as they do to `https://`. Because `allowed_domains` defaults to
+> `["*"]`, the shipped default permits opening **any public host over plaintext HTTP**. To
+> keep a host reachable over HTTPS only, restrict `browser.allowed_domains` to the specific
+> hosts you trust; the allowlist gates origins, not per-scheme.
+
 For the `agent_browser` backend, set `browser.headed = true` to launch the browser in headed mode for debugging or first-time login setup, or `browser.headed = false` to force headless mode. When `browser.headed` is unset, Zeroclaw preserves the inherited `AGENT_BROWSER_HEADED` environment behavior. The rust-native backend continues to use `browser.native_headless`.
 
 See the [Config reference](../reference/config.md) for all browser fields and defaults.
