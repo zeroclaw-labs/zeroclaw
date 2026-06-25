@@ -6,8 +6,8 @@ use super::events::StreamDelta;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
-use zeroclaw_api::observability_traits::{AuthorizationResponseType, ObserverEvent};
 use std::time::Duration;
+use zeroclaw_api::observability_traits::{AuthorizationResponseType, ObserverEvent};
 
 /// Outcome of [`gate_tool_approval`] for one tool call.
 ///
@@ -48,7 +48,6 @@ pub(crate) async fn gate_tool_approval(
             tool_name: tool_name.to_string(),
             arguments_summary,
             channel: Some(ctx.channel_name.to_string()),
-            agent_alias: None,
             turn_id: Some(ctx.turn_id.to_string()),
         };
         ctx.observer.record_event(&event);
@@ -128,7 +127,6 @@ pub(crate) async fn gate_tool_approval(
             granted: matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always),
             response_type,
             channel: Some(ctx.channel_name.to_string()),
-            agent_alias: None,
             turn_id: Some(ctx.turn_id.to_string()),
         };
         ctx.observer.record_event(&event);
@@ -214,41 +212,48 @@ pub(crate) async fn gate_tool_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::ApprovalManager;
-    use crate::integrations::herdr::tests::{HerdrSpy, HerdrSpyCall, make_spy_reporter};
-    use crate::integrations::herdr::{DebouncedReporter, HerdrObserver, HerdrState};
-    use crate::observability::{set_scoped_broadcast_hook, clear_broadcast_hook};
     use crate::agent::turn::context::TurnCtx;
-    use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse};
-    use zeroclaw_api::observability_traits::Observer;
-    use zeroclaw_config::schema::{RiskProfileConfig, PacingConfig, AutonomyLevel};
+    use crate::approval::ApprovalManager;
+    use crate::integrations::herdr::HerdrObserver;
+    use crate::integrations::herdr::tests::{HerdrSpy, HerdrSpyCall, make_spy_reporter};
+    use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+    use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse};
+    use zeroclaw_config::policy::AutonomyLevel;
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
 
-    /// A mock channel that approves all requests.
-    struct ApprovingChannel {
+    struct TestChannel {
+        response: ChannelApprovalResponse,
         approval_requests: Arc<AtomicUsize>,
     }
 
-    impl ApprovingChannel {
-        fn new(approval_requests: Arc<AtomicUsize>) -> Self {
-            Self { approval_requests }
+    impl TestChannel {
+        fn new(response: ChannelApprovalResponse, approval_requests: Arc<AtomicUsize>) -> Self {
+            Self {
+                response,
+                approval_requests,
+            }
         }
     }
 
-    impl ::zeroclaw_api::attribution::Attributable for ApprovingChannel {
+    impl ::zeroclaw_api::attribution::Attributable for TestChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
                 ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
             )
         }
-        fn alias(&self) -> &str { "approving-test" }
+        fn alias(&self) -> &str {
+            "test-channel"
+        }
     }
 
     #[async_trait::async_trait]
-    impl Channel for ApprovingChannel {
-        fn name(&self) -> &str { "approving-test" }
+    impl Channel for TestChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
 
         async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
             Ok(())
@@ -267,78 +272,7 @@ mod tests {
             _request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(ChannelApprovalResponse::Approve))
-        }
-    }
-
-    /// A mock channel that denies all requests.
-    struct DenyingChannel {
-        approval_requests: Arc<AtomicUsize>,
-    }
-
-    impl DenyingChannel {
-        fn new(approval_requests: Arc<AtomicUsize>) -> Self {
-            Self { approval_requests }
-        }
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for DenyingChannel {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Channel(
-                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
-            )
-        }
-        fn alias(&self) -> &str { "denying-test" }
-    }
-
-    #[async_trait::async_trait]
-    impl Channel for DenyingChannel {
-        fn name(&self) -> &str { "denying-test" }
-
-        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn request_approval(
-            &self,
-            _recipient: &str,
-            _request: &ChannelApprovalRequest,
-        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-            self.approval_requests.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(ChannelApprovalResponse::Deny))
-        }
-    }
-
-    fn make_turn_ctx<'a>(
-        observer: &'a dyn Observer,
-        approval: Option<&'a ApprovalManager>,
-        channel: Option<&'a dyn Channel>,
-    ) -> TurnCtx<'a> {
-        let (tx, _rx) = mpsc::channel(8);
-        TurnCtx {
-            observer,
-            provider_name: "test-provider",
-            model: "test-model",
-            temperature: None,
-            approval,
-            channel_name: "test-channel",
-            channel_reply_target: Some("user"),
-            cancellation_token: None,
-            on_delta: Some(&tx),
-            event_tx: None,
-            hooks: None,
-            dedup_exempt_tools: &[],
-            pacing: &PacingConfig::default(),
-            strict_tool_parsing: false,
-            channel,
-            turn_id: "turn-1",
+            Ok(Some(self.response.clone()))
         }
     }
 
@@ -365,27 +299,63 @@ mod tests {
 
         // 4. Mock channel that approves
         let approval_count = Arc::new(AtomicUsize::new(0));
-        let channel = Arc::new(ApprovingChannel::new(approval_count.clone())) as Arc<dyn Channel>;
+        let channel = Arc::new(TestChannel::new(
+            ChannelApprovalResponse::Approve,
+            approval_count.clone(),
+        )) as Arc<dyn Channel>;
 
         // 5. Build TurnCtx
-        let ctx = make_turn_ctx(&*herdr_observer, Some(&approval), Some(&*channel));
+        let (tx, _rx) = mpsc::channel(8);
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &*herdr_observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "test-channel",
+            channel_reply_target: Some("user"),
+            cancellation_token: None,
+            on_delta: Some(&tx),
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&*channel),
+            turn_id: "turn-1",
+            agent_alias: None,
+        };
 
         // 6. Call gate_tool_approval
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let outcome = rt.block_on(gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "echo hi"}), 0));
+        let outcome = rt.block_on(gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"cmd": "echo hi"}),
+            0,
+        ));
 
         // 7. Verify outcome
-        assert!(matches!(outcome, ApprovalGateOutcome::Proceed { approved: true }));
+        assert!(matches!(
+            outcome,
+            ApprovalGateOutcome::Proceed { approved: true }
+        ));
 
         // 8. Verify HerdrObserver state transitions: Blocked -> Working
         let captured = calls.lock().drain(..).collect::<Vec<HerdrSpyCall>>();
-        let state_sequence: Vec<&str> = captured.iter()
+        let state_sequence: Vec<&str> = captured
+            .iter()
             .filter(|c| c.method == "pane.report_agent")
             .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
             .collect();
 
-        assert_eq!(state_sequence, vec!["blocked", "working"],
-            "Expected state sequence [blocked, working], got {:?}", state_sequence);
+        assert_eq!(
+            state_sequence,
+            vec!["blocked", "working"],
+            "Expected state sequence [blocked, working], got {:?}",
+            state_sequence
+        );
     }
 
     #[test]
@@ -411,26 +381,59 @@ mod tests {
 
         // 4. Mock channel that denies
         let approval_count = Arc::new(AtomicUsize::new(0));
-        let channel = Arc::new(DenyingChannel::new(approval_count.clone())) as Arc<dyn Channel>;
+        let channel = Arc::new(TestChannel::new(
+            ChannelApprovalResponse::Deny,
+            approval_count.clone(),
+        )) as Arc<dyn Channel>;
 
         // 5. Build TurnCtx
-        let ctx = make_turn_ctx(&*herdr_observer, Some(&approval), Some(&*channel));
+        let (tx, _rx) = mpsc::channel(8);
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &*herdr_observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "test-channel",
+            channel_reply_target: Some("user"),
+            cancellation_token: None,
+            on_delta: Some(&tx),
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&*channel),
+            turn_id: "turn-1",
+            agent_alias: None,
+        };
 
         // 6. Call gate_tool_approval
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let outcome = rt.block_on(gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "rm -rf /"}), 0));
+        let outcome = rt.block_on(gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"cmd": "rm -rf /"}),
+            0,
+        ));
 
         // 7. Verify outcome is Deny
         assert!(matches!(outcome, ApprovalGateOutcome::Deny(_)));
 
         // 8. Verify HerdrObserver state transitions: Blocked -> Idle
         let captured = calls.lock().drain(..).collect::<Vec<HerdrSpyCall>>();
-        let state_sequence: Vec<&str> = captured.iter()
+        let state_sequence: Vec<&str> = captured
+            .iter()
             .filter(|c| c.method == "pane.report_agent")
             .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
             .collect();
 
-        assert_eq!(state_sequence, vec!["blocked", "idle"],
-            "Expected state sequence [blocked, idle], got {:?}", state_sequence);
+        assert_eq!(
+            state_sequence,
+            vec!["blocked", "idle"],
+            "Expected state sequence [blocked, idle], got {:?}",
+            state_sequence
+        );
     }
 }

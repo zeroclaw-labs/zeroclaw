@@ -3,6 +3,7 @@ use std::time::Duration;
 /// User response type for an authorization request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum AuthorizationResponseType {
     /// User approved this single call.
     Yes,
@@ -240,7 +241,6 @@ pub enum ObserverEvent {
         tool_name: String,
         arguments_summary: String,
         channel: Option<String>,
-        agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// User responded to an authorization request.
@@ -251,7 +251,6 @@ pub enum ObserverEvent {
         granted: bool,
         response_type: AuthorizationResponseType,
         channel: Option<String>,
-        agent_alias: Option<String>,
         turn_id: Option<String>,
     },
 }

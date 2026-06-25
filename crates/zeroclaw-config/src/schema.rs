@@ -7595,26 +7595,10 @@ impl Default for GoogleWorkspaceConfig {
 ///
 /// Requires running inside a Herdr pane — environment variables
 /// `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID` must be present.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "herdr"]
-#[integration(
-    category = "Platform",
-    display_name = "Herdr",
-    description = "Agent status reporting to Herdr panes",
-    status_field = "enabled"
-)]
-pub struct HerdrConfig {
-    /// Enable Herdr agent status reporting. Default: `true` (auto-detected via env).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl Default for HerdrConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
+pub struct HerdrConfig {}
 
 // ── Knowledge ───────────────────────────────────────────────────
 

@@ -1083,7 +1083,7 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
-        let _herdr_guard = crate::integrations::herdr::try_install_hook(&config.herdr);
+        let _herdr_guard = crate::integrations::herdr::try_install_hook();
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
