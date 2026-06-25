@@ -1372,12 +1372,14 @@ pub async fn run(
         // PipelineTool construction is deferred so the per-agent
         // ToolAccessPolicy is baked in immutably at construction time —
         // no mutable slot, no stale/missing policy.
-        if let Some(ref raw) = all_tools_result.pipeline_raw {
-            let policy =
-                mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
-            if let Some(pipe) =
-                crate::tools::build_pipeline_tool(raw, policy)
-            {
+        if let Some(ref raw) = all_tools_result.pipeline_raw
+            && security.is_tool_allowed("execute_pipeline")
+            && allowed_tools
+                .as_deref()
+                .is_none_or(|v| v.iter().any(|t| t == "execute_pipeline"))
+        {
+            let policy = mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
                 tools_registry.push(pipe);
             }
         }
@@ -3015,7 +3017,9 @@ pub async fn process_message(
         // ── Wire per-agent policy into PipelineTool (process_message path) ──
         // Same as the CLI path: defer construction so the per-agent
         // ToolAccessPolicy is baked in immutably at construction time.
-        if let Some(ref raw) = all_tools_result_pm.pipeline_raw {
+        if let Some(ref raw) = all_tools_result_pm.pipeline_raw
+            && security.as_ref().is_tool_allowed("execute_pipeline")
+        {
             let policy = mcp_tool_access_policy(security.as_ref(), None);
             if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
                 tools_registry.push(pipe);
@@ -15112,11 +15116,8 @@ Let me check the result."#;
         if let Some(ref raw) = all.pipeline_raw
             && policy.is_tool_allowed("execute_pipeline")
         {
-            let access =
-                super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) =
-                crate::tools::build_pipeline_tool(raw, access)
-            {
+            let access = super::mcp_tool_access_policy(&policy, None);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
                 registry.push(pipe);
             }
         }
@@ -15169,11 +15170,8 @@ Let me check the result."#;
         if let Some(ref raw) = all.pipeline_raw
             && policy.is_tool_allowed("execute_pipeline")
         {
-            let access =
-                super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) =
-                crate::tools::build_pipeline_tool(raw, access)
-            {
+            let access = super::mcp_tool_access_policy(&policy, None);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
                 registry.push(pipe);
             }
         }
@@ -15225,11 +15223,8 @@ Let me check the result."#;
         if let Some(ref raw) = all.pipeline_raw
             && policy.is_tool_allowed("execute_pipeline")
         {
-            let access =
-                super::mcp_tool_access_policy(&policy, None);
-            if let Some(pipe) =
-                crate::tools::build_pipeline_tool(raw, access)
-            {
+            let access = super::mcp_tool_access_policy(&policy, None);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
                 registry.push(pipe);
             }
         }
@@ -15238,6 +15233,63 @@ Let me check the result."#;
         assert!(
             names.contains(&"execute_pipeline"),
             "execute_pipeline must be present when policy admits it, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn execute_pipeline_denied_when_caller_allowed_tools_omits_it() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.pipeline.enabled = true;
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // SecurityPolicy admits execute_pipeline (unrestricted default),
+        // but the caller-supplied allowed_tools narrows to file_read only.
+        let policy = TestPolicy::default();
+        let caller_allowed: Option<Vec<String>> = Some(vec!["file_read".into()]);
+
+        let all = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        );
+
+        let mut registry = all.tools;
+        if let Some(ref raw) = all.pipeline_raw
+            && policy.is_tool_allowed("execute_pipeline")
+            && caller_allowed
+                .as_deref()
+                .is_none_or(|v| v.iter().any(|t| t == "execute_pipeline"))
+        {
+            let access = super::mcp_tool_access_policy(&policy, caller_allowed.as_deref());
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, access) {
+                registry.push(pipe);
+            }
+        }
+
+        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"execute_pipeline"),
+            "execute_pipeline must be denied when caller allowed_tools omits it, got {names:?}"
         );
     }
 }
