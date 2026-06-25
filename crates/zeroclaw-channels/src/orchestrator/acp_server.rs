@@ -50,11 +50,6 @@ pub struct AcpServerConfig {
     pub max_sessions: usize,
     /// Session inactivity timeout in seconds. Default: 3600 (1 hour).
     pub session_timeout_secs: u64,
-    /// Initialize MCP tools (from each agent's `mcp_bundles`) for ACP sessions.
-    /// Default: false — keeps `session/new` prompt by skipping MCP connection
-    /// at session creation. When true, sessions load MCP exactly like the
-    /// gateway/daemon paths do.
-    pub enable_mcp: bool,
 }
 
 impl Default for AcpServerConfig {
@@ -62,7 +57,6 @@ impl Default for AcpServerConfig {
         Self {
             max_sessions: 10,
             session_timeout_secs: 3600,
-            enable_mcp: false,
         }
     }
 }
@@ -579,14 +573,18 @@ impl AcpServer {
         // (identity, scheduled tasks) still lives under `config.data_dir`.
         // ACP sessions exclude persistent memory — context comes from the
         // persisted session history, not the agent's long-term memory store.
-        // MCP init is opt-in (`[acp].enable_mcp` / `--enable-mcp`): off by
-        // default to keep `session/new` prompt; on to load the agent's
+        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
+        // by default to keep `session/new` prompt; on to load this agent's
         // `mcp_bundles` tools.
+        let enable_mcp = self
+            .config
+            .agent(&agent_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
         let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
-            self.acp_config.enable_mcp,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -795,11 +793,17 @@ impl AcpServer {
             })
             .unwrap_or_else(|| "default".to_string());
 
+        // MCP init follows the restored agent's own opt-in
+        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
+        let enable_mcp = self
+            .config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
         let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            self.acp_config.enable_mcp,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -997,11 +1001,17 @@ impl AcpServer {
             })
             .unwrap_or_else(|| "default".to_string());
 
+        // MCP init follows the restored agent's own opt-in
+        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
+        let enable_mcp = self
+            .config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
         let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            self.acp_config.enable_mcp,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -2481,17 +2491,17 @@ mod tests {
     }
 
     #[test]
-    fn acp_server_config_default_disables_mcp() {
+    fn agent_acp_enable_mcp_defaults_off() {
         assert!(
-            !AcpServerConfig::default().enable_mcp,
-            "MCP must stay opt-in so session/new is prompt by default (#8193)"
+            !zeroclaw_config::schema::AliasedAgentConfig::default().acp_enable_mcp,
+            "MCP must stay opt-in per agent so session/new is prompt by default (#8193)"
         );
     }
 
-    /// By default (`enable_mcp = false`) an ACP session must NOT touch the
-    /// servers granted by the agent's mcp_bundles — preserving the
-    /// prompt-`session/new` contract (#8193). The granted MCP server records
-    /// zero requests.
+    /// By default (`acp_enable_mcp = false` on the agent) an ACP session must
+    /// NOT touch the servers granted by the agent's mcp_bundles — preserving
+    /// the prompt-`session/new` contract (#8193). The granted MCP server
+    /// records zero requests.
     #[tokio::test]
     async fn session_new_skips_mcp_by_default() {
         let cwd = tempfile::tempdir().unwrap();
@@ -2517,22 +2527,22 @@ mod tests {
         );
     }
 
-    /// With `enable_mcp = true` an ACP session connects to the servers granted
-    /// by the agent's mcp_bundles (the same eager wiring used by gateway/daemon
-    /// sessions), so the agent can call those tools. The granted MCP server
-    /// receives the `tools/list` handshake during `session/new`.
+    /// With the agent's `acp_enable_mcp = true` an ACP session connects to the
+    /// servers granted by that agent's mcp_bundles (the same eager wiring used
+    /// by gateway/daemon sessions), so the agent can call those tools. The
+    /// granted MCP server receives the `tools/list` handshake during
+    /// `session/new`.
     #[tokio::test]
-    async fn session_new_loads_mcp_bundles_when_enabled() {
+    async fn session_new_loads_mcp_bundles_when_agent_opts_in() {
         let cwd = tempfile::tempdir().unwrap();
         let server = start_mock_mcp_http_server("records.list").await;
-        let config = make_mcp_granting_test_config(cwd.path(), server.uri());
-        let acp = AcpServer::new(
-            config,
-            AcpServerConfig {
-                enable_mcp: true,
-                ..AcpServerConfig::default()
-            },
-        );
+        let mut config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .acp_enable_mcp = true;
+        let acp = AcpServer::new(config, AcpServerConfig::default());
 
         acp.handle_session_new(&serde_json::json!({
             "cwd": cwd.path().to_string_lossy(),
@@ -2551,7 +2561,7 @@ mod tests {
                     .map(|b| b.contains("tools/list"))
                     .unwrap_or(false)
             }),
-            "enable_mcp ACP session must list tools from granted MCP servers; \
+            "agent with acp_enable_mcp must list tools from granted MCP servers; \
              got {} request(s)",
             requests.len()
         );
