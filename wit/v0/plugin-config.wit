@@ -1,19 +1,9 @@
 package zeroclaw:plugin@0.1.0;
 
-/// Per-instance network and secrets configuration the host resolves at
-/// plugin-instantiation time. Shared by tool, memory, and channel plugins —
-/// see `PluginNetworkConfig` (host-side, `zeroclaw-plugins` crate) for the
-/// secret-sandboxing contract this interface exposes: `get-secret` only ever
-/// resolves a key the plugin's manifest declared via `declared_secrets`, and
-/// is backed by a small per-instance map, never a handle into the host's
-/// global secret store.
+/// Per-instance network configuration the host resolves at
+/// plugin-instantiation time. Shared by tool, memory, and channel plugins.
 @unstable(feature = plugins-wit-v0)
 interface plugin-config {
-    /// Read a secret this plugin declared in its manifest's
-    /// `declared_secrets` list (e.g. `"bot_token"`). Returns `none` for any
-    /// key not declared, or not provided by the operator for this instance.
-    get-secret: func(key: string) -> option<string>;
-
     /// The proxy URL applied to this plugin instance's outbound networking
     /// (`wasi:http` and, for channel plugins, `websocket`), if any. This is
     /// informational — the host already applies the proxy to every outbound

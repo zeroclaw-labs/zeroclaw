@@ -52,23 +52,10 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
-    /// Secret keys this plugin expects to read via `plugin-config.get-secret`
-    /// (e.g. `["bot_token"]`). `get-secret` only ever resolves a key listed
-    /// here — an undeclared key returns `none` even if the operator's config
-    /// happens to hold a value under that name for an unrelated purpose.
-    #[serde(default)]
-    pub declared_secrets: Vec<String>,
 }
 
-/// Per-instance network and secrets configuration resolved by the host at
+/// Per-instance network configuration resolved by the host at
 /// plugin-instantiation time, shared by tool, memory, and channel plugins.
-///
-/// `secrets` is deliberately a small, per-instance map — never a handle into
-/// the global secret store. It is built once by the orchestrator from
-/// already-decrypted config scoped to *this* plugin instance (e.g. one
-/// channel alias's `bot_token`), filtered to the keys the plugin declared via
-/// [`PluginManifest::declared_secrets`], and is never shared across plugin
-/// instances.
 #[derive(Debug, Clone, Default)]
 pub struct PluginNetworkConfig {
     /// Selector matched against `ProxyConfig::services` when the global
@@ -78,9 +65,6 @@ pub struct PluginNetworkConfig {
     pub service_key: String,
     /// Per-plugin proxy override, equivalent to a channel's `proxy_url`.
     pub proxy_url: Option<String>,
-    /// Already-decrypted secrets scoped to this plugin instance, filtered to
-    /// `PluginManifest::declared_secrets`.
-    pub secrets: std::collections::HashMap<String, String>,
 }
 
 /// What a plugin can do.

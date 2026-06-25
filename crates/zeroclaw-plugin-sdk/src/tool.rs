@@ -10,13 +10,6 @@ type RawToolResult = ToolResult;
 
 pub use logging::{LogLevel, PluginAction, PluginEvent, PluginOutcome};
 
-/// Read a secret this plugin declared in its manifest's `declared_secrets`
-/// list. Returns `None` for any key not declared, or not provided by the
-/// operator for this instance.
-pub fn get_secret(key: &str) -> Option<String> {
-    plugin_config::get_secret(key)
-}
-
 /// The proxy URL applied to this plugin instance's outbound networking, if
 /// any. Informational — the host already applies the proxy to every
 /// outbound call.

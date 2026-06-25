@@ -38,7 +38,7 @@ capabilities = ["channel"]
 
     let host = zeroclaw_plugins::host::PluginHost::new(workdir.path()).expect("PluginHost::new");
     let channel = host
-        .instantiate_channel_plugin("echo", None, None, Default::default())
+        .instantiate_channel_plugin("echo", None, None)
         .await
         .expect("instantiate_channel_plugin");
 

@@ -68,11 +68,9 @@ Concretely:
 - `http-helpers.wit` (`http_helpers_host.rs`, multipart upload + bounded
   attachment download) is convenience sugar over the same proxy-aware client
   and allow-list — not a parallel security boundary.
-- `plugin-config.wit` (`plugin_config.rs`) exposes `get-secret`/
-  `get-proxy-url` backed by `PluginStore::network_config`, a small
-  per-instance map built once at instantiation
-  (`host.rs::network_config_for`) and filtered to the plugin's manifest
-  `declared_secrets` — never a handle into the global secret store.
+- `plugin-config.wit` (`plugin_config.rs`) exposes `get-proxy-url`, backed
+  by `PluginStore::network_config` (`host.rs::network_config_for`). Plugin
+  access to secrets/config is not yet implemented — that's a follow-up.
 
 If you add a new networking-adjacent WIT interface to the `channel-plugin`
 world, it must route through `PluginStore::is_url_host_allowed` /
