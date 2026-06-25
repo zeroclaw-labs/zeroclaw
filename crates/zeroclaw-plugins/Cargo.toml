@@ -16,6 +16,7 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-infra.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

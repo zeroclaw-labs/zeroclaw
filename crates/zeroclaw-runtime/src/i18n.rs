@@ -540,7 +540,7 @@ mod tests {
             (
                 "cli-update-prebuilt-channel-note",
                 &[][..],
-                ["Slack", "Discord", "channel-*"].as_slice(),
+                ["Slack", "channel-*"].as_slice(),
             ),
             (
                 "cli-channels-not-compiled-entry",
@@ -563,6 +563,12 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+                if key == "cli-update-prebuilt-channel-note" {
+                    assert!(
+                        !value.contains("Discord"),
+                        "{key} in {locale} should not mention Discord because it is in default-channels"
                     );
                 }
             }

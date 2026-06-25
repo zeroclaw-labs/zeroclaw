@@ -4,6 +4,7 @@ pub mod gemini_oauth;
 pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
+pub mod xai_oauth;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
@@ -19,6 +20,7 @@ use zeroclaw_config::schema::Config;
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const GEMINI_PROVIDER: &str = "gemini";
+const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
@@ -72,6 +74,21 @@ impl AuthService {
         set_active: bool,
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(GEMINI_PROVIDER, profile_name, token_set);
+        profile.account_id = account_id;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
+        Ok(profile)
+    }
+
+    pub async fn store_xai_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        account_id: Option<String>,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let mut profile = AuthProfile::new_oauth(XAI_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
         self.store
             .upsert_profile(profile.clone(), set_active)
@@ -367,6 +384,94 @@ impl AuthService {
         Ok(updated.token_set.map(|t| t.access_token))
     }
 
+    /// Return a valid xAI OAuth access token, refreshing it when the cached
+    /// token is close to expiry and a refresh token is available.
+    pub async fn get_valid_xai_access_token(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<Option<String>> {
+        let data = self.store.load().await?;
+        let Some(profile_id) = select_profile_id(&data, XAI_PROVIDER, profile_override) else {
+            return Ok(None);
+        };
+
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(token_set) = profile.token_set.as_ref() else {
+            anyhow::bail!("xAI auth profile is not OAuth-based: {profile_id}");
+        };
+
+        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(token_set.access_token.clone()));
+        }
+
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            return Ok(Some(token_set.access_token.clone()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        let data = self.store.load().await?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            anyhow::bail!("xAI auth profile is missing token set: {profile_id}");
+        };
+        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(latest_tokens.access_token.clone()));
+        }
+
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!(
+                "xAI token refresh is in backoff for {remaining}s due to previous failures"
+            );
+        }
+
+        let mut refreshed =
+            match refresh_xai_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
+        if refreshed.refresh_token.is_none() {
+            refreshed
+                .refresh_token
+                .clone_from(&latest_tokens.refresh_token);
+        }
+
+        let account_id = refreshed
+            .id_token
+            .as_deref()
+            .or(Some(refreshed.access_token.as_str()))
+            .and_then(xai_oauth::extract_account_id_from_jwt)
+            .or_else(|| latest_profile.account_id.clone());
+
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                profile.account_id.clone_from(&account_id);
+                Ok(())
+            })
+            .await?;
+
+        Ok(updated.token_set.map(|t| t.access_token))
+    }
+
     /// Get Gemini profile info (for model_provider initialization).
     pub async fn get_gemini_profile(
         &self,
@@ -509,6 +614,8 @@ pub enum AuthProvider {
     Anthropic,
     #[serde(alias = "google", alias = "vertex")]
     Gemini,
+    #[serde(alias = "grok")]
+    Xai,
 }
 
 impl std::str::FromStr for AuthProvider {
@@ -528,7 +635,7 @@ impl std::str::FromStr for AuthProvider {
                 "auth: unknown auth provider"
             );
             anyhow::Error::msg(format!(
-                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini.",
+                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini, xai.",
             ))
         })
     }
@@ -543,6 +650,7 @@ impl AuthProvider {
             Self::OpenaiCodex => OPENAI_CODEX_PROVIDER,
             Self::Anthropic => ANTHROPIC_PROVIDER,
             Self::Gemini => GEMINI_PROVIDER,
+            Self::Xai => XAI_PROVIDER,
         }
     }
 }
@@ -744,6 +852,28 @@ fn oauth_refresh_retry_base_delay_ms() -> u64 {
     } else {
         OAUTH_REFRESH_RETRY_BASE_DELAY_MS
     }
+}
+
+async fn refresh_xai_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_err = None;
+    for attempt in 0..OAUTH_REFRESH_MAX_ATTEMPTS {
+        match crate::auth::xai_oauth::refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < OAUTH_REFRESH_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::Error::msg("xAI OAuth refresh failed")))
 }
 
 fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
@@ -973,10 +1103,19 @@ pub fn clear_pending_oauth_login(config: &Config, model_provider: &str) {
 /// Shared context for auth-flow trait methods. Carries the runtime
 /// dependencies each flow needs (config for OAuth client creds, auth
 /// service for token storage, http client for OAuth round-trips).
+type CliFormatter = dyn Fn(&str, &[(&str, &str)], &str) -> String + Send + Sync;
+
 pub struct AuthFlowContext<'a> {
     pub config: &'a Config,
     pub auth_service: &'a AuthService,
     pub client: &'a reqwest::Client,
+    pub format_cli: &'a CliFormatter,
+}
+
+impl AuthFlowContext<'_> {
+    fn cli_text(&self, key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+        (self.format_cli)(key, args, fallback)
+    }
 }
 
 /// Result of [`AuthProviderFlow::refresh_status`] — caller renders the
@@ -1049,6 +1188,7 @@ impl AuthProvider {
             Self::OpenaiCodex => Box::new(OpenaiCodexFlow),
             Self::Gemini => Box::new(GeminiFlow),
             Self::Anthropic => Box::new(AnthropicFlow),
+            Self::Xai => Box::new(XaiFlow),
         }
     }
 }
@@ -1322,7 +1462,7 @@ impl AuthProviderFlow for GeminiFlow {
     ) -> Result<()> {
         if import.is_some() {
             anyhow::bail!(
-                "`auth login --import` currently supports only --model-provider openai-codex.",
+                "`auth login --import` currently supports only --model-provider openai-codex and xai.",
             );
         }
         let (client_id, client_secret) = Self::alias_creds(ctx.config, profile)?;
@@ -1520,6 +1660,284 @@ impl AuthProviderFlow for GeminiFlow {
 pub struct AnthropicFlow;
 
 impl AuthProviderFlow for AnthropicFlow {}
+
+// ── xAI impl ───────────────────────────────────────────────────────────
+
+pub struct XaiFlow;
+
+#[async_trait::async_trait]
+impl AuthProviderFlow for XaiFlow {
+    async fn login(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile: &str,
+        device_code: bool,
+        import: Option<&std::path::Path>,
+    ) -> Result<()> {
+        if let Some(import_path) = import {
+            crate::auth::xai_oauth::import_grok_auth_profile(
+                ctx.auth_service,
+                profile,
+                import_path,
+            )
+            .await?;
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-xai-imported",
+                    &[("path", &import_path.display().to_string())],
+                    "Imported xAI auth profile"
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
+                )
+            );
+            return Ok(());
+        }
+
+        if device_code {
+            let discovery = crate::auth::xai_oauth::fetch_device_code_discovery(ctx.client).await?;
+            let device = crate::auth::xai_oauth::start_device_code_flow(
+                ctx.client,
+                &discovery.device_authorization_endpoint,
+            )
+            .await?;
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-xai-device-code-started",
+                    &[],
+                    "xAI device-code login started."
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-oauth-visit",
+                    &[("uri", &device.verification_uri)],
+                    "Visit"
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-oauth-code",
+                    &[("code", &device.user_code)],
+                    "Code"
+                )
+            );
+            if let Some(uri_complete) = &device.verification_uri_complete {
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-oauth-fast-link",
+                        &[("uri", uri_complete)],
+                        "Fast link"
+                    )
+                );
+            }
+            let token_set = crate::auth::xai_oauth::poll_device_code_tokens(
+                ctx.client,
+                &discovery.token_endpoint,
+                &device,
+            )
+            .await?;
+            let account_id = token_set
+                .id_token
+                .as_deref()
+                .or(Some(token_set.access_token.as_str()))
+                .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+            ctx.auth_service
+                .store_xai_tokens(profile, token_set, account_id, true)
+                .await?;
+            println!(
+                "{}",
+                ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
+                )
+            );
+            return Ok(());
+        }
+
+        let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
+        let pkce = crate::auth::xai_oauth::generate_pkce_state();
+        let authorize_url =
+            crate::auth::xai_oauth::build_authorize_url(&discovery.authorization_endpoint, &pkce);
+
+        let pending = PendingOAuthLogin {
+            model_provider: "xai".into(),
+            profile: profile.to_string(),
+            code_verifier: pkce.code_verifier.clone(),
+            state: pkce.state.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        save_pending_oauth_login(ctx.config, &pending)?;
+
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-xai-open-oauth-url",
+                &[],
+                "Open this xAI OAuth URL in your browser and authorize access:"
+            )
+        );
+        println!("{authorize_url}");
+        println!();
+
+        let code = match crate::auth::xai_oauth::receive_loopback_code(
+            &pkce.state,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        {
+            Ok(code) => {
+                clear_pending_oauth_login(ctx.config, "xai");
+                code
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-callback-capture-failed",
+                        &[("error", &e.to_string())],
+                        "Callback capture failed"
+                    )
+                );
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-run-paste-redirect",
+                        &[("provider", "xai"), ("profile", profile)],
+                        "Run paste-redirect"
+                    )
+                );
+                return Ok(());
+            }
+        };
+
+        let token_set = crate::auth::xai_oauth::exchange_code_for_tokens(
+            ctx.client,
+            &discovery.token_endpoint,
+            &code,
+            &pkce,
+        )
+        .await?;
+        let account_id = token_set
+            .id_token
+            .as_deref()
+            .or(Some(token_set.access_token.as_str()))
+            .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+        ctx.auth_service
+            .store_xai_tokens(profile, token_set, account_id, true)
+            .await?;
+        println!(
+            "{}",
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
+            )
+        );
+        Ok(())
+    }
+
+    async fn paste_redirect(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile: &str,
+        input: Option<&str>,
+    ) -> Result<()> {
+        let pending = load_pending_oauth_login(ctx.config, "xai")?.ok_or_else(|| {
+            anyhow::Error::msg(ctx.cli_text(
+                "cli-auth-xai-no-pending-login",
+                &[],
+                "No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.",
+            ))
+        })?;
+        if pending.profile != profile {
+            anyhow::bail!(
+                "Pending login profile mismatch: pending={}, requested={}",
+                pending.profile,
+                profile,
+            );
+        }
+        let redirect_input = input.ok_or_else(|| {
+            anyhow::Error::msg(ctx.cli_text(
+                "cli-auth-paste-redirect-requires-input",
+                &[],
+                "paste-redirect requires the redirect URL or OAuth code",
+            ))
+        })?;
+        let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
+        let code =
+            crate::auth::xai_oauth::parse_code_from_redirect(redirect_input, Some(&pending.state))?;
+        let pkce = crate::auth::xai_oauth::restore_pkce_state(
+            pending.code_verifier.clone(),
+            pending.state.clone(),
+        );
+        let token_set = crate::auth::xai_oauth::exchange_code_for_tokens(
+            ctx.client,
+            &discovery.token_endpoint,
+            &code,
+            &pkce,
+        )
+        .await?;
+        let account_id = token_set
+            .id_token
+            .as_deref()
+            .or(Some(token_set.access_token.as_str()))
+            .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+        ctx.auth_service
+            .store_xai_tokens(profile, token_set, account_id, true)
+            .await?;
+        clear_pending_oauth_login(ctx.config, "xai");
+        println!(
+            "{}",
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
+            )
+        );
+        Ok(())
+    }
+
+    async fn refresh_status(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile_override: Option<&str>,
+    ) -> Result<RefreshStatus> {
+        match ctx
+            .auth_service
+            .get_valid_xai_access_token(profile_override)
+            .await?
+        {
+            Some(_) => Ok(RefreshStatus::Refreshed {
+                profile: profile_override.unwrap_or("default").to_string(),
+            }),
+            None => Ok(RefreshStatus::NoProfile),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
