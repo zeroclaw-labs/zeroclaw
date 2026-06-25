@@ -4,7 +4,10 @@ use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
-pub struct NativeRuntime;
+pub struct NativeRuntime {
+    /// Shell binary to invoke for command execution (e.g. `"sh"`, `"bash"`).
+    shell: String,
+}
 
 impl Default for NativeRuntime {
     fn default() -> Self {
@@ -13,8 +16,17 @@ impl Default for NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Create a native runtime that uses the system default shell (`sh`).
     pub fn new() -> Self {
-        Self
+        Self { shell: "sh".into() }
+    }
+
+    /// Create a native runtime that uses a specific shell binary.
+    ///
+    /// `shell` should be a path or name resolvable via `PATH`,
+    /// e.g. `"bash"`, `"/bin/zsh"`, `"/usr/bin/fish"`.
+    pub fn with_shell(shell: String) -> Self {
+        Self { shell }
     }
 }
 
@@ -52,7 +64,12 @@ impl RuntimeAdapter for NativeRuntime {
             // Android keeps its shell at /system/bin/sh and it is not always
             // on PATH for spawned processes; use the absolute path when present
             // so the shell can launch (and reach platform tools).
-            let shell = if is_android() { "/system/bin/sh" } else { "sh" };
+            // User-configured shell is ignored on Android.
+            let shell = if is_android() {
+                "/system/bin/sh"
+            } else {
+                &self.shell
+            };
             let mut process = tokio::process::Command::new(shell);
             process.arg("-c").arg(command).current_dir(workspace_dir);
             Ok(process)
@@ -60,6 +77,7 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
+            // Windows always uses cmd.exe regardless of the configured shell.
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
             let mut process = tokio::process::Command::new("cmd.exe");
@@ -280,6 +298,84 @@ mod tests {
         assert!(
             stdout.contains(":\\"),
             "%%USERPROFILE%% should expand to a path, got: {stdout}"
+        );
+    }
+
+    // ── Configurable shell tests ─────────────────────────────
+
+    #[test]
+    fn native_with_shell_defaults_to_sh() {
+        let runtime = NativeRuntime::new();
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("\"sh\""),
+            "default shell should be 'sh', got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_with_shell_bash() {
+        let runtime = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("\"bash\""),
+            "configured shell should appear in command debug, got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_with_shell_absolute_path() {
+        let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("/usr/bin/zsh"),
+            "absolute path should appear verbatim, got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_default_and_with_shell_are_different() {
+        let default = NativeRuntime::new();
+        let configured = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        #[cfg(not(target_os = "windows"))]
+        {
+            let default_debug = format!(
+                "{:?}",
+                default.build_shell_command("echo hi", &cwd).unwrap()
+            );
+            let configured_debug = format!(
+                "{:?}",
+                configured.build_shell_command("echo hi", &cwd).unwrap()
+            );
+            assert_ne!(
+                default_debug, configured_debug,
+                "default shell and configured shell should produce different commands"
+            );
+        }
+    }
+
+    #[test]
+    fn native_with_shell_passes_c_flag() {
+        let runtime = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime
+            .build_shell_command("echo test_command", &cwd)
+            .unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(
+            debug.contains("-c"),
+            "shell command must use -c flag, got: {debug}"
+        );
+        assert!(
+            debug.contains("echo test_command"),
+            "command should contain the passed string, got: {debug}"
         );
     }
 }

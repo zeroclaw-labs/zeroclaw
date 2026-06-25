@@ -47,6 +47,17 @@ The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].
 
 Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
 
+### Shell binary
+
+By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].shell` to use a different shell:
+
+```toml
+[runtime]
+shell = "bash"      # resolves through PATH, or use an absolute path
+```
+
+The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. Defaults to `"sh"` when unset. Only applies to the native runtime kind; Docker and Windows runtimes are unaffected.
+
 ## Per-backend notes
 
 ### Landlock

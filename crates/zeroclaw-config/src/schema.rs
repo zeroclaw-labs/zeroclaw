@@ -10754,6 +10754,26 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
+    /// Shell binary to use for command execution on the native runtime.
+    ///
+    /// When unset or `null`, the system default `sh` is used.
+    /// Set to `"bash"`, `"/bin/bash"`, `"/usr/bin/zsh"`, etc. to use a
+    /// different shell. The shell is invoked as `<shell> -c "<command>"`,
+    /// so the value must be a path to a POSIX-compatible shell binary.
+    ///
+    /// **Note:** Android always uses `/system/bin/sh` regardless of this
+    /// setting, because the Android shell path is not on `PATH` by default
+    /// for spawned processes.
+    ///
+    /// **Examples:**
+    /// ```toml
+    /// [runtime]
+    /// shell = "bash"           # resolves via PATH
+    /// shell = "/bin/zsh"       # absolute path
+    /// ```
+    #[serde(default)]
+    pub shell: Option<String>,
+
     /// Global reasoning override for model_providers that expose explicit controls.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
