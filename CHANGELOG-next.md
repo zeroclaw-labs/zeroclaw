@@ -1,15 +1,17 @@
 # ZeroClaw v0.8.2
 
-This release sharpens ZeroClaw's security posture across plugins, channels, and the SOP runtime, lands a durable run/task control plane, and broadens channel surfaces (Discord interaction components, Slack attachments, WhatsApp group allowlists). It spans 104 commits from 17 contributors. Most of this is invisible at the surface and shows up as fewer leaks, fewer duplicate launches, and turns that behave the same on every transport.
+ZeroClaw v0.8.2 opens up three new front doors: **A2A agent discovery** for agent-to-agent interop, a richer **skills** story (user-configured extra registries, typed slash-command options), and a chat-based **onboarding** assistant that becomes the default `zeroclaw onboard`. Underneath, the release sharpens ZeroClaw's security posture across plugins, channels, and the SOP runtime, lands a durable run/task control plane, and broadens channel surfaces (Discord interaction components, Slack attachments, WhatsApp group allowlists). It spans 104 commits from 17 contributors. Much of this is invisible at the surface and shows up as fewer leaks, fewer duplicate launches, and turns that behave the same on every transport.
 
 ## Highlights
 
+- **A2A agent discovery** (#7763): agents can describe and discover one another over the gateway, opening up agent-to-agent interop.
+- **Richer skills story**: user-configured extra skill registries via `registry:<name>/<skill>` (#7827) and typed slash-command options in SKILL.md frontmatter (#8021).
+- **Conversational onboarding**: a chat-based setup assistant becomes the default `zeroclaw onboard` (#8033), and installation now adds `zeroclaw` to PATH automatically with a `--no-modify-path` opt-out (#8038).
 - Untrusted inbound content is now framed and sanitized before a model ever sees it, both through the new universal ingress policy layer and SOP trigger-payload framing.
 - A new durable run/task control plane backs SOP run-state, live run metrics, and delegate/subagent supervision in SQLite.
 - Plugins gained an SSRF guard on `zc_http_request`, per-alias config scoping, and removal of raw environment access.
 - Discord channels picked up interaction components (buttons, selects, modals, autocomplete, buttoned approval) and rich outbound embeds.
 - The Telegram bot token and similar secrets are now redacted through the canonical global leak detector instead of channel-local regexes.
-- Installation puts `zeroclaw` on PATH automatically, with a `--no-modify-path` opt-out.
 
 ## Security
 
@@ -25,6 +27,30 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - **HMAC tool receipts** (#8009): HMAC tool receipts are wired through the ACP, gateway WS, and CLI turn paths.
 - **WhatsApp MAC storage** (#7912): app-state mutation MACs are stored raw rather than JSON-wrapped, fixing a verification regression.
 - **Authenticated self-test probe** (#7732): the websocket handshake probe now authenticates instead of relying on an unauthenticated path.
+
+## Gateway
+
+- A2A agent discovery surface (#7763).
+- Device registration on legacy `/pair` with backfill of orphaned paired tokens (#7993).
+- Agent rename is persisted before owned state is moved (#7940).
+- The gateway drains before RPC reload (#8104).
+- Dashboard Skills page reflects an agent's effective skills (#7963).
+- Option-backed tunnel providers surface in the picker (#8026).
+- `enabled` is accepted on `CronPatchBody` for pause and resume, with the agent check scoped to shell-command patches (#7666).
+
+## Skills
+
+- User-configured extra skill registries via `registry:<name>/<skill>` (#7827).
+- Typed slash-command options in SKILL.md frontmatter (#8021).
+- `ZEROCLAW_SESSION_ID` exposed to skill shell tools (#8035).
+- Plugin-bundled and bundled skills load via `read_skill` (#7245).
+- `truncate_output` guards against UTF-8 char boundaries (#7962).
+
+## Install and Update
+
+- `zeroclaw` is added to PATH automatically, with a `--no-modify-path` opt-out (#8038).
+- Windows self-update repaired and the update pipeline hardened (#7853).
+- Intel versus Apple Silicon detection for the prebuilt target triple (#8096).
 
 ## Runtime and Engine
 
@@ -60,16 +86,6 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Bound channels are suppressed when their owning agent is disabled (#8051).
 - Voice channels no longer cache config-derived `static_voice_peers` on the channel handle (#7982).
 
-## Gateway
-
-- A2A agent discovery surface (#7763).
-- Device registration on legacy `/pair` with backfill of orphaned paired tokens (#7993).
-- Agent rename is persisted before owned state is moved (#7940).
-- The gateway drains before RPC reload (#8104).
-- Dashboard Skills page reflects an agent's effective skills (#7963).
-- Option-backed tunnel providers surface in the picker (#8026).
-- `enabled` is accepted on `CronPatchBody` for pause and resume, with the agent check scoped to shell-command patches (#7666).
-
 ## Web and Dashboard
 
 - Themed click-to-open config pickers via a Select primitive (#8086).
@@ -85,20 +101,6 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Active config directory surfaced in the Config header (#7999).
 - Approval overlay background filled (#7823).
 - Queue-paused hint skipped when the backlog is empty (#7857).
-
-## Skills
-
-- User-configured extra skill registries via `registry:<name>/<skill>` (#7827).
-- Typed slash-command options in SKILL.md frontmatter (#8021).
-- `ZEROCLAW_SESSION_ID` exposed to skill shell tools (#8035).
-- Plugin-bundled and bundled skills load via `read_skill` (#7245).
-- `truncate_output` guards against UTF-8 char boundaries (#7962).
-
-## Install and Update
-
-- `zeroclaw` is added to PATH automatically, with a `--no-modify-path` opt-out (#8038).
-- Windows self-update repaired and the update pipeline hardened (#7853).
-- Intel versus Apple Silicon detection for the prebuilt target triple (#8096).
 
 ## Cost and Budget
 
@@ -176,5 +178,3 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 @singlerider
 @wangmiao0668000666
 @ZOOWH
-
-**Full diff:** https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.1...v0.8.2
