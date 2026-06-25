@@ -1,5 +1,6 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
+pub(crate) mod approval_bridge;
 pub mod classifier;
 pub mod context_analyzer;
 pub mod cost;
