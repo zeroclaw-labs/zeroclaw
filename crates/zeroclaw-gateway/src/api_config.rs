@@ -637,7 +637,17 @@ pub async fn handle_prop_put(
     }
 
     let mut new_config = state.config.read().clone();
-    new_config.ensure_map_key_for_path(&body.path);
+    if new_config.ensure_map_key_for_path(&body.path) {
+        // Refused to vivify the reserved `default` agent: surface the same
+        // reserved error the explicit create surfaces do, not a generic 404.
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                "alias `default` is reserved and cannot be created",
+            )
+            .with_path(&body.path),
+        );
+    }
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&body.path)),
@@ -1000,7 +1010,7 @@ pub async fn handle_delete_map_key(
         return e.into_response();
     }
     let working = state.config.read().clone();
-    match parse_alias_kind(&q.path) {
+    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             // Agent deletion is special: it must scrub config references
             // (heartbeat, peer-groups, delegates, workspace.access, …) via
@@ -1241,14 +1251,28 @@ pub async fn handle_map_key(
     let path = q.path.clone();
     let key = q.key.clone();
 
-    let created = match working.create_map_key(&path, &key) {
-        Ok(b) => b,
-        Err(msg) => {
-            return error_response(
-                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
-            );
-        }
-    };
+    // Create through the shared guarded boundary so the reserved-agent rule (the
+    // `default` runtime fallback) is enforced once for every surface. Reserved ->
+    // 400 (validation_failed), symmetric with the rename guard; an unknown
+    // section or invalid key stays 404 (path_not_found) as before.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &path, &key) {
+            Ok(b) => b,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
+                return error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::ValidationFailed,
+                        format!("alias `{a}` is reserved and cannot be created"),
+                    )
+                    .with_path(format!("{path}.{key}")),
+                );
+            }
+            Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
+                );
+            }
+        };
 
     if created {
         // skill-bundles: materialize the bundle's resolved directory so
@@ -1334,7 +1358,7 @@ pub async fn handle_delete_plan(
         path: s.path.clone(),
         raw_value: s.raw_value.clone(),
     };
-    let Some(kind) = parse_alias_kind(&q.path) else {
+    let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) else {
         // Non-aliased section (e.g. `mcp.servers`): generic key removal with no
         // reference cascade — nothing to preview.
         return axum::Json(DeletePlanResponse {
@@ -1414,42 +1438,6 @@ pub struct RenameMapKeyResponse {
     /// and provider/channel rename paths, which have no owned state).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-}
-
-/// Parse a rename `path` (the map-keyed *section*) into the typed
-/// [`AliasKind`](zeroclaw_config::alias_refs::AliasKind) whose rename needs the
-/// reference-rewrite cascade. Returns `None` for non-aliased sections (e.g.
-/// `mcp.servers`), which fall back to the generic key-swap rename.
-fn parse_alias_kind(path: &str) -> Option<zeroclaw_config::alias_refs::AliasKind> {
-    use zeroclaw_config::alias_refs::{AliasKind, ProviderCategory};
-    if path == "agents" {
-        return Some(AliasKind::Agent);
-    }
-    if let Some(rest) = path.strip_prefix("providers.") {
-        let (cat, family) = rest.split_once('.')?;
-        if family.is_empty() || family.contains('.') {
-            return None;
-        }
-        let category = match cat {
-            "models" => ProviderCategory::Models,
-            "tts" => ProviderCategory::Tts,
-            "transcription" => ProviderCategory::Transcription,
-            _ => return None,
-        };
-        return Some(AliasKind::Provider {
-            category,
-            family: family.to_string(),
-        });
-    }
-    if let Some(ty) = path.strip_prefix("channels.") {
-        if ty.is_empty() || ty.contains('.') {
-            return None;
-        }
-        return Some(AliasKind::Channel {
-            channel_type: ty.to_string(),
-        });
-    }
-    None
 }
 
 /// Map a [`RenameError`](zeroclaw_config::alias_refs::RenameError) to the HTTP
@@ -1534,7 +1522,7 @@ pub async fn handle_rename_map_key(
 
     let working = state.config.read().clone();
 
-    match parse_alias_kind(&body.path) {
+    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             rename_agent_cascade(&state, working, &body).await
         }
@@ -1902,8 +1890,17 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") {
-            working.ensure_map_key_for_path(&path);
+        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
+            // Refused to vivify the reserved `default` agent: surface the same
+            // reserved error the explicit create surfaces do, not a generic 404.
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    "alias `default` is reserved and cannot be created",
+                )
+                .with_path(&path)
+                .with_op_index(idx),
+            );
         }
         let info = lookup_prop_field(&working, &path);
         let is_sensitive = info
