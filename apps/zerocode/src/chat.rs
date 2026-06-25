@@ -3183,6 +3183,37 @@ fn render_session_list_overlay(
 /// `width` is the available rendering width in cells (the chat-area inner
 /// width). It only matters for tables, which compute their column budgets
 /// from it; non-table content ignores it.
+/// Emit the body lines of a code fence into `lines`, two-space indented to
+/// match the no-gutter body convention the copy-region recovery relies on.
+/// When `lang` resolves to a known language the body is syntax-highlighted via
+/// the theme palette; otherwise every line falls back to the flat code-block
+/// style.
+fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.is_empty() {
+        return;
+    }
+    let plain_fg = theme::active().body;
+    let highlighted = lang.and_then(|token| crate::diff::highlight_code(body, token, plain_fg));
+    match highlighted {
+        Some(hl) => {
+            for line in hl {
+                let mut spans = vec![Span::styled("  ".to_string(), theme::code_block_style())];
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+        None => {
+            for code_line in body.split('\n') {
+                lines.push(Line::from(Span::styled(
+                    format!("  {code_line}"),
+                    theme::code_block_style(),
+                )));
+            }
+        }
+    }
+}
+
 /// Builds one full-width code-block border bar: `corner_l`, an optional left
 /// label (the language), then dashes wrapping a centered `[Copy]`, then
 /// `corner_r`. Header and footer share this so their geometry can never drift.
@@ -3232,6 +3263,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut in_strike = false;
     let mut in_code_block = false;
     let mut code_block_text: String = String::new();
+    let mut code_block_lang: Option<String> = None;
     let mut heading_level: Option<HeadingLevel> = None;
     let mut blockquote_depth: u32 = 0;
     let mut link_url: Option<String> = None;
@@ -3326,7 +3358,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = true;
                 code_block_text.clear();
-                let code_block_lang = match kind {
+                code_block_lang = match kind {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => info
                         .split_whitespace()
                         .next()
@@ -3353,12 +3385,15 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = false;
 
+                emit_code_block_body(&mut lines, &code_block_text, code_block_lang.as_deref());
+
                 // Footer bar: └──── [Copy] ────┘
                 lines.push(code_block_bar(width, '\u{2514}', '\u{2518}', None));
 
                 // Accumulated code text is ready for clipboard copy;
                 // the Copy action is handled by the chat pane.
                 code_block_text.clear();
+                code_block_lang = None;
             }
             MdEvent::Start(Tag::List(start)) => {
                 push_line(&mut lines, &mut current_spans);
@@ -3453,13 +3488,6 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 let owned = t.to_string();
                 if in_code_block {
                     code_block_text.push_str(&owned);
-                    for code_line in owned.split('\n') {
-                        push_line(&mut lines, &mut current_spans);
-                        current_spans.push(Span::styled(
-                            format!("  {code_line}"),
-                            theme::code_block_style(),
-                        ));
-                    }
                 } else {
                     let mut style = theme::body_style();
                     if let Some(level) = heading_level {
@@ -4318,11 +4346,12 @@ impl ChatState {
                     }
                 }
             } else if let Some((_, _, _, text)) = pending.as_mut() {
-                let body_text = first.strip_prefix("  ").unwrap_or(first);
+                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(body_text);
+                text.push_str(&body_text);
             }
 
             screen_cursor += wrapped_rows(line, width);
@@ -6043,6 +6072,55 @@ mod tests {
     }
 
     #[test]
+    fn md_code_block_body_is_syntax_highlighted() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let lines = markdown_to_lines("```rust\nfn main() {}\n```\n", 60);
+        let body = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("fn")
+            })
+            .expect("code body line");
+        assert!(
+            body.spans.len() > 2,
+            "highlighted body should split into multiple token spans, got {}",
+            body.spans.len()
+        );
+        let keyword_fg = theme::SyntaxScope::Keyword.color();
+        assert!(
+            body.spans.iter().any(|s| s.style.fg == Some(keyword_fg)),
+            "the `fn` keyword should carry the themed keyword colour"
+        );
+    }
+
+    #[test]
+    fn md_code_block_unknown_language_stays_plain() {
+        let lines = markdown_to_lines("```nonexistent_lang_xyz\nfoo bar\n```\n", 60);
+        let body = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("foo bar")
+            })
+            .expect("code body line");
+        let text: String = body.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text.strip_prefix("  ").map(str::trim_end),
+            Some("foo bar"),
+            "unknown language keeps the flat two-space-indented body: {text:?}"
+        );
+    }
+
+    #[test]
     fn copy_label_cells_locate_copy_on_header_bar() {
         let lines = markdown_to_lines("```rust\nlet x = 1;\n```\n", 50);
         let header = lines
@@ -6066,6 +6144,25 @@ mod tests {
             rendered.chars().nth(col as usize),
             Some('['),
             "label_cells column must point at '[' of [Copy]: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn copy_region_recovers_full_highlighted_body() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
+        let body = Rect::new(0, 0, 60, 20);
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            !state.copy_hit_regions.is_empty(),
+            "a highlighted fence must still register copy regions"
+        );
+        assert_eq!(
+            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
+            "copy text recovers the full multi-span highlighted body"
         );
     }
 
