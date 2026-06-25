@@ -5,13 +5,12 @@ use serde_json::json;
 
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::SopRunAction;
-use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
+use crate::sop::{SopEngine, SopMetricsCollector};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
-    audit: Option<Arc<SopAuditLogger>>,
     collector: Option<Arc<SopMetricsCollector>>,
     agent_alias: String,
 }
@@ -20,15 +19,9 @@ impl SopApproveTool {
     pub fn new(engine: Arc<Mutex<SopEngine>>) -> Self {
         Self {
             engine,
-            audit: None,
             collector: None,
             agent_alias: "agent".to_string(),
         }
-    }
-
-    pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
-        self.audit = Some(audit);
-        self
     }
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
@@ -111,28 +104,16 @@ impl Tool for SopApproveTool {
             }
         };
 
-        // Only a genuine approval (Resumed) records the legacy audit + metrics.
+        // Only a genuine approval (Resumed) records the completion metric. The
+        // audit of record is the append-only store ledger written inside
+        // resolve_gate (with the principal); the tool no longer dual-writes a
+        // legacy last-write-wins Memory audit key.
         let approved = matches!(result, Ok(ResolveOutcome::Resumed(_)));
-        if approved {
-            // Audit logging (engine lock dropped, safe to await)
-            if let Some(ref audit) = self.audit
-                && let Some(ref run) = run_snapshot
-                && let Err(e) = audit.log_approval(run, run.current_step).await
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "SOP audit log after approve failed"
-                );
-            }
-            // Metrics collector (independent of audit)
-            if let Some(ref collector) = self.collector
-                && let Some(ref run) = run_snapshot
-            {
-                collector.record_approval(&run.sop_name, &run.run_id);
-            }
+        if approved
+            && let Some(ref collector) = self.collector
+            && let Some(ref run) = run_snapshot
+        {
+            collector.record_approval(&run.sop_name, &run.run_id);
         }
 
         match result {
@@ -193,7 +174,6 @@ mod tests {
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
     use zeroclaw_config::schema::SopConfig;
-    use zeroclaw_memory::Memory;
 
     fn test_sop() -> Sop {
         Sop {
@@ -275,66 +255,6 @@ mod tests {
         let tool = SopApproveTool::new(engine);
         assert_eq!(tool.name(), "sop_approve");
         assert!(tool.parameters_schema()["required"].is_array());
-    }
-
-    #[tokio::test]
-    async fn approve_writes_audit() {
-        let (engine, run_id) = engine_with_run();
-        let tmp = tempfile::tempdir().unwrap();
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let audit = Arc::new(SopAuditLogger::new(memory.clone()));
-
-        let tool = SopApproveTool::new(engine).with_audit(audit.clone());
-        let result = tool.execute(json!({"run_id": &run_id})).await.unwrap();
-        assert!(result.success);
-
-        // Verify approval audit entry was written (stored under sop_approval_ key)
-        let entries = memory
-            .list(
-                Some(&zeroclaw_memory::traits::MemoryCategory::Custom(
-                    "sop".into(),
-                )),
-                None,
-            )
-            .await
-            .unwrap();
-        let approval_keys: Vec<_> = entries
-            .iter()
-            .filter(|e| e.key.starts_with("sop_approval_"))
-            .collect();
-        assert!(
-            !approval_keys.is_empty(),
-            "approval audit should be written on approve"
-        );
-    }
-
-    #[tokio::test]
-    async fn approve_failure_does_not_write_audit() {
-        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
-        let tmp = tempfile::tempdir().unwrap();
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let audit = Arc::new(SopAuditLogger::new(memory.clone()));
-
-        let tool = SopApproveTool::new(engine).with_audit(audit.clone());
-        let result = tool
-            .execute(json!({"run_id": "nonexistent"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-
-        // No audit entry for failed approval
-        let stored = audit.get_run("nonexistent").await.unwrap();
-        assert!(stored.is_none(), "failed approve should not write audit");
     }
 
     #[tokio::test]

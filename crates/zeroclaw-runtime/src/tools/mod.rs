@@ -1169,7 +1169,6 @@ pub fn all_tools_with_runtime(
             ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
                     .with_collector(crate::sop::SopMetricsCollector::shared()),
             ));
         } else {
