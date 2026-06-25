@@ -140,6 +140,7 @@ mod tests {
         let tool_result = ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "1".into(),
             content: "done".into(),
+            tool_name: String::new(),
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));

@@ -39,7 +39,55 @@ fn prebuilt_channel_note_message() -> String {
 
     #[cfg(not(feature = "agent-runtime"))]
     {
-        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.".to_string()
+        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.".to_string()
+    }
+}
+
+fn update_available_message(current: &str, latest: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-available",
+            &[("current", current), ("latest", latest)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!("Update available: v{current} -> v{latest}")
+    }
+}
+
+fn update_forcing_reinstall_message(current: &str, latest: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-forcing-reinstall",
+            &[("current", current), ("latest", latest)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!("Forcing reinstall: v{current} -> v{latest}")
+    }
+}
+
+fn install_dir_not_writable_message(dir: &str, error: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-not-writable",
+            &[("dir", dir), ("error", error)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "install directory {dir} is not writable ({error}); re-run `zeroclaw update` with \
+             elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)"
+        )
     }
 }
 
@@ -113,7 +161,9 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
 /// Run the full 6-phase update pipeline.
 ///
 /// If `target_version` is `Some`, fetch that specific version instead of latest.
-pub async fn run(target_version: Option<&str>) -> Result<()> {
+/// When `force` is set, install the target even if it is not newer than the
+/// current version (reinstall, or downgrade/pin to a specific `--version`).
+pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,
@@ -122,7 +172,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     );
     let update_info = check(target_version).await?;
 
-    if !update_info.is_newer {
+    if !should_install(update_info.is_newer, force) {
         println!(
             "{}",
             update_already_current_message(&update_info.current_version)
@@ -130,10 +180,21 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "Update available: v{} -> v{}",
-        update_info.current_version, update_info.latest_version
-    );
+    if update_info.is_newer {
+        println!(
+            "{}",
+            update_available_message(&update_info.current_version, &update_info.latest_version)
+        );
+    } else {
+        // --force on a version that is not newer: reinstall or downgrade/pin.
+        println!(
+            "{}",
+            update_forcing_reinstall_message(
+                &update_info.current_version,
+                &update_info.latest_version
+            )
+        );
+    }
 
     let download_url = update_info
         .download_url
@@ -141,6 +202,10 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
 
     let current_exe =
         std::env::current_exe().context("cannot determine current executable path")?;
+
+    // Fail fast before downloading if the install directory is not writable
+    // (e.g. a system-wide install that needs sudo / an elevated console).
+    ensure_install_dir_writable(&current_exe).await?;
 
     // Phase 2: Download
     ::zeroclaw_log::record!(
@@ -324,6 +389,14 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
     let cur = parse(current);
     let cand = parse(candidate);
     cand > cur
+}
+
+/// Decide whether to proceed with the install. A newer version always installs;
+/// a non-newer one (same or older) installs only with `--force`, which enables
+/// reinstalling the current version or downgrading/pinning to a specific
+/// `--version`.
+fn should_install(is_newer: bool, force: bool) -> bool {
+    is_newer || force
 }
 
 async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
@@ -549,13 +622,23 @@ async fn validate_binary(path: &Path) -> Result<()> {
 
 /// Read the binary header and verify its architecture matches the host.
 ///
-/// On Linux/FreeBSD this reads the ELF header; on macOS the Mach-O header.
-/// If the binary is for a different architecture, returns a descriptive error
-/// instead of the opaque "Exec format error (os error 8)".
+/// On Linux/FreeBSD this reads the ELF header, on macOS the Mach-O header, and
+/// on Windows the PE/COFF header. If the binary is for a different architecture,
+/// returns a descriptive error instead of the opaque "Exec format error
+/// (os error 8)" (Unix) or its Windows equivalent.
 async fn check_binary_arch(path: &Path) -> Result<()> {
-    let header = tokio::fs::read(path)
+    use tokio::io::AsyncReadExt;
+
+    // Read only the header — enough to cover a PE file's DOS stub and reach the
+    // COFF machine field pointed to by `e_lfanew` (well under 4 KiB in practice)
+    // — instead of pulling the whole multi-megabyte binary into memory.
+    let mut header = Vec::new();
+    tokio::fs::File::open(path)
         .await
-        .map(|bytes| bytes.into_iter().take(32).collect::<Vec<u8>>())
+        .context("failed to open binary to read header")?
+        .take(4096)
+        .read_to_end(&mut header)
+        .await
         .context("failed to read binary header")?;
 
     if header.len() < 20 {
@@ -577,30 +660,57 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Detect the CPU architecture from an ELF or Mach-O binary header.
+/// Detect the CPU architecture from an ELF, Mach-O, or PE binary header.
+///
+/// Returns `None` when the container format or its machine type is not
+/// recognized, so callers treat "can't tell" as "skip the check" rather than a
+/// mismatch (returning a placeholder string here would make a known host arch
+/// compare unequal and falsely report an architecture mismatch).
 fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
     // ELF magic: 0x7f 'E' 'L' 'F'
     if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
         // e_machine is at offset 18 (2 bytes, little-endian for LE binaries)
         let e_machine = u16::from_le_bytes([header[18], header[19]]);
-        return Some(match e_machine {
-            0x3E => "x86_64",
-            0xB7 => "aarch64",
-            0x03 => "x86",
-            0x28 => "arm",
-            0xF3 => "riscv",
-            _ => "unknown-elf",
-        });
+        return match e_machine {
+            0x3E => Some("x86_64"),
+            0xB7 => Some("aarch64"),
+            0x03 => Some("x86"),
+            0x28 => Some("arm"),
+            0xF3 => Some("riscv"),
+            _ => None,
+        };
     }
 
     // Mach-O magic (64-bit little-endian): 0xFEEDFACF
     if header.len() >= 8 && header[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {
         let cputype = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        return Some(match cputype {
-            0x0100_0007 => "x86_64",
-            0x0100_000C => "aarch64",
-            _ => "unknown-macho",
-        });
+        return match cputype {
+            0x0100_0007 => Some("x86_64"),
+            0x0100_000C => Some("aarch64"),
+            _ => None,
+        };
+    }
+
+    // PE (Windows): "MZ" DOS header; the PE header offset is stored at 0x3C and
+    // the COFF machine field follows the "PE\0\0" signature.
+    if header.len() >= 0x40 && header[0] == b'M' && header[1] == b'Z' {
+        let pe_off =
+            u32::from_le_bytes([header[0x3C], header[0x3D], header[0x3E], header[0x3F]]) as usize;
+        if let Some(coff) = pe_off
+            .checked_add(6)
+            .and_then(|end| header.get(pe_off..end))
+        {
+            if &coff[0..4] == b"PE\0\0" {
+                let machine = u16::from_le_bytes([coff[4], coff[5]]);
+                return match machine {
+                    0x8664 => Some("x86_64"),
+                    0xAA64 => Some("aarch64"),
+                    0x014C => Some("x86"),
+                    0x01C0 => Some("arm"),
+                    _ => None,
+                };
+            }
+        }
     }
 
     None
@@ -621,10 +731,44 @@ fn host_architecture() -> Option<&'static str> {
     }
 }
 
+/// Verify the directory containing the executable is writable, so the update
+/// fails fast with an actionable message instead of downloading a binary and
+/// only then erroring during backup or swap. System-wide installs (e.g.
+/// `/usr/local/bin`, `/usr/bin`, or `Program Files`) typically require elevated
+/// privileges.
+async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
+    let dir = exe
+        .parent()
+        .context("cannot determine install directory for the current executable")?;
+    let probe = dir.join(format!(".zeroclaw-update-probe-{}", std::process::id()));
+    match tokio::fs::File::create(&probe).await {
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&probe).await;
+            Ok(())
+        }
+        Err(e) => bail!(install_dir_not_writable_message(
+            &dir.display().to_string(),
+            &e.to_string()
+        )),
+    }
+}
+
+/// Replace the running executable at `target` with the freshly downloaded
+/// binary at `new`.
+///
+/// The mechanism differs by platform because each OS treats the file backing a
+/// running process differently:
+///
+/// * Unix — the kernel keeps the inode alive while the process runs, so the old
+///   path can be unlinked and the new binary copied into the now-free path
+///   (this avoids `ETXTBSY`).
+/// * Windows — the OS locks the image of a running process and refuses to delete
+///   it, but it *does* allow renaming. So the running exe is moved aside to a
+///   `.old` sidecar and the new binary is copied into the original path. The
+///   sidecar usually cannot be removed until the old process exits, so its
+///   deletion is best-effort and any leftover is swept on the next update run.
+#[cfg(not(windows))]
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
-    // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
-    // Remove the old file first, then copy the new one into the now-free path.
-    // This works because the kernel keeps the inode alive until the process exits.
     tokio::fs::remove_file(target)
         .await
         .context("failed to remove old binary")?;
@@ -634,6 +778,31 @@ async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
+    // Move the running exe aside under a process-unique name. A fixed name could
+    // collide with a sidecar left by an earlier update whose old process is
+    // still running (and therefore still locking the file); the rename would
+    // then have to delete that locked file and fail. A unique name sidesteps it.
+    let sidelined = sidecar_path(target, "old");
+    // Renaming a running executable is permitted on Windows even though deleting
+    // it is not.
+    tokio::fs::rename(target, &sidelined)
+        .await
+        .context("failed to move old binary aside")?;
+    if let Err(e) = tokio::fs::copy(new, target).await {
+        // Put the original back so the install is not left without a binary.
+        let _ = tokio::fs::rename(&sidelined, target).await;
+        return Err(e).context("failed to write new binary");
+    }
+    // Best-effort: the old image is still mapped by this process and usually
+    // cannot be removed until it exits. Also sweep sidecars from earlier runs.
+    let _ = tokio::fs::remove_file(&sidelined).await;
+    sweep_stale_sidecars(target).await;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
     // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
     let _ = tokio::fs::remove_file(target).await;
@@ -641,6 +810,53 @@ async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
         .await
         .context("failed to restore backup binary")?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
+    // `target` may be the currently running image (which cannot be deleted but
+    // can be renamed) or a stale, not-running new binary. Move whatever is there
+    // aside under a process-unique name, then restore the backup into the
+    // original path.
+    let sidelined = sidecar_path(target, "rollback-old");
+    let _ = tokio::fs::rename(target, &sidelined).await;
+    tokio::fs::copy(backup, target)
+        .await
+        .context("failed to restore backup binary")?;
+    let _ = tokio::fs::remove_file(&sidelined).await;
+    Ok(())
+}
+
+/// Build a process-unique sidecar path next to `target`, e.g.
+/// `zeroclaw.exe` -> `zeroclaw.exe.<pid>.old`.
+#[cfg(windows)]
+fn sidecar_path(target: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{suffix}", std::process::id()));
+    target.with_file_name(name)
+}
+
+/// Best-effort removal of sidecars left by earlier updates whose old process had
+/// not yet exited. Files still locked by a live process are silently skipped and
+/// swept by a later run.
+#[cfg(windows)]
+async fn sweep_stale_sidecars(target: &Path) {
+    let (Some(dir), Some(base)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{base}.");
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix) && (name.ends_with(".old") || name.ends_with(".rollback-old"))
+        {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 async fn smoke_test(binary: &Path) -> Result<()> {
@@ -660,6 +876,14 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_install_requires_newer_or_force() {
+        assert!(should_install(true, false)); // newer → install
+        assert!(should_install(true, true)); // newer + force → install
+        assert!(!should_install(false, false)); // not newer → skip
+        assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
+    }
 
     #[test]
     fn test_version_comparison() {
@@ -1087,6 +1311,50 @@ mod tests {
         assert_eq!(detect_arch_from_header(&header), Some("aarch64"));
     }
 
+    fn make_pe_header(machine: u16) -> Vec<u8> {
+        // "MZ" DOS header, e_lfanew at 0x3C pointing to a PE header at 0x40,
+        // "PE\0\0" signature, then the COFF machine field.
+        let mut header = vec![0u8; 0x48];
+        header[0] = b'M';
+        header[1] = b'Z';
+        header[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        header[0x40..0x44].copy_from_slice(b"PE\0\0");
+        header[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn detect_arch_pe_x86_64() {
+        assert_eq!(
+            detect_arch_from_header(&make_pe_header(0x8664)),
+            Some("x86_64")
+        );
+    }
+
+    #[test]
+    fn detect_arch_pe_aarch64() {
+        assert_eq!(
+            detect_arch_from_header(&make_pe_header(0xAA64)),
+            Some("aarch64")
+        );
+    }
+
+    #[test]
+    fn detect_arch_pe_unknown_machine_returns_none() {
+        // A valid PE container with an unrecognized machine must yield None so
+        // the caller skips the check instead of reporting a false mismatch.
+        assert_eq!(detect_arch_from_header(&make_pe_header(0xFFFF)), None);
+    }
+
+    #[test]
+    fn detect_arch_elf_unknown_machine_returns_none() {
+        let mut header = vec![0u8; 20];
+        header[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        header[18] = 0xEE; // not a recognized e_machine
+        header[19] = 0x00;
+        assert_eq!(detect_arch_from_header(&header), None);
+    }
+
     #[test]
     fn detect_arch_unknown_format() {
         let header = vec![0u8; 20]; // all zeros — not ELF or Mach-O
@@ -1232,6 +1500,54 @@ mod tests {
         extract_zip(&zip_buf, &dest).unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), fake_exe);
+    }
+
+    #[tokio::test]
+    async fn ensure_install_dir_writable_accepts_writable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("zeroclaw");
+        ensure_install_dir_writable(&exe).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_install_dir_writable_rejects_missing_dir() {
+        let exe = Path::new("/no-such-zeroclaw-install-dir-9f1c/zeroclaw");
+        let err = ensure_install_dir_writable(exe)
+            .await
+            .unwrap_err()
+            .to_string();
+        // Assert on the install-directory path, which the message interpolates in
+        // every locale, rather than the (now localized) "not writable" wording.
+        assert!(
+            err.contains("no-such-zeroclaw-install-dir-9f1c"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_binary_replaces_target_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let new = tmp.path().join("zeroclaw_new");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&new, b"new binary").unwrap();
+
+        swap_binary(&new, &target).await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+    }
+
+    #[tokio::test]
+    async fn rollback_binary_restores_backup_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let backup = tmp.path().join("zeroclaw.bak");
+        std::fs::write(&target, b"broken binary").unwrap();
+        std::fs::write(&backup, b"good binary").unwrap();
+
+        rollback_binary(&backup, &target).await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"good binary");
     }
 
     #[test]

@@ -119,63 +119,12 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 /// non-globally-routable address (SSRF guard).
 ///
 /// Handles both IPv4 and IPv6, as well as `localhost` and `.local` domains.
-pub fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-        .to_ascii_lowercase();
-
-    if &bare == "localhost" || bare.ends_with(".localhost") {
-        return true;
-    }
-
-    if bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local")
-    {
-        return true;
-    }
-
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
+pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 
 // ── private IP classification helpers ─────────────────────────────
-
-pub(crate) fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (a == 100 && (64..=127).contains(&b)) // RFC 6598 shared address space
-        || a >= 240 // Reserved
-        || (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24, 192.0.2.0/24
-        || (a == 198 && b == 51) // Documentation (198.51.100.0/24)
-        || (a == 203 && b == 0) // Documentation (203.0.113.0/24)
-        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
-}
-
-pub(crate) fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00 // Unique-local (fc00::/7)
-        || (segs[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
-}
+// Re-exported from the shared infra primitive so the tool layer and the
+// plugin host share one implementation (see zeroclaw-infra::net_guard).
+pub(crate) use zeroclaw_infra::net_guard::{is_non_global_v4, is_non_global_v6};
 
 #[cfg(test)]
 mod tests {

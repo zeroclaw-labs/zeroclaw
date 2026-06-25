@@ -76,44 +76,9 @@ struct Token {
     token: String,
 }
 
-#[derive(Deserialize)]
-struct TagPage {
-    results: Vec<TagEntry>,
-    next: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TagEntry {
-    name: String,
-}
-
-fn discover_node_tag(client: &reqwest::blocking::Client, repo: &str) -> anyhow::Result<String> {
-    let mut best: Option<u32> = None;
-    let mut url = Some(format!(
-        "https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&name={NODE_SUITE}"
-    ));
-    while let Some(next) = url.take() {
-        let page: TagPage = client
-            .get(&next)
-            .send()
-            .context("node tag list request")?
-            .error_for_status()
-            .context("node tag list status")?
-            .json()
-            .context("parse node tag list")?;
-        for t in &page.results {
-            if let Some(major) = node_major_for_suite(&t.name) {
-                best = Some(best.map_or(major, |b| b.max(major)));
-            }
-        }
-        url = page.next;
-    }
-    let major = best.context("registry returned no <major>-bookworm-slim node tag")?;
-    Ok(format!("{major}-{NODE_SUITE}"))
-}
-
 fn node_major_for_suite(tag: &str) -> Option<u32> {
-    tag.strip_suffix(&format!("-{NODE_SUITE}"))
+    tag.strip_suffix(NODE_SUITE)
+        .and_then(|tag| tag.strip_suffix('-'))
         .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
         .and_then(|m| m.parse::<u32>().ok())
 }
@@ -206,13 +171,11 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
     let client = client()?;
     let mut src = load(root)?;
     for img in &mut src.image {
-        let tag = if img.discover {
-            discover_node_tag(&client, &img.repo)?
-        } else {
-            img.tag
-                .clone()
-                .with_context(|| format!("{}: non-discover row must set a tag", img.zone))?
-        };
+        let tag = img
+            .tag
+            .clone()
+            .with_context(|| format!("{}: row must set a tag", img.zone))?;
+        validate_node_tag_policy(img, &tag)?;
         let digest = resolve_digest(&client, img.registry, &img.repo, &tag)?;
         img.tag = Some(tag);
         img.digest = Some(digest);
@@ -224,10 +187,11 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
 
 const SOURCE_HEADER: &str = "# Canonical container base-image pins for the generated container surfaces\n\
 # (Dockerfile, Dockerfile.debian). Edit registry/repo/image_ref/tag here; `tag`\n\
-# and `digest` are rewritten live by `cargo generate installers`. A row with\n\
-# discover=true resolves its tag live from the registry (node: highest\n\
-# <major>-bookworm-slim on Docker Hub). StageX pins in the Containerfile are\n\
-# excluded on purpose: digest-only, reproducible-build intent, no tag to follow.\n\n";
+# records the intended policy and `digest` is rewritten live by `cargo generate\n\
+# installers`. A row with discover=true refreshes the digest for its declared\n\
+# tag from the registry; Node discover rows must use a plain\n\
+# <major>-bookworm-slim tag. StageX pins in the Containerfile are excluded on\n\
+# purpose: digest-only, reproducible-build intent, no tag to follow.\n\n";
 
 fn render_source(src: &Source) -> anyhow::Result<String> {
     let body = toml::to_string_pretty(src).context("serialize source")?;
@@ -256,6 +220,7 @@ fn resolved(img: &BaseImage) -> anyhow::Result<(&str, &str)> {
             img.zone
         )
     })?;
+    validate_node_tag_policy(img, tag)?;
     let digest = img.digest.as_deref().with_context(|| {
         format!(
             "{}: TOML missing resolved digest; run `cargo generate installers`",
@@ -263,6 +228,15 @@ fn resolved(img: &BaseImage) -> anyhow::Result<(&str, &str)> {
         )
     })?;
     Ok((tag, digest))
+}
+
+fn validate_node_tag_policy(img: &BaseImage, tag: &str) -> anyhow::Result<()> {
+    if !img.discover {
+        return Ok(());
+    }
+    node_major_for_suite(tag)
+        .with_context(|| format!("{}: node tag {tag} is not <major>-{NODE_SUITE}", img.zone))?;
+    Ok(())
 }
 
 /// Network-free drift check: every declared ARG zone must match what the TOML
@@ -291,12 +265,6 @@ pub fn check(root: &Path, current: &str) -> anyhow::Result<Vec<String>> {
                 continue;
             }
         };
-        if img.discover && node_major_for_suite(tag).is_none() {
-            drift.push(format!(
-                "{}: node tag {tag} is not <major>-{NODE_SUITE}",
-                img.zone
-            ));
-        }
         if !valid_digest(digest) {
             drift.push(format!("{}: malformed digest {digest}", img.zone));
         }
@@ -318,6 +286,28 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+
+    fn source_with_node_tag(tag: &str) -> String {
+        format!(
+            r#"[[image]]
+zone = "base-arg-node"
+arg = "ZEROCLAW_BASE_NODE"
+registry = "dockerhub"
+repo = "library/node"
+image_ref = "node"
+discover = true
+tag = "{tag}"
+digest = "sha256:{}"
+"#,
+            "a".repeat(64)
+        )
+    }
+
+    fn write_source(root: &Path, source: &str) {
+        let dir = root.join("dev/ci");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("container-base-images.toml"), source).unwrap();
     }
 
     fn fixed(zone: &str) -> BaseImage {
@@ -380,5 +370,25 @@ mod tests {
         let content = "FROM ${ZEROCLAW_BASE_RUST_SLIM} AS x\n";
         let drift = check(&root(), content).unwrap();
         assert!(drift.iter().any(|d| d.contains("base-arg-rust-slim")));
+    }
+
+    #[test]
+    fn splice_zones_rejects_non_plain_node_discover_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        write_source(temp.path(), &source_with_node_tag("24.1-bookworm-slim"));
+        let content = format!(
+            "{}\nARG ZEROCLAW_BASE_NODE=node:24.1-bookworm-slim@sha256:{}\n{}\n",
+            begin("base-arg-node"),
+            "a".repeat(64),
+            end("base-arg-node")
+        );
+
+        let err = splice_zones(temp.path(), &content).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("node tag 24.1-bookworm-slim is not <major>-bookworm-slim"),
+            "expected Node tag-shape error, got {err:#}"
+        );
     }
 }
