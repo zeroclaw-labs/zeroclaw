@@ -95,6 +95,15 @@ struct Cli {
     /// PEM client private key for --tls-client-cert.
     #[arg(long, requires = "tls_client_cert")]
     tls_client_key: Option<String>,
+
+    /// Reach the daemon through a nominated relay at this `host:port`
+    /// (instead of connecting to --connect directly). Requires --relay-node.
+    #[arg(long, requires = "relay_node")]
+    relay: Option<String>,
+
+    /// Node-id of the target daemon to request from the relay.
+    #[arg(long, requires = "relay")]
+    relay_node: Option<String>,
 }
 
 /// Map an empty path string to `None`.
@@ -281,7 +290,26 @@ async fn run() -> anyhow::Result<()> {
         if let Some((uri, skip_verify)) =
             resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
         {
-            // CLI flags override config for the mutual-TLS material.
+            // CLI flags override config for the relay route and the mutual-TLS
+            // material.
+            let relay_addr = cli.relay.clone().or_else(|| cfg_wss.relay_url.clone());
+            let relay_node = cli
+                .relay_node
+                .clone()
+                .or_else(|| cfg_wss.relay_node.clone());
+            let relay = match (relay_addr, relay_node) {
+                (Some(relay_addr), Some(node_id)) => Some(client::RelayDial {
+                    relay_addr,
+                    node_id,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(anyhow::Error::msg(
+                        "relay routing needs both a relay address and a node-id \
+                         (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
+                    ));
+                }
+            };
             let tls = client::ClientTls {
                 skip_verify,
                 ca_cert_path: cli
@@ -296,6 +324,7 @@ async fn run() -> anyhow::Result<()> {
                     .tls_client_key
                     .clone()
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path)),
+                relay,
             };
             ConnectTarget::Wss { url: uri, tls }
         } else {

@@ -84,11 +84,21 @@ pub(crate) struct WssSection {
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
+    /// Reach the daemon through a nominated relay at this `host:port` instead of
+    /// connecting to `uri` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Node-id of the target daemon to request from the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node: Option<String>,
 }
 
 impl WssSection {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.tls.is_empty()
+        self.uri.is_none()
+            && self.tls.is_empty()
+            && self.relay_url.is_none()
+            && self.relay_node.is_none()
     }
 }
 

@@ -414,6 +414,15 @@ pub struct RpcClient {
     transport: Transport,
 }
 
+/// Dial the daemon through a nominated relay instead of connecting directly.
+#[derive(Debug, Clone)]
+pub struct RelayDial {
+    /// Relay address (`host:port`) to connect to.
+    pub relay_addr: String,
+    /// Node-id of the target daemon to request from the relay.
+    pub node_id: String,
+}
+
 /// TLS verification + mutual-TLS client identity for a WSS connection.
 #[derive(Debug, Clone, Default)]
 pub struct ClientTls {
@@ -426,6 +435,9 @@ pub struct ClientTls {
     pub client_cert_path: Option<String>,
     /// PEM private key for `client_cert_path`.
     pub client_key_path: Option<String>,
+    /// When set, reach the daemon through this relay (the inner mTLS still runs
+    /// end-to-end; the relay only forwards ciphertext).
+    pub relay: Option<RelayDial>,
 }
 
 impl ClientTls {
@@ -496,6 +508,44 @@ fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>>
     rustls_pemfile::private_key(&mut &pem[..])
         .with_context(|| format!("parsing private key from {path}"))?
         .ok_or_else(|| anyhow::Error::msg(format!("no private key found in {path}")))
+}
+
+/// Relay client handshake on a raw stream: request `node_id`, wait for the relay
+/// to open the route. The rest of the stream is then the daemon (inner mTLS).
+async fn relay_open(tcp: &mut tokio::net::TcpStream, node_id: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zeroclaw_relay_proto::Frame;
+
+    let connect = Frame::Connect {
+        node_id: node_id.to_string(),
+    };
+    tcp.write_all(connect.to_line().as_bytes())
+        .await
+        .context("sending relay Connect")?;
+    tcp.flush().await.ok();
+
+    // Read exactly one newline-terminated reply (no over-read into the WSS bytes).
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tcp.read(&mut byte).await.context("reading relay reply")?;
+        if n == 0 {
+            anyhow::bail!("relay closed before replying");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.len() > 64 * 1024 {
+            anyhow::bail!("relay reply exceeds 64 KiB");
+        }
+    }
+    let line = String::from_utf8(buf).context("relay reply is not UTF-8")?;
+    match Frame::from_line(&line).context("parsing relay reply")? {
+        Frame::Opened { .. } => Ok(()),
+        Frame::Error { code, msg } => anyhow::bail!("relay refused the route: {code}: {msg}"),
+        other => anyhow::bail!("unexpected relay reply: {other:?}"),
+    }
 }
 
 impl RpcClient {
@@ -646,21 +696,37 @@ impl RpcClient {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        // Use the built-in (webpki-roots) connector only for the plain default:
-        // no client certificate, no custom CA, no skip-verify. Any custom TLS
-        // material requires our own rustls ClientConfig.
-        let connector = if tls.is_default() {
-            None
-        } else {
-            Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
-                tls,
-            )?))
-        };
-
-        let (ws_stream, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+        let ws_stream = if let Some(relay) = &tls.relay {
+            // Through a nominated relay: open a raw TCP connection, perform the
+            // relay handshake (Connect -> Opened), then run the SAME WSS + mTLS
+            // over that tunnelled stream. The relay only forwards ciphertext.
+            let mut tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
                 .await
-                .with_context(|| format!("WSS connect to {url}"))?;
+                .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
+            relay_open(&mut tcp, &relay.node_id).await?;
+            let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
+            let (ws_stream, _response) =
+                tokio_tungstenite::client_async_tls_with_config(url, tcp, None, Some(connector))
+                    .await
+                    .with_context(|| format!("WSS-over-relay to {url} via {}", relay.relay_addr))?;
+            ws_stream
+        } else {
+            // Direct: the built-in (webpki-roots) connector only for the plain
+            // default (no client cert, no custom CA, no skip-verify); any custom
+            // TLS material requires our own rustls ClientConfig.
+            let connector = if tls.is_default() {
+                None
+            } else {
+                Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
+                    tls,
+                )?))
+            };
+            let (ws_stream, _response) =
+                tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+                    .await
+                    .with_context(|| format!("WSS connect to {url}"))?;
+            ws_stream
+        };
 
         let (mut sink, mut stream) = ws_stream.split();
 
