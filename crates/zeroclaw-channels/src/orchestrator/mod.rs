@@ -10041,19 +10041,37 @@ fn expand_tilde_in_path(path: &str) -> PathBuf {
 #[test]
 fn concurrent_persist_lock_serialization() {
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_runtime::approval::ApprovalManager;
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
 
-    struct CountingBackend {
-        appends: Arc<Mutex<HashMap<String, usize>>>,
+    /// Backend that records the append *sequence* (not just a count)
+    /// and introduces a per-caller varying delay **after** the push.
+    /// Without the per-sender persist lock in `append_sender_turn`,
+    /// threads exit `store.append` in a different order than they
+    /// entered, so the backend sequence diverges from the in-memory
+    /// `conversation_histories` order.  The persist lock makes the
+    /// store-append + history-push atomic → orders must match.
+    struct OrderBackend {
+        sequence: Arc<Mutex<Vec<String>>>,
+        call_n: Arc<AtomicUsize>,
     }
-    impl SessionBackend for CountingBackend {
+    impl SessionBackend for OrderBackend {
         fn load(&self, _key: &str) -> Vec<ChatMessage> { vec![] }
-        fn append(&self, key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
-            *self.appends.lock().unwrap_or_else(|e| e.into_inner())
-                .entry(key.to_string()).or_insert(0) += 1;
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            let content = msg.content.clone();
+            let n = self.call_n.fetch_add(1, Ordering::SeqCst);
+            self.sequence.lock().unwrap_or_else(|e| e.into_inner())
+                .push(content);
+            // Delay outside the sequence lock: later callers get
+            // shorter delays → they exit earlier and can win the
+            // history-push race.
+            std::thread::sleep(Duration::from_millis(
+                8_u64.saturating_sub(n as u64 * 2),
+            ));
             Ok(())
         }
         fn remove_last(&self, _key: &str) -> std::io::Result<bool> { Ok(true) }
@@ -10061,8 +10079,11 @@ fn concurrent_persist_lock_serialization() {
     }
 
     let sender = "concurrent_test_key".to_string();
-    let backend = CountingBackend { appends: Arc::new(Mutex::new(HashMap::new())) };
-    let appends = backend.appends.clone();
+    let sequence = Arc::new(Mutex::new(Vec::new()));
+    let backend = OrderBackend {
+        sequence: sequence.clone(),
+        call_n: Arc::new(AtomicUsize::new(0)),
+    };
 
     let ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(HashMap::new()),
@@ -10145,10 +10166,37 @@ fn concurrent_persist_lock_serialization() {
     }
     for h in handles { h.join().unwrap(); }
 
-    let count = appends.lock().unwrap_or_else(|e| e.into_inner())
-        .get(&sender).copied().unwrap_or(0);
-    assert_eq!(count, 4,
-        "all 4 concurrent append_sender_turn calls must be persisted under the per-key lock");
+    // ── Assertion ────────────────────────────────────────────────
+    // Under the per-sender persist lock every (append, history-push)
+    // pair is atomic, so the backend sequence must equal the
+    // in-memory history for this sender (minus the initial "start").
+    let backend_order: Vec<String> =
+        sequence.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let history: Vec<String> = {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(&sender)
+            .expect("history must exist for sender");
+        turns
+            .iter()
+            .filter(|m| m.content != "start")
+            .map(|m| m.content.clone())
+            .collect()
+    };
+    assert_eq!(
+        backend_order, history,
+        "backend append order must equal in-memory history order;\
+         a mismatch means the per-sender persist lock is not serializing\
+         store.append + history.push atomically"
+    );
+    assert_eq!(
+        backend_order.len(),
+        4,
+        "all 4 concurrent appends must be recorded"
+    );
 }
 
 #[cfg(test)]
