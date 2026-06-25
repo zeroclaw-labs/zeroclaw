@@ -10761,6 +10761,11 @@ pub struct RuntimeConfig {
     /// different shell. The shell is invoked as `<shell> -c "<command>"`,
     /// so the value must be a path to a POSIX-compatible shell binary.
     ///
+    /// On Unix the value is validated when the runtime is constructed: an
+    /// empty/whitespace value, a bare name not found on `PATH`, or a path
+    /// that does not exist or is not executable is rejected with an error
+    /// rather than failing later on the first shell command.
+    ///
     /// **Note:** Android always uses `/system/bin/sh` regardless of this
     /// setting, because the Android shell path is not on `PATH` by default
     /// for spawned processes.
