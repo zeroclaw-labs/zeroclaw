@@ -6491,7 +6491,9 @@ impl Default for GatewayClientAuthConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "wss.client_auth"]
 pub struct WssClientAuthConfig {
-    /// Enable client certificate verification for the WSS plane (default: false).
+    /// Use the bring-your-own CA below. When false (default) the daemon
+    /// auto-generates its own CA. The WSS plane is always mutually authenticated
+    /// either way; this does NOT toggle whether a client certificate is required.
     #[serde(default)]
     pub enabled: bool,
     /// Path to the PEM-encoded CA certificate used to verify client certificates.

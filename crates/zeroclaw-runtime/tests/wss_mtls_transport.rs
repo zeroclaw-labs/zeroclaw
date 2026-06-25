@@ -126,12 +126,14 @@ async fn valid_client_cert_completes_tls_and_ws_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // Server: accept one connection exactly as run_wss_listener does.
+    // Server: accept one connection exactly as run_wss_listener does, and report
+    // the negotiated protocol version.
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let tls = acceptor.accept(tcp).await?; // mandatory mTLS handshake
+        let version = tls.get_ref().1.protocol_version();
         let _ws = tokio_tungstenite::accept_async(tls).await?; // WS upgrade
-        Ok::<(), anyhow::Error>(())
+        Ok::<Option<rustls::ProtocolVersion>, anyhow::Error>(version)
     });
 
     let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_config(Some((
@@ -144,10 +146,15 @@ async fn valid_client_cert_completes_tls_and_ws_handshake() {
             .await
             .expect("valid client cert must complete the mTLS + WS handshake");
 
-    server
+    let version = server
         .await
         .unwrap()
         .expect("server side handshake must succeed");
+    assert_eq!(
+        version,
+        Some(rustls::ProtocolVersion::TLSv1_3),
+        "the remote plane must negotiate TLS 1.3"
+    );
 }
 
 #[tokio::test]
@@ -183,9 +190,16 @@ async fn missing_client_cert_is_rejected() {
         connect_result.is_err(),
         "a client presenting no certificate must be rejected"
     );
+    // The rejection must be the MANDATORY-CLIENT-AUTH rejection, not an unrelated
+    // failure: assert the server-side error names a certificate requirement.
     let server_result = server.await.unwrap();
+    let err = match server_result {
+        Ok(_) => panic!("the daemon accepted a client that presented no certificate"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:?}").to_lowercase();
     assert!(
-        server_result.is_err(),
-        "the daemon must reject the certless client at the TLS layer"
+        msg.contains("certificate") || msg.contains("certrequired") || msg.contains("required"),
+        "expected a client-certificate rejection at the TLS layer, got: {msg}"
     );
 }

@@ -2717,14 +2717,23 @@ enum SecurityCommands {
         #[arg(long, default_value = "zerocode")]
         name: String,
 
-        /// Directory to write client.crt / client.key. Defaults to `<data_dir>/tls`.
+        /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
         #[arg(long)]
         out_dir: Option<PathBuf>,
+
+        /// Overwrite an existing certificate/key for this name.
+        #[arg(long)]
+        force: bool,
     },
 }
 
 /// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
-fn issue_wss_client_cert(config: &Config, name: &str, out_dir: Option<PathBuf>) -> Result<()> {
+fn issue_wss_client_cert(
+    config: &Config,
+    name: &str,
+    out_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
     let tls_dir = config.data_dir.join("tls");
     let ca_cert = tls_dir.join("ca.crt");
     let ca_key = tls_dir.join("ca.key");
@@ -2736,21 +2745,42 @@ fn issue_wss_client_cert(config: &Config, name: &str, out_dir: Option<PathBuf>) 
         );
     }
 
+    // Per-device file names so issuing certs for multiple devices does not clobber.
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let dest = out_dir.unwrap_or(tls_dir);
+    let cert_path = dest.join(format!("client-{slug}.crt"));
+    let key_path = dest.join(format!("client-{slug}.key"));
+    if !force && (cert_path.exists() || key_path.exists()) {
+        anyhow::bail!(
+            "{} already exists. Pass --force to overwrite, or --out-dir / --name for a new one.",
+            key_path.display()
+        );
+    }
+
     let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
     let ca_key_pem = std::fs::read_to_string(&ca_key)?;
     let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
 
-    let dest = out_dir.unwrap_or(tls_dir);
-    std::fs::create_dir_all(&dest)?;
-    let cert_path = dest.join("client.crt");
-    let key_path = dest.join("client.key");
-    std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
-    std::fs::write(&key_path, issued.key_pem.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    // Directory 0700, private key written 0600 atomically (no world-readable window).
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
     }
+    std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
+    zeroclaw_tls::certgen::write_private_pem(&key_path, &issued.key_pem)?;
 
     println!("Issued client certificate for '{name}':");
     println!("  cert: {}", cert_path.display());
@@ -4058,20 +4088,34 @@ async fn main() -> Result<()> {
                             return Ok(());
                         }
                         // The remote WSS plane is ALWAYS mutually authenticated; there
-                        // is no server-only / plaintext fallback. Client-cert pinning,
-                        // if configured, comes from [wss.client_auth].
-                        let pinned = wss_cfg
-                            .client_auth
-                            .as_ref()
+                        // is no server-only / plaintext fallback.
+                        //
+                        // Guard against an under-configured bring-your-own intent: a CA
+                        // path set while the section is disabled would otherwise be
+                        // silently discarded and replaced by an auto-generated CA. Fail
+                        // closed with a clear message instead.
+                        if let Some(c) = wss_cfg.client_auth.as_ref() {
+                            if !c.ca_cert_path.is_empty() && !c.enabled {
+                                anyhow::bail!(
+                                    "[wss.client_auth].ca_cert_path is set but \
+                                     [wss.client_auth].enabled is false. Set enabled = true to use \
+                                     your CA, or clear ca_cert_path to auto-generate one."
+                                );
+                            }
+                        }
+                        // Only an enabled [wss.client_auth] contributes the CA and the
+                        // pins; both are gated on the same condition so they cannot
+                        // diverge (e.g. pins applied against an auto-generated CA).
+                        let active_client_auth =
+                            wss_cfg.client_auth.as_ref().filter(|c| c.enabled);
+                        let pinned = active_client_auth
                             .map(|c| c.pinned_certs.clone())
                             .unwrap_or_default();
                         // Bring-your-own mTLS when an operator CA is configured;
                         // otherwise auto-generate a per-daemon CA + server certificate
                         // under the data dir (secure by default, zero config).
-                        let byo_ca = wss_cfg
-                            .client_auth
-                            .as_ref()
-                            .filter(|c| c.enabled && !c.ca_cert_path.is_empty())
+                        let byo_ca = active_client_auth
+                            .filter(|c| !c.ca_cert_path.is_empty())
                             .map(|c| c.ca_cert_path.clone());
                         let (cert_path, key_path, ca_cert_path) = match byo_ca {
                             Some(ca_cert_path) => {
@@ -4607,9 +4651,11 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            SecurityCommands::IssueClientCert { name, out_dir } => {
-                issue_wss_client_cert(&config, &name, out_dir)
-            }
+            SecurityCommands::IssueClientCert {
+                name,
+                out_dir,
+                force,
+            } => issue_wss_client_cert(&config, &name, out_dir, force),
         },
 
         Commands::Estop {

@@ -429,9 +429,14 @@ pub struct ClientTls {
 }
 
 impl ClientTls {
-    /// True when no custom TLS material is configured (plain default path).
+    /// True when no custom TLS material is configured (plain default path). Any
+    /// lone field (including a stray `client_key_path`) forces the custom path so
+    /// the cert+key must-come-together validation in `wss_tls_config` runs.
     pub fn is_default(&self) -> bool {
-        !self.skip_verify && self.ca_cert_path.is_none() && self.client_cert_path.is_none()
+        !self.skip_verify
+            && self.ca_cert_path.is_none()
+            && self.client_cert_path.is_none()
+            && self.client_key_path.is_none()
     }
 }
 

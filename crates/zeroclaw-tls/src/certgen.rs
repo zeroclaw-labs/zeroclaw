@@ -87,32 +87,78 @@ fn default_server_sans() -> Vec<String> {
     vec!["localhost".to_string(), "127.0.0.1".to_string()]
 }
 
-fn write_pem(path: &Path, pem: &str, private: bool) -> Result<()> {
-    std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))?;
-    if private {
-        restrict_permissions(path)?;
+/// Write a public PEM (cert) file.
+fn write_public_pem(path: &Path, pem: &str) -> Result<()> {
+    std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Write a private-key PEM file, restricting permissions to `0600` on Unix
+/// **before** the bytes are written (no create-then-chmod world-readable window).
+pub fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(pem.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        // Enforce 0600 even if the file pre-existed with looser permissions.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("restricting permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
+/// Create `dir` (and parents), restricting it to `0700` on Unix.
+fn create_secure_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating directory {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
+    }
     Ok(())
 }
 
-/// Ensure mTLS server materials exist under `dir`, generating a fresh per-daemon
-/// CA + server certificate on first call. Idempotent: if all four files already
-/// exist they are returned unchanged (the CA is never silently rotated).
+/// Reconstruct the rcgen CA issuer (certificate + key) from on-disk PEM so it can
+/// sign new leaves without rotating the CA.
+fn load_ca(
+    ca_cert_path: &Path,
+    ca_key_path: &Path,
+) -> Result<(rcgen::Certificate, rcgen::KeyPair)> {
+    let ca_key_pem = std::fs::read_to_string(ca_key_path)
+        .with_context(|| format!("reading CA key {}", ca_key_path.display()))?;
+    let ca_cert_pem = std::fs::read_to_string(ca_cert_path)
+        .with_context(|| format!("reading CA certificate {}", ca_cert_path.display()))?;
+    let ca_key = rcgen::KeyPair::from_pem(&ca_key_pem).context("loading CA key")?;
+    let ca_cert = rcgen::CertificateParams::from_ca_cert_pem(&ca_cert_pem)
+        .context("loading CA certificate")?
+        .self_signed(&ca_key)
+        .context("reconstructing CA issuer")?;
+    Ok((ca_cert, ca_key))
+}
+
+/// Ensure mTLS server materials exist under `dir`.
 ///
-/// The private keys are written `0600` on Unix. `server_sans` overrides the
-/// default SAN set when non-empty.
+/// The per-daemon CA is the root of trust and is **never silently rotated**: if
+/// `ca.crt` and `ca.key` are present they are loaded and reused, and only a
+/// missing server leaf is regenerated. A fresh CA is generated only when the CA
+/// key is genuinely absent. This survives partial on-disk state (e.g. a deleted
+/// or corrupt `server.crt`) without invalidating already-issued client
+/// certificates. Private keys are written `0600` and the directory `0700` on
+/// Unix. `server_sans` overrides the default SAN set when non-empty.
 pub fn ensure_server_materials(dir: &Path, server_sans: &[String]) -> Result<ServerMaterials> {
     let materials = ServerMaterials {
         ca_cert_path: dir.join("ca.crt"),
@@ -129,32 +175,36 @@ pub fn ensure_server_materials(dir: &Path, server_sans: &[String]) -> Result<Ser
         return Ok(materials);
     }
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating TLS materials directory {}", dir.display()))?;
+    create_secure_dir(dir)?;
 
-    let ca_key = rcgen::KeyPair::generate().context("generating CA key")?;
-    let ca_cert = ca_params("ZeroClaw WSS CA")?
-        .self_signed(&ca_key)
-        .context("self-signing CA certificate")?;
-
-    let server_key = rcgen::KeyPair::generate().context("generating server key")?;
-    let sans = if server_sans.is_empty() {
-        default_server_sans()
+    // The CA is the crown jewel: reuse it whenever it exists, generate only when
+    // its key is genuinely absent.
+    let (ca_cert, ca_key) = if materials.ca_cert_path.exists() && materials.ca_key_path.exists() {
+        load_ca(&materials.ca_cert_path, &materials.ca_key_path)?
     } else {
-        server_sans.to_vec()
+        let ca_key = rcgen::KeyPair::generate().context("generating CA key")?;
+        let ca_cert = ca_params("ZeroClaw WSS CA")?
+            .self_signed(&ca_key)
+            .context("self-signing CA certificate")?;
+        write_public_pem(&materials.ca_cert_path, &ca_cert.pem())?;
+        write_private_pem(&materials.ca_key_path, &ca_key.serialize_pem())?;
+        (ca_cert, ca_key)
     };
-    let server_cert = server_params(&sans)?
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .context("signing server certificate")?;
 
-    write_pem(&materials.ca_cert_path, &ca_cert.pem(), false)?;
-    write_pem(&materials.ca_key_path, &ca_key.serialize_pem(), true)?;
-    write_pem(&materials.server_cert_path, &server_cert.pem(), false)?;
-    write_pem(
-        &materials.server_key_path,
-        &server_key.serialize_pem(),
-        true,
-    )?;
+    // (Re)generate the server leaf only if it is missing.
+    if !materials.server_cert_path.exists() || !materials.server_key_path.exists() {
+        let server_key = rcgen::KeyPair::generate().context("generating server key")?;
+        let sans = if server_sans.is_empty() {
+            default_server_sans()
+        } else {
+            server_sans.to_vec()
+        };
+        let server_cert = server_params(&sans)?
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .context("signing server certificate")?;
+        write_public_pem(&materials.server_cert_path, &server_cert.pem())?;
+        write_private_pem(&materials.server_key_path, &server_key.serialize_pem())?;
+    }
 
     Ok(materials)
 }
@@ -212,5 +262,34 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "CA key permissions are {mode:o}, expected 600");
+    }
+
+    #[test]
+    fn ca_is_reused_when_only_server_leaf_is_missing() {
+        // A deleted/corrupt server leaf (partial state) must NOT rotate the CA:
+        // the crown-jewel key and cert must survive byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let m = ensure_server_materials(dir.path(), &[]).unwrap();
+        let ca_crt = std::fs::read(&m.ca_cert_path).unwrap();
+        let ca_key = std::fs::read(&m.ca_key_path).unwrap();
+
+        // Delete only the server certificate and regenerate.
+        std::fs::remove_file(&m.server_cert_path).unwrap();
+        let m2 = ensure_server_materials(dir.path(), &[]).unwrap();
+
+        assert_eq!(
+            ca_crt,
+            std::fs::read(&m2.ca_cert_path).unwrap(),
+            "CA certificate was rotated on partial state"
+        );
+        assert_eq!(
+            ca_key,
+            std::fs::read(&m2.ca_key_path).unwrap(),
+            "CA key was rotated on partial state"
+        );
+        assert!(
+            m2.server_cert_path.exists(),
+            "server leaf was not regenerated"
+        );
     }
 }
