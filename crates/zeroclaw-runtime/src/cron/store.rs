@@ -1910,7 +1910,8 @@ mod tests {
 
         let job = add_job(&config, "test-agent", "* * * * *", "echo due").unwrap();
 
-        let due_now = due_jobs(&config, Utc::now()).unwrap();
+        let before_next_run = job.next_run - ChronoDuration::milliseconds(1);
+        let due_now = due_jobs(&config, before_next_run).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
 
         let far_future = Utc::now() + ChronoDuration::days(365);

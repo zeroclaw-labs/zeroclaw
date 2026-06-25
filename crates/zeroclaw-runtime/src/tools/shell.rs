@@ -588,6 +588,43 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    #[cfg(windows)]
+    fn stdin_reader_command() -> &'static str {
+        "more"
+    }
+
+    #[cfg(not(windows))]
+    fn stdin_reader_command() -> &'static str {
+        "cat"
+    }
+
+    #[cfg(windows)]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out && echo warn 1>&2"
+    }
+
+    #[cfg(not(windows))]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out; echo warn >&2"
+    }
+
+    #[cfg(windows)]
+    fn medium_risk_write_command() -> &'static str {
+        "copy /Y NUL zeroclaw_shell_approval_test"
+    }
+
+    #[cfg(not(windows))]
+    fn medium_risk_write_command() -> &'static str {
+        "touch zeroclaw_shell_approval_test"
+    }
+
+    fn medium_risk_write_base() -> &'static str {
+        medium_risk_write_command()
+            .split_whitespace()
+            .next()
+            .expect("medium-risk test command should have a base command")
+    }
+
     /// Returns the fully-wrapped shell tool as it is composed in production:
     /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
     /// rate-limiting behaviour must use this helper so they exercise the wrappers.
@@ -632,17 +669,21 @@ mod tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["cat".into()],
+            allowed_commands: vec![stdin_reader_command().into()],
             ..SecurityPolicy::default()
         });
         let tool = ShellTool::new(security, test_runtime());
-        let fut = tool.execute(json!({"command": "cat"}));
+        let fut = tool.execute(json!({"command": stdin_reader_command()}));
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
         assert!(
             res.is_ok(),
             "a stdin-reading command hung — stdin is not null and may reach the terminal"
         );
-        assert!(res.unwrap().expect("cat should return a result").success);
+        assert!(
+            res.unwrap()
+                .expect("stdin reader should return a result")
+                .success
+        );
     }
 
     #[tokio::test]
@@ -774,7 +815,7 @@ mod tests {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
             .with_persistent_writes(false);
         let result = tool
-            .execute(json!({"command": "echo out; echo warn >&2"}))
+            .execute(json!({"command": success_with_stderr_command()}))
             .await
             .expect("command should run");
         assert!(
@@ -1097,14 +1138,14 @@ mod tests {
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
+            allowed_commands: vec![medium_risk_write_base().into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": medium_risk_write_command()}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -1118,7 +1159,7 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": medium_risk_write_command(),
                 "approved": true
             }))
             .await

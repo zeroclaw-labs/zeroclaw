@@ -1067,23 +1067,38 @@ pub async fn handle_section_select(
         | Section::RiskProfiles
         | Section::RuntimeProfiles => {
             // OneTierAliasMap: the URL path key IS the alias. One
-            // `create_map_key("<section>", &key)` call works for every
+            // `create_map_key_checked("<section>", &key)` call works for every
             // operator-named HashMap section; create_map_key is
             // idempotent, so selecting an existing alias just returns
-            // the form prefix without modifying anything.
+            // the form prefix without modifying anything. Routing through the
+            // shared guarded boundary refuses the reserved `default` agent here
+            // too (this is the second operator create surface alongside
+            // `handle_map_key`), and delegates unchanged for every other section.
             let section_key = section_enum.as_str();
-            let created = working.create_map_key(section_key, &key).map_err(|msg| {
-                error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::PathNotFound,
-                        format!("could not select {section_key} alias `{key}`: {msg}"),
-                    )
-                    .with_path(section_key),
-                )
-            });
-            let created = match created {
+            let created = match zeroclaw_config::alias_refs::create_map_key_checked(
+                &mut working,
+                section_key,
+                &key,
+            ) {
                 Ok(c) => c,
-                Err(resp) => return resp,
+                Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            format!("alias `{a}` is reserved and cannot be created"),
+                        )
+                        .with_path(format!("{section_key}.{key}")),
+                    );
+                }
+                Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::PathNotFound,
+                            format!("could not select {section_key} alias `{key}`: {msg}"),
+                        )
+                        .with_path(section_key),
+                    );
+                }
             };
             // Agents need a per-alias workspace dir on disk so the
             // PersonalityEditor and the runtime have somewhere to read

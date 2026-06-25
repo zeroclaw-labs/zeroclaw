@@ -69,11 +69,13 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
 /// Returns the number of channels seeded. Parameters match the return order of
 /// `all_tools_with_runtime`:
 ///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   channel_room_handle = `Option<PerToolChannelHandle>`
 ///   reaction_handle = `PerToolChannelHandle` (NOT Option)
 ///   poll_handle = `Option<PerToolChannelHandle>`
 ///   escalate_handle = `Option<PerToolChannelHandle>`
 pub(crate) fn seed_channel_handles(
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &tools::PerToolChannelHandle,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
@@ -88,6 +90,7 @@ pub(crate) fn seed_channel_handles(
 
     let handles = [
         ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
         Some(reaction_handle),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
@@ -136,10 +139,9 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -272,7 +274,32 @@ pub(crate) fn filter_channel_builtin_tools(
     security: &zeroclaw_config::policy::SecurityPolicy,
 ) {
     let before_filter = tools_registry.len();
-    apply_policy_tool_filter(tools_registry, Some(security), None);
+
+    // At non-Full autonomy, the known default read-only auto-approve
+    // tools (web_search_tool, web_fetch, calculator, etc.) are always
+    // accessible on channels so the bot can fetch real-time information.
+    // Only the canonical builtin default set bypasses allowed_tools;
+    // operator-added auto_approve entries (e.g. shell) still require
+    // explicit allowlisting via allowed_tools.
+    if security.autonomy != AutonomyLevel::Full {
+        let defaults = zeroclaw_config::schema::default_auto_approve();
+        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
+        tools_registry.retain(|t| {
+            let name = t.name();
+            if safe_defaults.contains(name) {
+                // Builtin read-only tool: admit past allowed_tools but
+                // still respect the excluded_tools denylist.
+                return security
+                    .excluded_tools
+                    .as_ref()
+                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
+            }
+            security.is_tool_allowed(name)
+        });
+    } else {
+        apply_policy_tool_filter(tools_registry, Some(security), None);
+    }
+
     if tools_registry.len() != before_filter {
         ::zeroclaw_log::record!(
             INFO,
@@ -715,10 +742,7 @@ fn build_hardware_context(
 }
 
 // Tool execution moved to `super::tool_execution`.
-pub use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
-};
+pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_parallel};
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
@@ -748,6 +772,7 @@ pub async fn agent_turn(
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
+    let turn_id = uuid::Uuid::new_v4().to_string();
     run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -794,6 +819,8 @@ pub async fn agent_turn(
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
         ingress: IngressContext::internal(),
+        agent_alias: None,
+        turn_id: &turn_id,
     })
     .await
 }
@@ -992,142 +1019,6 @@ fn api_key_and_uri_for_provider(
     )
 }
 
-/// Resolve the agent's effective context-compression summary provider to a
-/// freshly-built `(provider, model)` pair (the cross-provider fix for #7964).
-///
-/// Mirrors the channel orchestrator's `resolve_classifier_route` fail-open
-/// contract exactly: `effective_summary_provider` is `None`, OR the ref is
-/// unparseable, OR the alias is missing from `[providers.models]`, OR it has no
-/// `.model`, OR the provider build fails ⇒ WARN once and return `None`. The
-/// caller then falls back to the agent's own provider + model (with the
-/// deprecated `summary_model` swap still honored for un-migrated configs), so
-/// compression never becomes a turn-killing hard error.
-fn resolve_summary_provider(
-    config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-) -> Option<(Box<dyn ModelProvider>, String)> {
-    let provider_ref = config.effective_summary_provider(agent_alias)?;
-    let provider_str = provider_ref.as_str().trim();
-    if provider_str.is_empty() {
-        return None;
-    }
-
-    let (type_key, alias_key) = match provider_str.split_once('.') {
-        Some(parts) => parts,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "summary_provider must be dotted `<type>.<alias>`; falling back to agent provider"
-            );
-            return None;
-        }
-    };
-
-    let model_cfg = match config.providers.models.find(type_key, alias_key) {
-        Some(cfg) => cfg,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to agent provider"
-            );
-            return None;
-        }
-    };
-
-    let model = model_cfg.model.clone().unwrap_or_default();
-    if model.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"provider": provider_str})),
-            "summary_provider points to a [providers.models] entry without a `model` field; falling back to agent provider"
-        );
-        return None;
-    }
-
-    let options = zeroclaw_providers::options_for_provider_ref(
-        config,
-        provider_str,
-        &zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias),
-    );
-    match zeroclaw_providers::create_resilient_model_provider_from_ref(
-        config,
-        provider_str,
-        model_cfg.api_key.as_deref(),
-        model_cfg.uri.as_deref(),
-        &config.reliability,
-        &options,
-    ) {
-        Ok(provider) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(
-                        ::serde_json::json!({"provider": provider_str, "model": model.as_str()})
-                    ),
-                "summary_provider override active"
-            );
-            Some((provider, model))
-        }
-        Err(e) => {
-            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
-                "Failed to initialize summary_provider; falling back to agent provider"
-            );
-            None
-        }
-    }
-}
-
-/// Runtime deprecation nudge for the legacy `context_compression.summary_model`
-/// fallback path (#7964). When no `summary_provider` is resolved and the
-/// deprecated bare `summary_model` is dispatched on the agent's OWN provider,
-/// WARN once per agent per process that this can silently mismatch for a
-/// runtime profile shared across providers, and recommend migrating to
-/// `summary_provider`. The config-time `cross_provider_summary_model`
-/// diagnostic carries the precise cross-provider detection; this is the
-/// belt-and-suspenders signal on the hot path, deduped so it does not spam
-/// every turn. Mirrors the warn-once pattern in `agent::cost`.
-///
-/// `pub` so the channel orchestrator's proactive-compression fallback (the third
-/// dispatch site, in `zeroclaw-channels`) shares this same process-global
-/// warn-once set, keeping the signal one-per-agent across every fallback path.
-pub fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
-    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-    let first = {
-        let mut seen = SEEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.insert(agent_alias.to_string())
-    };
-    if !first {
-        return;
-    }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(
-                ::serde_json::json!({"agent": agent_alias, "summary_model": summary_model})
-            ),
-        "Deprecated context_compression.summary_model is being dispatched on this agent's own \
-         provider. A bare summary_model shared by a runtime profile across providers can \
-         silently summarize on the wrong provider (#7964). Migrate to summary_provider. \
-         This warning fires once per agent per process."
-    );
-}
-
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1190,6 +1081,8 @@ pub async fn run(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let channel_name = if interactive { "cli" } else { "daemon" };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -1289,6 +1182,7 @@ pub async fn run(
         let delegate_handle = all_tools_result.delegate_handle;
         let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
         let ask_user_handle = all_tools_result.ask_user_handle;
+        let channel_room_handle = all_tools_result.channel_room_handle;
         let reaction_handle = all_tools_result.reaction_handle;
         let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
@@ -1296,6 +1190,7 @@ pub async fn run(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle,
+            &channel_room_handle,
             &reaction_handle,
             &poll_handle,
             &escalate_handle,
@@ -1578,9 +1473,9 @@ pub async fn run(
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: Some(agent_alias.to_string()),
+            turn_id: Some(turn_id.clone()),
         });
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -1716,6 +1611,10 @@ pub async fn run(
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
         tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels. Use with Matrix channel keys such as matrix.default.",
+        ));
+        tool_descs.push((
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
@@ -1796,7 +1695,6 @@ pub async fn run(
         } else {
             None
         };
-        let channel_name = if interactive { "cli" } else { "daemon" };
         let memory_session_id = session_state_file.as_deref().and_then(|path| {
             let raw = path.to_string_lossy().trim().to_string();
             if raw.is_empty() {
@@ -1810,21 +1708,8 @@ pub async fn run(
         });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
-        let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
-            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-                .map(|tracker| {
-                    let pricing: crate::agent::cost::ModelProviderPricing = config
-                        .providers
-                        .models
-                        .iter_entries()
-                        .map(|(type_k, alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
-                        .filter(|(_, p)| !p.is_empty())
-                        .collect();
-                    ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
-                        .with_agent_alias(agent_alias)
-                });
+        let cost_tracking_context =
+            crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();
@@ -1908,6 +1793,7 @@ pub async fn run(
                 &skills,
                 &runtime_capability_names,
                 &config.data_dir,
+                &config.skills.extra_registries,
                 config.skills.install_suggestions.enabled,
             ) {
                 final_output = suggestion;
@@ -1976,13 +1862,12 @@ pub async fn run(
                 ChatMessage::user(&enriched),
             ];
 
-            // Prune history for token efficiency (when enabled).
-            if agent.resolved.history_pruning.enabled {
-                let _stats = crate::agent::history_pruner::prune_history(
-                    &mut history,
-                    &agent.resolved.history_pruning,
-                );
-            }
+            // Compute per-turn excluded MCP tools from tool_filter_groups.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &agent.resolved.tool_filter_groups,
+                &effective_msg,
+            );
 
             #[allow(unused_assignments)]
             let mut response = String::new();
@@ -2044,7 +1929,9 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent.resolved.max_context_tokens,
+                                        context_token_budget: agent
+                                            .resolved
+                                            .effective_context_budget(),
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -2063,6 +1950,8 @@ pub async fn run(
                                 // Phase 1: stamp Internal/Trusted. Real per-transport
                                 // stamping is PR C (RFC #6971 §4).
                                 ingress: IngressContext::internal(),
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
                             }),
                         ),
                     )
@@ -2120,9 +2009,9 @@ pub async fn run(
                             observer.record_event(&ObserverEvent::AgentStart {
                                 model_provider: provider_name.to_string(),
                                 model: model_name.to_string(),
-                                channel: None,
-                                agent_alias: None,
-                                turn_id: None,
+                                channel: Some(channel_name.to_string()),
+                                agent_alias: Some(agent_alias.to_string()),
+                                turn_id: Some(turn_id.clone()),
                             });
 
                             continue;
@@ -2222,6 +2111,7 @@ pub async fn run(
                             agent.resolved.max_tool_result_chars,
                             agent.resolved.max_context_tokens,
                             None, // cancellation_token — no parent token in single-shot run
+                            Some(agent_alias),
                         ),
                     )
                     .await;
@@ -2374,6 +2264,7 @@ pub async fn run(
                     &skills,
                     &runtime_capability_names,
                     &config.data_dir,
+                    &config.skills.extra_registries,
                     config.skills.install_suggestions.enabled,
                 ) {
                     final_output = suggestion;
@@ -2559,7 +2450,9 @@ pub async fn run(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
-                                            context_token_budget: agent.resolved.max_context_tokens,
+                                            context_token_budget: agent
+                                                .resolved
+                                                .effective_context_budget(),
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2578,6 +2471,8 @@ pub async fn run(
                                     // Phase 1: stamp Internal/Trusted. Real per-transport
                                     // stamping is PR C (RFC #6971 §4).
                                     ingress: IngressContext::internal(),
+                                    agent_alias: Some(agent_alias),
+                                    turn_id: &turn_id,
                                 }),
                             ),
                         )
@@ -2637,14 +2532,15 @@ pub async fn run(
                                 observer.record_event(&ObserverEvent::AgentStart {
                                     model_provider: provider_name.to_string(),
                                     model: model_name.to_string(),
-                                    channel: None,
-                                    agent_alias: None,
-                                    turn_id: None,
+                                    channel: Some(channel_name.to_string()),
+                                    agent_alias: Some(agent_alias.to_string()),
+                                    turn_id: Some(turn_id.clone()),
                                 });
 
                                 continue;
                             }
-                            // Context overflow recovery: compress and retry
+                            // Context overflow recovery: drop oldest whole
+                            // turns and retry. No summarization, no splicing.
                             if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -2655,66 +2551,28 @@ pub async fn run(
                                     .with_category(::zeroclaw_log::EventCategory::Agent),
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
-                                let mut compressor =
-                                    crate::agent::context_compressor::ContextCompressor::new(
-                                        agent.resolved.context_compression.clone(),
-                                        eff_max_context_tokens,
-                                    )
-                                    .with_memory(mem.clone());
-                                let error_msg = format!("{e}");
-                                // Resolve the agent's effective summary provider
-                                // (#7964). On any failure we fall back to the
-                                // agent's own provider + model (with the
-                                // deprecated `summary_model` swap), and only the
-                                // agent-provider path may preserve media markers.
-                                let resolved_summary =
-                                    resolve_summary_provider(&config, agent_alias);
-                                let summary_target = match resolved_summary {
-                                    Some((ref provider, ref model)) => {
-                                        crate::agent::context_compressor::SummaryTarget {
-                                            provider: provider.as_ref(),
-                                            model: model.as_str(),
-                                            preserve_media_markers: false,
-                                        }
-                                    }
-                                    None => {
-                                        if let Some(legacy) = agent
-                                            .resolved
-                                            .context_compression
-                                            .summary_model
-                                            .as_deref()
-                                            .filter(|m| !m.trim().is_empty())
-                                        {
-                                            warn_deprecated_summary_model_fallback(
-                                                agent_alias,
-                                                legacy,
-                                            );
-                                        }
-                                        crate::agent::context_compressor::SummaryTarget {
-                                            provider: model_provider.as_ref(),
-                                            model: agent
-                                                .resolved
-                                                .context_compression
-                                                .summary_model
-                                                .as_deref()
-                                                .unwrap_or(&model_name),
-                                            preserve_media_markers: model_provider
-                                                .supports_vision(),
-                                        }
-                                    }
-                                };
-                                match compressor
-                                    .compress_on_error(
-                                        &mut history,
-                                        model_provider.as_ref(),
-                                        &model_name,
-                                        temperature,
-                                        &error_msg,
-                                        summary_target,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {
+                                let taken = std::mem::take(&mut history);
+                                let result = crate::agent::history_trim::trim_to_recent_turns(
+                                    taken,
+                                    eff_max_context_tokens,
+                                );
+                                if result.trimmed {
+                                    let mut trimmed = result.history;
+                                    let system_count =
+                                        trimmed.iter().take_while(|m| m.role == "system").count();
+                                    trimmed.insert(
+                                        system_count,
+                                        crate::agent::history_trim::breadcrumb(),
+                                    );
+                                    history = trimmed;
+                                    {
+                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                            target: "zeroclaw_log_internal_scope",
+                                            "zeroclaw_scope",
+                                            model = %model_name,
+                                            model_provider = %provider_name,
+                                        );
+                                        let _zc_trim_guard = __zc_trim_span.entered();
                                         ::zeroclaw_log::record!(
                                             INFO,
                                             ::zeroclaw_log::Event::new(
@@ -2722,26 +2580,36 @@ pub async fn run(
                                                 ::zeroclaw_log::Action::Retry
                                             )
                                             .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                                            "Context recovered via compression, retrying turn"
-                                        );
-                                        continue;
-                                    }
-                                    Ok(false) => {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "Compression ran but couldn't reduce enough"
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                            .with_attrs(::serde_json::json!({
+                                                "dropped_messages": result.dropped_messages,
+                                                "dropped_turns": result.dropped_turns,
+                                                "kept_turns": result.kept_turns,
+                                            })),
+                                            "Context recovered via whole-turn trim, retrying turn"
                                         );
                                     }
-                                    Err(compress_err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
-                                    }
+                                    continue;
+                                }
+                                history = result.history;
+                                {
+                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                        target: "zeroclaw_log_internal_scope",
+                                        "zeroclaw_scope",
+                                        model = %model_name,
+                                        model_provider = %provider_name,
+                                    );
+                                    let _zc_trim_guard = __zc_trim_span.entered();
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                        "Context overflow but only one turn remains; cannot trim further"
+                                    );
                                 }
                             }
 
@@ -2769,78 +2637,6 @@ pub async fn run(
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
 
-                // Context compression before hard trimming to preserve long-context signal.
-                {
-                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                        agent.resolved.context_compression.clone(),
-                        eff_max_context_tokens,
-                    )
-                    .with_memory(mem.clone());
-                    // Resolve the agent's effective summary provider (#7964);
-                    // fall back to the agent's own provider + model on any
-                    // failure, preserving media markers only on that path.
-                    let resolved_summary = resolve_summary_provider(&config, agent_alias);
-                    let summary_target = match resolved_summary {
-                        Some((ref provider, ref model)) => {
-                            crate::agent::context_compressor::SummaryTarget {
-                                provider: provider.as_ref(),
-                                model: model.as_str(),
-                                preserve_media_markers: false,
-                            }
-                        }
-                        None => {
-                            if let Some(legacy) = agent
-                                .resolved
-                                .context_compression
-                                .summary_model
-                                .as_deref()
-                                .filter(|m| !m.trim().is_empty())
-                            {
-                                warn_deprecated_summary_model_fallback(agent_alias, legacy);
-                            }
-                            crate::agent::context_compressor::SummaryTarget {
-                                provider: model_provider.as_ref(),
-                                model: agent
-                                    .resolved
-                                    .context_compression
-                                    .summary_model
-                                    .as_deref()
-                                    .unwrap_or(&model_name),
-                                preserve_media_markers: model_provider.supports_vision(),
-                            }
-                        }
-                    };
-                    match compressor
-                        .compress_if_needed(
-                            &mut history,
-                            model_provider.as_ref(),
-                            &model_name,
-                            temperature,
-                            summary_target,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.compressed => {
-                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Success).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
-                        }
-                        Ok(_) => {} // No compression needed
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Context compression failed, falling back to history trim"
-                            );
-                            trim_history(&mut history, eff_max_history_messages / 2);
-                        }
-                    }
-                }
-
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
 
@@ -2865,9 +2661,9 @@ pub async fn run(
             duration,
             tokens_used: None,
             cost_usd: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: Some(agent_alias.to_string()),
+            turn_id: Some(turn_id),
         });
 
         Ok(final_output)
@@ -3018,6 +2814,7 @@ pub async fn process_message(
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
         let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
         let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
+        let channel_room_handle_pm = all_tools_result_pm.channel_room_handle;
         let reaction_handle_pm = all_tools_result_pm.reaction_handle;
         let poll_handle_pm = all_tools_result_pm.poll_handle;
         let escalate_handle_pm = all_tools_result_pm.escalate_handle;
@@ -3025,6 +2822,7 @@ pub async fn process_message(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle_pm,
+            &channel_room_handle_pm,
             &reaction_handle_pm,
             &poll_handle_pm,
             &escalate_handle_pm,
@@ -3296,6 +3094,10 @@ pub async fn process_message(
         if config.composio.enabled {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
+        tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels.",
+        ));
         if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
             tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
             tool_descs.push((
@@ -3450,6 +3252,7 @@ pub async fn process_message(
             &skills,
             &runtime_capability_names,
             &config.data_dir,
+            &config.skills.extra_registries,
             config.skills.install_suggestions.enabled,
         ) {
             return Ok(suggestion);
@@ -3537,14 +3340,20 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, build_context, emergency_history_trim,
-        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
+        load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
@@ -3560,6 +3369,71 @@ mod tests {
         CancelsTurnTool,
         VerboseTool,
     );
+
+    struct SeedMockChannel;
+
+    impl ::zeroclaw_api::attribution::Attributable for SeedMockChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SeedMockChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── seed_channel_handles tests ───────────────────────────────
+
+    #[test]
+    fn seed_channel_handles_populates_channel_room_handle() {
+        let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
+        super::register_channel_map_fn(Box::new(move || {
+            let mut map = HashMap::new();
+            map.insert("matrix.default".to_string(), Arc::clone(&channel));
+            map
+        }));
+
+        let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
+        let channel_room_handle = Arc::new(RwLock::new(HashMap::new()));
+        let reaction = Arc::new(RwLock::new(HashMap::new()));
+        let poll_handle = Arc::new(RwLock::new(HashMap::new()));
+        let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
+
+        let count = seed_channel_handles(
+            &Some(Arc::clone(&ask_user_handle)),
+            &Some(Arc::clone(&channel_room_handle)),
+            &reaction,
+            &Some(Arc::clone(&poll_handle)),
+            &Some(Arc::clone(&escalate_handle)),
+        );
+
+        assert_eq!(count, 1);
+        assert!(ask_user_handle.read().contains_key("matrix.default"));
+        assert!(channel_room_handle.read().contains_key("matrix.default"));
+        assert!(reaction.read().contains_key("matrix.default"));
+        assert!(poll_handle.read().contains_key("matrix.default"));
+        assert!(escalate_handle.read().contains_key("matrix.default"));
+    }
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
 
@@ -3711,102 +3585,6 @@ mod tests {
         use crate::agent::history::truncate_tool_message;
         let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
         assert_eq!(truncate_tool_message(msg, 2000), msg);
-    }
-
-    // ── fast_trim_tool_results tests ────────────────────────────
-
-    #[test]
-    fn fast_trim_protects_recent_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("a".repeat(5000)),
-            ChatMessage::tool("b".repeat(5000)),
-            ChatMessage::user("recent user msg"),
-            ChatMessage::tool("c".repeat(5000)), // recent, should be protected
-        ];
-        // protect_last_n = 2 → last 2 messages protected
-        let saved = fast_trim_tool_results(&mut history, 2);
-        assert!(saved > 0);
-        // First two tool messages should be trimmed
-        assert!(history[1].content.len() <= 2100);
-        assert!(history[2].content.len() <= 2100);
-        // Last tool message (protected) should be unchanged
-        assert_eq!(history[4].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_skips_non_tool_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("a".repeat(5000)),
-            ChatMessage::assistant("b".repeat(5000)),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content.len(), 5000);
-        assert_eq!(history[2].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_small_tool_results_unchanged() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("short result"),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content, "short result");
-    }
-
-    // ── emergency_history_trim tests ──────────────────────────────
-
-    #[test]
-    fn emergency_trim_preserves_system() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("msg1"),
-            ChatMessage::assistant("resp1"),
-            ChatMessage::user("msg2"),
-            ChatMessage::assistant("resp2"),
-            ChatMessage::user("msg3"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // System message should always be preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "sys");
-        // Last 2 messages should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "msg3");
-    }
-
-    #[test]
-    fn emergency_trim_preserves_recent() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old1"),
-            ChatMessage::user("old2"),
-            ChatMessage::user("recent1"),
-            ChatMessage::user("recent2"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // Last 2 should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "recent2");
-        assert_eq!(history[len - 2].content, "recent1");
-    }
-
-    #[test]
-    fn emergency_trim_nothing_to_drop() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("only user msg"),
-        ];
-        // protect_last = 1, system is protected → only 1 droppable
-        // target_drop = 2/3 = 0 → nothing dropped
-        let dropped = emergency_history_trim(&mut history, 1);
-        assert_eq!(dropped, 0);
     }
 
     // ── estimate_history_tokens tests ─────────────────────────────
@@ -4018,8 +3796,8 @@ mod tests {
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -4052,12 +3830,18 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let result = execute_one_tool(
             "unknown_tool",
             call_arguments,
             None,
             &[],
             None,
+            &meta,
             &observer,
             None,
             None,
@@ -4085,12 +3869,18 @@ mod tests {
             .unwrap()
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
             &[],
             Some(&activated),
+            &meta,
             &observer,
             None,
             None, // receipt_generator
@@ -4124,12 +3914,18 @@ mod tests {
         })
         .join();
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
             &[],
             Some(&activated),
+            &meta,
             &observer,
             None,
             None,
@@ -4148,12 +3944,18 @@ mod tests {
         let observer = NoopObserver;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "empty_success",
             serde_json::json!({}),
             None,
             &tools,
             None,
+            &meta,
             &observer,
             None,
             None, // receipt_generator
@@ -4193,12 +3995,18 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "credential_output",
             serde_json::json!({}),
             None,
             &tools,
             None,
+            &meta,
             &observer,
             None,
             None, // receipt_generator
@@ -4884,6 +4692,55 @@ mod tests {
         }
     }
 
+    struct ApprovingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl ApprovingChannel {
+        fn new(approval_requests: Arc<AtomicUsize>) -> Self {
+            Self { approval_requests }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ApprovingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "approving-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approving-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
+
     struct CredentialOutputTool;
 
     #[async_trait]
@@ -5117,6 +4974,7 @@ mod tests {
     /// image the user actually sent.
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5170,6 +5028,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("user image on a non-vision provider should error");
@@ -5181,6 +5041,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_skips_oversized_image_payload() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = RecordingModelProvider::new().with_vision_support();
         let recorded_requests = Arc::clone(&model_provider.requests);
 
@@ -5240,6 +5101,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("oversized payload should be skipped and continue as text-only");
@@ -5284,6 +5147,7 @@ mod tests {
         ];
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
@@ -5327,6 +5191,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("a carried-over image must not fail a plain-text turn");
@@ -5356,6 +5222,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = VisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5409,6 +5276,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("valid multimodal payload should pass");
@@ -5425,6 +5294,7 @@ mod tests {
     /// text/metadata survives).
     #[tokio::test]
     async fn run_tool_call_loop_degrades_tool_result_image_for_non_vision_provider() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5482,6 +5352,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("text-only fallback should succeed, not abort the turn");
@@ -5496,6 +5368,7 @@ mod tests {
     /// capability error).
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_creation_failure() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5555,6 +5428,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("should fail when vision model_provider cannot be created");
@@ -5572,6 +5447,7 @@ mod tests {
     /// when `vision_model_provider` is configured.
     #[tokio::test]
     async fn run_tool_call_loop_no_images_uses_default_provider() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec!["hello world"]);
 
         let mut history = vec![ChatMessage::user("just text, no images".to_string())];
@@ -5628,6 +5504,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("text-only messages should succeed with default model_provider");
@@ -5649,6 +5527,7 @@ mod tests {
             let mut history = vec![ChatMessage::user("hello".to_string())];
             let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
             let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution {
@@ -5690,6 +5569,8 @@ mod tests {
                 new_messages_out: None,
                 image_cache: None,
                 ingress: ctx,
+                agent_alias: None,
+                turn_id: &turn_id,
             })
             .await
             .expect("default-Loop ingress must run the turn exactly as today")
@@ -5719,6 +5600,7 @@ mod tests {
     /// model should be used as fallback for the vision model_provider.
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5781,6 +5663,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
@@ -5798,6 +5682,7 @@ mod tests {
     /// parser) should not trigger vision model_provider routing.
     #[tokio::test]
     async fn run_tool_call_loop_empty_image_markers_use_default_provider() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec!["handled"]);
 
         let mut history = vec![ChatMessage::user(
@@ -5853,6 +5738,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -5864,6 +5751,7 @@ mod tests {
     /// vision_model_provider is configured.
     #[tokio::test]
     async fn run_tool_call_loop_multiple_images_trigger_vision_routing() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -5924,6 +5812,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
@@ -5998,6 +5888,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_executes_multiple_tools_with_ordered_results() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"delay_a","arguments":{"value":"A"}}
@@ -6079,6 +5970,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("parallel execution should complete");
@@ -6115,6 +6008,7 @@ mod tests {
     /// its own tool_call_id and output.
     #[tokio::test]
     async fn run_tool_call_loop_native_emits_tool_message_per_parallel_call() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_native_tool_calls(
             vec![
                 ("call_a", "delay_a", r#"{"value":"A"}"#),
@@ -6201,6 +6095,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("native parallel execution should complete");
@@ -6294,6 +6190,7 @@ mod tests {
     // interrupted result for that same tool_call_id (#7778 regression).
     #[tokio::test]
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_native_tool_calls(
             vec![
                 ("call_fast", "fast_tool", "{}"),
@@ -6370,6 +6267,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await;
 
@@ -6429,6 +6328,8 @@ mod tests {
         ];
         let observer = NoopObserver;
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6471,6 +6372,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6496,6 +6399,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_preserves_explicit_cron_delivery_none() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"run silently","schedule":{"kind":"every","every_ms":60000},"delivery":{"mode":"none"}}}
@@ -6557,6 +6461,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6574,6 +6480,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_lark() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
@@ -6635,6 +6542,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("lark cron_add delivery defaults should be injected");
@@ -6660,6 +6569,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_feishu() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"feishu reminder","schedule":{"kind":"every","every_ms":60000}}}
@@ -6721,6 +6631,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("feishu cron_add delivery defaults should be injected");
@@ -6746,6 +6658,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
@@ -6810,6 +6723,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6834,6 +6749,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"shell","arguments":{"command":"echo hello"}}
@@ -6904,6 +6820,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6922,7 +6840,297 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell"),
+        ];
+        let observer = NoopObserver;
+        let knobs = LoopKnobs {
+            dedup_enabled: false,
+            ..LoopKnobs::default()
+        };
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect_err("identical prompt-required shell call should abort before another prompt");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the repeated shell call should not execute a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_skips_same_round_prompt_required_shell_duplicate_without_reprompting()
+     {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat shell in one response"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("same-round prompt-required duplicate should use duplicate result path");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "same-round duplicate should not execute a second time"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(tool_results.content.contains("counted:"));
+        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_prompt_guard_ignores_same_round_dedup_exempt_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let repeated_shell_call = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            repeated_shell_call,
+            repeated_shell_call,
+            "should not reach final response",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("repeat dedup-exempt shell"),
+        ];
+        let observer = NoopObserver;
+        let dedup_exempt = vec!["shell".to_string()];
+
+        let err = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &dedup_exempt,
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect_err("dedup-exempt prompt-required repeats should still abort before reprompting");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("repeated prompt-required tool call 'shell'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not issue a second approval request"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "dedup-exempt repeated shell should not execute a second time"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
@@ -6988,6 +7196,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -7017,6 +7227,7 @@ mod tests {
     /// intentional, not a duplicate to collapse.
     #[tokio::test]
     async fn run_tool_call_loop_reentrant_agent_tools_are_dedup_exempt_by_default() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"spawn_subagent","arguments":{"prompt":"same"}}
@@ -7081,6 +7292,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("loop should finish running both identical subagent calls");
@@ -7095,6 +7308,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_only_affects_listed_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
@@ -7173,6 +7387,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("loop should complete");
@@ -7191,6 +7407,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
             "done",
@@ -7251,6 +7468,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("native fallback id flow should complete");
@@ -7276,6 +7495,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_retries_malformed_tool_protocol_without_leaking_json() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
             "Recovered answer.",
@@ -7333,6 +7553,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -7354,6 +7576,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_preserves_unknown_function_call_json_with_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let business_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
@@ -7410,6 +7633,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("business JSON should be returned as normal text");
@@ -7430,6 +7655,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_preserves_malformed_unknown_tool_calls_json_with_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -7485,6 +7711,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("unknown business JSON should be returned as normal text");
@@ -7505,6 +7733,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_falls_back_after_repeated_malformed_tool_protocol() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#,
             r#"{"toolcalls":[{"call_id":"call_2","arguments":{"value":"Y"}}]}"#,
@@ -7563,6 +7792,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("malformed tool protocol should return a safe fallback");
@@ -7586,6 +7817,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_toolcalls_reference_json_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![reference_json]);
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -7638,6 +7870,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -7661,6 +7895,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_toolcalls_reference_json_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -7712,6 +7947,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -7727,6 +7964,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_schema_json_array_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![schema]);
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -7778,6 +8016,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("schema JSON should remain visible without tools");
@@ -7793,6 +8033,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_tool_calls_audit_json_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let audit_json =
             r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![audit_json]);
@@ -7845,6 +8086,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("audit JSON should remain visible without tools");
@@ -7860,6 +8103,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_function_call_reference_json_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let reference_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
@@ -7912,6 +8156,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("reference JSON should remain visible without tools");
@@ -7927,6 +8173,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_tool_call_tag_example_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let example = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>
@@ -7981,6 +8228,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("tool_call tag examples should remain visible without tools");
@@ -7996,6 +8245,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_tool_call_fenced_example_with_registered_tool() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let example = r#"```tool_call
 {"name":"count_tool","arguments":{"value":"X"}}
 ```
@@ -8055,6 +8305,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("registered tool_call fenced examples should remain visible");
@@ -8083,6 +8335,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_returns_tool_call_tag_example_with_registered_tool() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let example = r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"X"}}
 </tool_call>
@@ -8141,6 +8394,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("registered tool_call tag examples should remain visible");
@@ -8155,6 +8410,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_retries_tagged_tool_call_with_trailing_text_without_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let leaked = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>
@@ -8210,6 +8466,8 @@ Done."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
@@ -8226,6 +8484,7 @@ Done."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_retries_embedded_fenced_tool_call_without_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let leaked = r#"Let me call it:
 ```tool_call
 {"name":"shell","arguments":{"command":"pwd"}}
@@ -8282,6 +8541,8 @@ Done."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("embedded fenced tool protocol should retry and recover");
@@ -8298,6 +8559,7 @@ Done."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_retries_malformed_tool_protocol_fenced_call_without_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let leaked = r#"```tool_call
 {"name":"shell","arguments":{"command":"pwd"}}
 ```"#;
@@ -8352,6 +8614,8 @@ Done."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
@@ -8368,6 +8632,7 @@ Done."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_tool_call_fenced_example_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let example = r#"```tool_call
 {"name":"shell","arguments":{"command":"pwd"}}
 ```
@@ -8423,6 +8688,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("tool_call fenced examples should remain visible without tools");
@@ -8446,6 +8713,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_split_tool_call_fenced_example_when_no_tools_are_enabled() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         struct SplitFencedExampleProvider;
         impl_test_model_provider_attribution!(SplitFencedExampleProvider);
 
@@ -8551,6 +8819,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
@@ -8575,6 +8845,7 @@ This is an example, not an invocation."#;
     #[tokio::test]
     async fn run_tool_call_loop_streams_json_fenced_tool_protocol_example_when_no_tools_are_enabled()
      {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let example = r#"```json
 {"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
 ```
@@ -8630,6 +8901,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
@@ -8653,6 +8926,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_executes_streamed_tool_call_fence_without_draft_leak() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![
             r#"```tool_call
 {"name":"count_tool","arguments":{"value":"X"}}
@@ -8713,6 +8987,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("streamed fenced tool call should execute and continue");
@@ -8735,6 +9011,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_sanitizes_native_tool_call_text_before_display_and_history() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
                 ChatResponse {
@@ -8819,6 +9096,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -8878,6 +9157,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
             StreamingScriptedModelProvider::from_text_responses(vec!["streamed final answer"]);
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -8930,6 +9210,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("streaming model_provider should complete");
@@ -8955,6 +9237,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_streaming_path_preserves_tool_loop_semantics() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = StreamingScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
@@ -9015,6 +9298,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -9843,6 +10128,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_native_tool_events_without_chat_fallback() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
             NativeStreamTurn::ToolCall(ToolCall {
                 id: "call_native_1".to_string(),
@@ -9906,6 +10192,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -9961,6 +10249,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10001,6 +10291,8 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("narration-then-tool streaming should preserve tool loop semantics");
@@ -10057,6 +10349,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10097,6 +10391,8 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("guard-withheld narration tail should not break the tool loop");
@@ -10176,6 +10472,7 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_routed_streaming_uses_live_provider_deltas_once() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let default_model_provider = RouteAwareStreamingModelProvider::new("default answer");
         let default_stream_calls = Arc::clone(&default_model_provider.stream_calls);
         let default_chat_calls = Arc::clone(&default_model_provider.chat_calls);
@@ -10251,6 +10548,8 @@ This is an example, not an invocation."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("routed streaming model_provider should complete");
@@ -12291,6 +12590,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"failing_shell","arguments":{"command":"rm -rf /"}}
@@ -12353,6 +12653,8 @@ Let me check the result."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("tool loop should complete");
@@ -12451,6 +12753,7 @@ Let me check the result."#;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
                 text: Some("done".to_string()),
@@ -12524,6 +12827,8 @@ Let me check the result."#;
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
                     ingress: IngressContext::internal(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
                 }),
             )
             .await
@@ -12541,6 +12846,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn tool_loop_normalizes_non_leading_system_messages_before_provider_request() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let provider = RecordingModelProvider::new();
         let requests = Arc::clone(&provider.requests);
         let observer = NoopObserver;
@@ -12594,6 +12900,8 @@ Let me check the result."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("tool loop should complete");
@@ -12627,6 +12935,7 @@ Let me check the result."#;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
             ScriptedModelProvider::from_text_responses(vec!["should not reach this"]);
         let observer = NoopObserver;
@@ -12703,6 +13012,8 @@ Let me check the result."#;
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
                     ingress: IngressContext::internal(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
                 }),
             )
             .await
@@ -12716,6 +13027,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn cost_tracking_is_noop_without_scope() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         use super::{ToolLoop, run_tool_call_loop};
         use crate::observability::noop::NoopObserver;
 
@@ -12778,6 +13090,8 @@ Let me check the result."#;
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("should succeed without cost scope");
@@ -12785,7 +13099,122 @@ Let me check the result."#;
         assert_eq!(result, "ok");
     }
 
-    // ── Skill review fork cost-accounting tests ──
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn trim_record_carries_model_attribution() {
+        use super::{ToolLoop, run_tool_call_loop};
+        use crate::observability::noop::NoopObserver;
+        use ::zeroclaw_log::Instrument;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+
+        let big = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("turn3 short"),
+        ];
+
+        let _ = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "anthropic.personal",
+                    model: "claude-opus-4-8",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &[],
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 1,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 50,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: "test-turn-id",
+        })
+        .instrument(zeroclaw_log::attribution_span!(
+            &crate::agent::AgentAttribution("trimtest")
+        ))
+        .await
+        .expect("loop should succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut trim_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.starts_with("History trimmed:"))
+                    {
+                        trim_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = trim_event.expect("trim record must be emitted when history exceeds budget");
+        assert_eq!(
+            value["zeroclaw"]["model"], "claude-opus-4-8",
+            "trim record must carry model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider"], "anthropic.personal",
+            "trim record must carry model_provider attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "trimtest",
+            "trim record must inherit agent_alias from the agent attribution span, got: {value}"
+        );
+    }
     //
     // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
     // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
@@ -12873,6 +13302,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // agent_alias — no parent alias in the review-fork test fixture
                 ),
             )
             .await;
@@ -12956,6 +13386,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // agent_alias — no parent alias in the review-fork test fixture
                 ),
             )
             .await;
@@ -13553,6 +13984,353 @@ Let me check the result."#;
         assert!(
             after_deny.contains(&"file_read"),
             "non-excluded file_read must remain, got {after_deny:?}"
+        );
+    }
+
+    // ── Observer metadata regression tests ──
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for CapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    fn assert_all_events_share_turn_id(
+        events: &[ObserverEvent],
+        expected_alias: Option<&str>,
+        expected_channel: Option<&str>,
+    ) {
+        // Regression guard for PR #7771: every lifecycle observer event that
+        // carries the `(channel, agent_alias, turn_id)` correlation triple
+        // MUST populate all three. These six variants back OTel parent-child
+        // span linkage and per-agent attribution; a `None` in any field
+        // silently breaks trace correlation. The original `run()` entry point
+        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
+        // `turn_id: None` because it recorded events outside the turn engine.
+        //
+        // This checks each event individually (no skipping
+        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
+        // than only checking consistency among the non-`None` subset — a
+        // single `None` field is a failure, not something to be filtered out.
+        let mut turn_ids: Vec<String> = Vec::new();
+        for event in events {
+            let (variant, channel, agent_alias, turn_id) = match event {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentStart", channel, agent_alias, turn_id),
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentEnd", channel, agent_alias, turn_id),
+                ObserverEvent::LlmRequest {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmRequest", channel, agent_alias, turn_id),
+                ObserverEvent::LlmResponse {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmResponse", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCallStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCallStart", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCall", channel, agent_alias, turn_id),
+                _ => continue,
+            };
+            assert!(
+                channel.is_some(),
+                "{variant} observer event must carry channel, got None: {event:?}"
+            );
+            assert!(
+                agent_alias.is_some(),
+                "{variant} observer event must carry agent_alias, got None: {event:?}"
+            );
+            assert!(
+                turn_id.is_some(),
+                "{variant} observer event must carry turn_id, got None: {event:?}"
+            );
+            turn_ids.push(turn_id.clone().expect("checked Some above"));
+        }
+
+        assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
+        let first = &turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|id| id == first),
+            "all turn_ids should be consistent"
+        );
+
+        if let Some(alias) = expected_alias {
+            for e in events {
+                let agent_alias = match e {
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                    | ObserverEvent::AgentEnd { agent_alias, .. }
+                    | ObserverEvent::LlmRequest { agent_alias, .. }
+                    | ObserverEvent::LlmResponse { agent_alias, .. }
+                    | ObserverEvent::ToolCallStart { agent_alias, .. }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    _ => continue,
+                };
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some(alias),
+                    "agent_alias should be consistent"
+                );
+            }
+        }
+
+        if let Some(channel) = expected_channel {
+            for e in events {
+                let ch = match e {
+                    ObserverEvent::AgentStart { channel: ch, .. }
+                    | ObserverEvent::LlmRequest { channel: ch, .. }
+                    | ObserverEvent::LlmResponse { channel: ch, .. }
+                    | ObserverEvent::ToolCallStart { channel: ch, .. }
+                    | ObserverEvent::ToolCall { channel: ch, .. }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    _ => continue,
+                };
+                assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_events_share_consistent_turn_id_channel_and_alias() {
+        use super::run_tool_call_loop;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: observer.as_ref(),
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 10,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    // ── filter_channel_builtin_tools safe-default bypass ─────────
+    //
+    // At non-Full autonomy the known read-only defaults
+    // (web_search_tool, web_fetch, calculator, etc.) bypass
+    // allowed_tools so the bot can always fetch real-time info.
+    // Operator-added auto_approve entries (e.g. shell) do NOT get
+    // the same bypass — they must be explicitly allowlisted.
+
+    #[test]
+    fn channel_safe_defaults_survive_restrictive_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Restrict allowed_tools to shell only — nothing else is
+        // admitted by the policy itself.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"web_search_tool"),
+            "precondition: web_search_tool in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            filtered.contains(&"web_search_tool"),
+            "safe default web_search_tool must survive restrictive allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"shell"),
+            "shell in allowed_tools must survive, got {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn channel_operator_auto_approve_gated_by_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Operator added shell to auto_approve but allowed_tools
+        // only lists file_read. Under the safe-defaults gate,
+        // shell (NOT a canonical safe default) must still pass
+        // is_tool_allowed — which means it's dropped.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            auto_approve: vec!["shell".into()],
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"file_read"),
+            "precondition: file_read in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            !filtered.contains(&"shell"),
+            "operator-added auto_approve shell must be dropped when not in allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"file_read"),
+            "file_read in allowed_tools must survive, got {filtered:?}"
         );
     }
 }

@@ -1271,6 +1271,7 @@ fn conversation_message_serialization_roundtrip() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1434,6 +1435,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1461,10 +1463,12 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
         ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {}", image_path.display().to_string()),
+            tool_name: String::new(),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
             content: "output2".into(),
+            tool_name: String::new(),
         },
     ])];
 
