@@ -4765,6 +4765,7 @@ async fn process_channel_message_body(
         }
     });
     let loop_knobs = LoopKnobs::default();
+    let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -4832,6 +4833,8 @@ async fn process_channel_message_body(
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
                 ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(ctx.agent_alias.as_str()),
+                turn_id: &turn_id,
             });
             let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(thinking.params.native_thinking, tool_loop);
@@ -4900,9 +4903,9 @@ async fn process_channel_message_body(
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
-                            channel: None,
-                            agent_alias: None,
-                            turn_id: None,
+                            channel: Some(msg.channel.to_string()),
+                            agent_alias: Some(ctx.agent_alias.to_string()),
+                            turn_id: Some(turn_id.clone()),
                         });
 
                         continue;

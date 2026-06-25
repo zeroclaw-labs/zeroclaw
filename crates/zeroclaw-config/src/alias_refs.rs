@@ -45,6 +45,46 @@ pub enum ProviderCategory {
     Transcription,
 }
 
+/// Parse a map-keyed config section path into the alias kind whose rename or
+/// delete needs config-reference cascade handling.
+///
+/// The section path is the parent map path, not a concrete key path:
+/// `agents`, `providers.models.openai`, or `channels.discord`.
+#[must_use]
+pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
+    if path == "agents" {
+        return Some(AliasKind::Agent);
+    }
+
+    if let Some(rest) = path.strip_prefix("providers.") {
+        let (cat, family) = rest.split_once('.')?;
+        if family.is_empty() || family.contains('.') {
+            return None;
+        }
+        let category = match cat {
+            "models" => ProviderCategory::Models,
+            "tts" => ProviderCategory::Tts,
+            "transcription" => ProviderCategory::Transcription,
+            _ => return None,
+        };
+        return Some(AliasKind::Provider {
+            category,
+            family: family.to_string(),
+        });
+    }
+
+    if let Some(ty) = path.strip_prefix("channels.") {
+        if ty.is_empty() || ty.contains('.') {
+            return None;
+        }
+        return Some(AliasKind::Channel {
+            channel_type: ty.to_string(),
+        });
+    }
+
+    None
+}
+
 /// HARD = mandatory referrer; deleting the target invalidates config, so the
 /// delete must refuse. SOFT = removable; the delete scrubs the referrer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
