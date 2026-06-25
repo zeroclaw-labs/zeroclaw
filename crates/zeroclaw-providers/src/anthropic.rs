@@ -1614,7 +1614,10 @@ impl ModelProvider for AnthropicModelProvider {
 
         let body = match Self::build_streaming_request(&native_request) {
             Ok(body) => body,
-            Err(e) => return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) }).boxed(),
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
+                    .boxed();
+            }
         };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
