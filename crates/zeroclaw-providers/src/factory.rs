@@ -2001,6 +2001,137 @@ mod tests {
         );
     }
 
+    // Symmetric pair of `responses_factory_forwards_timeout_secs_to_responses_provider`
+    // (singlerider 🟡 follow-up, review 4568610917): the factory wiring for
+    // `extra_headers` must (a) emit configured custom headers on the wire and
+    // (b) drop a case-insensitive `Authorization` from `extra_headers` so the
+    // built-in bearer credential is the only one on the request. The drop is
+    // the security boundary — reqwest 0.12 *appends* per-request headers on
+    // top of `default_headers`, so a duplicated `Authorization` would produce
+    // two values and the server would pick one unpredictably.
+    #[tokio::test]
+    async fn responses_factory_forwards_extra_headers_to_responses_provider() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture_headers(
+            State(captured): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            *captured.lock().expect("captured headers mutex") = Some(headers);
+            Json(json!({
+                "id": "resp_ok",
+                "object": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/responses", post(capture_headers))
+            .with_state(Arc::clone(&captured));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some(format!("http://{addr}/v1")),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let mut extra_headers = HashMap::new();
+        // The two non-reserved custom headers we expect to see on the wire.
+        extra_headers.insert("X-Trace-Id".to_string(), "trace-abc-123".to_string());
+        extra_headers.insert("X-Tenant".to_string(), "acme".to_string());
+        // The reserved-header case we expect the factory to drop — the
+        // built-in `Bearer test-key` (from `Some("test-key")` below) must be
+        // the only Authorization value on the request.
+        extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer should-be-dropped".to_string(),
+        );
+        // And the case-insensitive variant — must be dropped by the same
+        // case-insensitive check in `build_default_headers`.
+        extra_headers.insert(
+            "authorization".to_string(),
+            "Bearer lower-case-should-also-be-dropped".to_string(),
+        );
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                Some("test-key"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai responses provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5", Some(0.7))
+            .await;
+
+        server.abort();
+
+        assert!(result.is_ok(), "fast response should succeed: {result:?}");
+
+        let captured_headers = captured
+            .lock()
+            .expect("captured headers mutex")
+            .clone()
+            .expect("server handler must have captured the request headers");
+
+        // (a) configured custom headers arrive on the wire.
+        assert_eq!(
+            captured_headers
+                .get("X-Trace-Id")
+                .map(|v| v.to_str().unwrap()),
+            Some("trace-abc-123"),
+            "configured extra_headers['X-Trace-Id'] must reach the wire"
+        );
+        assert_eq!(
+            captured_headers
+                .get("X-Tenant")
+                .map(|v| v.to_str().unwrap()),
+            Some("acme"),
+            "configured extra_headers['X-Tenant'] must reach the wire"
+        );
+
+        // (b) only one Authorization value, and it is the built-in one. The
+        // case-insensitive drop in `build_default_headers` (see
+        // `crates/zeroclaw-providers/src/openai.rs::build_default_headers`)
+        // must reject both the `Authorization` and the lowercase
+        // `authorization` entries from extra_headers — the only Authorization
+        // left on the wire is the one the provider built from the
+        // constructor-supplied credential.
+        let auth_values: Vec<&str> = captured_headers
+            .get_all("Authorization")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            auth_values.len(),
+            1,
+            "exactly one Authorization header must reach the wire; got {auth_values:?}"
+        );
+        assert_eq!(
+            auth_values[0], "Bearer test-key",
+            "the surviving Authorization must be the built-in bearer credential, not the dropped extra_headers entry"
+        );
+    }
+
     #[test]
     fn custom_factory_disables_native_tools_by_default() {
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
