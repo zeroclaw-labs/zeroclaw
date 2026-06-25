@@ -19671,8 +19671,9 @@ pub struct SopConfig {
     pub max_concurrent_total: usize,
 
     /// Approval timeout in seconds. When a run waits for approval longer than
-    /// this, Critical/High-priority SOPs auto-approve; others stay waiting.
-    /// Set to 0 to disable timeout.
+    /// this, the configured `approval_timeout_action` is applied (default
+    /// `escalate`: re-surface the gate to the out-of-band approver and never
+    /// self-approve). Set to 0 to disable the timeout sweep.
     #[serde(default = "default_sop_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 

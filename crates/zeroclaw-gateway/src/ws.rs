@@ -264,6 +264,88 @@ async fn resolve_ws_memory_handle(
         .map(Some)
 }
 
+/// Resolve a SOP approval gate from a WebSocket `kind:"sop"` `approval_response`
+/// frame and reply with the result/error frame. Returns `true` when the frame was
+/// a SOP frame (handled), so the caller stops further processing.
+///
+/// EPIC C: the principal is transport-derived (ws + session id), never from the
+/// frame. Shared by the idle connection loop AND the mid-turn forward loop so a
+/// SOP approval over the same connection is answered, never silently dropped, no
+/// matter when it arrives.
+async fn handle_ws_sop_frame<S>(
+    parsed: &serde_json::Value,
+    state: &AppState,
+    session_id: &str,
+    sender: &mut S,
+) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if parsed["kind"].as_str() != Some("sop") {
+        return false;
+    }
+    let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+    let decision = match parsed["decision"].as_str().unwrap_or("") {
+        "approve" => Some(SopApprovalDecision::Approve),
+        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
+        // the ledger records it.
+        "deny" => Some(SopApprovalDecision::Deny {
+            reason: parsed["reason"].as_str().map(str::to_string),
+        }),
+        _ => None,
+    };
+    // run_id + a valid decision are both required; the let-else avoids an expect()
+    // on the downstream resolve (codebase rule: no expect/unwrap in production).
+    let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-invalid-approval"
+            ),
+            "code": "INVALID_APPROVAL_RESPONSE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return true;
+    };
+    let frame = if let Some(engine) = state.sop_engine.as_ref() {
+        let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
+        match engine.lock() {
+            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
+                Ok(outcome) => serde_json::json!({
+                    "type": "sop_approval_result",
+                    "run_id": run_id,
+                    "outcome": outcome.label(),
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "error",
+                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-sop-ws-resolve-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    "code": "SOP_RESOLVE_FAILED"
+                }),
+            },
+            Err(_) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-sop-ws-engine-lock-poisoned"
+                ),
+                "code": "SOP_LOCK_POISONED"
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-subsystem-disabled"
+            ),
+            "code": "SOP_DISABLED"
+        })
+    };
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    true
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -533,6 +615,7 @@ async fn handle_socket(
                         &ws_memory,
                         &content,
                         &session_key,
+                        &session_id,
                     )
                     .await;
                 }
@@ -607,70 +690,7 @@ async fn handle_socket(
                     // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
                     // pending_approvals map (keyed by request_id). The principal is
                     // transport-derived (ws + session id), never from the frame.
-                    if parsed["kind"].as_str() == Some("sop") {
-                        let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
-                        let decision = match parsed["decision"].as_str().unwrap_or("") {
-                            "approve" => Some(SopApprovalDecision::Approve),
-                            // Thread the optional reason through, like the HTTP/CLI deny
-                            // surfaces, so the ledger records it.
-                            "deny" => Some(SopApprovalDecision::Deny {
-                                reason: parsed["reason"].as_str().map(str::to_string),
-                            }),
-                            _ => None,
-                        };
-                        // run_id + a valid decision are both required; the let-else
-                        // avoids an expect() on the downstream resolve (codebase rule:
-                        // no expect/unwrap in production paths).
-                        let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
-                            let err = serde_json::json!({
-                                "type": "error",
-                                "message": zeroclaw_runtime::i18n::get_required_cli_string(
-                                    "cli-sop-ws-invalid-approval"
-                                ),
-                                "code": "INVALID_APPROVAL_RESPONSE"
-                            });
-                            let _ = sender.send(Message::Text(err.to_string().into())).await;
-                            continue;
-                        };
-                        let frame = if let Some(engine) = state.sop_engine.as_ref() {
-                            let principal = SopApprovalPrincipal::ws(session_id.clone(), None);
-                            match engine.lock() {
-                                Ok(mut g) => {
-                                    match g.resolve_gate(&run_id, decision, principal)
-                                    {
-                                        Ok(outcome) => serde_json::json!({
-                                            "type": "sop_approval_result",
-                                            "run_id": run_id,
-                                            "outcome": outcome.label(),
-                                        }),
-                                        Err(e) => serde_json::json!({
-                                            "type": "error",
-                                            "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                                                "cli-sop-ws-resolve-failed",
-                                                &[("error", &e.to_string())],
-                                            ),
-                                            "code": "SOP_RESOLVE_FAILED"
-                                        }),
-                                    }
-                                }
-                                Err(_) => serde_json::json!({
-                                    "type": "error",
-                                    "message": zeroclaw_runtime::i18n::get_required_cli_string(
-                                        "cli-sop-ws-engine-lock-poisoned"
-                                    ),
-                                    "code": "SOP_LOCK_POISONED"
-                                }),
-                            }
-                        } else {
-                            serde_json::json!({
-                                "type": "error",
-                                "message": zeroclaw_runtime::i18n::get_required_cli_string(
-                                    "cli-sop-ws-subsystem-disabled"
-                                ),
-                                "code": "SOP_DISABLED"
-                            })
-                        };
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    if handle_ws_sop_frame(&parsed, &state, &session_id, &mut sender).await {
                         continue;
                     }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
@@ -745,6 +765,7 @@ async fn handle_socket(
                     &ws_memory,
                     &content,
                     &session_key,
+                    &session_id,
                 )
                 .await;
             }
@@ -966,6 +987,7 @@ async fn process_chat_message(
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
+    session_id: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -1128,6 +1150,15 @@ async fn process_chat_message(
                     };
                     match parsed["type"].as_str() {
                         Some("approval_response") => {
+                            // A SOP-kind frame is a gate resolution (keyed by run_id),
+                            // not a tool-prompt response (keyed by request_id). Resolve
+                            // it here too so it is answered mid-turn instead of being
+                            // silently dropped on the request_id path below.
+                            if handle_ws_sop_frame(&parsed, state, session_id, &mut *sender)
+                                .await
+                            {
+                                continue;
+                            }
                             let request_id = parsed["request_id"].as_str().unwrap_or("");
                             let decision = match parsed["decision"].as_str().unwrap_or("") {
                                 "approve" => Some(ChannelApprovalResponse::Approve),

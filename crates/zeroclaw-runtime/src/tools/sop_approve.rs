@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::sop::SopEngine;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
-use crate::sop::types::SopRunAction;
+use crate::sop::types::{SopRunAction, SopRunStatus};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
@@ -71,6 +71,11 @@ impl Tool for SopApproveTool {
         // no longer writes a legacy Memory audit key nor a separate metric. Under
         // approval_mode=out_of_band_required this returns RejectedSelfApproval (the
         // gate stays open for a CLI/gateway approver).
+        //
+        // A deterministic SOP paused at a checkpoint is an in-band agent pause, not
+        // an out-of-band approval gate, so resolve_gate reports NotWaiting for it;
+        // resume it through approve_step (the checkpoint owner) so the agent can
+        // still advance deterministic runs.
         let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
@@ -84,11 +89,24 @@ impl Tool for SopApproveTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            engine.resolve_gate(
+            match engine.resolve_gate(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),
-            )
+            ) {
+                Ok(ResolveOutcome::NotWaiting) => {
+                    let is_checkpoint = matches!(
+                        engine.get_run(run_id).map(|r| r.status),
+                        Some(SopRunStatus::PausedCheckpoint)
+                    );
+                    if is_checkpoint {
+                        engine.approve_step(run_id).map(ResolveOutcome::Resumed)
+                    } else {
+                        Ok(ResolveOutcome::NotWaiting)
+                    }
+                }
+                other => other,
+            }
         };
 
         match result {

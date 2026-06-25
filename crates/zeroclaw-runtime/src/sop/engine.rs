@@ -433,6 +433,11 @@ impl SopEngine {
     }
 
     /// Approve a step that is waiting for approval, transitioning back to Running.
+    /// Resume a deterministic SOP run paused at a checkpoint. This owns ONLY the
+    /// `PausedCheckpoint` resume; clearing a `WaitingApproval` gate is the
+    /// out-of-band `resolve_gate` chokepoint (EPIC C) - the single audited
+    /// gate-clear path. The `sop_approve` tool routes here for checkpoints and to
+    /// `resolve_gate` for approval gates.
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
         let status = self
             .active_runs
@@ -449,50 +454,51 @@ impl SopEngine {
             })?
             .status;
 
+        if status != SopRunStatus::PausedCheckpoint {
+            bail!("Run {run_id} is not paused at a checkpoint (status: {status})");
+        }
+
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
         // completed and its output (or the previous step's) is piped forward.
-        if status == SopRunStatus::PausedCheckpoint {
-            let run = self.active_runs.get_mut(run_id).unwrap();
-            let piped = run
-                .step_results
-                .last()
-                .map(|r| serde_json::Value::String(r.output.clone()))
-                .unwrap_or(serde_json::Value::Null);
-            run.status = SopRunStatus::Running;
-            run.waiting_since = None;
-            return self.advance_deterministic_step(run_id, piped, None);
-        }
-
-        if status != SopRunStatus::WaitingApproval {
-            bail!(
-                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {status})"
-            );
-        }
-
-        // The WaitingApproval -> ExecuteStep transition is shared with the
-        // out-of-band `resolve_gate` path (EPIC C) via `clear_waiting_gate`.
-        self.clear_waiting_gate(run_id)
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let piped = run
+            .step_results
+            .last()
+            .map(|r| serde_json::Value::String(r.output.clone()))
+            .unwrap_or(serde_json::Value::Null);
+        run.status = SopRunStatus::Running;
+        run.waiting_since = None;
+        self.advance_deterministic_step(run_id, piped, None)
     }
 
     /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
     /// action for the current step, and persist. Shared by `approve_step` (the
     /// agent path) and `resolve_gate` (the out-of-band path) so the transition
     /// lives in exactly one place. Caller guarantees the run is `WaitingApproval`.
+    ///
+    /// All-or-nothing: the SOP definition and current step are resolved (and
+    /// bounds-checked) BEFORE any in-memory mutation, so a definition removed or
+    /// shrunk mid-run returns `Err` with the gate left untouched (still
+    /// `WaitingApproval`, re-resolvable) rather than half-transitioned or panicking
+    /// on an out-of-range step index (which would poison the engine mutex).
     pub(crate) fn clear_waiting_gate(&mut self, run_id: &str) -> Result<SopRunAction> {
-        let run = self
-            .active_runs
-            .get_mut(run_id)
-            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        run.status = SopRunStatus::Running;
-        run.waiting_since = None;
+        let (sop_name, current_step) = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            (run.sop_name.clone(), run.current_step)
+        };
 
         let sop = self
             .sops
             .iter()
-            .find(|s| s.name == run.sop_name)
+            .find(|s| s.name == sop_name)
             .ok_or_else(|| {
-                let sop_name = run.sop_name.clone();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -500,12 +506,31 @@ impl SopEngine {
                         .with_attrs(::serde_json::json!({"sop_name": sop_name})),
                     "SOP engine: sop no longer loaded (definition removed mid-run)"
                 );
-                anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
+                anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded"))
             })?
             .clone();
 
-        let step_idx = (run.current_step - 1) as usize;
-        let step = sop.steps[step_idx].clone();
+        let step_idx = (current_step - 1) as usize;
+        let step = sop.steps.get(step_idx).cloned().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"sop_name": sop_name, "step": current_step})),
+                "SOP engine: step no longer exists (definition changed mid-run)"
+            );
+            anyhow::Error::msg(format!(
+                "SOP '{sop_name}' step {current_step} no longer exists (definition changed mid-run)"
+            ))
+        })?;
+
+        // The lookups succeeded; commit the transition.
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        run.status = SopRunStatus::Running;
+        run.waiting_since = None;
         let context = format_step_context(&sop, run, &step);
 
         self.persist_active(run_id);
@@ -914,8 +939,17 @@ impl SopEngine {
     /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
     /// open but the clock resets so it re-surfaces, not self-approves).
     pub(crate) fn restamp_waiting(&mut self, run_id: &str) {
-        if let Some(run) = self.active_runs.get_mut(run_id) {
-            run.waiting_since = Some(now_iso8601());
+        let restamped = match self.active_runs.get_mut(run_id) {
+            Some(run) => {
+                run.waiting_since = Some(now_iso8601());
+                true
+            }
+            None => false,
+        };
+        // Persist so the re-stamped clock survives a restart; otherwise an
+        // escalated gate would re-time-out immediately on the next boot.
+        if restamped {
+            self.persist_active(run_id);
         }
     }
 
@@ -1333,7 +1367,25 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::types::SopExecutionMode;
+
+    /// Clear a WaitingApproval gate through the production out-of-band chokepoint
+    /// (a CLI principal), returning the resumed action. Mirrors what a real
+    /// `zeroclaw sop approve` does, replacing the old `approve_step` agent path.
+    fn approve_gate_cli(engine: &mut SopEngine, run_id: &str) -> SopRunAction {
+        match engine
+            .resolve_gate(
+                run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap()
+        {
+            ResolveOutcome::Resumed(action) => action,
+            other => panic!("expected Resumed, got {other:?}"),
+        }
+    }
 
     fn manual_event() -> SopEvent {
         SopEvent {
@@ -1949,7 +2001,7 @@ mod tests {
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
 
         // Approve step 1
-        let action = engine.approve_step(&run_id).unwrap();
+        let action = approve_gate_cli(&mut engine, &run_id);
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
 
         // Complete step 1, step 2 should also WaitApproval
@@ -2022,7 +2074,7 @@ mod tests {
         assert_eq!(run.status, SopRunStatus::WaitingApproval);
 
         // Approve
-        let action = engine.approve_step(&run_id).unwrap();
+        let action = approve_gate_cli(&mut engine, &run_id);
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
 
         let run = engine.active_runs().get(&run_id).unwrap();
@@ -2421,7 +2473,7 @@ mod tests {
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
-        engine.approve_step(&run_id).unwrap();
+        approve_gate_cli(&mut engine, &run_id);
 
         let run = engine.get_run(&run_id).unwrap();
         assert_eq!(run.status, SopRunStatus::Running);
@@ -2782,9 +2834,10 @@ type = "manual"
 
     #[test]
     fn deterministic_checkpoint_resumes_through_approve_step() {
-        // The sop_approve tool calls approve_step. A deterministic run paused at
-        // a checkpoint must resume through it, not bail. deterministic_sop is
-        // step1=Execute, step2=Checkpoint, step3=Execute.
+        // approve_step owns the deterministic PausedCheckpoint resume (the
+        // sop_approve tool routes here when resolve_gate reports NotWaiting). A run
+        // paused at a checkpoint must resume through it, not bail. deterministic_sop
+        // is step1=Execute, step2=Checkpoint, step3=Execute.
         let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
         let action = engine.start_run("det-cp", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
@@ -2822,6 +2875,42 @@ type = "manual"
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
             "deterministic run should complete after the post-checkpoint step"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_approve_tool_resumes_deterministic_checkpoint() {
+        // Regression guard (#8304 review): the sop_approve tool must route a
+        // PausedCheckpoint to approve_step, because resolve_gate reports NotWaiting
+        // for it. Without that routing the tool answers "not waiting for approval"
+        // and a deterministic run is stuck unresumable through every surface.
+        use crate::tools::SopApproveTool;
+        use zeroclaw_api::tool::Tool;
+
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let tool = SopApproveTool::new(std::sync::Arc::new(std::sync::Mutex::new(engine)));
+        let result = tool
+            .execute(serde_json::json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "sop_approve must resume a deterministic checkpoint, not report not-waiting: {result:?}"
+        );
+        assert!(
+            result.output.contains("Approved"),
+            "checkpoint resume should be reported as approved: {result:?}"
         );
     }
 

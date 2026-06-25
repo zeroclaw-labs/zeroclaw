@@ -6341,11 +6341,15 @@ async fn sop_admin_post(
         );
         Ok(())
     } else {
-        let err = out
-            .get("error")
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
             .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
             .unwrap_or("request failed");
-        anyhow::bail!("Gateway responded {status}: {err}");
+        anyhow::bail!("Gateway responded {status}: {detail}");
     }
 }
 
