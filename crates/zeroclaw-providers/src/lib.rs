@@ -2763,6 +2763,15 @@ mod tests {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
 
+    #[test]
+    fn factory_nvidia_supports_vision() {
+        let provider = create_model_provider("nvidia", Some("nvapi-test")).unwrap();
+        assert!(
+            provider.supports_vision(),
+            "nvidia provider must report supports_vision()=true for multimodal models"
+        );
+    }
+
     // ── AI inference routers ─────────────────────────────────
 
     #[test]
@@ -4095,6 +4104,56 @@ mod tests {
         assert!(
             result.is_ok(),
             "OpenAI external-auth fallbacks may intentionally omit api_key: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_allows_xai_oauth_fallback_without_api_key() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, XaiModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "xai.oauth",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.xai.insert(
+            "oauth".to_string(),
+            XaiModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("grok-4.3".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let temp = tempfile::tempdir().expect("temp zeroclaw dir");
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "xAI OAuth fallbacks may intentionally omit api_key: {}",
             result.err().unwrap()
         );
     }

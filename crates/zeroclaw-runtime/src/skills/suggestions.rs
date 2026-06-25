@@ -1,9 +1,10 @@
-use super::Skill;
+use super::{EXTRA_REGISTRY_DIR_PREFIX, SKILLS_REGISTRY_DIR_NAME, Skill};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use zeroclaw_config::schema::ExternalRegistryKind;
 
 /// Server-side, post-submit install suggestions for cached skill registry metadata.
 ///
@@ -45,13 +46,14 @@ pub(crate) fn render_missing_skill_install_suggestion(
     installed_skills: &[Skill],
     installed_runtime_capabilities: &[&str],
     workspace_dir: &Path,
+    extra_registries: &[zeroclaw_config::schema::ExternalRegistry],
     enabled: bool,
 ) -> Option<String> {
     if !enabled || prompt.trim().is_empty() {
         return None;
     }
 
-    let catalog = load_cached_installable_skill_capabilities(workspace_dir);
+    let catalog = load_cached_installable_skill_capabilities(workspace_dir, extra_registries);
     suggest_missing_skill_install(
         prompt,
         installed_skills,
@@ -94,13 +96,46 @@ fn suggest_missing_skill_install(
 
 fn load_cached_installable_skill_capabilities(
     workspace_dir: &Path,
+    extra_registries: &[zeroclaw_config::schema::ExternalRegistry],
 ) -> Vec<InstallableSkillCapability> {
-    let skills_dir = workspace_dir.join("skills-registry").join("skills");
+    let mut capabilities = Vec::new();
+    let skills_dir = workspace_dir.join(SKILLS_REGISTRY_DIR_NAME).join("skills");
+    load_cached_registry_skill_capabilities(&skills_dir, None, &mut capabilities);
+
+    for registry in extra_registries
+        .iter()
+        .filter(|registry| registry.enabled && registry.kind == ExternalRegistryKind::Git)
+    {
+        if !zeroclaw_config::schema::ExternalRegistry::is_valid_name(&registry.name) {
+            continue;
+        }
+        let skills_dir = workspace_dir
+            .join(format!("{}{}", EXTRA_REGISTRY_DIR_PREFIX, registry.name))
+            .join("skills");
+        load_cached_registry_skill_capabilities(
+            &skills_dir,
+            Some(&registry.name),
+            &mut capabilities,
+        );
+    }
+
+    capabilities.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    capabilities
+}
+
+fn load_cached_registry_skill_capabilities(
+    skills_dir: &Path,
+    registry_name: Option<&str>,
+    capabilities: &mut Vec<InstallableSkillCapability>,
+) {
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return Vec::new();
+        return;
     };
 
-    let mut capabilities = Vec::new();
     for entry in entries.flatten() {
         let skill_dir = entry.path();
         if !skill_dir.is_dir() {
@@ -115,22 +150,27 @@ fn load_cached_installable_skill_capabilities(
             continue;
         };
 
-        if let Some(capability) = load_skill_package_metadata(&skill_dir, &source) {
+        let skill_name = source;
+        let source = match registry_name {
+            Some(registry_name) => {
+                if !super::is_registry_source(&skill_name) {
+                    continue;
+                }
+                format!("registry:{registry_name}/{skill_name}")
+            }
+            None => skill_name.clone(),
+        };
+
+        if let Some(capability) = load_skill_package_metadata(&skill_dir, &source, &skill_name) {
             capabilities.push(capability);
         }
     }
-
-    capabilities.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.source.cmp(&right.source))
-    });
-    capabilities
 }
 
 fn load_skill_package_metadata(
     skill_dir: &Path,
     source: &str,
+    fallback_name: &str,
 ) -> Option<InstallableSkillCapability> {
     for manifest_name in ["SKILL.toml", "manifest.toml"] {
         let manifest_path = skill_dir.join(manifest_name);
@@ -141,7 +181,7 @@ fn load_skill_package_metadata(
 
     let markdown_path = skill_dir.join("SKILL.md");
     if markdown_path.exists() {
-        return load_markdown_skill_package_metadata(&markdown_path, source);
+        return load_markdown_skill_package_metadata(&markdown_path, source, fallback_name);
     }
 
     None
@@ -176,12 +216,13 @@ fn load_toml_skill_package_metadata(
 fn load_markdown_skill_package_metadata(
     markdown_path: &Path,
     source: &str,
+    fallback_name: &str,
 ) -> Option<InstallableSkillCapability> {
     let frontmatter = read_markdown_frontmatter(markdown_path)?;
     let meta = super::parse_simple_frontmatter(&frontmatter);
     let description = meta.description.unwrap_or_default();
     Some(InstallableSkillCapability {
-        name: meta.name.unwrap_or_else(|| source.to_string()),
+        name: meta.name.unwrap_or_else(|| fallback_name.to_string()),
         source: source.to_string(),
         description,
         aliases: Vec::new(),
@@ -304,11 +345,13 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: "Installed capability".to_string(),
+            description_localizations: Default::default(),
             version: "0.1.0".to_string(),
             author: None,
             tags: vec![],
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -319,6 +362,23 @@ mod tests {
             source: name.to_string(),
             description: "Registry metadata description".to_string(),
             aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+        }
+    }
+
+    fn extra_registry(name: &str, enabled: bool) -> zeroclaw_config::schema::ExternalRegistry {
+        extra_registry_with_kind(name, "git", enabled)
+    }
+
+    fn extra_registry_with_kind(
+        name: &str,
+        kind: &str,
+        enabled: bool,
+    ) -> zeroclaw_config::schema::ExternalRegistry {
+        zeroclaw_config::schema::ExternalRegistry {
+            name: name.to_string(),
+            url: format!("file:///tmp/{name}"),
+            kind: kind.to_string().into(),
+            enabled,
         }
     }
 
@@ -443,6 +503,7 @@ mod tests {
             &[],
             &[],
             dir.path(),
+            &[],
             false,
         );
 
@@ -472,7 +533,7 @@ tags = ["scheduling"]
         )
         .unwrap();
 
-        let catalog = load_cached_installable_skill_capabilities(dir.path());
+        let catalog = load_cached_installable_skill_capabilities(dir.path(), &[]);
 
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "calendar");
@@ -492,6 +553,7 @@ tags = ["scheduling"]
             &[],
             &[],
             dir.path(),
+            &[],
             true,
         )
         .expect("cached registry metadata should render a suggestion");
@@ -517,7 +579,7 @@ aliases = ["release check"]
         )
         .unwrap();
 
-        let catalog = load_cached_installable_skill_capabilities(dir.path());
+        let catalog = load_cached_installable_skill_capabilities(dir.path(), &[]);
         let suggestion = suggest_missing_skill_install(
             "please run a release check before tagging",
             &[],
@@ -548,7 +610,7 @@ This body-only browser automation phrase must not be used for matching.
         )
         .unwrap();
 
-        let catalog = load_cached_installable_skill_capabilities(dir.path());
+        let catalog = load_cached_installable_skill_capabilities(dir.path(), &[]);
         let suggestion =
             suggest_missing_skill_install("please use screenshot helper here", &[], &[], &catalog);
         let body_only_match = suggest_missing_skill_install(
@@ -562,5 +624,162 @@ This body-only browser automation phrase must not be used for matching.
         assert_eq!(catalog[0].name, "screenshot-helper");
         assert!(suggestion.is_some());
         assert!(body_only_match.is_none());
+    }
+
+    #[test]
+    fn cached_registry_catalog_includes_enabled_extra_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("extra-registry-acme/skills/team-calendar");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "team-calendar"
+description = "Schedule meetings on the team calendar"
+aliases = ["team calendar"]
+"#,
+        )
+        .unwrap();
+
+        let catalog =
+            load_cached_installable_skill_capabilities(dir.path(), &[extra_registry("acme", true)]);
+        let suggestion = suggest_missing_skill_install(
+            "please use the team calendar to schedule this",
+            &[],
+            &[],
+            &catalog,
+        )
+        .expect("enabled cached extra registry metadata should suggest installation");
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "team-calendar");
+        assert_eq!(catalog[0].source, "registry:acme/team-calendar");
+        assert_eq!(suggestion.source, "registry:acme/team-calendar");
+        assert!(
+            suggestion
+                .render_user_message()
+                .contains("zeroclaw skills install registry:acme/team-calendar")
+        );
+    }
+
+    #[test]
+    fn cached_registry_catalog_skips_disabled_extra_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("extra-registry-acme/skills/team-calendar");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+description: Team calendar scheduling
+---
+"#,
+        )
+        .unwrap();
+
+        let catalog = load_cached_installable_skill_capabilities(
+            dir.path(),
+            &[extra_registry("acme", false)],
+        );
+
+        assert!(catalog.is_empty());
+    }
+
+    #[test]
+    fn cached_registry_catalog_skips_non_git_extra_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("extra-registry-acme/skills/team-calendar");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "team-calendar"
+description = "Schedule meetings on the team calendar"
+aliases = ["team calendar"]
+"#,
+        )
+        .unwrap();
+
+        let catalog = load_cached_installable_skill_capabilities(
+            dir.path(),
+            &[extra_registry_with_kind("acme", "http", true)],
+        );
+
+        assert!(catalog.is_empty());
+    }
+
+    #[test]
+    fn cached_registry_catalog_skips_invalid_extra_registry_skill_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("extra-registry-acme/skills/team.calendar");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "team-calendar"
+description = "Schedule meetings on the team calendar"
+aliases = ["team calendar"]
+"#,
+        )
+        .unwrap();
+
+        let catalog =
+            load_cached_installable_skill_capabilities(dir.path(), &[extra_registry("acme", true)]);
+        let suggestion =
+            suggest_missing_skill_install("please use the team calendar", &[], &[], &catalog);
+
+        assert!(catalog.is_empty());
+        assert!(suggestion.is_none());
+    }
+
+    /// Regression: a capability in the raw registry but absent from the
+    /// effective tool set must not suppress install suggestions.
+    ///
+    /// Before the fix, `process_message` built `runtime_capability_names`
+    /// from the raw `tools_registry` (all registered tools regardless of
+    /// exclusion). A tool excluded for the current turn was still treated
+    /// as "installed", causing `suggest_missing_skill_install` to skip the
+    /// suggestion. Using `effective_tool_names` instead ensures that only
+    /// tools available for this turn suppress suggestions.
+    ///
+    /// This test demonstrates the two outcomes:
+    /// - passing the raw name suppresses the suggestion (old behavior);
+    /// - omitting it (as the effective set does) returns the suggestion.
+    #[test]
+    fn excluded_tool_does_not_suppress_missing_skill_suggestion() {
+        let catalog = vec![catalog_entry("calendar", &["calendar", "google calendar"])];
+
+        // With the excluded tool in runtime capabilities (old behavior: raw
+        // registry), the suggestion is suppressed because "calendar" is
+        // treated as already installed.
+        let suppressed = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["calendar"],
+            &catalog,
+        );
+        assert!(
+            suppressed.is_none(),
+            "raw registry including excluded tool should suppress suggestion — this is the old bug"
+        );
+
+        // Without the excluded tool in runtime capabilities (new behavior:
+        // effective tool set), the suggestion is returned because "calendar"
+        // is not considered available for this turn.
+        let suggestion = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["shell", "file_read"],
+            &catalog,
+        );
+        assert!(
+            suggestion.is_some(),
+            "effective tool set excluding the capability must return the suggestion"
+        );
+        let suggestion = suggestion.expect("suggestion should be present");
+        assert_eq!(suggestion.name, "calendar");
+        assert!(suggestion.render_user_message().contains("calendar"));
     }
 }

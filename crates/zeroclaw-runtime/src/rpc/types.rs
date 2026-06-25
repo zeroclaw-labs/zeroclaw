@@ -691,6 +691,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
     }
 }
 
@@ -818,6 +820,34 @@ rpc_type! {
 rpc_type! {
     pub struct SkillsListResult {
         pub skills: Vec<SkillListEntry>,
+    }
+}
+
+rpc_type! {
+    /// One skill in an agent's *effective* set (the runtime's four-source
+    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
+    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
+    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
+    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
+    pub struct AgentSkillEntry {
+        pub name: String,
+        pub description: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plugin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bundle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
+        pub editable: bool,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillsResult {
+        pub agent: String,
+        pub skills: Vec<AgentSkillEntry>,
     }
 }
 
@@ -1028,6 +1058,8 @@ rpc_type! {
         /// backend picker).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
     }
 }
 
@@ -1279,6 +1311,17 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+    },
+    /// Emitted whenever older whole turns were dropped from the context window
+    /// to fit the token budget. Surfaces a user-visible "context was cut here"
+    /// marker so trimming is never silent. `dropped_messages` is the count of
+    /// conversation messages removed; `kept_turns` is how many whole turns
+    /// remained after the cut.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
     },
 }
 

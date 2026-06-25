@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 

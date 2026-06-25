@@ -916,7 +916,7 @@ Examples:
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Skip confirmation prompt
+        /// Install even if the target is not newer (reinstall or downgrade/pin to --version)
         #[arg(long)]
         force: bool,
         /// Target version (default: latest)
@@ -2730,9 +2730,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2742,13 +2742,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2782,9 +2782,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -2813,6 +2813,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3905,7 +3914,7 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -3915,7 +3924,7 @@ async fn main() -> Result<()> {
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
                                 sop_engine,
@@ -4435,6 +4444,34 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            let uncompiled =
+                zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-not-compiled-header",
+                        "  Configured but not compiled in this binary:"
+                    )
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "  {:9} {}",
+                        entry.name,
+                        t(
+                            "cli-status-channel-not-compiled",
+                            "🚫 configured, not compiled"
+                        )
+                    );
+                }
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-build-hint",
+                        "  Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature."
+                    )
+                );
+            }
             println!();
             println!("{}", t("cli-status-peripherals", "Peripherals:"));
             let peripherals_enabled = if config.peripherals.enabled {
@@ -4829,15 +4866,22 @@ async fn main() -> Result<()> {
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(
@@ -4851,7 +4895,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                commands::update::run(version.as_deref(), force).await
             }
         }
 
@@ -6482,6 +6526,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6496,6 +6542,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6514,6 +6561,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6610,6 +6658,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
@@ -6734,6 +6783,51 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
+            }
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
+            Ok(())
+        }
     }
 }
 
@@ -6811,9 +6905,10 @@ async fn run_gateway_if_enabled(
     .await;
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
+            let restart_port = available_gateway_restart_hint_port(host, port);
             anyhow::bail!(
                 "{}",
-                gateway_addr_in_use_message(host, port, &default_host, default_port)
+                gateway_addr_in_use_message(host, port, &default_host, default_port, restart_port)
             );
         }
         other => other,
@@ -6848,6 +6943,7 @@ fn gateway_addr_in_use_message(
     port: u16,
     default_host: &str,
     default_port: u16,
+    restart_port: Option<u16>,
 ) -> String {
     let mut lines = vec![
         format!("Port {port} is already in use, so the gateway could not start."),
@@ -6867,16 +6963,27 @@ fn gateway_addr_in_use_message(
         default_host,
         default_port,
     ));
-    lines.push(format!(
-        "    zeroclaw gateway start --port {}",
-        next_gateway_port(port)
-    ));
+    if let Some(restart_port) = restart_port {
+        lines.push(gateway_restart_recovery_command(
+            host,
+            restart_port,
+            default_host,
+        ));
+    }
     lines.extend([
         String::new(),
         "To inspect the listener:".to_string(),
         format!("    lsof -nP -iTCP:{port} -sTCP:LISTEN"),
     ]);
     lines.join("\n")
+}
+
+fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
+    let mut command = format!("    zeroclaw gateway start --port {port}");
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
 }
 
 fn gateway_paircode_recovery_command(
@@ -6896,14 +7003,30 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-fn next_gateway_port(port: u16) -> u16 {
-    port.checked_add(1).unwrap_or(port)
+fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
+    const SCAN_LIMIT: u16 = 20;
+
+    for offset in 1..=SCAN_LIMIT {
+        let Some(candidate) = port.checked_add(offset) else {
+            break;
+        };
+        if std::net::TcpListener::bind(zeroclaw_infra::effective_gateway_bind_socket_addr(
+            host, candidate,
+        ))
+        .is_ok()
+        {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::net::TcpListener;
 
     #[test]
     #[cfg(feature = "agent-runtime")]
@@ -7303,7 +7426,13 @@ mod tests {
     #[test]
     fn gateway_addr_in_use_message_guides_default_gateway_recovery() {
         let default = config::GatewayConfig::default();
-        let msg = gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port);
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            Some(42618),
+        );
 
         assert!(msg.contains("Port 42617 is already in use"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -7315,21 +7444,79 @@ mod tests {
     #[test]
     fn gateway_addr_in_use_message_keeps_non_default_host_context() {
         let default = config::GatewayConfig::default();
-        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, &default.host, default.port);
+        let msg =
+            gateway_addr_in_use_message("0.0.0.0", 9001, &default.host, default.port, Some(9002));
 
         assert!(!msg.contains("open http://127.0.0.1:42617"));
-        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 192.168.1.20"));
-        assert!(msg.contains("zeroclaw gateway start --port 9002"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
+        assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
     }
 
     #[test]
+    fn gateway_addr_in_use_message_omits_restart_when_no_available_port() {
+        let default = config::GatewayConfig::default();
+        let msg =
+            gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port, None);
+
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("zeroclaw gateway start --port"));
+        assert!(msg.contains("lsof -nP -iTCP:42617 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_skips_occupied_restart_hint_port() {
+        let default = config::GatewayConfig::default();
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        let restart_port = available_gateway_restart_hint_port("127.0.0.1", port);
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            port,
+            &default.host,
+            default.port,
+            restart_port,
+        );
+
+        assert!(
+            !msg.contains(&format!("zeroclaw gateway start --port {}", port + 1)),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("zeroclaw gateway start --port {available_port}")),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn gateway_addr_in_use_message_uses_configured_default_gateway_recovery() {
-        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001);
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001, None);
 
         assert!(msg.contains("open http://192.168.1.20:9001"));
         assert!(msg.contains("zeroclaw gateway get-paircode\n"));
         assert!(!msg.contains("get-paircode --port 9001"));
+    }
+
+    #[test]
+    fn gateway_restart_hint_uses_gateway_bind_fallback_for_hostnames() {
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        assert_eq!(
+            available_gateway_restart_hint_port("localhost", port),
+            Some(available_port)
+        );
+    }
+
+    #[test]
+    fn gateway_bind_addr_resolver_accepts_bracketed_ipv6_hosts() {
+        let addr = zeroclaw_infra::effective_gateway_bind_socket_addr("[::1]", 9001);
+
+        assert_eq!(addr.port(), 9001);
+        assert!(addr.is_ipv6());
     }
 
     #[test]
@@ -7338,6 +7525,36 @@ mod tests {
         let err = anyhow::Error::new(err).context("gateway bind failed");
 
         assert!(is_addr_in_use_error(&err));
+    }
+
+    fn reserve_consecutive_local_ports(count: u16) -> (u16, Vec<TcpListener>) {
+        for _ in 0..100 {
+            let Ok(first) = TcpListener::bind(("127.0.0.1", 0)) else {
+                continue;
+            };
+            let port = first.local_addr().expect("listener has local addr").port();
+            if port > u16::MAX - count {
+                continue;
+            }
+
+            let mut listeners = vec![first];
+            let mut reserved_all = true;
+            for offset in 1..count {
+                match TcpListener::bind(("127.0.0.1", port + offset)) {
+                    Ok(listener) => listeners.push(listener),
+                    Err(_) => {
+                        reserved_all = false;
+                        break;
+                    }
+                }
+            }
+
+            if reserved_all {
+                return (port, listeners);
+            }
+        }
+
+        panic!("could not reserve {count} consecutive local ports");
     }
 
     #[test]

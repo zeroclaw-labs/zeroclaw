@@ -631,6 +631,62 @@ fn rootless_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+struct NormalizedRootlessPath {
+    drive: Option<u8>,
+    text: String,
+}
+
+fn normalized_rootless_path_text(path: &Path) -> Option<NormalizedRootlessPath> {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        text = rest.to_string();
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+
+    let mut drive = None;
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        drive = Some(bytes[0].to_ascii_lowercase());
+        text = text[2..].to_string();
+    }
+
+    let parts: Vec<&str> = text
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if parts.is_empty() || parts.contains(&"..") {
+        None
+    } else {
+        Some(NormalizedRootlessPath {
+            drive,
+            text: parts.join("/"),
+        })
+    }
+}
+
+fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Option<PathBuf> {
+    let path_text = normalized_rootless_path_text(path)?;
+    let workspace_text = normalized_rootless_path_text(workspace_dir)?;
+
+    if path_text.drive.is_some() && path_text.drive != workspace_text.drive {
+        return None;
+    }
+
+    if path_text.text == workspace_text.text {
+        return Some(PathBuf::new());
+    }
+
+    let prefix = format!("{}/", workspace_text.text);
+    path_text
+        .text
+        .strip_prefix(&prefix)
+        .map(|suffix| PathBuf::from(suffix.replace('/', std::path::MAIN_SEPARATOR_STR)))
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -2109,6 +2165,14 @@ impl SecurityPolicy {
                 } else {
                     self.workspace_dir.join(stripped)
                 }
+            } else if let Some(stripped) =
+                workspace_prefixed_relative_suffix(&expanded, &self.workspace_dir)
+            {
+                if stripped.as_os_str().is_empty() {
+                    self.workspace_dir.clone()
+                } else {
+                    self.workspace_dir.join(stripped)
+                }
             } else {
                 self.workspace_dir.join(expanded)
             }
@@ -2828,6 +2892,29 @@ mod tests {
         assert!(
             !policy.workspace_only,
             "Full autonomy must drop workspace_only even when the profile sets it true"
+        );
+    }
+
+    #[test]
+    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(
+            policy.allowed_tools.is_none(),
+            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
+             from allowed_tools = []; both map to no authorization constraint"
+        );
+        assert!(
+            policy.is_tool_allowed("filesystem__write_file"),
+            "empty risk-profile allowed_tools is unrestricted, not deny-all"
         );
     }
 
@@ -4946,6 +5033,32 @@ mod tests {
             resolved,
             PathBuf::from("/zeroclaw-data/workspace/scripts/daily.py")
         );
+    }
+
+    #[test]
+    fn resolve_tool_path_normalizes_windows_workspace_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_eq!(resolved, workspace.join("nested").join("out.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_does_not_normalize_mismatched_drive_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"D:Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_ne!(resolved, workspace.join("nested").join("out.txt"));
     }
 
     #[test]

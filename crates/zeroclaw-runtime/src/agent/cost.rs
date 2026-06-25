@@ -3,6 +3,7 @@ use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use zeroclaw_config::schema::Config;
 
 // ── Cost tracking via task-local ──
 
@@ -14,15 +15,130 @@ use std::sync::{Arc, OnceLock};
 /// are USD per 1M tokens.
 pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
-/// Per-scope token/cost accumulator. Records pushed by
-/// `record_tool_loop_cost_usage` alongside the shared `CostTracker` so the
-/// wrapping code can read out the total for *this* call after the scope
-/// exits, without racing concurrent requests sharing the same tracker.
+/// Per-scope token/cost accumulator derived from the usage events emitted
+/// during a single task-local runtime invocation.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+}
+
+pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
+    let mut pricing: ModelProviderPricing = HashMap::new();
+
+    for (type_k, alias_k, profile) in config.providers.models.iter_entries() {
+        let mut slot = profile.pricing.clone();
+        apply_rate_sheet_pricing(config, type_k, &mut slot);
+        if !slot.is_empty() {
+            pricing.insert(format!("{type_k}.{alias_k}"), slot);
+        }
+    }
+
+    pricing
+}
+
+pub fn tool_loop_cost_tracking_context_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> Option<ToolLoopCostTrackingContext> {
+    CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
+}
+
+pub fn tool_loop_cost_tracking_context_from_tracker(
+    config: &Config,
+    agent_alias: &str,
+    tracker: Arc<CostTracker>,
+) -> ToolLoopCostTrackingContext {
+    ToolLoopCostTrackingContext::new(tracker, Arc::new(build_model_provider_pricing(config)))
+        .with_agent_alias(agent_alias)
+}
+
+pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProviderPricing {
+    let mut pricing: ModelProviderPricing = HashMap::new();
+
+    for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
+        if profile.pricing.is_empty() {
+            continue;
+        }
+        let slot = pricing.entry(type_k.to_string()).or_default();
+        merge_pricing(slot, &profile.pricing);
+    }
+
+    for (provider_type, _model_id, _rates) in config.cost.rates.providers.models.iter_entries() {
+        let slot = pricing.entry(provider_type.to_string()).or_default();
+        apply_rate_sheet_pricing(config, provider_type, slot);
+    }
+
+    pricing
+}
+
+/// Resolve the per-model pricing map for a provider reference.
+///
+/// `model_provider_name` usually arrives as the composite `<type>.<alias>`,
+/// but the outer pricing map may be keyed either way depending on which
+/// builder populated it: the CLI / gateway / cron agent loop uses
+/// `build_model_provider_pricing` (alias-keyed), while the channel
+/// orchestrator uses `build_type_level_model_provider_pricing` (type-keyed).
+/// Three-level fallback:
+/// 1. Exact match on the full `<type>.<alias>`.
+/// 2. Bare `<type>` (for type-keyed maps from the channels path).
+/// 3. Prefix match when only the bare type is known and exactly one alias
+///    entry exists (keeps pricing deterministic).
+pub fn provider_pricing<'a>(
+    pricing: &'a ModelProviderPricing,
+    model_provider_name: &str,
+) -> Option<&'a HashMap<String, f64>> {
+    if let Some(slot) = pricing.get(model_provider_name) {
+        return Some(slot);
+    }
+
+    // Type-keyed maps are still used in the channels path; when the lookup
+    // arrives as `<type>.<alias>`, fall back to the bare provider family.
+    if let Some((provider_type, _alias)) = model_provider_name.split_once('.')
+        && let Some(slot) = pricing.get(provider_type)
+    {
+        return Some(slot);
+    }
+
+    // Some call sites surface only the bare provider type while the
+    // pricing view is keyed by `<type>.<alias>`. Fall back only when the
+    // type resolves to exactly one alias entry so pricing stays deterministic.
+    let prefix = format!("{model_provider_name}.");
+    let mut matches = pricing
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, slot)| slot);
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
+    for (rate_provider_type, model_id, rates) in config.cost.rates.providers.models.iter_entries() {
+        if rate_provider_type != provider_type {
+            continue;
+        }
+        if let Some(input) = rates.input_per_mtok {
+            slot.insert(format!("{model_id}.input"), input);
+        }
+        if let Some(output) = rates.output_per_mtok {
+            slot.insert(format!("{model_id}.output"), output);
+        }
+        if let Some(cached) = rates.cached_input_per_mtok {
+            slot.insert(format!("{model_id}.cached_input"), cached);
+        }
+    }
+}
+
+fn merge_pricing(slot: &mut HashMap<String, f64>, pricing: &HashMap<String, f64>) {
+    for (key, value) in pricing {
+        slot.insert(key.clone(), *value);
+    }
 }
 
 /// Context for cost tracking within the tool call loop.
@@ -34,6 +150,9 @@ pub struct ToolLoopCostTrackingContext {
     /// budgets (see [`Self::usage_only`]).
     pub tracker: Option<Arc<CostTracker>>,
     pub model_provider_pricing: Arc<ModelProviderPricing>,
+    /// Per-scope usage accumulator so wrapping code can read token/cost
+    /// totals after the scoped future exits (without racing concurrent
+    /// traffic sharing the same tracker).
     pub turn_usage: Arc<Mutex<TurnUsage>>,
     /// Alias of the agent driving this turn. Stamped onto persisted
     /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
@@ -78,13 +197,23 @@ impl ToolLoopCostTrackingContext {
 
     /// Snapshot the per-scope usage. Wrapping code calls this after the
     /// scoped future completes to populate observer-event annotations.
+    ///
+    /// Prefers the caller-scoped `TOOL_LOOP_TURN_USAGE` task-local (ws.rs
+    /// gateway path), falling back to the context's own `turn_usage` field
+    /// (Agent::turn_streamed path).
     pub fn snapshot_turn_usage(&self) -> TurnUsage {
-        *self.turn_usage.lock()
+        TOOL_LOOP_TURN_USAGE
+            .try_with(|turn_usage| turn_usage.as_ref().map(|u| *u.lock()).unwrap_or_default())
+            .unwrap_or_else(|_| *self.turn_usage.lock())
     }
 }
 
 tokio::task_local! {
     pub static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+tokio::task_local! {
+    pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
 /// Resolve `(input, output, cached_input)` per-1M-token rates for a given
@@ -133,27 +262,6 @@ fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64)
     (0.0, 0.0, 0.0)
 }
 
-/// Resolve the per-model pricing map for a provider reference.
-///
-/// `model_provider_name` always arrives as the composite `<type>.<alias>`
-/// (see `agent_provider_composite`), but the outer pricing map may be keyed
-/// either way depending on which builder populated it: the CLI / cron / web
-/// agent loop keys by the composite alias, while the channel orchestrator keys
-/// by the bare provider `<type>` (rates are per provider type, not per alias).
-/// Try the composite verbatim first, then fall back to the bare type prefix so
-/// cost tracking resolves regardless of the builder — and so the type-keyed
-/// `cost.rates` sheet is honored on the alias paths too.
-fn provider_pricing<'a>(
-    map: &'a ModelProviderPricing,
-    model_provider_name: &str,
-) -> Option<&'a HashMap<String, f64>> {
-    map.get(model_provider_name).or_else(|| {
-        model_provider_name
-            .split_once('.')
-            .and_then(|(provider_type, _alias)| map.get(provider_type))
-    })
-}
-
 /// Record token usage from an LLM response via the task-local cost tracker.
 /// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
 pub fn record_tool_loop_cost_usage(
@@ -178,14 +286,14 @@ pub fn record_tool_loop_cost_usage(
         .map(|map| resolve_rates(map, model))
         .unwrap_or((0.0, 0.0, 0.0));
 
-    let cost_usage = CostTokenUsage::new(
+    let cost_usage = CostTokenUsage::new_with_cache(
         model,
         input_tokens,
-        output_tokens,
         cached_input_tokens,
+        output_tokens,
         input_rate,
-        output_rate,
         cached_rate,
+        output_rate,
     );
 
     // Promote first sighting of (model_provider, model) without pricing to a WARN
@@ -198,18 +306,33 @@ pub fn record_tool_loop_cost_usage(
         warn_once_missing_pricing(model_provider_name, model);
     }
 
+    // Accumulate turn usage: prefer the caller-scoped TOOL_LOOP_TURN_USAGE
+    // task-local (ws.rs gateway path), fall back to the context's own
+    // turn_usage field (Agent::turn_streamed path, where the task-local is
+    // not set up).
+    let accumulated = TOOL_LOOP_TURN_USAGE.try_with(|turn_usage| {
+        if let Some(turn_usage) = turn_usage {
+            let mut usage = turn_usage.lock();
+            usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+            usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+            usage.cost_usd += cost_usage.cost_usd;
+            true
+        } else {
+            false
+        }
+    });
+    if !accumulated.unwrap_or(false) {
+        let mut turn_usage = ctx.turn_usage.lock();
+        turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
+        turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
+        turn_usage.cost_usd += cost_usage.cost_usd;
+    }
+
     if let Some(tracker) = &ctx.tracker
         && let Err(error) =
             tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
     {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
-    }
-
-    {
-        let mut usage = ctx.turn_usage.lock();
-        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
-        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
-        usage.cost_usd += cost_usage.cost_usd;
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
@@ -244,6 +367,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(
                     ::serde_json::json!({"model_provider": model_provider, "model": model})
@@ -258,9 +382,11 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
     } else {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"model_provider": model_provider, "model": model})
-            ),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(
+                    ::serde_json::json!({"model_provider": model_provider, "model": model})
+                ),
             "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
         );
     }
@@ -282,6 +408,7 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
@@ -378,5 +505,270 @@ mod tests {
         assert!(missing_pricing_first_sighting(&seen, "model_provider", ""));
         assert!(missing_pricing_first_sighting(&seen, "", ""));
         assert!(!missing_pricing_first_sighting(&seen, "", ""));
+    }
+
+    fn pricing_with_cache(
+        model: &str,
+        input: f64,
+        cached_input: f64,
+        output: f64,
+    ) -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+        map.insert(format!("{model}.input"), input);
+        map.insert(format!("{model}.cached_input"), cached_input);
+        map.insert(format!("{model}.output"), output);
+        map
+    }
+
+    #[test]
+    fn build_model_provider_pricing_prefers_rate_sheet_over_legacy_alias_pricing() {
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "default".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".into()),
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.cost.rates.providers.models.deepseek.insert(
+            "deepseek-v4-flash".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(0.14),
+                output_per_mtok: Some(0.28),
+                cached_input_per_mtok: Some(0.0028),
+            },
+        );
+
+        let alias_map = build_model_provider_pricing(&config);
+        let deepseek = alias_map
+            .get("deepseek.default")
+            .expect("deepseek alias pricing");
+        assert_eq!(deepseek.get("deepseek-v4-flash.input").copied(), Some(0.14));
+        assert_eq!(
+            deepseek.get("deepseek-v4-flash.cached_input").copied(),
+            Some(0.0028)
+        );
+        assert_eq!(
+            deepseek.get("deepseek-v4-flash.output").copied(),
+            Some(0.28),
+            "cost.rates must remain the canonical pricing source"
+        );
+    }
+
+    #[test]
+    fn build_model_provider_pricing_keeps_alias_legacy_pricing_isolated() {
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "work".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.deepseek.insert(
+            "personal".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let alias_map = build_model_provider_pricing(&config);
+        let work = alias_map.get("deepseek.work").expect("work alias pricing");
+        let personal = alias_map
+            .get("deepseek.personal")
+            .expect("personal alias pricing");
+
+        assert_eq!(work.get("deepseek-v4-flash.output").copied(), Some(0.77));
+        assert_eq!(
+            personal.get("deepseek-v4-flash.output").copied(),
+            Some(0.91)
+        );
+    }
+
+    #[test]
+    fn build_type_level_model_provider_pricing_merges_aliases_and_rate_sheet() {
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "work".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([
+                        ("deepseek-v4-flash.input".into(), 0.33),
+                        ("deepseek-v4-flash.output".into(), 0.77),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.deepseek.insert(
+            "personal".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.cost.rates.providers.models.deepseek.insert(
+            "deepseek-v4-flash".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(0.14),
+                output_per_mtok: Some(0.28),
+                cached_input_per_mtok: Some(0.0028),
+            },
+        );
+
+        let by_type = build_type_level_model_provider_pricing(&config);
+        let deepseek = by_type.get("deepseek").expect("deepseek type pricing");
+        assert_eq!(deepseek.get("deepseek-v4-flash.input").copied(), Some(0.14));
+        assert_eq!(
+            deepseek.get("deepseek-v4-flash.output").copied(),
+            Some(0.28)
+        );
+        assert_eq!(
+            deepseek.get("deepseek-v4-flash.cached_input").copied(),
+            Some(0.0028)
+        );
+    }
+
+    #[test]
+    fn build_type_level_model_provider_pricing_keeps_legacy_last_alias_wins_behavior() {
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "work".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.deepseek.insert(
+            "personal".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut expected = HashMap::new();
+        for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
+            if profile.pricing.is_empty() {
+                continue;
+            }
+            let slot = expected
+                .entry(type_k.to_string())
+                .or_insert_with(HashMap::new);
+            for (key, value) in &profile.pricing {
+                slot.insert(key.clone(), *value);
+            }
+        }
+
+        let by_type = build_type_level_model_provider_pricing(&config);
+        let deepseek = by_type.get("deepseek").expect("deepseek type pricing");
+        let expected_deepseek = expected.get("deepseek").expect("expected deepseek pricing");
+        assert_eq!(deepseek, expected_deepseek);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_applies_cached_input_pricing() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (total_tokens, cost_usd) = runtime
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+            }))
+            .expect("cost usage");
+
+        let expected = (1_000.0 * 0.27 / 1_000_000.0)
+            + (4_000.0 * 0.027 / 1_000_000.0)
+            + (200.0 * 1.10 / 1_000_000.0);
+        assert_eq!(total_tokens, 5_200);
+        assert!((cost_usd - expected).abs() < 1e-12);
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert_eq!(record.usage.cached_input_tokens, 4_000);
+        assert_eq!(record.usage.billable_input_tokens(), 1_000);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_keeps_turn_usage_when_persistence_fails() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(workspace.path().join("state").join("costs.jsonl"))
+            .expect("make costs.jsonl path unwritable as a directory");
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (total_tokens, cost_usd) = runtime
+            .block_on(TOOL_LOOP_TURN_USAGE.scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                }),
+            ))
+            .expect("cost usage");
+
+        let expected = (1_000.0 * 0.27 / 1_000_000.0)
+            + (4_000.0 * 0.027 / 1_000_000.0)
+            + (200.0 * 1.10 / 1_000_000.0);
+        assert_eq!(total_tokens, 5_200);
+        assert!((cost_usd - expected).abs() < 1e-12);
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 5_000);
+        assert_eq!(recorded.output_tokens, 200);
+        assert!((recorded.cost_usd - expected).abs() < 1e-12);
     }
 }

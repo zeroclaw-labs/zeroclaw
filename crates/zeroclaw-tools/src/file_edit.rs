@@ -319,6 +319,16 @@ mod tests {
         FileEditTool::new(security)
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     /// Wraps `FileEditTool` with the production `PathGuardedTool` + `RateLimitedTool`
     /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
     /// in tests that exercise path-allowlist or rate-limit behavior.
@@ -712,7 +722,7 @@ mod tests {
         let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({
-                "path": "/etc/passwd",
+                "path": absolute_path_outside_workspace(),
                 "old_string": "root",
                 "new_string": "hacked"
             }))
@@ -740,10 +750,9 @@ mod tests {
             .unwrap();
 
         let tool = test_tool(workspace.clone());
-        let workspace_prefixed = workspace
-            .strip_prefix(std::path::Path::new("/"))
-            .unwrap()
-            .join("nested/target.txt");
+        let workspace_prefixed =
+            crate::util_helpers::workspace_prefixed_relative_path_for_test(&workspace)
+                .join("nested/target.txt");
         let result = tool
             .execute(json!({
                 "path": workspace_prefixed.to_string_lossy(),
