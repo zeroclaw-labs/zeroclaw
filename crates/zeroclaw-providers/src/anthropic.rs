@@ -460,7 +460,10 @@ impl AnthropicModelProvider {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
-        for msg in messages.iter() {
+        for (index, msg) in messages.iter().enumerate() {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+                continue;
+            }
             match msg.role.as_str() {
                 "system" => {
                     if system_text.is_none() {

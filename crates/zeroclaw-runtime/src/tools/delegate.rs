@@ -2076,6 +2076,7 @@ impl DelegateTool {
             .flatten();
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
@@ -2128,6 +2129,8 @@ impl DelegateTool {
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
                 ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(agent_name),
+                turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)

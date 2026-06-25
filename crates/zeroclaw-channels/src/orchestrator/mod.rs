@@ -118,17 +118,17 @@ use tokio_util::sync::CancellationToken;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
-    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
-    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
+    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -250,9 +250,10 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+type ThinkingOverrideMap = Arc<Mutex<HashMap<String, ThinkingLevel>>>;
 /// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
 /// Keyed by a `scope_override_key` (prefixed `user::`/`agent::`), so both
-/// tiers share one in-memory map. Never persisted — lost on restart by design.
+/// scopes share one in-memory map. Never persisted — lost on restart by design.
 type ScopedRouteMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
@@ -321,6 +322,8 @@ enum ChannelRuntimeCommand {
     SetModelScoped(OverrideScope, String),
     ShowConfig,
     NewSession,
+    SetThinking(Option<ThinkingLevel>),
+    InvalidThinking(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -461,6 +464,7 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
+    thinking_overrides: ThinkingOverrideMap,
     /// Session-only `/model` overrides scoped by user/agent (see
     /// [`ScopedRouteMap`]). Consulted above `route_overrides` in
     /// [`get_route_selection`]; never persisted.
@@ -1039,59 +1043,48 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
-fn channel_history_content_for_user_turn(content: &str) -> String {
-    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
-    if image_refs.is_empty() {
-        return content.to_string();
-    }
-
-    let mut cleaned = cleaned.trim().to_string();
-    while cleaned.contains("\n\n\n") {
-        cleaned = cleaned.replace("\n\n\n", "\n\n");
-    }
-
-    if cleaned.is_empty() {
-        "[Image attachment processed by vision model]".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn restore_current_user_turn_media_payload(
-    turns: &mut [ChatMessage],
-    history_content: &str,
-    full_content: &str,
-) {
-    if history_content == full_content {
-        return;
-    }
-
-    if let Some(turn) = turns
-        .iter_mut()
-        .rev()
-        .find(|turn| turn.role == "user" && turn.content == history_content)
-    {
-        turn.content = full_content.to_string();
-    }
-}
-
-fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+/// Collapse only heavy inline `data:` image payloads in historical turns while
+/// preserving re-loadable `[IMAGE:<path>]` file references, so a later turn can
+/// re-inflate from disk (#8151) without re-sending megabytes of base64 every
+/// request (#3460). File-path and placeholder markers pass through untouched.
+fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
     if turns.len() <= 1 {
         return;
     }
-
     let last_idx = turns.len() - 1;
     for turn in &mut turns[..last_idx] {
-        if turn.content.contains("[IMAGE:") {
-            turn.content = channel_history_content_for_user_turn(&turn.content);
+        if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
+            continue;
+        }
+        let (_, refs) = zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
+        if refs.iter().any(|r| r.starts_with("data:")) {
+            turn.content = strip_inline_data_image_markers(&turn.content);
         }
     }
+}
 
-    let current = turns.pop();
-    turns.retain(|turn| !turn.content.trim().is_empty());
-    if let Some(current) = current {
-        turns.push(current);
+fn strip_inline_data_image_markers(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = content[cursor..].find("[IMAGE:data:") {
+        let start = cursor + rel;
+        out.push_str(&content[cursor..start]);
+        match content[start..].find(']') {
+            Some(rel_end) => {
+                out.push_str("[Image attachment omitted from history]");
+                cursor = start + rel_end + 1;
+            }
+            None => {
+                out.push_str(&content[start..]);
+                cursor = content.len();
+                break;
+            }
+        }
     }
+    if cursor < content.len() {
+        out.push_str(&content[cursor..]);
+    }
+    out.trim().to_string()
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -1188,6 +1181,62 @@ fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
+fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    match token.to_ascii_lowercase().as_str() {
+        "reset" | "default" | "auto" => Ok(None),
+        "on" | "true" | "1" | "enable" | "enabled" | "yes" => Ok(Some(ThinkingLevel::High)),
+        "off" | "false" | "0" | "disable" | "disabled" | "no" => Ok(Some(ThinkingLevel::Off)),
+        _ => ThinkingLevel::from_str_insensitive(token)
+            .map(Some)
+            .ok_or_else(|| token.to_string()),
+    }
+}
+
+struct ChannelThinkingResolution {
+    effective_content: String,
+    level: ThinkingLevel,
+    params: zeroclaw_runtime::agent::thinking::ThinkingParams,
+    effective_temperature: Option<f64>,
+}
+
+fn resolve_channel_thinking(
+    content: &str,
+    session_override: Option<ThinkingLevel>,
+    config: &ThinkingConfig,
+    base_temperature: Option<f64>,
+) -> ChannelThinkingResolution {
+    let (directive, effective_content) =
+        match zeroclaw_runtime::agent::thinking::parse_thinking_directive(content) {
+            Some((level, remaining)) => (Some(level), remaining),
+            None => (None, content.to_string()),
+        };
+    let level = zeroclaw_runtime::agent::thinking::resolve_thinking_level(
+        directive,
+        session_override,
+        config,
+    );
+    let params = zeroclaw_runtime::agent::thinking::apply_thinking_level_with_config(level, config);
+    let effective_temperature = base_temperature.map(|temperature| {
+        zeroclaw_runtime::agent::thinking::clamp_temperature(
+            temperature + params.temperature_adjustment,
+        )
+    });
+
+    ChannelThinkingResolution {
+        effective_content,
+        level,
+        params,
+        effective_temperature,
+    }
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
@@ -1210,6 +1259,19 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::NewSession)
             } else {
                 None
+            }
+        }
+        "/thinking" => {
+            let arg = parts.next();
+            if parts.next().is_some() {
+                Some(ChannelRuntimeCommand::InvalidThinking(
+                    "too many arguments".to_string(),
+                ))
+            } else {
+                match parse_thinking_command_arg(arg) {
+                    Ok(level) => Some(ChannelRuntimeCommand::SetThinking(level)),
+                    Err(raw) => Some(ChannelRuntimeCommand::InvalidThinking(raw)),
+                }
             }
         }
         // Model/model_provider switching is channel-gated.
@@ -2577,6 +2639,10 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            ctx.thinking_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sender_key);
             if let Some(ref store) = ctx.session_store
                 && let Err(e) = store.delete_session(&sender_key)
             {
@@ -2593,6 +2659,39 @@ async fn handle_runtime_command_if_needed(
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::SetThinking(level) => match level {
+            Some(level) => {
+                ctx.thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(sender_key.clone(), level);
+                format!(
+                    "Thinking set to `{}` for this sender session.\nUse `/thinking reset` to return to the agent default.",
+                    level.as_str()
+                )
+            }
+            None => {
+                let removed = ctx
+                    .thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&sender_key)
+                    .is_some();
+                let default = ctx.agent_cfg.resolved.thinking.default_level.as_str();
+                if removed {
+                    format!(
+                        "Thinking override cleared. Using agent default `{default}` for this sender session."
+                    )
+                } else {
+                    format!(
+                        "Thinking is already using agent default `{default}` for this sender session.\nUse `/thinking high`, `/thinking max`, or `/thinking off` to override it."
+                    )
+                }
+            }
+        },
+        ChannelRuntimeCommand::InvalidThinking(raw) => format!(
+            "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
+        ),
     };
 
     if let Err(err) = channel
@@ -3963,6 +4062,29 @@ async fn process_channel_message_body(
         msg
     };
 
+    let history_key = conversation_history_key(&msg);
+    let thinking_override = ctx
+        .thinking_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .copied();
+    let thinking = resolve_channel_thinking(
+        &msg.content,
+        thinking_override,
+        &ctx.agent_cfg.resolved.thinking,
+        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
+    );
+    if thinking.effective_content != msg.content {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"thinking_level": thinking.level})),
+            "Thinking directive parsed from channel message"
+        );
+        msg.content = thinking.effective_content.clone();
+    }
+
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision = ctx.model_provider.supports_vision();
@@ -4051,7 +4173,6 @@ async fn process_channel_message_body(
         return;
     }
 
-    let history_key = conversation_history_key(&msg);
     if let Some(ref store) = ctx.session_store {
         let channel_id = msg
             .channel_alias
@@ -4131,17 +4252,22 @@ async fn process_channel_message_body(
             return;
         }
     };
-    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+    let history_user_content = msg.content.clone();
+    // Autosave must not persist heavy/private inline `data:` image bytes into
+    // durable memory. Strip them here (path/markers are preserved) before the
+    // store; the channel-history cache still keeps the re-loadable markers via
+    // collapse_inline_image_payloads downstream.
+    let autosave_content = strip_inline_data_image_markers(&history_user_content);
     if ctx.auto_save_memory
-        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
+        && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &history_user_content,
+                &autosave_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -4173,19 +4299,18 @@ async fn process_channel_message_body(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve the dated user turn before the LLM call so interrupted requests
-    // keep the same temporal context as CLI turns. Keep history compact so
-    // inline image payloads are not reloaded into later requests.
+    // Preserve the dated user turn verbatim before the LLM call so interrupted
+    // requests keep the same temporal context as CLI turns. History stores the
+    // full content for every marker type so a later turn can re-load it.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
-    let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_history_content),
+        ChatMessage::user(&timestamped_content),
     );
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns_raw = if force_fresh_session {
+    let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
         ctx.conversation_histories
@@ -4195,13 +4320,6 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
-    if !force_fresh_session {
-        restore_current_user_turn_media_payload(
-            &mut prior_turns_raw,
-            &timestamped_history_content,
-            &timestamped_content,
-        );
-    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -4221,10 +4339,11 @@ async fn process_channel_message_body(
         }
     }
 
-    // Strip [IMAGE:] markers from older cached turns before context
-    // compression. The current message keeps its full payload so vision still
-    // works for the active turn; historical turns keep compact annotations.
-    strip_historical_image_payloads(&mut prior_turns);
+    // Collapse only heavy inline `data:` image payloads in older cached turns.
+    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
+    // re-inflate from disk (#8151); inline base64 is dropped to keep history
+    // within the context budget (#3460).
+    collapse_inline_image_payloads(&mut prior_turns);
 
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
@@ -4294,6 +4413,9 @@ async fn process_channel_message_body(
     }
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
+    }
+    if let Some(ref prefix) = thinking.params.system_prompt_prefix {
+        system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -4643,92 +4765,91 @@ async fn process_channel_message_body(
         }
     });
     let loop_knobs = LoopKnobs::default();
+    let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
+            let thread_scope_id = msg
+                .interruption_scope_id
+                .clone()
+                .or_else(|| msg.thread_ts.clone())
+                .or_else(|| Some(msg.id.clone()));
+            let excluded_tools: &[String] =
+                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+                    &[]
+                } else {
+                    ctx.non_cli_excluded_tools.as_ref()
+                };
+            let tool_loop = run_tool_call_loop(ToolLoop {
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: active_model_provider.as_ref(),
+                        provider_name: route.model_provider.as_str(),
+                        model: route.model.as_str(),
+                        temperature: thinking.effective_temperature,
+                    },
+                    tools_registry: ctx.tools_registry.as_ref(),
+                    observer: notify_observer.as_ref() as &dyn Observer,
+                    silent: true,
+                    approval: Some(&*ctx.approval_manager),
+                    multimodal_config: &ctx.multimodal,
+                    max_tool_iterations: ctx.max_tool_iterations,
+                    hooks: ctx.hooks.as_deref(),
+                    excluded_tools,
+                    dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                    activated_tools: ctx.activated_tools.as_ref(),
+                    model_switch_callback: Some(model_switch_callback.clone()),
+                    pacing: &ctx.pacing,
+                    strict_tool_parsing: ctx
+                        .prompt_config
+                        .agent(ctx.agent_alias.as_str())
+                        .is_some_and(|agent| agent.resolved.strict_tool_parsing),
+                    parallel_tools: ctx
+                        .prompt_config
+                        .agent(ctx.agent_alias.as_str())
+                        .is_some_and(|agent| agent.resolved.parallel_tools),
+                    max_tool_result_chars: ctx.max_tool_result_chars,
+                    context_token_budget: ctx.context_token_budget,
+                    receipt_generator: ctx.receipt_generator.as_ref(),
+                    knobs: &loop_knobs,
+                },
+                history: &mut history,
+                channel_name: msg.channel.as_str(),
+                channel_reply_target: Some(msg.reply_target.as_str()),
+                cancellation_token: Some(cancellation_token.clone()),
+                on_delta: delta_tx.clone(),
+                shared_budget: None,
+                channel: target_channel.as_deref(),
+                // Collector is meaningful only when the generator is active.
+                // Pass None when receipts are disabled so the call site
+                // reflects that coupling explicitly.
+                collected_receipts: ctx
+                    .receipt_generator
+                    .as_ref()
+                    .map(|_| tool_receipts_collector.as_ref()),
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(ctx.agent_alias.as_str()),
+                turn_id: &turn_id,
+            });
+            let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(thinking.params.native_thinking, tool_loop);
+            let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                .scope(receipt_scope.clone(), tool_loop);
+            let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(cost_tracking_context.clone(), tool_loop);
+            let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            let timed_tool_loop =
+                tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
+
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = tokio::time::timeout(
-                    Duration::from_secs(timeout_budget_secs),
-                    scope_thread_id(
-                        msg.interruption_scope_id.clone()
-                            .or_else(|| msg.thread_ts.clone())
-                            .or_else(|| Some(msg.id.clone())),
-                    scope_session_key(
-                        Some(history_key.clone()),
-                        zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                            cost_tracking_context.clone(),
-                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
-                            receipt_scope.clone(),
-                        run_tool_call_loop(ToolLoop {
-exec: ResolvedAgentExecution::resolve(
-ResolvedModelAccess {
-model_provider: active_model_provider.as_ref(),
-provider_name: route.model_provider.as_str(),
-model: route.model.as_str(),
-temperature: runtime_defaults.defaults.temperature,
-},
-ResolvedIo {
-tools_registry: ctx.tools_registry.as_ref(),
-observer: notify_observer.as_ref() as &dyn Observer,
-silent: true,
-approval: Some(&*ctx.approval_manager),
-multimodal_config: &ctx.multimodal,
-hooks: ctx.hooks.as_deref(),
-activated_tools: ctx.activated_tools.as_ref(),
-model_switch_callback: Some(model_switch_callback.clone()),
-receipt_generator: ctx.receipt_generator.as_ref(),
-},
-ResolvedRuntimeKnobs {
-max_tool_iterations: ctx.max_tool_iterations,
-excluded_tools: if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
-dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-pacing: &ctx.pacing,
-strict_tool_parsing: ctx
-                            .prompt_config
-                            .agent(ctx.agent_alias.as_str())
-                            .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-parallel_tools: ctx
-                            .prompt_config
-                            .agent(ctx.agent_alias.as_str())
-                            .is_some_and(|agent| agent.resolved.parallel_tools),
-max_tool_result_chars: ctx.max_tool_result_chars,
-context_token_budget: ctx.context_token_budget,
-knobs: &loop_knobs,
-},
-),
-history: &mut history,
-channel_name: msg.channel.as_str(),
-channel_reply_target: Some(msg.reply_target.as_str()),
-cancellation_token: Some(cancellation_token.clone()),
-on_delta: delta_tx.clone(),
-shared_budget: None,
-channel: target_channel.as_deref(),
-// Collector is meaningful only when the generator is
-                        // active. Pass None when receipts are disabled so the
-                        // call site reflects that coupling explicitly.
-                        collected_receipts: ctx
-                            .receipt_generator
-                            .as_ref()
-                            .map(|_| tool_receipts_collector.as_ref()),
-event_tx: None,
-steering: None,
-new_messages_out: None,
-image_cache: None,
-// Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
-}),
-                    ),
-                    ),
-                    ),
-                    ),
-                ) => LlmExecutionResult::Completed(result),
+                result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
 
             // Handle model switch: re-create the model_provider and retry
@@ -4782,9 +4903,9 @@ image_cache: None,
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
-                            channel: None,
-                            agent_alias: None,
-                            turn_id: None,
+                            channel: Some(msg.channel.to_string()),
+                            agent_alias: Some(ctx.agent_alias.to_string()),
+                            turn_id: Some(turn_id.clone()),
                         });
 
                         continue;
@@ -5273,11 +5394,7 @@ image_cache: None,
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        &timestamped_history_content,
-                    );
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -6627,6 +6744,24 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
+fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
+    let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for cc in configured {
+        *name_counts.entry(cc.channel.name()).or_insert(0) += 1;
+    }
+    for cc in configured {
+        let name = cc.channel.name();
+        let composite = composite_channel_key(name, cc.alias.as_deref());
+        map.insert(composite, Arc::clone(&cc.channel));
+        if name_counts.get(name).copied().unwrap_or(0) == 1 {
+            map.entry(name.to_string())
+                .or_insert_with(|| Arc::clone(&cc.channel));
+        }
+    }
+    map
+}
+
 /// Look up the live channel handle that should send a reply to `msg`.
 ///
 /// Resolution order:
@@ -6787,13 +6922,8 @@ pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    collect_configured_channels(&config_arc, "", &[])
-        .into_iter()
-        .map(|ch| {
-            let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
-            (key, ch.channel)
-        })
-        .collect()
+    let configured = collect_configured_channels(&config_arc, "", &[]);
+    configured_channel_map(&configured)
 }
 
 /// Build configured channels and register them into late-bound tool handles.
@@ -6806,6 +6936,7 @@ pub fn build_channel_map(
 pub fn register_channels_for_tools(
     config: &Config,
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &Option<tools::PerToolChannelHandle>,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
@@ -6815,19 +6946,20 @@ pub fn register_channels_for_tools(
 
     let handles = [
         ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
         reaction_handle.as_ref(),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
     ];
 
-    let mut names = Vec::new();
-    for ch in &configured {
-        let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
+    let map = configured_channel_map(&configured);
+    for (key, channel) in &map {
         for handle in handles.iter().flatten() {
-            handle.write().insert(key.clone(), Arc::clone(&ch.channel));
+            handle.write().insert(key.clone(), Arc::clone(channel));
         }
-        names.push(key);
     }
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort();
     names
 }
 
@@ -8793,6 +8925,7 @@ pub async fn start_channels(
         }
         let reaction_handle_ch = all_tools_result_ch.reaction_handle;
         let ask_user_handle_ch = all_tools_result_ch.ask_user_handle;
+        let channel_room_handle_ch = all_tools_result_ch.channel_room_handle;
         let poll_handle_ch = all_tools_result_ch.poll_handle;
         let escalate_handle_ch = all_tools_result_ch.escalate_handle;
 
@@ -9047,6 +9180,10 @@ pub async fn start_channels(
             "pushover",
             "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
         ));
+        tool_descs.push((
+            "channel_room",
+            "Create channel rooms and invite users through active channels. Use with Matrix channel keys such as matrix.default.",
+        ));
         if !config.agents.is_empty() {
             tool_descs.push((
                 "delegate",
@@ -9253,23 +9390,7 @@ pub async fn start_channels(
             drop(tx);
 
             // Composite-key registry (see `composite_channel_key`).
-            let cbn = Arc::new({
-                let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
-                let mut name_counts: HashMap<&str, usize> = HashMap::new();
-                for cc in &configured_channels {
-                    *name_counts.entry(cc.channel.name()).or_insert(0) += 1;
-                }
-                for cc in &configured_channels {
-                    let name = cc.channel.name();
-                    let composite = composite_channel_key(name, cc.alias.as_deref());
-                    map.insert(composite, Arc::clone(&cc.channel));
-                    if name_counts.get(name).copied().unwrap_or(0) == 1 {
-                        map.entry(name.to_string())
-                            .or_insert_with(|| Arc::clone(&cc.channel));
-                    }
-                }
-                map
-            });
+            let cbn = Arc::new(configured_channel_map(&configured_channels));
             *CRON_CHANNEL_REGISTRY
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
@@ -9288,7 +9409,7 @@ pub async fn start_channels(
                 .expect("channels_by_name initialized on first iteration"),
         );
 
-        // Wire this agent's reaction / ask_user / escalate tool handles
+        // Wire this agent's reaction / ask_user / channel room / escalate tool handles
         // into the shared `channels_by_name` map.
         {
             let mut map = reaction_handle_ch.write();
@@ -9297,6 +9418,12 @@ pub async fn start_channels(
             }
         }
         if let Some(ref handle) = ask_user_handle_ch {
+            let mut map = handle.write();
+            for (name, ch) in channels_by_name.as_ref() {
+                map.insert(name.clone(), Arc::clone(ch));
+            }
+        }
+        if let Some(ref handle) = channel_room_handle_ch {
             let mut map = handle.write();
             for (name, ch) in channels_by_name.as_ref() {
                 map.insert(name.clone(), Arc::clone(ch));
@@ -9352,6 +9479,7 @@ pub async fn start_channels(
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(config.reliability.clone()),
             provider_runtime_options,
@@ -10078,6 +10206,48 @@ temperature = 0.3
     }
 
     #[test]
+    fn configured_channel_map_adds_bare_key_for_singleton_type() {
+        let matrix = mock_channel("matrix");
+        let configured = vec![ConfiguredChannel {
+            display_name: "Matrix",
+            alias: Some("default".to_string()),
+            channel: Arc::clone(&matrix),
+        }];
+
+        let map = configured_channel_map(&configured);
+
+        assert!(Arc::ptr_eq(map.get("matrix.default").unwrap(), &matrix));
+        assert!(Arc::ptr_eq(map.get("matrix").unwrap(), &matrix));
+    }
+
+    #[test]
+    fn configured_channel_map_keeps_multi_aliases_composite_only() {
+        let clamps = mock_channel("discord");
+        let glados = mock_channel("discord");
+        let configured = vec![
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("clamps".to_string()),
+                channel: Arc::clone(&clamps),
+            },
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("glados".to_string()),
+                channel: Arc::clone(&glados),
+            },
+        ];
+
+        let map = configured_channel_map(&configured);
+
+        assert!(Arc::ptr_eq(map.get("discord.clamps").unwrap(), &clamps));
+        assert!(Arc::ptr_eq(map.get("discord.glados").unwrap(), &glados));
+        assert!(
+            !map.contains_key("discord"),
+            "bare key would be ambiguous for multiple aliases"
+        );
+    }
+
+    #[test]
     fn find_channel_for_message_resolves_by_composite_key_for_multi_alias() {
         // Two Discord bots in the registry: only the composite key
         // distinguishes them. Without this, the second insertion silently
@@ -10228,6 +10398,7 @@ temperature = 0.3
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -10816,6 +10987,7 @@ temperature = 0.3
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11291,6 +11463,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11384,6 +11557,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11495,6 +11669,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11610,6 +11785,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -12007,6 +12183,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -12744,6 +12921,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -12825,6 +13003,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -12938,6 +13117,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13052,6 +13232,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13205,6 +13386,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13329,6 +13511,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13468,6 +13651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13590,6 +13774,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13697,6 +13882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13824,6 +14010,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -13968,6 +14155,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -14175,6 +14363,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -14277,6 +14466,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -14389,6 +14579,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -14760,6 +14951,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -14901,6 +15093,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -15052,6 +15245,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -15213,6 +15407,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -15350,6 +15545,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -15476,6 +15672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -15583,6 +15780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -16603,6 +16801,105 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    #[test]
+    fn parse_runtime_command_maps_thinking_levels() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking high"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(
+                ThinkingLevel::High
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking max"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(ThinkingLevel::Max)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking off"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(ThinkingLevel::Off)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking on"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(
+                ThinkingLevel::High
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_thinking_reset_and_invalid() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking"),
+            Some(ChannelRuntimeCommand::SetThinking(None))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking reset"),
+            Some(ChannelRuntimeCommand::SetThinking(None))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking banana"),
+            Some(ChannelRuntimeCommand::InvalidThinking("banana".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/thinking high now"),
+            Some(ChannelRuntimeCommand::InvalidThinking(
+                "too many arguments".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_channel_thinking_uses_session_override_without_inline_directive() {
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
+        };
+        let resolved = resolve_channel_thinking(
+            "explain the tradeoff",
+            Some(ThinkingLevel::High),
+            &config,
+            Some(0.5),
+        );
+
+        assert_eq!(resolved.effective_content, "explain the tradeoff");
+        assert_eq!(resolved.level, ThinkingLevel::High);
+        assert!(resolved.effective_temperature.unwrap() > 0.5);
+    }
+
+    #[test]
+    fn resolve_channel_thinking_inline_directive_beats_session_override() {
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
+        };
+        let resolved = resolve_channel_thinking(
+            "/think:off explain briefly",
+            Some(ThinkingLevel::Max),
+            &config,
+            Some(0.5),
+        );
+
+        assert_eq!(resolved.effective_content, "explain briefly");
+        assert_eq!(resolved.level, ThinkingLevel::Off);
+        assert!(resolved.effective_temperature.unwrap() < 0.5);
+    }
+
+    #[test]
+    fn resolve_channel_thinking_strips_directive_before_url_enrichment() {
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
+        };
+        let resolved = resolve_channel_thinking(
+            "/think:max summarize https://example.com",
+            None,
+            &config,
+            Some(0.5),
+        );
+
+        assert_eq!(resolved.effective_content, "summarize https://example.com");
+        assert_eq!(resolved.level, ThinkingLevel::Max);
+    }
+
     /// `/models <family>` must resolve to a configured alias-backed ref so the
     /// switched provider uses the alias entry's key/URI — never construct a bare
     /// family provider that ignores `[providers.models.<family>.<alias>]`.
@@ -17090,6 +17387,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -17257,6 +17555,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -17638,7 +17937,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+    async fn process_channel_message_persists_image_payload_verbatim() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -17677,6 +17976,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -17772,8 +18072,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.starts_with('['));
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("[IMAGE:data:"));
+        assert!(turns[0].content.contains("AQIDBA"));
     }
 
     #[tokio::test]
@@ -17822,6 +18122,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -19175,53 +19476,92 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
-        let content =
-            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
-
-        let history_content = channel_history_content_for_user_turn(content);
-
-        assert_eq!(
-            history_content,
-            "[Image: sticker.webp attached]\n\nwhat is this?"
-        );
-        assert!(!history_content.contains("[IMAGE:data:"));
-        assert!(!history_content.contains("abcd"));
-    }
-
-    #[test]
-    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
-        let history_content =
-            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
-
-        assert_eq!(
-            history_content,
-            "[Image attachment processed by vision model]"
-        );
-    }
-
-    #[test]
-    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+    fn channel_history_preserves_image_marker_verbatim_across_followup() {
+        let img = "[IMAGE:/tmp/media/screenshot.png] wait look at this";
         let mut turns = vec![
-            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
-            ChatMessage::assistant("I saw the old image."),
-            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+            ChatMessage::user(img),
+            ChatMessage::assistant("\u{1f44d}"),
+            ChatMessage::user("can you see the screenshot?"),
         ];
 
-        strip_historical_image_payloads(&mut turns);
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
 
-        assert_eq!(turns.len(), 3);
-        assert!(turns[0].content.contains("[Image: old.png attached]"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("base64,old"));
+        assert_eq!(kept[0].content, img);
+        assert!(kept[0].content.contains("/tmp/media/screenshot.png"));
+        assert!(!kept[0].content.contains("processed by vision model"));
+    }
+
+    #[test]
+    fn channel_history_preserves_document_voice_and_text_verbatim() {
+        let doc = "[Document: report.pdf] /tmp/media/report.pdf summarize this";
+        let voice = "[Voice] what did i just send";
+        let text = "plain text with no markers";
+        let mut turns = vec![
+            ChatMessage::user(doc),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(voice),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(text),
+        ];
+
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
+
+        assert_eq!(kept[0].content, doc);
+        assert_eq!(kept[2].content, voice);
+        assert_eq!(kept[4].content, text);
+    }
+
+    #[test]
+    fn collapse_inline_image_payloads_drops_data_uri_keeps_path() {
+        let path_turn = "[IMAGE:/tmp/media/screenshot.png] can you see this?";
+        let data_turn = format!(
+            "[IMAGE:data:image/png;base64,{}] old screenshot",
+            "AQIDBAUGBwg".repeat(64)
+        );
+        let mut turns = vec![
+            ChatMessage::user(path_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(&data_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("[IMAGE:/tmp/media/current.png] and this?"),
+        ];
+
+        collapse_inline_image_payloads(&mut turns);
+
+        assert_eq!(turns[0].content, path_turn, "file-path marker must survive");
         assert!(
-            turns[2]
-                .content
-                .contains("[IMAGE:data:image/png;base64,current]")
+            !turns[2].content.contains("base64"),
+            "inline data payload must be collapsed"
+        );
+        assert!(turns[2].content.contains("old screenshot"));
+        assert_eq!(
+            turns[4].content, "[IMAGE:/tmp/media/current.png] and this?",
+            "current turn is never collapsed"
         );
     }
 
-    // ── E2E: photo [IMAGE:] marker rejected by non-vision model_provider ───
+    #[test]
+    fn strip_inline_data_image_markers_drops_bytes_keeps_path_marker_for_autosave() {
+        // The autosave path calls strip_inline_data_image_markers before
+        // storing to durable memory, so inline data: bytes never persist while
+        // re-loadable path markers and surrounding text survive.
+        let img_open = format!("[{}", "IMAGE:/tmp/shot.png]");
+        let payload = "AQIDBAUGBwg".repeat(64);
+        let data_marker = format!("[{}{payload}]", "IMAGE:data:image/png;base64,");
+        let content = format!("look at {img_open} and {data_marker} please");
+
+        let cleaned = strip_inline_data_image_markers(&content);
+
+        assert!(
+            !cleaned.contains("base64"),
+            "inline data bytes must be stripped before autosave: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("/tmp/shot.png"),
+            "re-loadable path marker must survive: {cleaned}"
+        );
+        assert!(cleaned.contains("look at") && cleaned.contains("please"));
+    }
 
     /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
     /// marker) sent through `process_channel_message` with a non-vision
@@ -19264,6 +19604,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -19378,6 +19719,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -19532,6 +19874,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -19759,6 +20102,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -19906,6 +20250,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -20045,6 +20390,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -20204,6 +20550,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
@@ -20602,6 +20949,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
