@@ -690,6 +690,33 @@ export async function putPersonalityFile(
 
 // ── Skills (api_skills.rs) ───────────────────────────────────────────
 
+/** A predefined choice for a typed slash option. Only meaningful for
+ *  string/integer/number options; `value` is kept as text and coerced to the
+ *  option's type by the channel. Mirrors the runtime `SkillSlashChoice`. */
+export interface SkillSlashChoice {
+  name: string;
+  value: string;
+}
+
+/** A typed option a `slash`-tagged skill exposes on its slash command. Mirrors
+ *  the runtime `SkillSlashOption` (SKILL.md `slash_options:` /
+ *  SKILL.toml `[[skill.slash_options]]`), shaped after Discord's application
+ *  command option model. `type` is one of `string | integer | number |
+ *  boolean | user | channel | role | mentionable`; unknown values are dropped
+ *  by the channel. `choices` apply to string/integer/number; `min`/`max` to
+ *  integer/number; `min_length`/`max_length` to string. */
+export interface SkillSlashOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  choices?: SkillSlashChoice[];
+  min?: number | null;
+  max?: number | null;
+  min_length?: number | null;
+  max_length?: number | null;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -700,6 +727,10 @@ export interface SkillFrontmatter {
   /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
    *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
   tags?: string[];
+  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+   *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
+   *  Omitted by the backend when empty. */
+  slash_options?: SkillSlashOption[];
 }
 
 export interface SkillBundleEntry {
