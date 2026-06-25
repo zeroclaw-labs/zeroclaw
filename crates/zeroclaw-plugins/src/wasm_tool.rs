@@ -4,6 +4,7 @@ use crate::PluginPermission;
 use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -18,6 +19,7 @@ pub struct WasmTool {
     parameters_schema: Value,
     wasm_path: PathBuf,
     permissions: Vec<PluginPermission>,
+    config: HashMap<String, String>,
 }
 
 impl WasmTool {
@@ -27,6 +29,7 @@ impl WasmTool {
         parameters_schema: Value,
         wasm_path: PathBuf,
         permissions: Vec<PluginPermission>,
+        config: HashMap<String, String>,
     ) -> Self {
         Self {
             name,
@@ -34,6 +37,7 @@ impl WasmTool {
             parameters_schema,
             wasm_path,
             permissions,
+            config,
         }
     }
 
@@ -44,6 +48,7 @@ impl WasmTool {
         permissions: Vec<PluginPermission>,
         fallback_name: String,
         fallback_description: String,
+        config: HashMap<String, String>,
     ) -> Self {
         // Try to load metadata from the WASM module itself.
         let (name, description, schema) = match runtime::create_plugin(&wasm_path, &permissions) {
@@ -89,6 +94,7 @@ impl WasmTool {
             parameters_schema: schema,
             wasm_path,
             permissions,
+            config,
         }
     }
 }
@@ -126,12 +132,13 @@ impl Tool for WasmTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let wasm_path = self.wasm_path.clone();
         let permissions = self.permissions.clone();
+        let config = self.config.clone();
         let args_json = serde_json::to_vec(&args)?;
 
         // Extism Plugin is !Send, so we must create it inside spawn_blocking.
         tokio::task::spawn_blocking(move || {
             let mut plugin = runtime::create_plugin(&wasm_path, &permissions)?;
-            runtime::call_execute(&mut plugin, &args_json)
+            runtime::call_execute(&mut plugin, &args_json, &config, &permissions)
         })
         .await?
     }
