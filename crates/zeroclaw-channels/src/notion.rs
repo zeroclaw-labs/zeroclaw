@@ -89,9 +89,9 @@ impl NotionChannel {
         );
         headers.insert(
             "Content-Type",
-            "application/json"
-                .parse()
-                .map_err(|e| anyhow::Error::msg(format!("Invalid Content-Type header value: {e}")))?,
+            "application/json".parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Content-Type header value: {e}"))
+            })?,
         );
         Ok(headers)
     }
