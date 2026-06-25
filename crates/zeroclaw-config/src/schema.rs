@@ -3446,6 +3446,14 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Per-agent reply-intent precheck controls. The classifier call reads
+    /// this block at message time; model/provider selection stays on
+    /// `classifier_provider` so there is only one routing source of truth.
+    #[tab(Channels)]
+    #[serde(default)]
+    #[nested]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
     /// the runtime profile's `context_compression.summary_provider`, else the
@@ -3537,6 +3545,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
@@ -17365,6 +17374,15 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
+        for (alias, agent) in &self.agents {
+            if agent.precheck.timeout_secs == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.precheck.timeout_secs"),
+                    "agents.{alias}.precheck.timeout_secs must be greater than 0"
+                );
+            }
+        }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
         if self.heartbeat.enabled {
@@ -21934,6 +21952,51 @@ reasoning_effort = "turbo"
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
+        assert!(cfg.precheck.enabled);
+        assert_eq!(cfg.precheck.timeout_secs, 5);
+    }
+
+    #[test]
+    async fn agent_precheck_config_parses_from_agent_block() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+enabled = false
+timeout_secs = 12
+"#;
+        let parsed = parse_test_config(raw);
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(!agent.precheck.enabled);
+        assert_eq!(agent.precheck.timeout_secs, 12);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_agent_precheck_timeout() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+timeout_secs = 0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("zero precheck timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.default.precheck.timeout_secs")
+        );
     }
 
     #[test]
