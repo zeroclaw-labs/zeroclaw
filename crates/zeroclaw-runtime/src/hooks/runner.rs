@@ -33,6 +33,19 @@ impl HookRunner {
         }
     }
 
+    pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
+        let mut runner = Self::new();
+        if hooks.builtin.command_logger {
+            runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
+        }
+        if hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(super::builtin::WebhookAuditHook::new(
+                hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+        runner
+    }
+
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
         self.handlers.push(handler);

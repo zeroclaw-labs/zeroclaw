@@ -183,6 +183,7 @@ impl RpcContext {
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -275,6 +276,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 }
