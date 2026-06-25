@@ -242,6 +242,7 @@ Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
 
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
@@ -292,9 +293,12 @@ JSON-RPC returns HTTP `400`.
 
 ## Exposure and the one sharp edge
 
-The task endpoint shares the exact posture of the cards: it answers only when
-`[a2a.server] enabled` is set and the alias is enabled and published. A task POST
-to an unpublished or unknown alias returns `404`, the same as its card.
+The task endpoint shares the cards' enabled and published gates: it answers only
+when `[a2a.server] enabled` is set and the alias is enabled and published. A task
+POST to an unpublished or unknown alias returns `404`, the same as its card. It
+does not share the cards' auth posture, though: discovery cards stay public,
+while task invocation requires the gateway bearer token and returns `401` without
+it.
 
 One sharp edge to know about: the interface URL answers a bare GET with the web
 dashboard, not an agent, because the gateway falls back to serving the dashboard
