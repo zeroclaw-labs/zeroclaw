@@ -444,6 +444,27 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Ask the user a multi-select multiple-choice question and return the
+    /// chosen options' text.
+    ///
+    /// Returns `Ok(Some(answers))` if the channel handled it natively (e.g.
+    /// ACP `elicitation/create` with a `type: array` schema). Returns
+    /// `Ok(None)` to signal the caller should fall back to a non-native
+    /// path (formatted text + reactions, etc.). Default impl returns `None`.
+    ///
+    /// `min_items` and `max_items` map to JSON Schema's `minItems` /
+    /// `maxItems` — clients enforce the bound before submitting.
+    async fn request_multi_choice(
+        &self,
+        _question: &str,
+        _choices: &[String],
+        _min_items: usize,
+        _max_items: usize,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow.
     ///

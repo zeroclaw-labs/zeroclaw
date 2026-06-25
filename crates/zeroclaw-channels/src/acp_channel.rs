@@ -391,6 +391,35 @@ fn single_select_schema_with_property_name(
     })
 }
 
+/// Build the restricted JSON Schema for a multi-select enum elicitation.
+///
+/// Index-based `const` values mirror `single_select_schema` so the
+/// response → text round-trip survives duplicates.
+fn multi_select_schema(
+    choices: &[String],
+    min_items: usize,
+    max_items: usize,
+) -> serde_json::Value {
+    let any_of: Vec<serde_json::Value> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| json!({ "const": format!("choice-{i}"), "title": text }))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "choices": {
+                "type": "array",
+                "title": "Choices",
+                "minItems": min_items,
+                "maxItems": max_items,
+                "items": { "anyOf": any_of },
+            }
+        },
+        "required": ["choices"],
+    })
+}
+
 #[async_trait]
 impl Channel for AcpChannel {
     fn name(&self) -> &str {
@@ -474,6 +503,75 @@ impl Channel for AcpChannel {
         } else {
             self.request_choice_via_permission(question, choices, timeout)
                 .await
+        }
+    }
+
+    async fn request_multi_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        min_items: usize,
+        max_items: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        if choices.is_empty() {
+            anyhow::bail!("AcpChannel.request_multi_choice requires at least one choice")
+        }
+        if !self.client_caps.form {
+            // No legacy fallback for multi-select — session/request_permission
+            // is single-select-only. Signal Ok(None) so the caller (poll tool)
+            // takes its own non-ACP fallback path.
+            return Ok(None);
+        }
+
+        let req = ElicitationRequest {
+            session_id: self.session_id.clone(),
+            mode: ElicitationMode::Form,
+            message: question.to_string(),
+            requested_schema: multi_select_schema(choices, min_items, max_items),
+        };
+        let params = serde_json::to_value(&req)?;
+        let call = self.rpc.request("elicitation/create", params);
+        let response_value = match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => anyhow::bail!(
+                "ACP elicitation/create (multi) failed: {} ({})",
+                e.message,
+                e.code
+            ),
+            Err(_) => {
+                anyhow::bail!("ACP elicitation/create (multi) timed out after {timeout:?}")
+            }
+        };
+
+        let parsed: ElicitationResponse = serde_json::from_value(response_value)
+            .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
+        match parsed {
+            ElicitationResponse::Accept { content } => {
+                let arr = content
+                    .get("choices")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("elicitation accept missing content.choices array")
+                    })?;
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| anyhow::Error::msg("non-string entry in content.choices"))?;
+                    let idx = s
+                        .strip_prefix("choice-")
+                        .and_then(|n| n.parse::<usize>().ok());
+                    match idx.and_then(|i| choices.get(i)) {
+                        Some(text) => out.push(text.clone()),
+                        None => {
+                            anyhow::bail!("elicitation returned unknown choice const: {s}")
+                        }
+                    }
+                }
+                Ok(Some(out))
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
     }
 
@@ -1411,5 +1509,210 @@ mod tests {
         // This test exists so a future caller renaming "choice" to "password"
         // (or building a schema with such a property) fails loudly in CI.
         let _ = single_select_schema_with_property_name("password", &["x".to_string()]);
+    }
+
+    #[test]
+    fn multi_select_schema_has_array_anyof_items() {
+        let schema = multi_select_schema(
+            &["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+            1,
+            2,
+        );
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["choices"]));
+        let choices = &schema["properties"]["choices"];
+        assert_eq!(choices["type"], "array");
+        assert_eq!(choices["minItems"], 1);
+        assert_eq!(choices["maxItems"], 2);
+        let any_of = choices["items"]["anyOf"].as_array().expect("anyOf array");
+        assert_eq!(any_of.len(), 3);
+        assert_eq!(any_of[0]["const"], "choice-0");
+        assert_eq!(any_of[0]["title"], "Red");
+        assert_eq!(any_of[1]["const"], "choice-1");
+        assert_eq!(any_of[1]["title"], "Green");
+        assert_eq!(any_of[2]["const"], "choice-2");
+        assert_eq!(any_of[2]["title"], "Blue");
+    }
+
+    #[tokio::test]
+    async fn request_multi_choice_uses_elicitation_when_capability_present() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_multi_choice("Pick colors", &choices, 1, 2, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(req["method"], "elicitation/create");
+        assert_eq!(req["params"]["sessionId"], "sess-1");
+        assert_eq!(req["params"]["mode"], "form");
+        assert_eq!(req["params"]["message"], "Pick colors");
+
+        // Schema is a multi-select array with anyOf items.
+        let schema = &req["params"]["requestedSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"][0], "choices");
+        let arr = &schema["properties"]["choices"];
+        assert_eq!(arr["type"], "array");
+        assert_eq!(arr["minItems"], 1);
+        assert_eq!(arr["maxItems"], 2);
+        let any_of = arr["items"]["anyOf"].as_array().expect("anyOf array");
+        assert_eq!(any_of.len(), 3);
+        assert_eq!(any_of[0]["const"], "choice-0");
+        assert_eq!(any_of[0]["title"], "Red");
+        assert_eq!(any_of[2]["const"], "choice-2");
+        assert_eq!(any_of[2]["title"], "Blue");
+
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({
+                "action": "accept",
+                "content": {"choices": ["choice-0", "choice-2"]},
+            })),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some(vec!["Red".to_string(), "Blue".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn request_multi_choice_returns_none_without_capability() {
+        let (rpc, mut rx) = make_rpc();
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+
+        // No legacy fallback for multi-select — must return Ok(None) directly
+        // without emitting any RPC. So we can await inline.
+        let result = ch
+            .request_multi_choice("Q?", &choices, 1, 2, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+
+        // No outbound RPC should have been sent.
+        match rx.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Ok(line) => panic!("unexpected outbound RPC line: {line}"),
+            Err(e) => panic!("unexpected rx state: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_multi_choice_decline_returns_none() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_multi_choice("Q?", &choices, 1, 2, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "elicitation/create");
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(&id, Some(json!({"action": "decline"})), None);
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn request_multi_choice_cancel_returns_none() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_multi_choice("Q?", &choices, 1, 2, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "elicitation/create");
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(&id, Some(json!({"action": "cancel"})), None);
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn request_multi_choice_accept_with_unknown_const_is_error() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_multi_choice("Q?", &choices, 1, 2, Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"action": "accept", "content": {"choices": ["choice-99"]}})),
+            None,
+        );
+
+        let res = task.await.unwrap();
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("unknown") || msg.contains("choice-99"),
+            "unexpected error: {msg}"
+        );
     }
 }
