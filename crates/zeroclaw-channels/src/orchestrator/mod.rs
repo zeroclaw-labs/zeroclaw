@@ -522,10 +522,7 @@ struct ChannelRuntimeContext {
 /// Acquire the per-conversation-history-key persistence lock so that
 /// append/remove_last/delete_session operations for the same sender are
 /// serialized without blocking the full message-processing loop (#7753).
-fn acquire_persist_lock(
-    ctx: &ChannelRuntimeContext,
-    key: &str,
-) -> Arc<std::sync::Mutex<()>> {
+fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync::Mutex<()>> {
     let mut map = ctx.persist_locks.lock().unwrap_or_else(|e| e.into_inner());
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
@@ -2668,9 +2665,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::NewSession => {
             // Serialize per-sender persistence to prevent interleaving (#7753).
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
-            let _lock = persist_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
             clear_sender_history(ctx, &sender_key);
             ctx.thinking_overrides
                 .lock()
@@ -4321,9 +4316,7 @@ async fn process_channel_message_body(
         // older cached turns reappear before this message starts.
         // Serialize per-sender persistence to prevent interleaving (#7753).
         let persist_lock = acquire_persist_lock(ctx.as_ref(), &history_key);
-        let _lock = persist_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
@@ -10044,9 +10037,9 @@ fn concurrent_persist_lock_serialization() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
     use zeroclaw_runtime::approval::ApprovalManager;
     use zeroclaw_runtime::observability::NoopObserver;
-    use zeroclaw_providers::ChatMessage;
 
     /// Backend that records the append *sequence* (not just a count)
     /// and introduces a per-caller varying delay **after** the push.
@@ -10060,22 +10053,28 @@ fn concurrent_persist_lock_serialization() {
         call_n: Arc<AtomicUsize>,
     }
     impl SessionBackend for OrderBackend {
-        fn load(&self, _key: &str) -> Vec<ChatMessage> { vec![] }
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            vec![]
+        }
         fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
             let content = msg.content.clone();
             let n = self.call_n.fetch_add(1, Ordering::SeqCst);
-            self.sequence.lock().unwrap_or_else(|e| e.into_inner())
+            self.sequence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(content);
             // Delay outside the sequence lock: later callers get
             // shorter delays → they exit earlier and can win the
             // history-push race.
-            std::thread::sleep(Duration::from_millis(
-                8_u64.saturating_sub(n as u64 * 2),
-            ));
+            std::thread::sleep(Duration::from_millis(8_u64.saturating_sub(n as u64 * 2)));
             Ok(())
         }
-        fn remove_last(&self, _key: &str) -> std::io::Result<bool> { Ok(true) }
-        fn list_sessions(&self) -> Vec<String> { vec![] }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(true)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
     }
 
     let sender = "concurrent_test_key".to_string();
@@ -10108,15 +10107,20 @@ fn concurrent_persist_lock_serialization() {
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
-            telegram: false, slack: false, discord: false,
-            mattermost: false, matrix: false, whatsapp: false,
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
         },
         multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10143,14 +10147,18 @@ fn concurrent_persist_lock_serialization() {
         pacing: zeroclaw_config::schema::PacingConfig::default(),
         max_tool_result_chars: 0,
         context_token_budget: 0,
-        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(Duration::ZERO)),
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            Duration::ZERO,
+        )),
         receipt_generator: None,
         show_receipts_in_response: false,
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
     });
-    ctx.conversation_histories.lock().unwrap_or_else(|e| e.into_inner())
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .push(sender.clone(), vec![ChatMessage::user("start")]);
 
     let barrier = Arc::new(Barrier::new(4));
@@ -10164,14 +10172,15 @@ fn concurrent_persist_lock_serialization() {
             append_sender_turn(&ctx, &key, ChatMessage::user(format!("msg-{i}")));
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 
     // ── Assertion ────────────────────────────────────────────────
     // Under the per-sender persist lock every (append, history-push)
     // pair is atomic, so the backend sequence must equal the
     // in-memory history for this sender (minus the initial "start").
-    let backend_order: Vec<String> =
-        sequence.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let backend_order: Vec<String> = sequence.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let history: Vec<String> = {
         let histories = ctx
             .conversation_histories
