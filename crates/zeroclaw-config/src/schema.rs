@@ -300,6 +300,12 @@ pub struct Config {
     #[nested]
     pub wss: WssConfig,
 
+    /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub relay: RelayConfig,
+
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     #[nested]
@@ -6548,6 +6554,32 @@ impl Default for WssConfig {
             client_auth: None,
         }
     }
+}
+
+/// Nominated-relay client (`[relay]`).
+///
+/// When enabled, the daemon keeps a persistent outbound connection to a relay
+/// and registers `node_id`, so clients behind NAT can reach it *through* the
+/// relay. The relay is a blind forwarder: the inner client<->daemon mTLS still
+/// terminates at the daemon's WSS listener and is never decrypted by the relay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "relay"]
+pub struct RelayConfig {
+    /// Enable the relay bridge (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay address to connect to, as `host:port`.
+    #[serde(default)]
+    pub url: String,
+    /// Opaque node-id this daemon registers under (clients dial this id).
+    #[serde(default)]
+    pub node_id: String,
+    /// Relay account token presented at registration (admission credential).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    pub token: String,
 }
 
 fn default_wss_bind() -> String {
@@ -15649,6 +15681,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -21306,6 +21339,7 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -21970,6 +22004,7 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),

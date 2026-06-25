@@ -65,6 +65,7 @@ pub struct DaemonRegistry {
     channels_start: Option<ChannelsStarter>,
     socket_start: Option<RpcStarter>,
     wss_start: Option<RpcStarter>,
+    relay_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
@@ -115,6 +116,19 @@ impl DaemonRegistry {
 
     pub(crate) fn has_wss_start(&self) -> bool {
         self.wss_start.is_some()
+    }
+
+    pub fn register_relay(&mut self, starter: RpcStarter) -> &mut Self {
+        self.relay_start = Some(starter);
+        self
+    }
+
+    pub(crate) fn has_relay_start(&self) -> bool {
+        self.relay_start.is_some()
+    }
+
+    pub(crate) fn take_relay_start(&mut self) -> Option<RpcStarter> {
+        self.relay_start.take()
     }
 
     pub fn register_mqtt(&mut self, starter: MqttStarter) -> &mut Self {

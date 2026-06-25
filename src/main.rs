@@ -4160,6 +4160,44 @@ async fn main() -> Result<()> {
                     })
                 }));
 
+                // Relay bridge: keep an outbound connection to a nominated relay
+                // so clients behind NAT can reach this daemon through it. The
+                // relay forwards to the local WSS listener (loopback), where the
+                // inner mTLS terminates; it never decrypts anything.
+                registry.register_relay(Box::new(|ctx, cancel, _client_count| {
+                    Box::pin(async move {
+                        let (relay_cfg, wss_cfg) = {
+                            let cfg = ctx.config.read();
+                            (cfg.relay.clone(), cfg.wss.clone())
+                        };
+                        if !relay_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::anyhow!(
+                                "[relay] is enabled but [wss] is not. The relay forwards clients to \
+                                 the local WSS listener, so enable [wss] (it provides the mutually \
+                                 authenticated plane the relay tunnels)."
+                            ));
+                        }
+                        if relay_cfg.url.is_empty() || relay_cfg.node_id.is_empty() {
+                            return Err(anyhow::anyhow!(
+                                "[relay] is enabled but relay.url and relay.node_id are required."
+                            ));
+                        }
+                        let local_wss = format!("127.0.0.1:{}", wss_cfg.port);
+                        zeroclaw_runtime::relay::run_relay_bridge(
+                            relay_cfg.url,
+                            relay_cfg.node_id,
+                            relay_cfg.token,
+                            local_wss,
+                            cancel,
+                        )
+                        .await
+                    })
+                }));
+
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(sop_engine, sop_audit);
