@@ -29,6 +29,7 @@ If you upgraded to v0.8.0 and hit rough edges with channel routing, cron deliver
 - **Email**: XOAUTH2 auth, observer mode, and read-only IMAP tools (#7021).
 - **WhatsApp**: Web media markers are sent natively (#7811).
 - **Voice pipeline facade** for channels that want to plug into audio I/O (#7394).
+- **ACP elicitation (Phase 1, multiple-choice)**: agent-driven `ask_user` and `poll` calls now use the ACP `elicitation/create` RFD (form mode, enum schema) when the client advertises `elicitation.form` in `initialize.clientCapabilities`. Clients that don't yet advertise the capability keep using the existing `session/request_permission` path with no behaviour change. Free-form text and URL mode are tracked as Phase 2/3 in `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
 
 ### Providers and runtime
 
