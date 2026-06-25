@@ -14975,12 +14975,19 @@ name = "zerorelay"
 version = "0.8.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "futures-util",
+ "hex",
+ "ring",
  "rustls",
+ "rustls-pemfile",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.29.0",
  "zeroclaw-relay-proto",
  "zeroclaw-tls",
 ]

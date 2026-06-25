@@ -4166,35 +4166,52 @@ async fn main() -> Result<()> {
                 // inner mTLS terminates; it never decrypts anything.
                 registry.register_relay(Box::new(|ctx, cancel, _client_count| {
                     Box::pin(async move {
-                        let (relay_cfg, wss_cfg) = {
+                        let (relay_cfg, wss_cfg, data_dir) = {
                             let cfg = ctx.config.read();
-                            (cfg.relay.clone(), cfg.wss.clone())
+                            (cfg.relay.clone(), cfg.wss.clone(), cfg.data_dir.clone())
                         };
                         if !relay_cfg.enabled {
                             cancel.cancelled().await;
                             return Ok(());
                         }
                         if !wss_cfg.enabled {
-                            return Err(anyhow::anyhow!(
+                            return Err(anyhow::Error::msg(
                                 "[relay] is enabled but [wss] is not. The relay forwards clients to \
                                  the local WSS listener, so enable [wss] (it provides the mutually \
-                                 authenticated plane the relay tunnels)."
+                                 authenticated plane the relay tunnels).",
                             ));
                         }
                         if relay_cfg.url.is_empty() || relay_cfg.node_id.is_empty() {
-                            return Err(anyhow::anyhow!(
-                                "[relay] is enabled but relay.url and relay.node_id are required."
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but relay.url and relay.node_id are required.",
                             ));
                         }
-                        let local_wss = format!("127.0.0.1:{}", wss_cfg.port);
-                        zeroclaw_runtime::relay::run_relay_bridge(
-                            relay_cfg.url,
-                            relay_cfg.node_id,
-                            relay_cfg.token,
-                            local_wss,
-                            cancel,
-                        )
-                        .await
+                        // Persistent Ed25519 identity the relay binds the node-id to.
+                        let signing_key_pkcs8 =
+                            zeroclaw_runtime::relay::ensure_signing_key(&data_dir)?;
+                        // Default the relay's expected cert name to its host:port host.
+                        let relay_host = if relay_cfg.relay_host.is_empty() {
+                            relay_cfg
+                                .url
+                                .rsplit_once(':')
+                                .map(|(h, _)| h.to_string())
+                                .unwrap_or_else(|| relay_cfg.url.clone())
+                        } else {
+                            relay_cfg.relay_host.clone()
+                        };
+                        let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
+                            relay_addr: relay_cfg.url,
+                            relay_host,
+                            node_id: relay_cfg.node_id,
+                            relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
+                            local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
+                            signing_key_pkcs8,
+                            relay_ca_path: Some(relay_cfg.relay_ca_path)
+                                .filter(|p| !p.is_empty()),
+                            relay_insecure: relay_cfg.relay_insecure,
+                            max_conns: 256,
+                        };
+                        zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })
                 }));
 

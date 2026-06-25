@@ -104,6 +104,20 @@ struct Cli {
     /// Node-id of the target daemon to request from the relay.
     #[arg(long, requires = "relay")]
     relay_node: Option<String>,
+
+    /// PEM CA to trust for the relay's OWN (outer) certificate. Without it the
+    /// built-in public roots are used (for a relay with a public-CA cert).
+    #[arg(long)]
+    relay_ca: Option<String>,
+
+    /// Server name to expect on the relay's outer certificate. Defaults to the
+    /// host portion of --relay.
+    #[arg(long)]
+    relay_host: Option<String>,
+
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    #[arg(long)]
+    relay_insecure: bool,
 }
 
 /// Map an empty path string to `None`.
@@ -298,10 +312,22 @@ async fn run() -> anyhow::Result<()> {
                 .clone()
                 .or_else(|| cfg_wss.relay_node.clone());
             let relay = match (relay_addr, relay_node) {
-                (Some(relay_addr), Some(node_id)) => Some(client::RelayDial {
-                    relay_addr,
-                    node_id,
-                }),
+                (Some(relay_addr), Some(node_id)) => {
+                    // Default the relay's expected cert name to its host:port host.
+                    let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
+                        relay_addr
+                            .rsplit_once(':')
+                            .map(|(h, _)| h.to_string())
+                            .unwrap_or_else(|| relay_addr.clone())
+                    });
+                    Some(client::RelayDial {
+                        relay_addr,
+                        relay_host,
+                        node_id,
+                        relay_ca_path: cli.relay_ca.clone(),
+                        relay_insecure: cli.relay_insecure,
+                    })
+                }
                 (None, None) => None,
                 _ => {
                     return Err(anyhow::Error::msg(

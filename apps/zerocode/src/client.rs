@@ -419,8 +419,16 @@ pub struct RpcClient {
 pub struct RelayDial {
     /// Relay address (`host:port`) to connect to.
     pub relay_addr: String,
+    /// Server name presented for the relay's outer TLS certificate (its SAN).
+    /// Defaults to the host portion of `relay_addr` when unset.
+    pub relay_host: String,
     /// Node-id of the target daemon to request from the relay.
     pub node_id: String,
+    /// PEM CA to trust for the relay's outer certificate. When unset (and not
+    /// insecure) the built-in public webpki roots are used.
+    pub relay_ca_path: Option<String>,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    pub relay_insecure: bool,
 }
 
 /// TLS verification + mutual-TLS client identity for a WSS connection.
@@ -510,42 +518,138 @@ fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>>
         .ok_or_else(|| anyhow::Error::msg(format!("no private key found in {path}")))
 }
 
-/// Relay client handshake on a raw stream: request `node_id`, wait for the relay
-/// to open the route. The rest of the stream is then the daemon (inner mTLS).
-async fn relay_open(tcp: &mut tokio::net::TcpStream, node_id: &str) -> Result<()> {
+/// Open a tunnel to the daemon through a nominated relay.
+///
+/// Establishes the OUTER TLS + WebSocket session to the relay, requests the
+/// target `node_id`, and on `Opened` returns an in-memory byte stream over which
+/// the caller runs the INNER WSS + mTLS. A pump task bridges that byte stream
+/// to/from the relay's binary `DATA` frames; the relay only ever forwards the
+/// (still-encrypted) inner bytes and never sees plaintext.
+async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use zeroclaw_relay_proto::Frame;
+    use tokio_tungstenite::tungstenite::Message;
+    use zeroclaw_relay_proto::{Control, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data};
 
-    let connect = Frame::Connect {
-        node_id: node_id.to_string(),
-    };
-    tcp.write_all(connect.to_line().as_bytes())
+    let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
         .await
-        .context("sending relay Connect")?;
-    tcp.flush().await.ok();
+        .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
 
-    // Read exactly one newline-terminated reply (no over-read into the WSS bytes).
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = tcp.read(&mut byte).await.context("reading relay reply")?;
-        if n == 0 {
-            anyhow::bail!("relay closed before replying");
+    // Outer TLS connector verifying the relay's OWN certificate (distinct from the
+    // inner mTLS to the daemon). `None` falls back to the built-in public roots.
+    let outer = if relay.relay_insecure {
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    } else if let Some(ca) = &relay.relay_ca_path {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_pem_certs(ca)? {
+            roots.add(cert).context("adding relay CA to root store")?;
         }
-        if byte[0] == b'\n' {
-            break;
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    } else {
+        None
+    };
+
+    let relay_uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{}/", relay.relay_host)
+            .parse()
+            .context("building relay ws uri")?;
+    let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(relay_uri)
+        .with_sub_protocol(SUBPROTOCOL);
+    let (relay_ws, _resp) =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, outer)
+            .await
+            .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
+
+    let (mut sink, mut stream) = relay_ws.split();
+
+    sink.send(Message::text(
+        Control::Connect {
+            node_id: relay.node_id.clone(),
         }
-        buf.push(byte[0]);
-        if buf.len() > 64 * 1024 {
-            anyhow::bail!("relay reply exceeds 64 KiB");
+        .to_json(),
+    ))
+    .await
+    .context("sending relay Connect")?;
+
+    // Wait for the relay to pair us with the daemon (answer pings while waiting).
+    let conn_id = loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                Ok(Control::Opened { conn_id }) => break conn_id,
+                Ok(Control::Error { code, msg }) => {
+                    anyhow::bail!("relay refused the route: {code}: {msg}")
+                }
+                _ => {}
+            },
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sink.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(anyhow::Error::new(e).context("relay reply")),
+            None => anyhow::bail!("relay closed before opening the route"),
         }
-    }
-    let line = String::from_utf8(buf).context("relay reply is not UTF-8")?;
-    match Frame::from_line(&line).context("parsing relay reply")? {
-        Frame::Opened { .. } => Ok(()),
-        Frame::Error { code, msg } => anyhow::bail!("relay refused the route: {code}: {msg}"),
-        other => anyhow::bail!("unexpected relay reply: {other:?}"),
-    }
+    };
+
+    // Bridge the relay's DATA frames <-> an in-memory byte stream the inner mTLS
+    // runs over. What the inner TLS writes to `client_io` is read here and shipped
+    // as DATA; inbound DATA payloads are written back for the inner TLS to read.
+    let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
+        loop {
+            tokio::select! {
+                n = relay_io.read(&mut buf) => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sink
+                            .send(Message::binary(encode_data(conn_id, &buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                msg = stream.next() => match msg {
+                    Some(Ok(Message::Binary(b))) => {
+                        if let Some((_, payload)) = decode_data(&b)
+                            && relay_io.write_all(payload).await.is_err() {
+                                break;
+                            }
+                    }
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(Control::Close { .. }) = Control::from_json(t.as_str()) {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+        let _ = relay_io.shutdown().await;
+        let _ = sink.close().await;
+    });
+
+    Ok(client_io)
 }
 
 impl RpcClient {
@@ -693,40 +797,53 @@ impl RpcClient {
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
     ) -> Result<Self> {
+        if let Some(relay) = &tls.relay {
+            // Through a nominated relay: establish the OUTER TLS + WS to the relay,
+            // request the node-id, then run the SAME inner WSS + mTLS over the
+            // tunnelled byte stream. The relay only forwards ciphertext DATA frames.
+            let client_io = dial_through_relay(relay).await?;
+            let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
+            let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
+                url,
+                client_io,
+                None,
+                Some(connector),
+            )
+            .await
+            .with_context(|| format!("WSS-over-relay to {url} via {}", relay.relay_addr))?;
+            return Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await;
+        }
+
+        // Direct: the built-in (webpki-roots) connector only for the plain default
+        // (no client cert, no custom CA, no skip-verify); any custom TLS material
+        // requires our own rustls ClientConfig.
+        let connector = if tls.is_default() {
+            None
+        } else {
+            Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
+                tls,
+            )?))
+        };
+        let (ws_stream, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+                .await
+                .with_context(|| format!("WSS connect to {url}"))?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+    }
+
+    /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
+    /// the `initialize` handshake. Generic over the underlying transport so it
+    /// serves both the direct (`TcpStream`) and relayed (`DuplexStream`) paths.
+    async fn spawn_ws_session<S>(
+        ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-
-        let ws_stream = if let Some(relay) = &tls.relay {
-            // Through a nominated relay: open a raw TCP connection, perform the
-            // relay handshake (Connect -> Opened), then run the SAME WSS + mTLS
-            // over that tunnelled stream. The relay only forwards ciphertext.
-            let mut tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
-                .await
-                .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
-            relay_open(&mut tcp, &relay.node_id).await?;
-            let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
-            let (ws_stream, _response) =
-                tokio_tungstenite::client_async_tls_with_config(url, tcp, None, Some(connector))
-                    .await
-                    .with_context(|| format!("WSS-over-relay to {url} via {}", relay.relay_addr))?;
-            ws_stream
-        } else {
-            // Direct: the built-in (webpki-roots) connector only for the plain
-            // default (no client cert, no custom CA, no skip-verify); any custom
-            // TLS material requires our own rustls ClientConfig.
-            let connector = if tls.is_default() {
-                None
-            } else {
-                Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
-                    tls,
-                )?))
-            };
-            let (ws_stream, _response) =
-                tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
-                    .await
-                    .with_context(|| format!("WSS connect to {url}"))?;
-            ws_stream
-        };
 
         let (mut sink, mut stream) = ws_stream.split();
 

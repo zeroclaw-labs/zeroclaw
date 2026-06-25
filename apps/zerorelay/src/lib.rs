@@ -1,58 +1,76 @@
 //! The ZeroClaw nominated relay: a standalone **blind forwarder**.
 //!
-//! A daemon behind NAT keeps a persistent *control* connection to the relay and
-//! claims a `node_id`. A client connects to the relay and asks for that
-//! `node_id`; the relay tells the daemon to open a *data* connection, pairs it
-//! with the client, and then transparently pipes bytes between the two
-//! ([`tokio::io::copy_bidirectional`]). Those bytes are the inner client<->daemon
-//! mTLS session: the relay never terminates or inspects it, holds no keys, and
-//! routes only on the opaque `node_id`.
+//! Each party reaches the relay over an **outer** TLS + WebSocket session
+//! (`zeroclaw.relay.v1`). A daemon opens one persistent WS and registers a
+//! `node_id` through a signed Ed25519 handshake; many client connections are then
+//! multiplexed over that single WS by `conn_id`. A client opens its own WS, names
+//! a target `node_id`, and once paired the relay shuttles binary `DATA` messages
+//! between client and daemon. Those `DATA` payloads are the **inner** client<->
+//! daemon mTLS: the relay terminates only the outer TLS, never the inner session,
+//! holds no CA or daemon key material, and routes purely on the opaque `node_id`.
 //!
-//! Admission control decides which daemons may register (open vs allowlist, keyed
-//! on the per-daemon relay token; deny always wins). It is operational access
-//! control on the rendezvous, not RPC authorization, and does not weaken the
-//! blind-forwarder property.
+//! Admission (open vs allowlist) is keyed on the daemon's registration pubkey
+//! fingerprint; deny always wins. A node-id is bound to the first registrant's
+//! pubkey, so a different key cannot hijack a live node-id. These are operational
+//! controls on the rendezvous, not RPC authorization, and do not weaken the
+//! blind-forwarder property (the inner mTLS still rejects any unauthenticated
+//! client at the daemon).
 //!
 //! `zerorelay` is a standalone networking app (not daemon-path code), so bare
 //! `tokio::spawn` is the right primitive here; the `zeroclaw_spawn::spawn!` rule
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use futures_util::{SinkExt, StreamExt};
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ED25519, UnparsedPublicKey};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
-use zeroclaw_relay_proto::Frame;
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use zeroclaw_relay_proto::{Control, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data};
 
-const MAX_CONTROL_FRAME: usize = 64 * 1024;
+/// How long a freshly connected client waits to be paired with the daemon before
+/// the relay gives up and drops it.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Which daemons may register a rendezvous on this relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// Any daemon that passes the deny list may register.
+    /// Any daemon that passes the deny list (and optional relay-token gate) and
+    /// completes the signed handshake may register.
     Open,
-    /// Only daemons whose relay token is on the allow list may register.
+    /// Only daemons whose pubkey fingerprint is on the allow list may register.
     Allowlist,
 }
 
-/// Relay admission policy. Deny always wins.
+/// Relay admission + abuse policy. Deny always wins.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub registration_mode: Admission,
-    /// Relay tokens allowed to register (used in `Allowlist` mode).
+    /// Daemon pubkey fingerprints (sha256 hex) allowed to register (Allowlist).
     pub allow: HashSet<String>,
-    /// Relay tokens always rejected.
+    /// Daemon pubkey fingerprints always rejected.
     pub deny: HashSet<String>,
-    /// Drop a parked client socket if no daemon data connection pairs it within
-    /// this window (prevents unbounded FD/memory accumulation).
-    pub pending_timeout: Duration,
-    /// Cap on simultaneously parked (unpaired) client sockets.
-    pub max_pending: usize,
+    /// Optional shared-secret gate presented in `Hello.relay_token`.
+    pub relay_token: Option<String>,
+    /// Lease advertised to daemons; renewal is the persistent WS staying alive
+    /// (with keepalive). Advisory in v1; WS liveness is the real cleanup signal.
+    pub lease_ttl: Duration,
+    /// Cap on simultaneously-open client connections per node-id.
+    pub max_conns_per_node: usize,
+    /// Drop a client connection after this much inactivity.
+    pub idle_timeout: Duration,
 }
 
 impl Default for RelayConfig {
@@ -61,27 +79,54 @@ impl Default for RelayConfig {
             registration_mode: Admission::Open,
             allow: HashSet::new(),
             deny: HashSet::new(),
-            pending_timeout: Duration::from_secs(30),
-            max_pending: 1024,
+            relay_token: None,
+            lease_ttl: Duration::from_secs(300),
+            max_conns_per_node: 256,
+            idle_timeout: Duration::from_secs(300),
         }
     }
 }
 
-struct DaemonLink {
-    /// Send a `conn_id` here to push an `Open` frame to the daemon control link.
-    open_tx: mpsc::Sender<u64>,
-    /// Unique registration epoch. Teardown only removes the map entry if it still
-    /// carries this epoch, so a superseded (stale) connection can never evict the
-    /// daemon that replaced it on reconnect.
+/// One control event routed from the daemon link toward a waiting client task.
+enum ConnEvent {
+    /// Daemon accepted the `Open`; the route is live.
+    Opened,
+    /// Inner payload bytes from the daemon for this connection.
+    Data(Vec<u8>),
+    /// Daemon (or relay) is closing this connection.
+    Close(String),
+}
+
+/// A registered daemon's routing handle.
+struct DaemonHandle {
+    /// Pubkey fingerprint that owns this node-id (anti-hijack binding).
+    fpr: String,
+    /// Registration epoch; teardown only deregisters if still current, so a
+    /// superseded link cannot evict the daemon that replaced it.
     epoch: u64,
+    /// Serialized outbound channel to the daemon's WS writer task.
+    to_daemon: mpsc::Sender<Message>,
+    /// Live client connections multiplexed over this daemon link.
+    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
 }
 
 struct Inner {
     cfg: RelayConfig,
-    daemons: Mutex<HashMap<String, DaemonLink>>,
-    pending: Mutex<HashMap<u64, TcpStream>>,
+    daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
+}
+
+impl Inner {
+    fn admit(&self, fpr: &str) -> bool {
+        if self.cfg.deny.contains(fpr) {
+            return false;
+        }
+        match self.cfg.registration_mode {
+            Admission::Open => true,
+            Admission::Allowlist => self.cfg.allow.contains(fpr),
+        }
+    }
 }
 
 /// A running relay. Cheap to clone (`Arc` inside).
@@ -96,219 +141,439 @@ impl RelayServer {
             inner: Arc::new(Inner {
                 cfg,
                 daemons: Mutex::new(HashMap::new()),
-                pending: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
             }),
         }
     }
 
-    /// Accept connections forever from `listener`.
-    pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<()> {
+    /// Accept TLS + WebSocket connections forever, dispatching daemon vs client.
+    pub async fn serve(self, listener: TcpListener, acceptor: TlsAcceptor) -> Result<()> {
         loop {
-            let (sock, _) = listener
-                .accept()
-                .await
-                .context("accepting relay connection")?;
+            let (sock, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
             let inner = self.inner.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(inner, sock).await;
+                let tls = match acceptor.accept(sock).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                // Echo our subprotocol so a client that offered it does not fail
+                // the handshake (RFC 6455 / tungstenite enforces this on the client).
+                let ws = match tokio_tungstenite::accept_hdr_async(tls, select_subprotocol).await {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let _ = handle_conn(inner, ws).await;
             });
         }
     }
 }
 
-impl Inner {
-    fn admit(&self, token: &str) -> bool {
-        if self.cfg.deny.contains(token) {
-            return false;
-        }
-        match self.cfg.registration_mode {
-            Admission::Open => true,
-            Admission::Allowlist => self.cfg.allow.contains(token),
-        }
+/// WebSocket handshake callback: select `zeroclaw.relay.v1` in the response when
+/// the client offered it, so the client's required-subprotocol check passes.
+// The Result type is dictated by tungstenite's `accept_hdr_async` callback trait
+// (its error variant carries an http Response); we cannot box it.
+#[allow(clippy::result_large_err)]
+fn select_subprotocol(
+    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    mut resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> std::result::Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    let offered = req
+        .headers()
+        .get_all("Sec-WebSocket-Protocol")
+        .iter()
+        .any(|v| {
+            v.to_str()
+                .map(|s| s.split(',').any(|p| p.trim() == SUBPROTOCOL))
+                .unwrap_or(false)
+        });
+    if offered {
+        resp.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static(SUBPROTOCOL),
+        );
     }
+    Ok(resp)
 }
 
-/// Read exactly one newline-terminated control frame without over-reading into
-/// the byte stream that follows (so transparent piping starts at the right byte).
-async fn read_control_frame(sock: &mut TcpStream) -> Result<Frame> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = sock
-            .read(&mut byte)
-            .await
-            .context("reading control frame")?;
-        if n == 0 {
-            anyhow::bail!("connection closed before a control frame");
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        buf.push(byte[0]);
-        if buf.len() > MAX_CONTROL_FRAME {
-            anyhow::bail!("control frame exceeds {MAX_CONTROL_FRAME} bytes");
-        }
-    }
-    let line = String::from_utf8(buf).context("control frame is not UTF-8")?;
-    Frame::from_line(&line).context("parsing control frame")
-}
-
-async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
-    w.write_all(frame.to_line().as_bytes())
-        .await
-        .context("writing control frame")?;
-    w.flush().await.ok();
-    Ok(())
-}
-
-async fn handle_conn(inner: Arc<Inner>, mut sock: TcpStream) -> Result<()> {
-    let frame = read_control_frame(&mut sock).await?;
-    match frame {
-        Frame::Register {
+/// Read the first control frame and dispatch by role.
+async fn handle_conn<S>(inner: Arc<Inner>, mut ws: WebSocketStream<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match next_control(&mut ws).await {
+        Some(Control::Hello {
+            daemon_pubkey,
             node_id,
             relay_token,
-        } => handle_register(inner, sock, node_id, relay_token).await,
-        Frame::Connect { node_id } => handle_connect(inner, sock, node_id).await,
-        Frame::Accept { conn_id, .. } => handle_accept(inner, sock, conn_id).await,
-        other => {
-            let _ = write_frame(
-                &mut sock,
-                &Frame::error("bad_first_frame", format!("unexpected {other:?}")),
+        }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token).await,
+        Some(Control::Connect { node_id }) => handle_client(inner, ws, node_id).await,
+        Some(other) => {
+            let _ = send_control(
+                &mut ws,
+                &Control::error("bad_first_frame", format!("unexpected {other:?}")),
             )
             .await;
             Ok(())
         }
+        None => Ok(()),
     }
 }
 
-/// Daemon control connection: claim a node-id and pump `Open` frames to it.
-async fn handle_register(
+/// Daemon control connection: signed admission, then multiplex client conns.
+async fn handle_daemon<S>(
     inner: Arc<Inner>,
-    mut sock: TcpStream,
+    mut ws: WebSocketStream<S>,
+    daemon_pubkey: String,
     node_id: String,
-    relay_token: String,
-) -> Result<()> {
-    if !inner.admit(&relay_token) {
-        let _ = write_frame(&mut sock, &Frame::error("forbidden", "registration denied")).await;
+    relay_token: Option<String>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Optional shared-secret gate.
+    if let Some(required) = &inner.cfg.relay_token
+        && relay_token.as_deref() != Some(required.as_str())
+    {
+        let _ = send_control(&mut ws, &Control::error("forbidden", "bad relay token")).await;
         return Ok(());
     }
 
-    // Last-writer-wins registration, tagged with a unique epoch. A reconnect
-    // (same node-id) replaces the stale link; the stale connection's teardown
-    // below only removes the entry if it still carries its own epoch, so it can
-    // never evict the daemon that superseded it. (Cross-daemon node-id hijack is
-    // separately gated by the deferred signed-registration / pubkey binding.)
-    let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
-    let (open_tx, mut open_rx) = mpsc::channel::<u64>(64);
-    inner
-        .daemons
-        .lock()
-        .await
-        .insert(node_id.clone(), DaemonLink { open_tx, epoch });
+    let pubkey = match B64.decode(daemon_pubkey.as_bytes()) {
+        Ok(k) => k,
+        Err(_) => {
+            let _ = send_control(&mut ws, &Control::error("bad_pubkey", "not base64")).await;
+            return Ok(());
+        }
+    };
+    let fpr = hex::encode(Sha256::digest(&pubkey));
+    if !inner.admit(&fpr) {
+        let _ = send_control(&mut ws, &Control::error("forbidden", "registration denied")).await;
+        return Ok(());
+    }
 
-    write_frame(
-        &mut sock,
-        &Frame::Registered {
+    // Challenge / verify: prove possession of the private key over a fresh nonce.
+    let mut nonce = [0u8; 32];
+    if SystemRandom::new().fill(&mut nonce).is_err() {
+        let _ = send_control(&mut ws, &Control::error("internal", "rng")).await;
+        return Ok(());
+    }
+    send_control(
+        &mut ws,
+        &Control::Challenge {
+            nonce: B64.encode(nonce),
+        },
+    )
+    .await?;
+    let (reg_node, sig_b64) = match next_control(&mut ws).await {
+        Some(Control::Register { node_id, sig }) => (node_id, sig),
+        _ => {
+            let _ = send_control(
+                &mut ws,
+                &Control::error("bad_register", "expected register"),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if reg_node != node_id {
+        let _ = send_control(&mut ws, &Control::error("bad_register", "node_id mismatch")).await;
+        return Ok(());
+    }
+    let sig = match B64.decode(sig_b64.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = send_control(&mut ws, &Control::error("bad_sig", "not base64")).await;
+            return Ok(());
+        }
+    };
+    if UnparsedPublicKey::new(&ED25519, &pubkey)
+        .verify(&nonce, &sig)
+        .is_err()
+    {
+        let _ = send_control(&mut ws, &Control::error("bad_sig", "signature invalid")).await;
+        return Ok(());
+    }
+
+    // node-id <-> pubkey binding + last-writer-wins registration.
+    let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
+    let (to_daemon, mut from_clients) = mpsc::channel::<Message>(256);
+    let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut daemons = inner.daemons.lock().await;
+        if let Some(existing) = daemons.get(&node_id)
+            && existing.fpr != fpr
+        {
+            drop(daemons);
+            let _ = send_control(
+                &mut ws,
+                &Control::error("node_taken", "node-id bound to another key"),
+            )
+            .await;
+            return Ok(());
+        }
+        daemons.insert(
+            node_id.clone(),
+            DaemonHandle {
+                fpr: fpr.clone(),
+                epoch,
+                to_daemon: to_daemon.clone(),
+                conns: conns.clone(),
+            },
+        );
+    }
+    send_control(
+        &mut ws,
+        &Control::Registered {
             node_id: node_id.clone(),
+            lease_ttl_secs: inner.cfg.lease_ttl.as_secs(),
         },
     )
     .await?;
 
-    let (mut read_half, mut write_half) = sock.into_split();
-    loop {
-        tokio::select! {
-            maybe = open_rx.recv() => match maybe {
-                Some(conn_id) => {
-                    if write_frame(&mut write_half, &Frame::Open { conn_id }).await.is_err() {
-                        break;
+    let (mut sink, mut stream) = ws.split();
+
+    // Writer task: the single serialization point for everything sent to the
+    // daemon (client Opens/Data/Closes + our Pongs).
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = from_clients.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    // Reader loop: demultiplex daemon -> client.
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(Message::Text(t)) => match Control::from_json(&t) {
+                Ok(Control::Opened { conn_id }) => {
+                    if let Some(tx) = conns.lock().await.get(&conn_id) {
+                        let _ = tx.send(ConnEvent::Opened).await;
                     }
                 }
-                None => break,
+                Ok(Control::Close { conn_id, reason }) => {
+                    if let Some(tx) = conns.lock().await.remove(&conn_id) {
+                        let _ = tx.send(ConnEvent::Close(reason)).await;
+                    }
+                }
+                _ => {}
             },
-            // The daemon control link carries no payload; any readable event is a
-            // disconnect (EOF or error). Use it to detect the daemon going away.
-            _ = wait_for_close(&mut read_half) => break,
+            Ok(Message::Binary(b)) => {
+                if let Some((conn_id, payload)) = decode_data(&b)
+                    && let Some(tx) = conns.lock().await.get(&conn_id)
+                {
+                    let _ = tx.send(ConnEvent::Data(payload.to_vec())).await;
+                }
+            }
+            Ok(Message::Ping(p)) => {
+                let _ = to_daemon.send(Message::Pong(p)).await;
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
         }
     }
 
-    // Only deregister if we are still the registered link (epoch match); a newer
-    // reconnection that replaced us must not be evicted by our teardown.
-    let mut daemons = inner.daemons.lock().await;
-    if daemons.get(&node_id).map(|link| link.epoch) == Some(epoch) {
-        daemons.remove(&node_id);
+    // Teardown: deregister only if still current (epoch guard), close all conns.
+    {
+        let mut daemons = inner.daemons.lock().await;
+        if daemons.get(&node_id).map(|h| h.epoch) == Some(epoch) {
+            daemons.remove(&node_id);
+        }
     }
+    for (_, tx) in conns.lock().await.drain() {
+        let _ = tx.send(ConnEvent::Close("daemon_gone".into())).await;
+    }
+    writer.abort();
     Ok(())
 }
 
-/// Resolves when the half-connection reaches EOF or errors.
-async fn wait_for_close(read_half: &mut OwnedReadHalf) {
-    let mut buf = [0u8; 256];
-    loop {
-        match read_half.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {} // unexpected payload on the control link; ignore
-        }
-    }
-}
-
-/// Client connection: route it to the daemon serving `node_id`.
-async fn handle_connect(inner: Arc<Inner>, mut sock: TcpStream, node_id: String) -> Result<()> {
-    let open_tx = {
+/// Client connection: route it to the daemon serving `node_id` and pipe `DATA`.
+async fn handle_client<S>(
+    inner: Arc<Inner>,
+    mut ws: WebSocketStream<S>,
+    node_id: String,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (to_daemon, conns) = {
         let daemons = inner.daemons.lock().await;
         match daemons.get(&node_id) {
-            Some(link) => link.open_tx.clone(),
+            Some(h) => (h.to_daemon.clone(), h.conns.clone()),
             None => {
-                let _ = write_frame(&mut sock, &Frame::error("no_such_node", node_id)).await;
+                let _ = send_control(&mut ws, &Control::error("no_such_node", node_id)).await;
                 return Ok(());
             }
         }
     };
 
     let conn_id = inner.next_conn.fetch_add(1, Ordering::Relaxed);
-    // Tell the client the route is open before parking it; the bytes it sends now
-    // buffer in the kernel until the daemon's data connection pairs and drains.
-    write_frame(&mut sock, &Frame::Opened { conn_id }).await?;
+    let (conn_tx, mut conn_rx) = mpsc::channel::<ConnEvent>(256);
     {
-        // Cap simultaneously-parked client sockets so a slow/absent daemon (or a
-        // flood of clients) cannot exhaust file descriptors / memory.
-        let mut pending = inner.pending.lock().await;
-        if pending.len() >= inner.cfg.max_pending {
-            drop(pending);
-            let _ = write_frame(&mut sock, &Frame::error("busy", "relay at capacity")).await;
+        let mut cs = conns.lock().await;
+        if cs.len() >= inner.cfg.max_conns_per_node {
+            drop(cs);
+            let _ = send_control(&mut ws, &Control::error("busy", "node at capacity")).await;
             return Ok(());
         }
-        pending.insert(conn_id, sock);
+        cs.insert(conn_id, conn_tx);
     }
 
-    if open_tx.send(conn_id).await.is_err() {
-        // Daemon vanished between lookup and notify.
-        inner.pending.lock().await.remove(&conn_id);
+    // Ask the daemon to open the logical connection.
+    if to_daemon
+        .send(Message::text(
+            Control::Open {
+                conn_id,
+                peer_hint: None,
+            }
+            .to_json(),
+        ))
+        .await
+        .is_err()
+    {
+        conns.lock().await.remove(&conn_id);
+        let _ = send_control(&mut ws, &Control::error("no_such_node", "daemon gone")).await;
         return Ok(());
     }
 
-    // Reap the parked socket if no daemon data connection pairs it in time
-    // (daemon crash, slow/hostile daemon, or a failed bridge dial). Dropping the
-    // entry closes the socket and bounds the relay's outstanding state.
-    let reaper = inner.clone();
-    let timeout = inner.cfg.pending_timeout;
-    tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        reaper.pending.lock().await.remove(&conn_id);
-    });
+    let (mut sink, mut stream) = ws.split();
+
+    // Wait to be paired (daemon Opened) within the timeout.
+    let paired = tokio::time::timeout(PAIR_TIMEOUT, async {
+        while let Some(ev) = conn_rx.recv().await {
+            match ev {
+                ConnEvent::Opened => return true,
+                ConnEvent::Close(_) => return false,
+                ConnEvent::Data(_) => {} // shouldn't precede Opened; ignore
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    if !paired {
+        conns.lock().await.remove(&conn_id);
+        let _ = to_daemon
+            .send(Message::text(
+                Control::Close {
+                    conn_id,
+                    reason: "pair_timeout".into(),
+                }
+                .to_json(),
+            ))
+            .await;
+        let _ = sink
+            .send(Message::text(
+                Control::error("timeout", "daemon did not accept").to_json(),
+            ))
+            .await;
+        return Ok(());
+    }
+    sink.send(Message::text(Control::Opened { conn_id }.to_json()))
+        .await?;
+
+    // Pump bytes both ways until either side closes or the conn goes idle.
+    let idle = inner.cfg.idle_timeout;
+    loop {
+        let deadline = tokio::time::Instant::now() + idle;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            ev = conn_rx.recv() => match ev {
+                Some(ConnEvent::Data(payload)) => {
+                    if sink.send(Message::binary(encode_data(conn_id, &payload))).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ConnEvent::Close(reason)) => {
+                    let _ = sink
+                        .send(Message::text(Control::Close { conn_id, reason }.to_json()))
+                        .await;
+                    break;
+                }
+                Some(ConnEvent::Opened) => {}
+                None => break,
+            },
+            msg = stream.next() => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    // Re-stamp the authoritative conn_id so a client cannot inject
+                    // bytes into another connection on the shared daemon link.
+                    let payload = decode_data(&b).map(|(_, p)| p).unwrap_or(&b);
+                    if payload.len() > MAX_DATA_PAYLOAD {
+                        break;
+                    }
+                    if to_daemon
+                        .send(Message::binary(encode_data(conn_id, payload)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(Control::Close { .. }) = Control::from_json(&t) {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sink.send(Message::Pong(p)).await;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                _ => {}
+            }
+        }
+    }
+
+    // Tell the daemon to release the conn and unregister it.
+    let _ = to_daemon
+        .send(Message::text(
+            Control::Close {
+                conn_id,
+                reason: "client_gone".into(),
+            }
+            .to_json(),
+        ))
+        .await;
+    conns.lock().await.remove(&conn_id);
     Ok(())
 }
 
-/// Daemon data connection: pair with the waiting client and blind-pipe.
-async fn handle_accept(inner: Arc<Inner>, mut daemon_data: TcpStream, conn_id: u64) -> Result<()> {
-    let client = inner.pending.lock().await.remove(&conn_id);
-    match client {
-        Some(mut client) => {
-            // Opaque, end-to-end: the relay never inspects these bytes.
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon_data).await;
-            Ok(())
+/// Send one control frame as a WS Text message.
+async fn send_control<S>(ws: &mut WebSocketStream<S>, frame: &Control) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    ws.send(Message::text(frame.to_json())).await?;
+    Ok(())
+}
+
+/// Read the next control frame, transparently answering pings. Returns `None` on
+/// close, error, or a non-text message where a control frame was expected.
+async fn next_control<S>(ws: &mut WebSocketStream<S>) -> Option<Control>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Text(t)) => return Control::from_json(&t).ok(),
+            Ok(Message::Ping(p)) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Ok(Message::Pong(_)) => {}
+            _ => return None,
         }
-        None => Ok(()), // stale / unknown conn_id
     }
+    None
 }

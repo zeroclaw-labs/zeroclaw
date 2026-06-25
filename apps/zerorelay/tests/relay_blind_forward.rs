@@ -1,29 +1,29 @@
-//! Make-or-break: the inner client<->daemon mTLS session completes end-to-end
-//! THROUGH the relay, which only ever pipes opaque bytes.
-//!
-//! Topology built here (all on loopback):
-//!   client --(relay protocol)--> RelayServer <--(relay protocol)-- daemon bridge
-//!   client --------------------- inner mTLS ------------------------> daemon mTLS listener
-//! The relay pairs the two streams and `copy_bidirectional`s them; the inner
-//! mTLS (server config from `zeroclaw_tls`, client cert issued from its CA)
-//! handshakes across it unbroken. A second test checks admission control.
+//! Admission + node-id binding tests for the designed relay protocol: the signed
+//! Ed25519 `Hello`/`Challenge`/`Register` handshake over the outer TLS + WS, the
+//! open/allowlist policy (keyed on pubkey fingerprint, deny wins), and the
+//! node-id<->pubkey binding that stops a different key hijacking a live node-id.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
-use zeroclaw_relay_proto::Frame;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use futures_util::{SinkExt, StreamExt};
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Message};
+use zeroclaw_relay_proto::{Control, SUBPROTOCOL};
 use zerorelay::{Admission, RelayConfig, RelayServer};
 
-// ---- inner-mTLS helpers (server config + a cert-presenting client) ----
+type RelayWs =
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 #[derive(Debug)]
-struct NoServerVerify;
-impl rustls::client::danger::ServerCertVerifier for NoServerVerify {
+struct NoVerify;
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
         _e: &rustls::pki_types::CertificateDer<'_>,
@@ -57,292 +57,195 @@ impl rustls::client::danger::ServerCertVerifier for NoServerVerify {
     }
 }
 
-fn write_temp(content: &str) -> tempfile::NamedTempFile {
-    use std::io::Write;
-    let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(content.as_bytes()).unwrap();
-    f.flush().unwrap();
-    f
+fn gen_key() -> Vec<u8> {
+    let rng = ring::rand::SystemRandom::new();
+    Ed25519KeyPair::generate_pkcs8(&rng)
+        .unwrap()
+        .as_ref()
+        .to_vec()
 }
 
-/// Returns (mTLS server config, client config presenting an issued client cert).
-fn mtls_pair() -> (rustls::ServerConfig, rustls::ClientConfig) {
+fn fingerprint(pkcs8: &[u8]) -> String {
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
+    hex::encode(Sha256::digest(kp.public_key().as_ref()))
+}
+
+/// Start a relay with the given policy and its own (self-signed) outer TLS cert.
+async fn start_relay(cfg: RelayConfig) -> std::net::SocketAddr {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let mats = zeroclaw_tls::ensure_server_materials(dir.path(), &[]).unwrap();
-    let server = zeroclaw_tls::build_mtls_server_config(
-        mats.server_cert_path.to_str().unwrap(),
-        mats.server_key_path.to_str().unwrap(),
-        mats.ca_cert_path.to_str().unwrap(),
-        &[],
-    )
-    .unwrap();
-
-    let ca_pem = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
-    let ca_key_pem = std::fs::read_to_string(&mats.ca_key_path).unwrap();
-    let issued = zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key_pem, "relay-client").unwrap();
-    let cert_f = write_temp(&issued.cert_pem);
-    let key_f = write_temp(&issued.key_pem);
-    let chain = zeroclaw_tls::load_certs(cert_f.path().to_str().unwrap()).unwrap();
-    let key = zeroclaw_tls::load_private_key(key_f.path().to_str().unwrap()).unwrap();
-    // Keep temp files alive until after the chain/key are loaded (they are).
-    drop((cert_f, key_f, dir));
-
-    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+    let certs = zeroclaw_tls::load_certs(mats.server_cert_path.to_str().unwrap()).unwrap();
+    let key = zeroclaw_tls::load_private_key(mats.server_key_path.to_str().unwrap()).unwrap();
+    let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoServerVerify))
-    .with_client_auth_cert(chain, key)
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+    // Keep the tempdir (and its cert files) alive for the relay's lifetime.
+    std::mem::forget(dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(RelayServer::new(cfg).serve(listener, acceptor));
+    addr
+}
+
+fn insecure_client_config() -> Arc<rustls::ClientConfig> {
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth(),
+    )
+}
+
+async fn next_control(ws: &mut RelayWs) -> Option<Control> {
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Text(t)) => return Control::from_json(t.as_str()).ok(),
+            Ok(Message::Ping(p)) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Ok(Message::Pong(_)) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Run the signed registration handshake. When `valid_sig` is false a corrupted
+/// signature is sent. Returns the live socket and the terminal control frame.
+async fn handshake(
+    relay_addr: std::net::SocketAddr,
+    node_id: &str,
+    pkcs8: &[u8],
+    token: Option<&str>,
+    valid_sig: bool,
+) -> (RelayWs, Control) {
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
+    let pubkey = kp.public_key().as_ref().to_vec();
+    let tcp = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(sni, tcp).await.unwrap();
+    let req = ClientRequestBuilder::new("wss://localhost/".parse().unwrap())
+        .with_sub_protocol(SUBPROTOCOL);
+    let (mut ws, _) = tokio_tungstenite::client_async_with_config(req, tls, None)
+        .await
+        .unwrap();
+
+    ws.send(Message::text(
+        Control::Hello {
+            daemon_pubkey: B64.encode(&pubkey),
+            node_id: node_id.to_string(),
+            relay_token: token.map(|s| s.to_string()),
+        }
+        .to_json(),
+    ))
+    .await
     .unwrap();
 
-    (server, client)
-}
-
-// ---- relay-protocol helpers (byte-exact control-frame IO) ----
-
-async fn write_frame(sock: &mut TcpStream, frame: &Frame) {
-    sock.write_all(frame.to_line().as_bytes()).await.unwrap();
-    sock.flush().await.unwrap();
-}
-
-async fn read_frame(sock: &mut TcpStream) -> Frame {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = sock.read(&mut byte).await.unwrap();
-        assert!(n == 1, "connection closed before a control frame");
-        if byte[0] == b'\n' {
-            break;
-        }
-        buf.push(byte[0]);
-    }
-    Frame::from_line(&String::from_utf8(buf).unwrap()).unwrap()
-}
-
-async fn start_relay(cfg: RelayConfig) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(RelayServer::new(cfg).serve(listener));
-    addr
-}
-
-/// Start an mTLS "daemon": echoes "pong\n" once the handshake completes.
-async fn start_mtls_daemon(server: rustls::ServerConfig) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let acceptor = TlsAcceptor::from(Arc::new(server));
-    tokio::spawn(async move {
-        loop {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                if let Ok(mut tls) = acceptor.accept(tcp).await {
-                    let mut buf = [0u8; 64];
-                    if tls.read(&mut buf).await.unwrap_or(0) > 0 {
-                        let _ = tls.write_all(b"pong\n").await;
-                        let _ = tls.flush().await;
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-/// Daemon-side bridge: register `node_id`, and on each `Open` open a data
-/// connection and pipe it to the local mTLS daemon.
-async fn start_bridge(relay: SocketAddr, daemon: SocketAddr, node_id: &str, token: &str) {
-    let mut ctrl = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut ctrl,
-        &Frame::Register {
+    let nonce = match next_control(&mut ws).await {
+        Some(Control::Challenge { nonce }) => B64.decode(nonce.as_bytes()).unwrap(),
+        Some(other) => return (ws, other), // e.g. forbidden before challenge
+        None => panic!("relay closed before challenge"),
+    };
+    let sig = kp.sign(&nonce);
+    let sig_b64 = if valid_sig {
+        B64.encode(sig.as_ref())
+    } else {
+        let mut bad = sig.as_ref().to_vec();
+        bad[0] ^= 0xff;
+        B64.encode(bad)
+    };
+    ws.send(Message::text(
+        Control::Register {
             node_id: node_id.to_string(),
-            relay_token: token.to_string(),
-        },
-    )
-    .await;
-    let reg = read_frame(&mut ctrl).await;
-    assert!(
-        matches!(reg, Frame::Registered { .. }),
-        "bridge registration rejected: {reg:?}"
-    );
-    tokio::spawn(async move {
-        while let Frame::Open { conn_id } = read_frame(&mut ctrl).await {
-            tokio::spawn(async move {
-                let mut data = TcpStream::connect(relay).await.unwrap();
-                write_frame(
-                    &mut data,
-                    &Frame::Accept {
-                        conn_id,
-                        relay_token: String::new(),
-                    },
-                )
-                .await;
-                let mut local = TcpStream::connect(daemon).await.unwrap();
-                let _ = tokio::io::copy_bidirectional(&mut data, &mut local).await;
-            });
+            sig: sig_b64,
         }
-    });
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+
+    let term = next_control(&mut ws).await.expect("terminal frame");
+    (ws, term)
 }
 
 #[tokio::test]
-async fn inner_mtls_completes_through_blind_relay() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let (server, client) = mtls_pair();
-
-    let daemon = start_mtls_daemon(server).await;
-    let relay = start_relay(RelayConfig::default()).await;
-    start_bridge(relay, daemon, "node-1", "").await;
-
-    // Client: ask the relay for node-1, then run the inner mTLS over the stream.
-    let mut sock = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut sock,
-        &Frame::Connect {
-            node_id: "node-1".into(),
-        },
-    )
-    .await;
-    let opened = read_frame(&mut sock).await;
-    assert!(matches!(opened, Frame::Opened { .. }), "got {opened:?}");
-
-    let connector = TlsConnector::from(Arc::new(client));
-    let server_name = rustls::pki_types::ServerName::try_from("localhost")
-        .unwrap()
-        .to_owned();
-    let mut tls = connector
-        .connect(server_name, sock)
-        .await
-        .expect("inner mTLS must complete through the blind relay");
-
-    // Exchange application bytes to prove the full duplex pipe works post-handshake.
-    tls.write_all(b"ping\n").await.unwrap();
-    tls.flush().await.unwrap();
-    let mut buf = vec![0u8; 8];
-    let n = tls.read(&mut buf).await.unwrap();
-    assert_eq!(
-        &buf[..n],
-        b"pong\n",
-        "echo did not round-trip through the relay"
-    );
-}
-
-#[tokio::test]
-async fn allowlist_rejects_unlisted_daemon() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let relay = start_relay(RelayConfig {
-        registration_mode: Admission::Allowlist,
-        allow: HashSet::from(["good-token".to_string()]),
-        ..Default::default()
-    })
-    .await;
-
-    // A daemon with an unlisted token is refused (forbidden), not registered.
-    let mut ctrl = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut ctrl,
-        &Frame::Register {
-            node_id: "node-x".into(),
-            relay_token: "bad-token".into(),
-        },
-    )
-    .await;
-    let reply = read_frame(&mut ctrl).await;
-    match reply {
-        Frame::Error { code, .. } => assert_eq!(code, "forbidden"),
-        other => panic!("expected forbidden, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reconnect_does_not_self_evict() {
-    // An honest daemon whose connection drops and reconnects (re-registering the
-    // same node-id) must remain reachable: the stale connection's teardown must
-    // not evict the live reconnection.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let relay = start_relay(RelayConfig::default()).await;
-
-    let mut a = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut a,
-        &Frame::Register {
-            node_id: "node-1".into(),
-            relay_token: String::new(),
-        },
-    )
-    .await;
-    assert!(matches!(read_frame(&mut a).await, Frame::Registered { .. }));
-
-    // Reconnect (same node-id) wins via last-writer-wins.
-    let mut b = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut b,
-        &Frame::Register {
-            node_id: "node-1".into(),
-            relay_token: String::new(),
-        },
-    )
-    .await;
-    assert!(matches!(read_frame(&mut b).await, Frame::Registered { .. }));
-
-    // The stale connection goes away; its teardown must NOT remove node-1.
-    drop(a);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let mut c = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut c,
-        &Frame::Connect {
-            node_id: "node-1".into(),
-        },
-    )
-    .await;
+async fn signed_daemon_registers_in_open_mode() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, "node-a", &key, None, true).await;
     assert!(
-        matches!(read_frame(&mut c).await, Frame::Opened { .. }),
-        "live reconnection was self-evicted by the stale connection's teardown"
+        matches!(term, Control::Registered { ref node_id, .. } if node_id == "node-a"),
+        "expected Registered, got {term:?}"
     );
 }
 
 #[tokio::test]
-async fn pending_client_is_reaped_when_unpaired() {
-    // A client parked for a daemon that never opens a data connection must be
-    // reaped (its socket dropped) within the configured window, not leaked.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let relay = start_relay(RelayConfig {
-        pending_timeout: std::time::Duration::from_millis(200),
+async fn bad_signature_is_rejected() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, "node-a", &key, None, false).await;
+    assert!(
+        matches!(term, Control::Error { ref code, .. } if code == "bad_sig"),
+        "expected bad_sig error, got {term:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_admits_listed_and_rejects_unlisted() {
+    let listed = gen_key();
+    let unlisted = gen_key();
+    let mut allow = HashSet::new();
+    allow.insert(fingerprint(&listed));
+    let addr = start_relay(RelayConfig {
+        registration_mode: Admission::Allowlist,
+        allow,
         ..Default::default()
     })
     .await;
 
-    // Daemon registers but will never send Accept.
-    let mut d = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut d,
-        &Frame::Register {
-            node_id: "n".into(),
-            relay_token: String::new(),
-        },
-    )
-    .await;
-    assert!(matches!(read_frame(&mut d).await, Frame::Registered { .. }));
+    let (_ws1, ok) = handshake(addr, "node-listed", &listed, None, true).await;
+    assert!(
+        matches!(ok, Control::Registered { .. }),
+        "listed fingerprint must register, got {ok:?}"
+    );
 
-    let mut c = TcpStream::connect(relay).await.unwrap();
-    write_frame(
-        &mut c,
-        &Frame::Connect {
-            node_id: "n".into(),
-        },
-    )
-    .await;
-    assert!(matches!(read_frame(&mut c).await, Frame::Opened { .. }));
+    let (_ws2, denied) = handshake(addr, "node-unlisted", &unlisted, None, true).await;
+    assert!(
+        matches!(denied, Control::Error { ref code, .. } if code == "forbidden"),
+        "unlisted fingerprint must be forbidden, got {denied:?}"
+    );
+}
 
-    // After the reap window the relay drops the parked socket -> client sees EOF.
-    let mut buf = [0u8; 1];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(3), c.read(&mut buf))
-        .await
-        .expect("reaper should close the unpaired parked socket")
-        .unwrap();
-    assert_eq!(n, 0, "parked client socket was not reaped");
+#[tokio::test]
+async fn node_id_is_bound_to_pubkey() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let key_a = gen_key();
+    let key_b = gen_key();
+
+    // Daemon A registers "shared" and HOLDS the connection open.
+    let (mut ws_a, term_a) = handshake(addr, "shared", &key_a, None, true).await;
+    assert!(matches!(term_a, Control::Registered { .. }));
+    tokio::spawn(async move {
+        // Keep the registration live (answer pings) for the duration of the test.
+        while next_control(&mut ws_a).await.is_some() {}
+    });
+
+    // Daemon B (different key) tries to claim the same node-id -> node_taken.
+    let (_ws_b, term_b) = handshake(addr, "shared", &key_b, None, true).await;
+    assert!(
+        matches!(term_b, Control::Error { ref code, .. } if code == "node_taken"),
+        "a different key must not hijack a live node-id, got {term_b:?}"
+    );
 }

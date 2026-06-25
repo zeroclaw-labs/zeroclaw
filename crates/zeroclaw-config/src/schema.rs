@@ -6580,6 +6580,17 @@ pub struct RelayConfig {
     #[secret]
     #[credential_class = "encrypted_secret"]
     pub token: String,
+    /// PEM CA to trust for the relay's OWN (outer) TLS certificate. Empty uses the
+    /// built-in public roots (for a relay fronted by a public-CA certificate).
+    #[serde(default)]
+    pub relay_ca_path: String,
+    /// Server name to expect on the relay's outer certificate. Empty derives it
+    /// from the host portion of `url`.
+    #[serde(default)]
+    pub relay_host: String,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    #[serde(default)]
+    pub relay_insecure: bool,
 }
 
 fn default_wss_bind() -> String {
