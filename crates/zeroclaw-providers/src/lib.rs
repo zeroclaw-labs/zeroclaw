@@ -2762,6 +2762,15 @@ mod tests {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
 
+    #[test]
+    fn factory_nvidia_supports_vision() {
+        let provider = create_model_provider("nvidia", Some("nvapi-test")).unwrap();
+        assert!(
+            provider.supports_vision(),
+            "nvidia provider must report supports_vision()=true for multimodal models"
+        );
+    }
+
     // ── AI inference routers ─────────────────────────────────
 
     #[test]

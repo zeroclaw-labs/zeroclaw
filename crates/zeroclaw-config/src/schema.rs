@@ -10143,6 +10143,32 @@ impl LogToolIo {
     }
 }
 
+/// LLM request payload capture policy. Mirrors [`LogToolIo`] but gates the
+/// prompt/messages sent on each `llm_request`. Defaults to `Off` because the
+/// full payload is the entire system prompt plus conversation every turn.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogLlmRequestPayload {
+    #[default]
+    Off,
+    Redacted,
+    Full,
+}
+
+impl LogLlmRequestPayload {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10216,6 +10242,22 @@ pub struct ObservabilityConfig {
     /// secret reads). Empty by default.
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
+
+    /// LLM request payload capture: "off" | "redacted" | "full".
+    /// - `off` (default): only `messages_count` lands on the `llm_request`
+    ///   event. No prompt or conversation content is persisted.
+    /// - `redacted`: the full message history (role + content) is leak-scanned
+    ///   and truncated at `log_tool_io_truncate_bytes` before persisting.
+    /// - `full`: full message history, still leak-scanned, untruncated. For
+    ///   operators who need replay fidelity and accept the disk cost.
+    ///
+    /// Opt-in (default off) because `full`/`redacted` capture the entire system
+    /// prompt and conversation on every turn.
+    #[serde(
+        default = "default_log_llm_request_payload",
+        deserialize_with = "deserialize_enum_lenient"
+    )]
+    pub log_llm_request_payload: LogLlmRequestPayload,
 }
 
 impl Default for ObservabilityConfig {
@@ -10231,6 +10273,7 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+            log_llm_request_payload: default_log_llm_request_payload(),
         }
     }
 }
@@ -10249,6 +10292,10 @@ fn default_log_persistence_max_entries() -> usize {
 
 fn default_log_tool_io() -> LogToolIo {
     LogToolIo::Redacted
+}
+
+fn default_log_llm_request_payload() -> LogLlmRequestPayload {
+    LogLlmRequestPayload::Off
 }
 
 fn default_log_tool_io_truncate_bytes() -> usize {
@@ -18435,7 +18482,17 @@ impl Config {
         self.dirty_paths.insert(path.to_string());
     }
 
-    pub fn ensure_map_key_for_path(&mut self, path: &str) {
+    /// Auto-create the parent map key for a dotted set-prop `path` when it does
+    /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
+    /// the entry first.
+    ///
+    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
+    /// set-prop surface should then surface a reserved-name error rather than the
+    /// generic "not configured" that the still-missing entry would otherwise
+    /// produce. Returns `false` in every other case (created, already existed, or
+    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
+    /// that do not distinguish the reserved case may ignore it.
+    pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -18451,19 +18508,44 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return;
+            return false;
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return;
+            return false;
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return;
+            return false;
+        }
+        // Never auto-vivify the reserved `default` agent from a set-prop path: a
+        // prop write under a nonexistent `agents.default` must not materialize the
+        // reserved runtime fallback (the operator would get an agent the rename
+        // guard then traps). This is the set-prop analogue of the create guard in
+        // `create_map_key_checked`. The migration that legitimately synthesizes
+        // `agents.default` calls `create_map_key` directly, not this path, and an
+        // already-present `default` is left untouched by the existence check above.
+        if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
+            // Make the refusal observable: callers that check the return surface a
+            // reserved-name error, and this WARN with a stable `error_key` lets an
+            // operator see why a set-prop on a fresh `agents.default` was dropped.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.reserved_agent_vivify_refused",
+                        "alias": alias,
+                        "path": path,
+                    })),
+                "refused to auto-create the reserved `default` agent from a set-prop path"
+            );
+            return true;
         }
         let _ = self.create_map_key(section, alias);
+        false
     }
 
     pub fn clear_dirty(&mut self) {
@@ -20617,6 +20699,12 @@ log_tool_io = "off"
         assert_eq!(ObservabilityBackend::Otel.as_wire(), "otel");
         assert_eq!(LogPersistence::Full.as_wire(), "full");
         assert_eq!(LogToolIo::Off.as_wire(), "off");
+
+        // log_llm_request_payload parses leniently and round-trips its wire form.
+        let payload: ObservabilityConfig =
+            toml::from_str("log_llm_request_payload = \"full\"").unwrap();
+        assert_eq!(payload.log_llm_request_payload, LogLlmRequestPayload::Full);
+        assert_eq!(LogLlmRequestPayload::Off.as_wire(), "off");
     }
 
     #[test]
@@ -20655,6 +20743,7 @@ log_tool_io = "off"
         assert_eq!(o.log_tool_io, LogToolIo::Redacted);
         assert_eq!(o.log_tool_io_truncate_bytes, 40960);
         assert!(o.log_tool_io_denylist.is_empty());
+        assert_eq!(o.log_llm_request_payload, LogLlmRequestPayload::Off);
     }
 
     #[test]

@@ -843,6 +843,33 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nvidia");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("nvidia");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        // NVIDIA NIM exposes vision-capable models (e.g. `nvidia/llama-3.2-90av`,
+        // `google/deepseek-r1`). Compose the catalog-conf'd base with vision flag
+        // override via the constructor variant; we replay both consts manually
+        // since this constructor path doesn't fold through `build_compat_base`.
+        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
+            Self::DISPLAY,
+            api_url.unwrap_or(Self::DEFAULT_URL),
+            key,
+            Self::AUTH,
+            true,
+        );
+        if let Some(catalog_key) = Self::MODELS_DEV_KEY {
+            p = p.with_models_dev_key(catalog_key);
+        }
+        if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
+            p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        p
+    }
 }
 
 impl CompatFamilySpec for QianfanModelProviderConfig {
