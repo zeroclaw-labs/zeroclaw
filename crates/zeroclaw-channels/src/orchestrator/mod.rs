@@ -1852,9 +1852,10 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
 
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
-        &zeroclaw_runtime::skills::load_skills_with_config(
+        &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
             ctx.prompt_config.as_ref(),
+            ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.skills.prompt_injection_mode,

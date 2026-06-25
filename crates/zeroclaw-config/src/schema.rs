@@ -842,6 +842,13 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, f64>,
+    /// Whether stored assistant reasoning should be replayed on outbound
+    /// assistant history messages. `Some(false)` strips `reasoning_content`
+    /// and `reasoning` before sending. `None` (default) honours the provider's
+    /// built-in default (true for most compat providers, false for Groq).
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
@@ -1045,7 +1052,9 @@ impl ModelEndpoint for MoonshotEndpoint {
         match self {
             Self::Cn => "https://api.moonshot.cn/v1",
             Self::Intl => "https://api.moonshot.ai/v1",
-            Self::Code => "https://api.moonshot.cn/coder/v1",
+            // Kimi Code (Kimi For Coding) moved to api.kimi.com — the old api.moonshot.cn/coder/v1 returns 404.
+            // See issue #8154: https://github.com/zeroclaw-labs/zeroclaw/issues/8154
+            Self::Code => "https://api.kimi.com/coding/v1",
         }
     }
 }
@@ -6936,7 +6945,14 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`)
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
+    /// Exact and subdomain matches are supported. Listing a host skips the
+    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
+    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
+    /// wildcard permits any literal private/local host and lets a name already in
+    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
+    /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -10399,7 +10415,7 @@ impl Default for WebhookAuditConfig {
 // contexts). Configs from older schema versions are folded into
 // `risk_profiles.default` by the migration in `schema/v2.rs`.
 
-fn default_auto_approve() -> Vec<String> {
+pub fn default_auto_approve() -> Vec<String> {
     vec![
         "file_read".into(),
         "memory_recall".into(),

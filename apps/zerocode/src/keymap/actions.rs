@@ -140,8 +140,10 @@ keyactions! {
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::CONTROL), Chord::ctrl('k')] => "enter browse mode",
-        BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::CONTROL)] => "exit browse mode",
+        // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
+        // and queue navigation conflict (alt+up/down). See issue #8075.
+        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
+        BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",
         BrowseUpVim             [Chord::char('k')] => "browse prev (vim)",
@@ -170,6 +172,7 @@ keyactions! {
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
         QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
         QueueNarrow             [Chord::shift(KeyCode::Right)] => "narrow queue",
+        ErrorDismiss            [Chord::char('q')] => "dismiss error",
     }
 }
 
@@ -236,9 +239,32 @@ keyactions! {
         Back          [Chord::char('q'), Chord::key(KeyCode::Esc)] => "back",
         TabLeft       [Chord::char('h'), Chord::key(KeyCode::Left)] => "prev tab",
         TabRight      [Chord::char('l'), Chord::key(KeyCode::Right)] => "next tab",
+        SectionNext   [Chord::key(KeyCode::Tab)] => "next section",
+        SectionPrev   [Chord::key(KeyCode::BackTab)] => "prev section",
+        BeginSearch   [Chord::char('/')] => "search",
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
         ApplyTemplate [Chord::char('t')] => "apply template",
+    }
+}
+
+keyactions! {
+    pub enum CaptureAction ("capture") {
+        Cancel [Chord::key(KeyCode::Esc)] => "cancel capture",
+    }
+}
+
+keyactions! {
+    pub enum DoctorTabAction ("doctor") {
+        Up         [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down       [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        Refresh    [Chord::char('r')] => "refresh",
+        FilterNext [Chord::char('+'), Chord::char('=')] => "next filter",
+        FilterPrev [Chord::char('-')] => "prev filter",
+        PageUp     [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown   [Chord::key(KeyCode::PageDown)] => "page down",
+        JumpStart  [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
+        JumpEnd    [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
     }
 }
 
@@ -259,9 +285,11 @@ keyactions! {
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
-        CursorStart        [Chord::key(KeyCode::Home), Chord::ctrl('a')] => "line start",
+        CursorStart        [Chord::key(KeyCode::Home)] => "line start",
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
+        OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
+        ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",
         HistoryPrev        [Chord::key(KeyCode::Up)] => "history prev",
@@ -278,6 +306,8 @@ keyactions! {
     pub enum ModalAction ("modal") {
         Confirm [Chord::key(KeyCode::Enter), Chord::char('y'), Chord::char('Y')] => "confirm",
         Cancel  [Chord::key(KeyCode::Esc), Chord::char('n'), Chord::char('N')] => "cancel",
+        Up      [Chord::key(KeyCode::Up)] => "prev",
+        Down    [Chord::key(KeyCode::Down)] => "next",
     }
 }
 
@@ -311,6 +341,8 @@ keyactions! {
         Accept    [Chord::key(KeyCode::Enter)] => "accept",
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        Up        [Chord::key(KeyCode::Up)] => "prev",
+        Down      [Chord::key(KeyCode::Down)] => "next",
     }
 }
 
