@@ -1765,6 +1765,18 @@ impl Chat {
                         }
                         return;
                     }
+                    if let Some(text) = state
+                        .copy_hit_regions
+                        .iter()
+                        .find(|r| mouse::in_rect(col, row, r.rect))
+                        .map(|r| r.text.clone())
+                    {
+                        if !text.is_empty() {
+                            crate::mouse::copy_osc52(&text);
+                            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                        }
+                        return;
+                    }
                     let hit = state
                         .entry_rects
                         .iter()
@@ -2824,6 +2836,52 @@ fn render_entry_into(
     }
 }
 
+/// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
+/// starting column (display cells from line start) and its trimmed width in
+/// cells, or `None` if the line has no copy label.
+fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    let mut col = 0u16;
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        if content == copy_lbl {
+            let lead = copy_lbl.len() - copy_lbl.trim_start().len();
+            let trimmed = copy_lbl.trim();
+            return Some((
+                col + lead as u16,
+                UnicodeWidthStr::width(trimmed) as u16,
+            ));
+        }
+        col += UnicodeWidthStr::width(content) as u16;
+    }
+    None
+}
+
+/// Wrapped screen-row count for a single cached line at the given width.
+fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
+    Paragraph::new(vec![borrow_line(line)])
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
+}
+
+/// Build a `[Copy]` region if its global wrapped row is on-screen.
+fn copy_region(
+    global_row: u16,
+    col: u16,
+    cells: u16,
+    scroll: u16,
+    body: Rect,
+    text: &str,
+) -> Option<CopyHitRegion> {
+    if global_row < scroll || global_row >= scroll + body.height {
+        return None;
+    }
+    Some(CopyHitRegion {
+        rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
+        text: text.to_string(),
+    })
+}
+
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
     let spans: Vec<Span<'a>> = line
         .spans
@@ -2948,6 +3006,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.entry_rects.push((entry_idx, rect));
     }
 
+    let body_rect = Rect::new(body_x, body_y, body_w, body_h);
+    state.rebuild_copy_regions(inner_width, scroll, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -3723,6 +3783,14 @@ struct TitleHitRect {
     rect: Rect,
 }
 
+/// A clickable `[Copy]` label on a code-fence header bar. `text` is the exact
+/// fence contents; `rect` is the label's screen cells from the last draw.
+#[derive(Debug, Clone)]
+struct CopyHitRegion {
+    rect: Rect,
+    text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueItemStatus {
     Pending,
@@ -3791,6 +3859,8 @@ pub struct ChatState {
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Clickable `[Copy]` code-fence labels from the last draw.
+    copy_hit_regions: Vec<CopyHitRegion>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -3884,6 +3954,7 @@ impl ChatState {
             highlighted_entry: None,
             mouse_down_entry: None,
             entry_rects: Vec::new(),
+            copy_hit_regions: Vec::new(),
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -4207,6 +4278,60 @@ impl ChatState {
             self.cached_screen_ranges
                 .push((entry_idx, screen_lo, screen_cursor));
         }
+    }
+
+    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
+    /// tracking its wrapped screen-row offset, and for each code fence records
+    /// the `[Copy]` label cells on both the header and footer bars plus the
+    /// fence's exact text (recovered from the indented body lines between
+    /// them). `scroll` and `body` translate global wrapped rows into on-screen
+    /// cells; labels scrolled out of view are dropped.
+    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
+    /// tracking its wrapped screen-row offset, and for each code fence records
+    /// the `[Copy]` label cells on both the header and footer bars plus the
+    /// fence's exact text (recovered from the indented body lines between
+    /// them). `scroll` and `body` map global wrapped rows onto screen cells;
+    /// labels scrolled out of view are dropped.
+    fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
+        let copy_lbl = " [Copy] ";
+        let mut regions: Vec<CopyHitRegion> = Vec::new();
+        let mut screen_cursor = 0u16;
+        // (header_row, header_label_col, header_label_cells, accumulated_text)
+        let mut pending: Option<(u16, u16, u16, String)> = None;
+        for line in &self.cached_lines {
+            let first = line
+                .spans
+                .first()
+                .map(|s| s.content.as_ref())
+                .unwrap_or("");
+            if first.starts_with('\u{250c}') {
+                pending = label_cells(line, copy_lbl)
+                    .map(|(col, cells)| (screen_cursor, col, cells, String::new()));
+            } else if first.starts_with('\u{2514}') {
+                if let Some((header_row, header_col, header_cells, text)) = pending.take() {
+                    if let Some(r) =
+                        copy_region(header_row, header_col, header_cells, scroll, body, &text)
+                    {
+                        regions.push(r);
+                    }
+                    if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
+                        && let Some(r) =
+                            copy_region(screen_cursor, footer_col, footer_cells, scroll, body, &text)
+                    {
+                        regions.push(r);
+                    }
+                }
+            } else if let Some((_, _, _, text)) = pending.as_mut() {
+                let body_text = first.strip_prefix("  ").unwrap_or(first);
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(body_text);
+            }
+
+            screen_cursor += wrapped_rows(line, width);
+        }
+        self.copy_hit_regions = regions;
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -5862,6 +5987,51 @@ mod tests {
             copy_col(header),
             copy_col(footer),
             "[Copy] must start at the same column on header and footer\nheader: {header:?}\nfooter: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_body_has_no_left_gutter() {
+        let out = rendered("```rust\nlet x = 1;\n```\n", 50);
+        let body = out
+            .lines()
+            .find(|l| l.contains("let x = 1;"))
+            .expect("code body line");
+        assert!(
+            !body.starts_with('\u{2502}'),
+            "code body must not start with a vertical gutter: {body:?}"
+        );
+        assert_eq!(
+            body.strip_prefix("  ").map(str::trim_end),
+            Some("let x = 1;"),
+            "body line is two-space indented code: {body:?}"
+        );
+    }
+
+    #[test]
+    fn copy_label_cells_locate_copy_on_header_bar() {
+        let lines = markdown_to_lines("```rust\nlet x = 1;\n```\n", 50);
+        let header = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .map(|s| s.content.starts_with('\u{250c}'))
+                    .unwrap_or(false)
+            })
+            .expect("header bar");
+        let (col, cells) = label_cells(header, " [Copy] ").expect("copy label present");
+        assert_eq!(cells, "[Copy]".chars().count() as u16);
+        // The cell at `col` on the rendered header must be the '[' of [Copy].
+        let rendered: String = header
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            rendered.chars().nth(col as usize),
+            Some('['),
+            "label_cells column must point at '[' of [Copy]: {rendered:?}"
         );
     }
 
