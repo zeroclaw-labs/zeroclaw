@@ -1010,7 +1010,7 @@ pub async fn handle_delete_map_key(
         return e.into_response();
     }
     let working = state.config.read().clone();
-    match parse_alias_kind(&q.path) {
+    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             // Agent deletion is special: it must scrub config references
             // (heartbeat, peer-groups, delegates, workspace.access, …) via
