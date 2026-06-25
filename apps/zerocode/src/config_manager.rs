@@ -460,7 +460,7 @@ impl App {
 
         // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
             chunks[2],
         );
 
@@ -522,27 +522,17 @@ impl App {
         }
     }
 
-    /// Highlight style + symbol for the right (detail) pane lists.
-    ///
-    /// Three visual states are intentionally separated so a *selected* field
-    /// in the field list is no longer mistaken for an *editable* input:
-    ///
-    /// 1. FieldList (selection) — the row is highlighted with the selection
-    ///    background but kept dim and un-bolded. The arrow gutter is a thin
-    ///    ">" instead of the bold "› " reserved for active editing.
-    /// 2. FieldEdit (active editing) — bold + bright foreground on the
-    ///    selection background with the "› " gutter, matching the rest of
-    ///    the editor's active surfaces.
-    /// 3. Other screens / section-list holds focus — dim "you are here"
-    ///    marker, identical to the previous behavior.
+    /// Highlight style + symbol for the right (detail) pane lists, mirroring
+    /// `zerocode_pane::ZerocodePane::detail_highlight`: the active selection
+    /// style and "› " gutter when the detail pane holds focus, the dim "you
+    /// are here" marker when focus has stepped back to the section list.
     fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        match (&self.screen, self.zeroclaw_pane) {
-            (Screen::FieldEdit { .. }, _) => (theme::selected_style(), "\u{203a} "),
-            (Screen::FieldList { .. }, ZeroclawPane::Detail) => {
-                (theme::selected_inactive_style(), ">")
-            }
-            _ => (theme::selected_inactive_style(), "  "),
-        }
+        let focused = matches!(
+            (&self.screen, self.zeroclaw_pane),
+            (Screen::FieldEdit { .. }, _) | (_, ZeroclawPane::Detail)
+        );
+        let symbol = if focused { "\u{203a} " } else { "  " };
+        (theme::selection_highlight(focused, false), symbol)
     }
 
     fn draw_section_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -585,19 +575,26 @@ impl App {
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-            self.cycle_section(1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
-        }
-        if key.code == KeyCode::BackTab {
-            self.cycle_section(-1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
+        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+            use crate::keymap::ConfigTabAction;
+            if action == ConfigTabAction::SectionNext {
+                self.cycle_section(1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
+            if action == ConfigTabAction::SectionPrev {
+                self.cycle_section(-1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
         }
 
         if self.section == ConfigSection::Zerocode {
-            self.zerocode.handle_key(key);
+            if !self.zerocode.handle_key(key) {
+                // Left/Back at the zerocode section level was not consumed:
+                // cross back to the outer left (zeroclaw) pane.
+                self.cycle_section(-1);
+            }
             self.sync_zerocode_locales().await;
             return Ok(false);
         }
@@ -1722,15 +1719,14 @@ impl App {
         let has_tabs = self.alias_list_has_tabs();
 
         // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
-        // the FieldList tab bar uses. On these screens those chords no longer
-        // mean back/into; Back is the only way out to the type list.
+        // the FieldList tab bar uses. TabRight steps into Costs; TabLeft steps
+        // back toward Aliases, then on the leftmost tab walks out to the type
+        // list (the opposite of "into"), mirroring the FieldList sub-tab gesture.
         if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
             match action {
-                ConfigTabAction::TabLeft => {
-                    if self.alias_tab > 0 {
-                        self.alias_tab -= 1;
-                        self.deactivate_filter();
-                    }
+                ConfigTabAction::TabLeft if self.alias_tab > 0 => {
+                    self.alias_tab -= 1;
+                    self.deactivate_filter();
                     return Ok(());
                 }
                 ConfigTabAction::TabRight => {
@@ -1772,15 +1768,12 @@ impl App {
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
-        // With tabs present, TabLeft no longer doubles as Back.
-        let back = if has_tabs {
-            matches!(action, Some(ConfigTabAction::Back))
-        } else {
-            matches!(
-                action,
-                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
-            )
-        };
+        // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
+        // it only reaches here on the leftmost tab, where it walks out like Back.
+        let back = matches!(
+            action,
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+        );
         let into = if has_tabs {
             matches!(action, Some(ConfigTabAction::Enter))
         } else {
@@ -2929,28 +2922,21 @@ impl App {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
-        use crate::keymap::Chord;
+        use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
-            return match key.code {
-                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.activate_filter();
-                    FilterAction::Consumed
-                }
-                _ => FilterAction::Passthrough,
-            };
+            if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
+                self.activate_filter();
+                return FilterAction::Consumed;
+            }
+            return FilterAction::Passthrough;
         }
-        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
-            Some(FilterEditAction::Cancel)
-        } else if Chord::key(KeyCode::Enter).matches(&key) {
-            Some(FilterEditAction::Accept)
-        } else if Chord::key(KeyCode::Backspace).matches(&key) {
-            Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) {
-            Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) {
-            Some(FilterEditAction::CursorDown)
-        } else {
-            None
+        let editor_chord = match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Cancel) => Some(FilterEditAction::Cancel),
+            Some(SearchBoxAction::Accept) => Some(FilterEditAction::Accept),
+            Some(SearchBoxAction::Backspace) => Some(FilterEditAction::Backspace),
+            Some(SearchBoxAction::Up) => Some(FilterEditAction::CursorUp),
+            Some(SearchBoxAction::Down) => Some(FilterEditAction::CursorDown),
+            None => None,
         };
         match editor_chord {
             Some(FilterEditAction::Cancel) => {
@@ -3322,9 +3308,9 @@ impl App {
         }
 
         let (style, symbol) = if active {
-            (theme::selected_style(), "› ")
+            (theme::selection_highlight(true, false), "\u{203a} ")
         } else {
-            (theme::selected_inactive_style(), "  ")
+            (theme::selection_highlight(false, false), "  ")
         };
 
         frame.render_stateful_widget(
@@ -4086,8 +4072,8 @@ impl App {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&title))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(theme::selection_highlight(true, false))
+                    .highlight_symbol("\u{203a} "),
                 r.main,
                 &mut state,
             );
@@ -4283,10 +4269,11 @@ impl App {
 
 impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
-            vec!["Tab", "Shift+Tab"],
+            [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
             crate::i18n::t("zc-config-help-switch-section"),
         );
         if self.section == ConfigSection::Zerocode {
@@ -4308,8 +4295,18 @@ impl App {
         // All chords resolve from the live keymap so overrides/vim/emacs show.
         let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
         let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
-        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
-        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let help = || {
+            E::new(
+                crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+                crate::i18n::t("zc-config-help-this-help"),
+            )
+        };
+        let filter = || {
+            E::new(
+                tab_keys(A::BeginSearch),
+                crate::i18n::t("zc-config-help-filter"),
+            )
+        };
         let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
@@ -4561,12 +4558,18 @@ impl App {
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
         ));
-        entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
+        entries.push(E::new(
+            tab_keys(A::BeginSearch),
+            crate::i18n::t("zc-config-help-filter"),
+        ));
         entries.push(E::new(
             tab_keys(A::Back),
             crate::i18n::t("zc-config-help-back"),
         ));
-        entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
+        entries.push(E::new(
+            crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+            crate::i18n::t("zc-config-help-this-help"),
+        ));
         entries.push(E::spacer());
         let mouse = if has_tabs {
             crate::i18n::t("zc-config-help-mouse-tabs-edit")
@@ -4705,6 +4708,53 @@ mod tests {
             keyboard_enhancement_flags()
                 .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
+    }
+
+    fn test_manager() -> App {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            shape: None,
+            cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn left_on_leftmost_alias_tab_walks_back_to_type_list() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut mgr = test_manager();
+        mgr.sections = vec![entry_with_cost("providers.models", "models")];
+        mgr.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.models.anthropic".to_string(),
+            breadcrumb: vec!["providers.models".to_string(), "anthropic".to_string()],
+        };
+        mgr.alias_tab = 0;
+
+        assert!(
+            mgr.alias_list_has_tabs(),
+            "Aliases/Costs tabs must be present for this scenario"
+        );
+
+        mgr.handle_alias_list(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
+            "Left on the leftmost alias tab walks out to the type list like Back"
         );
     }
 }
