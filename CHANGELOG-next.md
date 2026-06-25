@@ -106,6 +106,9 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Active config directory surfaced in the Config header (#7999).
 - Approval overlay background filled (#7823).
 - Queue-paused hint skipped when the backlog is empty (#7857).
+- Chat surface refresh: mode bar and code-block chrome, browse-mode badge, and mouse click-to-copy (#8000).
+- Selected field is visually distinguished from the editable input (#7995).
+- Queue pauses when a turn is cancelled (#8214).
 
 ## Cost and Budget
 
