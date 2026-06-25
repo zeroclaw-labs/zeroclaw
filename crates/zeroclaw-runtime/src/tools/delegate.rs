@@ -125,6 +125,8 @@ impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
+    const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
+        "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
     pub fn new(
         agents: HashMap<String, AliasedAgentConfig>,
@@ -501,6 +503,82 @@ impl DelegateTool {
             .as_ref()
             .and_then(|config| config.delegate_target_mode(&self.caller_alias, target_alias))
             .unwrap_or(DelegateExecutionMode::Bounded)
+    }
+
+    /// Runtime-only guard for independent targets whose risk profile still
+    /// declares `always_ask`.
+    ///
+    /// Independent delegation deliberately runs under the target agent's own
+    /// policy and tool registry (#8238, related to the broader delegation ask
+    /// in #7743). That is fine for target-owned authorization, but
+    /// `always_ask` is a runtime approval contract: starting an independent
+    /// child that can later ask for approval would require an approval
+    /// forwarding channel back through the parent. That channel is explicitly
+    /// out of scope for independent-delegates PR #8239, so fail closed
+    /// here before any target run, task id, or parallel spawn is created.
+    ///
+    /// Keep this centralized. Sync, background, and parallel paths all call
+    /// the same helper so the refusal string and structured diagnostics do not
+    /// drift, and so a future approval-forwarding implementation has one
+    /// temporary guard to remove.
+    ///
+    /// References:
+    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/8238
+    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/7743
+    /// - https://github.com/zeroclaw-labs/zeroclaw/pull/8239
+    fn independent_always_ask_refusal(&self, target_alias: &str) -> Option<ToolResult> {
+        let config = self.root_config.as_ref()?;
+        if config.delegate_target_mode(&self.caller_alias, target_alias)
+            != Some(DelegateExecutionMode::Independent)
+        {
+            return None;
+        }
+
+        let target_agent = config.agents.get(target_alias)?;
+        let target_risk_profile = target_agent.risk_profile.trim();
+        if target_risk_profile.is_empty() {
+            return None;
+        }
+
+        let profile = config.risk_profiles.get(target_risk_profile)?;
+        let always_ask_entries: Vec<String> = profile
+            .always_ask
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        if always_ask_entries.is_empty() {
+            return None;
+        }
+        let always_ask_label = always_ask_entries.join(", ");
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "delegate.independent_always_ask_unsupported",
+                    "caller_alias": self.caller_alias,
+                    "target_agent": target_alias,
+                    "target_risk_profile": target_risk_profile,
+                    "always_ask": always_ask_entries.clone(),
+                })),
+            "delegate refused: independent target has always_ask entries"
+        );
+
+        Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "delegate target {target_alias:?} cannot run in independent mode from {:?}: \
+                 risk profile {target_risk_profile:?} has always_ask entries ({}). \
+                 See {}.",
+                self.caller_alias,
+                always_ask_label,
+                Self::INDEPENDENT_ALWAYS_ASK_DOC_REF
+            )),
+        })
     }
 
     fn build_target_provider(
@@ -1104,6 +1182,9 @@ impl DelegateTool {
                 error: Some(format!("{e:#}")),
             });
         }
+        if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
+            return Ok(refusal);
+        }
 
         // Create model_provider for this agent
         let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
@@ -1268,6 +1349,9 @@ impl DelegateTool {
                 });
             }
         };
+        if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
+            return Ok(refusal);
+        }
 
         // Runaway backstop: refuse a new background delegation once too many are already in
         // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
@@ -1578,6 +1662,9 @@ impl DelegateTool {
                     output: String::new(),
                     error: Some(format!("{e:#}")),
                 });
+            }
+            if let Some(refusal) = self.independent_always_ask_refusal(name) {
+                return Ok(refusal);
             }
         }
 
@@ -5624,6 +5711,192 @@ mod tests {
             },
         );
         Arc::new(config)
+    }
+
+    fn config_with_always_ask_delegate(mode: DelegateExecutionMode) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{RiskProfileConfig, RuntimeProfileConfig};
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-delegate-always-ask-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                always_ask: vec![" shell ".to_string(), String::new()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("peer_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "bounded".to_string(),
+            RuntimeProfileConfig {
+                max_delegation_depth: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![
+                    DelegateTargetConfig {
+                        agent: "target".to_string(),
+                        mode,
+                    },
+                    DelegateTargetConfig {
+                        agent: "peer".to_string(),
+                        mode: DelegateExecutionMode::Independent,
+                    },
+                ],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "peer".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "peer_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.peer".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    fn delegate_tool_for_config(config: Arc<Config>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_rejects_target_always_ask() {
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "check the system",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("independent always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains(
+                "delegate target \"target\" cannot run in independent mode from \"caller\""
+            ),
+            "expected target/caller context, got: {error}"
+        );
+        assert!(
+            error.contains("risk profile \"target_profile\" has always_ask entries (shell)"),
+            "expected risk profile and trimmed always_ask entries, got: {error}"
+        );
+        assert!(
+            error.contains("ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\""),
+            "expected docs section reference, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_does_not_trigger_target_always_ask_guard() {
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Bounded);
+        let tool = delegate_tool_for_config(config);
+
+        tool.policy_for_target("target")
+            .expect("bounded explicit target remains reachable");
+        assert!(
+            tool.independent_always_ask_refusal("target").is_none(),
+            "bounded mode must leave always_ask handling to the normal approval path"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_independent_delegate_rejects_always_ask_before_task_id() {
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "check the system",
+                "background": true,
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("background always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains("always_ask entries (shell)"),
+            "expected always_ask refusal, got: {error}"
+        );
+        assert!(
+            !result.output.contains("task_id:"),
+            "background refusal must not return a task id, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_independent_delegate_rejects_always_ask_before_spawning() {
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "parallel": ["peer", "target"],
+                "prompt": "check both systems",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("parallel always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains(
+                "delegate target \"target\" cannot run in independent mode from \"caller\""
+            ),
+            "expected target/caller refusal, got: {error}"
+        );
+        assert!(
+            result.output.is_empty(),
+            "parallel refusal must happen before fan-out output is built, got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
