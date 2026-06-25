@@ -10106,6 +10106,15 @@ pub enum LogPersistence {
     #[default]
     Rolling,
     Full,
+    /// Persist all events, but with ZeroClaw-managed archive rotation: the
+    /// active file is rotated to a timestamped archive on a size and/or daily
+    /// boundary, and old archives are pruned by count and/or age. Unlike
+    /// `rolling` (entry-count trim of the active file), rotated events are
+    /// preserved in archive files for later diagnostics. Rotation is tuned via
+    /// the `log_persistence_max_bytes`, `log_persistence_rotate_daily`,
+    /// `log_persistence_retention_max_files`, and
+    /// `log_persistence_retention_max_age_days` settings.
+    Rotating,
 }
 
 impl LogPersistence {
@@ -10115,6 +10124,7 @@ impl LogPersistence {
             Self::None => "none",
             Self::Rolling => "rolling",
             Self::Full => "full",
+            Self::Rotating => "rotating",
         }
     }
 }
@@ -10218,6 +10228,34 @@ pub struct ObservabilityConfig {
     )]
     pub log_persistence_max_entries: usize,
 
+    /// Size threshold in bytes that triggers an archive rotation when
+    /// `log_persistence = "rotating"`. The active file is rotated once an
+    /// append leaves it at or above this size. `0` disables size-based
+    /// rotation. Ignored unless `log_persistence = "rotating"`.
+    #[serde(default = "default_log_persistence_max_bytes")]
+    pub log_persistence_max_bytes: u64,
+
+    /// Rotate the active file to an archive on a UTC day boundary when
+    /// `log_persistence = "rotating"`: before the first event of a new day is
+    /// appended, a file whose last write fell on an earlier day is archived.
+    /// Ignored unless `log_persistence = "rotating"`.
+    #[serde(default = "default_log_persistence_rotate_daily")]
+    pub log_persistence_rotate_daily: bool,
+
+    /// Retention cap on the number of rotated archive files kept alongside the
+    /// active file when `log_persistence = "rotating"`. After a rotation the
+    /// oldest archives beyond this count are deleted. `0` keeps all archives.
+    /// Ignored unless `log_persistence = "rotating"`.
+    #[serde(default = "default_log_persistence_retention_max_files")]
+    pub log_persistence_retention_max_files: usize,
+
+    /// Retention cap on the age (in days) of rotated archive files when
+    /// `log_persistence = "rotating"`. After a rotation, archives older than
+    /// this many days are deleted. `0` disables age-based cleanup. Ignored
+    /// unless `log_persistence = "rotating"`.
+    #[serde(default = "default_log_persistence_retention_max_age_days")]
+    pub log_persistence_retention_max_age_days: u64,
+
     /// Tool I/O capture policy: "off" | "redacted" | "full".
     /// - `off`: only tool name + outcome + duration land in the log.
     /// - `redacted` (default): tool input + output are leak-scanned and
@@ -10270,6 +10308,11 @@ impl Default for ObservabilityConfig {
             log_persistence: default_log_persistence(),
             log_persistence_path: default_log_persistence_path(),
             log_persistence_max_entries: default_log_persistence_max_entries(),
+            log_persistence_max_bytes: default_log_persistence_max_bytes(),
+            log_persistence_rotate_daily: default_log_persistence_rotate_daily(),
+            log_persistence_retention_max_files: default_log_persistence_retention_max_files(),
+            log_persistence_retention_max_age_days: default_log_persistence_retention_max_age_days(
+            ),
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
@@ -10288,6 +10331,27 @@ fn default_log_persistence_path() -> String {
 
 fn default_log_persistence_max_entries() -> usize {
     200
+}
+
+/// Size rotation off by default; operators opt in with an explicit byte budget.
+fn default_log_persistence_max_bytes() -> u64 {
+    0
+}
+
+/// Daily rotation is on by default so `rotating` mode produces day-scoped
+/// archives out of the box even without a configured size budget.
+fn default_log_persistence_rotate_daily() -> bool {
+    true
+}
+
+/// Keep a week of rotated archives by default.
+fn default_log_persistence_retention_max_files() -> usize {
+    7
+}
+
+/// Age-based cleanup off by default; count-based retention governs unless set.
+fn default_log_persistence_retention_max_age_days() -> u64 {
+    0
 }
 
 fn default_log_tool_io() -> LogToolIo {
@@ -20698,7 +20762,27 @@ log_tool_io = "off"
         // boundary (`to_log_config`) and downstream `from_raw` expect.
         assert_eq!(ObservabilityBackend::Otel.as_wire(), "otel");
         assert_eq!(LogPersistence::Full.as_wire(), "full");
+        assert_eq!(LogPersistence::Rotating.as_wire(), "rotating");
         assert_eq!(LogToolIo::Off.as_wire(), "off");
+
+        // The `rotating` mode and its knobs parse from a TOML config.
+        let rot: ObservabilityConfig = toml::from_str(
+            "log_persistence = \"rotating\"\nlog_persistence_max_bytes = 1048576\nlog_persistence_rotate_daily = false\nlog_persistence_retention_max_files = 3\nlog_persistence_retention_max_age_days = 14\n",
+        )
+        .unwrap();
+        assert_eq!(rot.log_persistence, LogPersistence::Rotating);
+        assert_eq!(rot.log_persistence_max_bytes, 1_048_576);
+        assert!(!rot.log_persistence_rotate_daily);
+        assert_eq!(rot.log_persistence_retention_max_files, 3);
+        assert_eq!(rot.log_persistence_retention_max_age_days, 14);
+
+        // Rotation knobs are serde-defaulted, so existing configs that omit them
+        // still parse and pick up the documented defaults.
+        let defaults: ObservabilityConfig = toml::from_str("backend = \"none\"").unwrap();
+        assert_eq!(defaults.log_persistence_max_bytes, 0);
+        assert!(defaults.log_persistence_rotate_daily);
+        assert_eq!(defaults.log_persistence_retention_max_files, 7);
+        assert_eq!(defaults.log_persistence_retention_max_age_days, 0);
 
         // log_llm_request_payload parses leniently and round-trips its wire form.
         let payload: ObservabilityConfig =
