@@ -452,6 +452,7 @@ async fn handle_socket(
                 return;
             }
         };
+    agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -486,6 +487,7 @@ async fn handle_socket(
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
         &config,
         &ch.ask_user,
+        &ch.channel_room,
         &Some(ch.reaction.clone()),
         &ch.poll,
         &ch.escalate,

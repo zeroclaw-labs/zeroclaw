@@ -93,6 +93,7 @@ struct TurnGuard {
     turn_id: Option<String>,
     turn_started_at: Instant,
     agent_alias: Option<String>,
+    channel_name: String,
     total_input_tokens: u64,
     total_output_tokens: u64,
     saw_usage: bool,
@@ -116,7 +117,7 @@ impl TurnGuard {
                 },
             ),
             cost_usd: None,
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
         });
@@ -202,6 +203,9 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Channel name stamped onto observer events to identify the calling surface
+    /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
+    channel_name: String,
 }
 
 impl Drop for Agent {
@@ -238,6 +242,7 @@ pub struct StreamedTurnError {
 #[derive(Clone, Default)]
 pub struct AgentChannelHandles {
     pub ask_user: Option<tools::PerToolChannelHandle>,
+    pub channel_room: Option<tools::PerToolChannelHandle>,
     pub reaction: tools::PerToolChannelHandle,
     pub poll: Option<tools::PerToolChannelHandle>,
     pub escalate: Option<tools::PerToolChannelHandle>,
@@ -248,6 +253,7 @@ impl AgentChannelHandles {
     fn populated_handles(&self) -> Vec<Option<&tools::PerToolChannelHandle>> {
         vec![
             self.ask_user.as_ref(),
+            self.channel_room.as_ref(),
             Some(&self.reaction),
             self.poll.as_ref(),
             self.escalate.as_ref(),
@@ -316,6 +322,7 @@ pub struct AgentBuilder {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
+    channel_name: Option<String>,
     exclude_memory: bool,
 }
 
@@ -358,6 +365,7 @@ impl AgentBuilder {
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
+            channel_name: None,
             exclude_memory: false,
         }
     }
@@ -534,6 +542,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn channel_name(mut self, name: String) -> Self {
+        self.channel_name = Some(name);
+        self
+    }
+
     /// Exclude persistent memory from this agent. When set, the memory
     /// backend is replaced with `NoneMemory`, auto-save is forced off, and
     /// all `memory_*` tools are stripped from the tool set. Used by ACP
@@ -685,6 +698,7 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
         })
     }
 }
@@ -692,6 +706,20 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
+        if let Ok(Some(context)) =
+            crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(Clone::clone)
+        {
+            return context;
+        }
+
+        crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
+    pub fn set_channel_name(&mut self, name: String) {
+        self.channel_name = name;
     }
 
     fn new_turn_id() -> String {
@@ -1200,6 +1228,7 @@ impl Agent {
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
         let ask_user_handle = all_tools_result.ask_user_handle;
+        let channel_room_handle = all_tools_result.channel_room_handle;
         let reaction_handle = all_tools_result.reaction_handle;
         let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
@@ -1503,6 +1532,7 @@ impl Agent {
         // the ACP server) can register back-channels after construction.
         agent.channel_handles = AgentChannelHandles {
             ask_user: ask_user_handle,
+            channel_room: channel_room_handle,
             reaction: reaction_handle,
             poll: poll_handle,
             escalate: escalate_handle,
@@ -1953,7 +1983,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -1965,6 +1995,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2014,16 +2045,14 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
 
-        // Usage-only cost context: the loop's per-call recording accumulates
-        // token totals here so AgentEnd keeps reporting them, without
-        // persisting cost records or enforcing budgets (this path never did
-        // either). The loop call below must stay a plain `.await` on this
-        // task — caller-scoped task-locals (thread id, session key, tool
-        // choice / thinking overrides) silently vanish across a spawn.
-        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        // Keep the loop call as a plain `.await` on this task. Caller-scoped
+        // task-locals (session key, cost tracking, tool choice / thinking
+        // overrides) silently vanish across a spawn.
+        let cost_context = self.tool_loop_cost_tracking_context();
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let agent_alias_for_loop = self.observer_agent_alias();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2066,7 +2095,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
-                        channel_name: "cli",
+                        channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
@@ -2082,6 +2111,8 @@ impl Agent {
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        turn_id: &turn_id,
                     }),
                 ),
             )
@@ -2321,7 +2352,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -2333,6 +2364,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2391,16 +2423,8 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
 
-        // Reuse any caller-scoped cost context (gateway WS / RPC) so streamed
-        // turns keep the real tracker + pricing wiring instead of shadowing it
-        // with a usage-only fallback. When no outer scope exists, preserve the
-        // legacy Agent behavior by synthesizing a local accumulation-only
-        // context for AgentEnd token reporting.
-        let cost_context = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
-            .try_with(Clone::clone)
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only);
+        let cost_context = self.tool_loop_cost_tracking_context();
+        let agent_alias_for_loop = self.observer_agent_alias();
 
         // Built once per turn so the HMAC key is stable across steering rounds
         // and the same collector accumulates every round's receipts. `None`
@@ -2492,7 +2516,7 @@ impl Agent {
                                 },
                             ),
                             history: &mut loop_history,
-                            channel_name: "cli",
+                            channel_name: &self.channel_name,
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
@@ -2508,6 +2532,8 @@ impl Agent {
                             // Phase 1: stamp Internal/Trusted. Real per-transport
                             // stamping is PR C (RFC #6971 §4).
                             ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            turn_id: &turn_id,
                         }),
                     ),
                 )
@@ -2686,8 +2712,6 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
-
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -2713,48 +2737,6 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
-
-    let (provider_name, model_name) =
-        match effective_config.resolved_model_provider_for_agent(agent_alias) {
-            Some((ty, _alias, entry)) => {
-                let model = entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| effective_config.resolve_default_model())
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                (ty.to_string(), model)
-            }
-            None => (
-                provider_override.unwrap_or_else(|| "unknown".to_string()),
-                effective_config
-                    .resolve_default_model()
-                    .unwrap_or_else(|| "<unresolved>".to_string()),
-            ),
-        };
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
-    });
-
-    let _run_guard = TurnGuard {
-        observer: Arc::clone(&agent.observer),
-        model_provider: provider_name,
-        model: model_name,
-        turn_id: None,
-        turn_started_at: start,
-        agent_alias: None,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        saw_usage: false,
-        done: false,
-    };
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -6818,8 +6800,124 @@ mod tests {
             | ObserverEvent::LlmRequest { turn_id, .. }
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
-            | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
             _ => None,
+        }
+    }
+
+    fn assert_all_events_share_turn_id(
+        events: &[ObserverEvent],
+        expected_alias: Option<&str>,
+        expected_channel: Option<&str>,
+    ) {
+        // Regression guard for PR #7771: every lifecycle observer event that
+        // carries the `(channel, agent_alias, turn_id)` correlation triple
+        // MUST populate all three. These six variants back OTel parent-child
+        // span linkage and per-agent attribution; a `None` in any field
+        // silently breaks trace correlation. The original `run()` entry point
+        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
+        // `turn_id: None` because it recorded events outside the turn engine.
+        //
+        // This checks each event individually (no skipping
+        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
+        // than only checking consistency among the non-`None` subset — a
+        // single `None` field is a failure, not something to be filtered out.
+        let mut turn_ids: Vec<String> = Vec::new();
+        for event in events {
+            let (variant, channel, agent_alias, turn_id) = match event {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentStart", channel, agent_alias, turn_id),
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentEnd", channel, agent_alias, turn_id),
+                ObserverEvent::LlmRequest {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmRequest", channel, agent_alias, turn_id),
+                ObserverEvent::LlmResponse {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmResponse", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCallStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCallStart", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCall", channel, agent_alias, turn_id),
+                _ => continue,
+            };
+            assert!(
+                channel.is_some(),
+                "{variant} observer event must carry channel, got None: {event:?}"
+            );
+            assert!(
+                agent_alias.is_some(),
+                "{variant} observer event must carry agent_alias, got None: {event:?}"
+            );
+            assert!(
+                turn_id.is_some(),
+                "{variant} observer event must carry turn_id, got None: {event:?}"
+            );
+            turn_ids.push(turn_id.clone().expect("checked Some above"));
+        }
+
+        assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
+        let first = &turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|id| id == first),
+            "all turn_ids should be consistent"
+        );
+
+        if let Some(alias) = expected_alias {
+            for e in events {
+                let agent_alias = match e {
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                    | ObserverEvent::AgentEnd { agent_alias, .. }
+                    | ObserverEvent::LlmRequest { agent_alias, .. }
+                    | ObserverEvent::LlmResponse { agent_alias, .. }
+                    | ObserverEvent::ToolCallStart { agent_alias, .. }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    _ => continue,
+                };
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some(alias),
+                    "agent_alias should be consistent"
+                );
+            }
+        }
+
+        if let Some(channel) = expected_channel {
+            for e in events {
+                let ch = match e {
+                    ObserverEvent::AgentStart { channel: ch, .. }
+                    | ObserverEvent::LlmRequest { channel: ch, .. }
+                    | ObserverEvent::LlmResponse { channel: ch, .. }
+                    | ObserverEvent::ToolCallStart { channel: ch, .. }
+                    | ObserverEvent::ToolCall { channel: ch, .. }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    _ => continue,
+                };
+                assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
+            }
         }
     }
 
@@ -7020,6 +7118,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_reuses_outer_cost_tracking_context() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+            TurnUsage,
+        };
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("agent-turn");
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("turn cost".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("agent-turn".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hello")),
+            )
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(response, "turn cost");
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 1_000);
+        assert_eq!(recorded.output_tokens, 200);
+        assert!(
+            recorded.cost_usd > 0.0,
+            "outer turn usage should accumulate non-zero cost from scoped pricing"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(
+            summary.session_cost_usd > 0.0,
+            "scoped tracker should persist turn usage"
+        );
+        let agent_summary = tracker
+            .get_summary_for_agent("agent-turn")
+            .expect("agent-scoped summary");
+        assert_eq!(agent_summary.request_count, 1);
+        assert!(
+            agent_summary.session_cost_usd > 0.0,
+            "agent alias should flow through persisted turn usage"
+        );
+    }
+
+    #[tokio::test]
     async fn turn_streamed_reuses_outer_cost_tracking_context() {
         use crate::agent::cost::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
@@ -7189,18 +7386,13 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
-        let turn_ids: Vec<&str> = events.iter().filter_map(observer_event_turn_id).collect();
-        assert!(!turn_ids.is_empty(), "turn events should carry turn_id");
-        let first = turn_ids[0];
-        assert!(
-            turn_ids.iter().all(|turn_id| *turn_id == first),
-            "all turn_ids should be consistent"
-        );
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 }

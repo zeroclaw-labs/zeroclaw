@@ -868,6 +868,7 @@ pub async fn run_gateway(
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
+                &all_tools_result.channel_room_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
@@ -2709,7 +2710,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let (provider_label, model_label) = {
+    let (provider_label, model_label, resolved_agent_alias) = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
         let resolved_provider = resolved_agent_alias
@@ -2730,17 +2731,20 @@ async fn handle_webhook(
             })
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string());
-        (provider_label, model_label)
+        (provider_label, model_label, resolved_agent_alias)
     };
     let started_at = Instant::now();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let agent_alias = resolved_agent_alias.as_deref();
+    let channel_name = "gateway";
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
     state.observer.record_event(
@@ -2748,9 +2752,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
 
@@ -2785,9 +2789,9 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens,
                     output_tokens,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2800,9 +2804,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
 
@@ -2822,9 +2826,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2843,9 +2847,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id),
                 },
             );
 

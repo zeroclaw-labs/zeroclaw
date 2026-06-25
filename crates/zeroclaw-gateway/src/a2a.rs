@@ -24,7 +24,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -36,7 +36,7 @@ use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::skills::SkillsService;
 
-use crate::{AppState, run_gateway_chat_with_tools};
+use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
 
 /// A2A protocol version advertised on per-alias interfaces.
 const A2A_PROTOCOL_VERSION: &str = "1.0";
@@ -433,13 +433,20 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
 
 /// `POST /a2a/{alias}` — A2A JSON-RPC task endpoint. Runs one agent turn for a
 /// `message/send` call and returns a completed `Task` with the reply as an
-/// artifact. Gated on `[a2a.server] enabled` and the alias being published, so
-/// it shares the exact exposure posture as the discovery cards.
+/// artifact. Requires a paired bearer token (a turn is tool-enabled, so it is
+/// never served unauthenticated), then gated on `[a2a.server] enabled` and the
+/// alias being published. The discovery cards are intentionally unauthenticated
+/// so peers can read the published surface before pairing; invocation is not.
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
+    headers: HeaderMap,
     body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
     {
         let config = state.config.read();
         if !config.a2a.server.enabled {
