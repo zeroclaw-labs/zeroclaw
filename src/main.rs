@@ -4649,7 +4649,7 @@ async fn main() -> Result<()> {
             // engine). List/Validate/Show stay local + synchronous.
             cmd @ (SopCommands::Approve { .. }
             | SopCommands::Deny { .. }
-            | SopCommands::Pending) => sop_admin_request(cmd, &config).await,
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
 
@@ -6202,9 +6202,27 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
 /// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
 /// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
 /// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
 async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
@@ -6292,6 +6310,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
 }
 
 /// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
 async fn sop_admin_post(
     client: &reqwest::Client,
     url: &str,

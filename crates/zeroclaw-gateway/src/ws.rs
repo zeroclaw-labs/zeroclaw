@@ -610,10 +610,17 @@ async fn handle_socket(
                         let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
                         let decision = match parsed["decision"].as_str().unwrap_or("") {
                             "approve" => Some(SopApprovalDecision::Approve),
-                            "deny" => Some(SopApprovalDecision::Deny { reason: None }),
+                            // Thread the optional reason through, like the HTTP/CLI deny
+                            // surfaces, so the ledger records it.
+                            "deny" => Some(SopApprovalDecision::Deny {
+                                reason: parsed["reason"].as_str().map(str::to_string),
+                            }),
                             _ => None,
                         };
-                        if run_id.is_empty() || decision.is_none() {
+                        // run_id + a valid decision are both required; the let-else
+                        // avoids an expect() on the downstream resolve (codebase rule:
+                        // no expect/unwrap in production paths).
+                        let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
                             let err = serde_json::json!({
                                 "type": "error",
                                 "message": "sop approval_response requires run_id and decision in {approve,deny}",
@@ -621,12 +628,12 @@ async fn handle_socket(
                             });
                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                             continue;
-                        }
+                        };
                         let frame = if let Some(engine) = state.sop_engine.as_ref() {
                             let principal = SopApprovalPrincipal::ws(session_id.clone(), None);
                             match engine.lock() {
                                 Ok(mut g) => {
-                                    match g.resolve_gate(&run_id, decision.expect("checked"), principal)
+                                    match g.resolve_gate(&run_id, decision, principal)
                                     {
                                         Ok(outcome) => serde_json::json!({
                                             "type": "sop_approval_result",
