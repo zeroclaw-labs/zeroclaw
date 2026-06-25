@@ -1,6 +1,6 @@
 # ZeroClaw v0.8.2
 
-ZeroClaw v0.8.2 opens up three new front doors: **A2A agent discovery** for agent-to-agent interop, a richer **skills** story (user-configured extra registries, typed slash-command options), and a chat-based **onboarding** assistant that becomes the default `zeroclaw onboard`. Underneath, the release sharpens ZeroClaw's security posture across plugins, channels, and the SOP runtime, lands a durable run/task control plane, and broadens channel surfaces (Discord interaction components, Slack attachments, WhatsApp group allowlists). It spans 104 commits from 17 contributors. Much of this is invisible at the surface and shows up as fewer leaks, fewer duplicate launches, and turns that behave the same on every transport.
+ZeroClaw v0.8.2 opens up three new front doors: **A2A agent discovery** for agent-to-agent interop, a richer **skills** story (user-configured extra registries, typed slash-command options), and a chat-based **onboarding** assistant that becomes the default `zeroclaw onboard`. Underneath, the release sharpens ZeroClaw's security posture across plugins, channels, and the SOP runtime, lands a durable run/task control plane, and broadens channel surfaces (Discord interaction components, Slack attachments, WhatsApp group allowlists). It spans 129 commits from 25 contributors. Much of this is invisible at the surface and shows up as fewer leaks, fewer duplicate launches, and turns that behave the same on every transport.
 
 ## Highlights
 
@@ -31,6 +31,8 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 ## Gateway
 
 - A2A agent discovery surface (#7763).
+- xAI OAuth login support (#7945).
+- Email-login subcommand for OAuth2 email channel auth (#8008).
 - Device registration on legacy `/pair` with backfill of orphaned paired tokens (#7993).
 - Agent rename is persisted before owned state is moved (#7940).
 - The gateway drains before RPC reload (#8104).
@@ -65,6 +67,8 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Cached extra registry skills are now suggested (#8185).
 - Agent-loop log events are categorized and verb-tagged (#8067).
 - Path-listing tool results are gated from vision routing (#7345); the no-vision capability error is scoped to the latest user image (#8180).
+- Config alias renames cascade safely across referencing surfaces (#8109).
+- Channel, `agent_alias` and `turn_id` propagate to agent lifecycle observer events (#7771).
 
 ## SOP
 
@@ -96,6 +100,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 ## ZeroCode and TUI
 
 - Aliases and Costs tabs on the provider alias list (#8006).
+- Registry-driven pane help, themed code-fence syntax highlighting, per-fence copy, and unified split-pane config navigation (#8282).
 - Daemon version mismatch detection (#8192).
 - MCP initialized for Chat TUI sessions (#8199).
 - Active config directory surfaced in the Config header (#7999).
@@ -161,11 +166,17 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 
 ## Contributors
 
+@Alix-007
 @Audacity88
+@ConYel
 @danielO99
+@databillm
 @eldar702
+@FTDGRT
 @jokewithme110
 @JordanTheJet
+@khhjoe
+@legokichi
 @MaHaoHao-ch
 @mov-xound-glitch
 @Nillth
@@ -176,5 +187,9 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 @RyanHoldren
 @sbenedetto
 @singlerider
+@theredspoon
+@tidux
 @wangmiao0668000666
 @ZOOWH
+
+**Full diff:** https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.1...v0.8.2
