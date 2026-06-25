@@ -1660,8 +1660,9 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+export function getTools(agent?: string): Promise<ToolSpec[]> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
     (data) => {
       const result = unwrapField(data, "tools");
       return Array.isArray(result) ? result : [];

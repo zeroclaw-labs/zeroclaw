@@ -1450,6 +1450,7 @@ mod tests {
             gmail_push: None,
             observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: std::sync::Arc::new(Vec::new()),
+            tools_registry_by_agent: std::sync::Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: std::sync::Arc::new(crate::sse::EventBuffer::new(16)),
