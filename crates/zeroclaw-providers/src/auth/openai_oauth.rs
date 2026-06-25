@@ -596,8 +596,9 @@ mod tests {
     fn extract_account_id_prefers_chatgpt_account_id_over_generic() {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
         // When both chatgpt_account_id and account_id are present, prefer chatgpt_account_id
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("{\"chatgpt_account_id\":\"chatgpt_acct_first\",\"account_id\":\"generic_acct\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            "{\"chatgpt_account_id\":\"chatgpt_acct_first\",\"account_id\":\"generic_acct\"}",
+        );
         let token = format!("{header}.{payload}.sig");
 
         let account = extract_account_id_from_jwt(&token);
