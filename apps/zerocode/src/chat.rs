@@ -2847,10 +2847,7 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
         if content == copy_lbl {
             let lead = copy_lbl.len() - copy_lbl.trim_start().len();
             let trimmed = copy_lbl.trim();
-            return Some((
-                col + lead as u16,
-                UnicodeWidthStr::width(trimmed) as u16,
-            ));
+            return Some((col + lead as u16, UnicodeWidthStr::width(trimmed) as u16));
         }
         col += UnicodeWidthStr::width(content) as u16;
     }
@@ -3330,14 +3327,11 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 in_code_block = true;
                 code_block_text.clear();
                 let code_block_lang = match kind {
-                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
-                        let s = info.trim();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(s.to_string())
-                        }
-                    }
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
 
@@ -4299,11 +4293,7 @@ impl ChatState {
         // (header_row, header_label_col, header_label_cells, accumulated_text)
         let mut pending: Option<(u16, u16, u16, String)> = None;
         for line in &self.cached_lines {
-            let first = line
-                .spans
-                .first()
-                .map(|s| s.content.as_ref())
-                .unwrap_or("");
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 pending = label_cells(line, copy_lbl)
                     .map(|(col, cells)| (screen_cursor, col, cells, String::new()));
@@ -4315,8 +4305,14 @@ impl ChatState {
                         regions.push(r);
                     }
                     if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
-                        && let Some(r) =
-                            copy_region(screen_cursor, footer_col, footer_cells, scroll, body, &text)
+                        && let Some(r) = copy_region(
+                            screen_cursor,
+                            footer_col,
+                            footer_cells,
+                            scroll,
+                            body,
+                            &text,
+                        )
                     {
                         regions.push(r);
                     }
@@ -5987,6 +5983,44 @@ mod tests {
             copy_col(header),
             copy_col(footer),
             "[Copy] must start at the same column on header and footer\nheader: {header:?}\nfooter: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_header_shows_language() {
+        let out = rendered("```python\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" python "),
+            "header must show the fence language: {header:?}"
+        );
+        assert!(
+            !header.contains(" code "),
+            "labeled fence must not fall back to ` code `: {header:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_header_strips_info_extras() {
+        let out = rendered("```python title=\"x\"\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" python "),
+            "only the language token is used as the label: {header:?}"
+        );
+        assert!(
+            !header.contains("title"),
+            "info-string extras must not leak into the label: {header:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_unlabeled_fence_falls_back() {
+        let out = rendered("```\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" code "),
+            "unlabeled fence keeps the ` code ` fallback: {header:?}"
         );
     }
 
