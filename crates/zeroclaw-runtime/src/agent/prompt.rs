@@ -471,6 +471,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -485,6 +486,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -518,6 +520,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -532,6 +535,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
         }];
 
@@ -598,6 +602,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -612,6 +617,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
         let ctx = PromptContext {

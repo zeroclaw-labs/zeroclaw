@@ -18,6 +18,7 @@ pub struct LogConfig {
     pub log_tool_io: String,
     pub log_tool_io_truncate_bytes: usize,
     pub log_tool_io_denylist: Vec<String>,
+    pub log_llm_request_payload: String,
 }
 
 impl Default for LogConfig {
@@ -29,6 +30,7 @@ impl Default for LogConfig {
             log_tool_io: "redacted".into(),
             log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
+            log_llm_request_payload: "off".into(),
         }
     }
 }
@@ -85,6 +87,34 @@ impl ToolIoPolicy {
     }
 }
 
+/// LLM request payload capture policy. Mirrors [`ToolIoPolicy`] but gates the
+/// prompt/messages on each `llm_request`. Unlike tool I/O, an unknown or
+/// empty value resolves to [`Self::Off`] so the prompt is never captured
+/// unless the operator explicitly opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmRequestPayloadPolicy {
+    /// Only `messages_count` on the request event. No payload.
+    Off,
+    /// Leak-scan + truncate to `truncate_bytes`.
+    Redacted,
+    /// Full payload, still leak-scanned. No truncation.
+    Full,
+}
+
+impl LlmRequestPayloadPolicy {
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "redacted" => Self::Redacted,
+            "full" => Self::Full,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn captures_payload(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// Resolved policy bundle the writer + tool-io capturers read at runtime.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
@@ -94,6 +124,7 @@ pub struct ResolvedPolicy {
     pub tool_io: ToolIoPolicy,
     pub tool_io_truncate_bytes: usize,
     pub tool_io_denylist: Vec<String>,
+    pub llm_request_payload: LlmRequestPayloadPolicy,
 }
 
 impl ResolvedPolicy {
@@ -105,6 +136,7 @@ impl ResolvedPolicy {
             tool_io: ToolIoPolicy::from_raw(&config.log_tool_io),
             tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
             tool_io_denylist: config.log_tool_io_denylist.clone(),
+            llm_request_payload: LlmRequestPayloadPolicy::from_raw(&config.log_llm_request_payload),
         }
     }
 

@@ -56,7 +56,7 @@ pub fn run(root: &Path) -> Result<()> {
     std::fs::write(dir.join("hardware-pi-targets.md"), render_pi_targets(root)?)?;
     std::fs::write(dir.join("hardware-lowmem-lto.md"), render_lowmem_lto(root)?)?;
 
-    println!("==> Generated hardware reference snippets from registry + catalog");
+    eprintln!("==> Generated hardware reference snippets from registry + catalog");
     Ok(())
 }
 

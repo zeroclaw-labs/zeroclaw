@@ -43,6 +43,25 @@ pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(test)]
+pub(crate) fn workspace_prefixed_relative_path_for_test(
+    workspace: &std::path::Path,
+) -> std::path::PathBuf {
+    let mut relative = std::path::PathBuf::new();
+    for component in workspace.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                panic!("test workspace path must not contain parent components")
+            }
+            std::path::Component::Normal(part) => relative.push(part),
+        }
+    }
+    relative
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
