@@ -52,12 +52,16 @@
             inherit pname;
             version = "0.8.2";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = builtins.fromJSON (builtins.readFile ./nix/hashes.json);
+            };
             cargoBuildFlags =
               [ "-p" cargoPkg "--no-default-features" ]
               ++ pkgs.lib.optionals (features != [])
                 [ "--features" (pkgs.lib.concatStringsSep "," features) ];
             doCheck = false;
+            buildInputs = [ pkgs.stdenv.cc.cc ];
           };
         # >>> end generated:flake-packages <<<
       in {
@@ -73,6 +77,8 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.nix-prefetch-git
+            pkgs.jq
           ];
         };
       }) // {

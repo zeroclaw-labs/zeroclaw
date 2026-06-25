@@ -330,6 +330,62 @@ jobs:
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
 
+  nix-hash-drift:
+    name: Nix Hash Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate nix/hashes.json matches Cargo.lock git deps
+        run: |
+          set -euo pipefail
+          if [[ ! -f Cargo.lock ]]; then
+            echo "Cargo.lock not found; nothing to check."
+            exit 0
+          fi
+          # Extract git-dep keys from Cargo.lock using the same Python
+          # logic as refresh-nix-hashes.sh.
+          python3 -c '
+import json, re, sys
+try:
+    import tomllib as tom
+except ImportError:
+    import tomli as tom
+with open("Cargo.lock", "rb") as f:
+    data = tom.load(f)
+keys = set()
+for pkg in data.get("package", []):
+    src = pkg.get("source", "") or ""
+    if not src.startswith("git+"):
+        continue
+    keys.add(f"{pkg["name"]}-{pkg["version"]}")
+print(json.dumps(sorted(keys)))
+' > /tmp/lock_keys.json
+          LOCK_COUNT=$(jq length /tmp/lock_keys.json)
+          echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
+          if [[ "$LOCK_COUNT" -eq 0 ]]; then
+            echo "No git deps; nothing to check."
+            exit 0
+          fi
+          if [[ ! -f nix/hashes.json ]]; then
+            echo "error: nix/hashes.json not found — git deps present but no hashes file."
+            exit 1
+          fi
+          HASH_KEYS=$(jq 'keys' nix/hashes.json)
+          MISSING=$(jq -n --argjson lock "$(cat /tmp/lock_keys.json)" \
+            --argjson hash "$HASH_KEYS" \
+            '$lock - $hash')
+          MISSING_COUNT=$(echo "$MISSING" | jq length)
+          if [[ "$MISSING_COUNT" -gt 0 ]]; then
+            echo "error: $MISSING_COUNT git-dep hash(es) missing from nix/hashes.json:"
+            echo "$MISSING" | jq -r '.[]'
+            echo ""
+            echo "Run scripts/dev/refresh-nix-hashes.sh and commit the result."
+            exit 1
+          fi
+          echo "All git deps have hashes in nix/hashes.json."
+
   docs-style:
     name: Docs Style
     needs: [fmt]
@@ -398,7 +454,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
