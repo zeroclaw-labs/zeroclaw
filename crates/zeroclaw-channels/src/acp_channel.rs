@@ -9,12 +9,22 @@
 //!
 //! - `send` emits an `agent_message_chunk` `session/update` notification —
 //!   the ACP client renders it inline in the conversation.
-//! - `request_choice` issues a `session/request_permission` JSON-RPC request
-//!   with the question's choices mapped to permission options. Returns the
-//!   selected option's text (or `Err` on cancellation/timeout).
+//! - `request_choice` issues an `elicitation/create` JSON-RPC request
+//!   (form mode, single-select enum) when the client advertises
+//!   `elicitation.form` in `initialize.clientCapabilities`. Otherwise
+//!   it falls back to the legacy `session/request_permission` overload
+//!   for backward compatibility with clients that haven't yet shipped
+//!   the [elicitation RFD][rfd]. See the design spec at
+//!   `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+//! - `request_multi_choice` issues an `elicitation/create` request
+//!   with a `type: array` / `anyOf` schema. There is no legacy
+//!   fallback for multi-select — callers receive `Ok(None)` when the
+//!   client lacks the capability and should take their own non-ACP
+//!   path.
 //! - `listen` is **not implemented**. Free-form ACP "ask the user" has no
-//!   first-class method until the [elicitation RFD][rfd] lands; until then
-//!   `ask_user` callers under ACP must supply structured `choices`.
+//!   first-class method in Phase 1 of the elicitation rollout; until
+//!   Phase 2 lands, `ask_user` callers under ACP must supply structured
+//!   `choices`.
 //!
 //! ## Wire format
 //!
@@ -29,7 +39,7 @@
 //! upstream ACP spec is the contract these IDE clients (Zed, Toad, …)
 //! parse against, and divergence breaks them.
 //!
-//! [rfd]: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+//! [rfd]: https://agentclientprotocol.com/rfds/elicitation
 //! [acp-conventions]: https://agentclientprotocol.com/protocol/v1/overview#conventions
 
 use async_trait::async_trait;
@@ -450,12 +460,13 @@ impl Channel for AcpChannel {
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // ACP has no first-class "next free-form user message in this session"
-        // method. The elicitation RFD is the future fix; until it lands,
-        // `ask_user` under ACP must supply structured `choices`, which routes
-        // through `request_choice` → `session/request_permission` instead.
-        // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+        // method. Phase 1 of the elicitation rollout shipped multiple-choice
+        // via `request_choice` → `elicitation/create`; free-form text is
+        // Phase 2. Until Phase 2 lands, `ask_user` under ACP must supply
+        // structured `choices`, which routes through `request_choice`.
+        // Spec: docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md
         anyhow::bail!(
-            "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation RFD)"
+            "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation Phase 2)"
         )
     }
 
