@@ -1,3 +1,4 @@
+pub mod herdr;
 pub mod platform;
 pub mod registry;
 

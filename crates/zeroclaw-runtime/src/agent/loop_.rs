@@ -1056,6 +1056,7 @@ pub async fn run(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let _herdr_guard = crate::integrations::herdr::try_install_hook();
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -1680,6 +1681,9 @@ pub async fn run(
                 )))
             }
         });
+        if let Some(sid) = memory_session_id.as_deref() {
+            crate::integrations::herdr::update_session_id(sid);
+        }
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
