@@ -1007,18 +1007,22 @@ impl SopEngine {
         }
     }
 
-    /// Append an approval-ledger row via EPIC B's append-only event log
-    /// (best-effort; logs on failure). The store assigns the monotonic seq.
-    pub(crate) fn record_gate_event(&self, entry: super::approval::GateLedgerEntry) {
-        if let Err(e) = self.store.append_event(&entry.into_event_record()) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "SOP engine: failed to append approval ledger event"
-            );
-        }
+    /// Append an approval-ledger row via EPIC B's append-only event log. The store
+    /// assigns the monotonic seq.
+    ///
+    /// FAIL-LOUD: the `StoreError` is propagated, never swallowed, so the caller
+    /// can fail closed. The run-store gate ledger is the single audit of record
+    /// for gate resolutions (the legacy Memory approval audit was removed), so a
+    /// gate must not clear / deny / escalate / cancel unless its who/what/when row
+    /// is durably written first - matching the store's fail-loud, fail-closed
+    /// persistence contract. Callers append BEFORE mutating gate state.
+    pub(crate) fn record_gate_event(
+        &self,
+        entry: super::approval::GateLedgerEntry,
+    ) -> Result<(), StoreError> {
+        self.store
+            .append_event(&entry.into_event_record())
+            .map(|_| ())
     }
 
     /// Ordered event/ledger history for a run (from the durable store).

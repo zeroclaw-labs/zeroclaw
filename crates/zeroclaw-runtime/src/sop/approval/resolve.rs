@@ -45,8 +45,33 @@ pub fn resolve_gate(
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 
-    // 3. Apply the decision.
-    let (outcome, kind) = match &decision {
+    // 3. Audit FIRST, fail-closed. Durably append the immutable ledger row
+    //    (WHO/what/when) BEFORE any gate transition, so a store failure aborts the
+    //    resolution and leaves the gate untouched: the gate cannot clear or deny
+    //    without its audit-of-record row. (The store ledger is the only audit
+    //    source now that the legacy Memory approval audit is gone.)
+    if let Err(e) = engine.record_gate_event(GateLedgerEntry {
+        run_id: run_id.to_string(),
+        step,
+        kind: GateEventKind::Resolved,
+        decision: Some(decision.clone()),
+        principal: principal.clone(),
+        ts: now_iso8601(),
+    }) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id, "error": e.to_string()})),
+            "SOP gate resolution aborted: could not persist the audit ledger row (fail-closed)"
+        );
+        return Err(anyhow::Error::msg(format!(
+            "failed to persist approval ledger event: {e}"
+        )));
+    }
+
+    // 4. Apply the decision (only after the audit row is durable).
+    let outcome = match decision {
         ApprovalDecision::Approve => {
             let action = engine.clear_waiting_gate(run_id)?;
             // Meter the approval at the chokepoint (every principal, exactly once):
@@ -54,26 +79,14 @@ pub fn resolve_gate(
             // approval. Keeps the live counters in lockstep with the ledger-sourced
             // `rebuild_from_persistence`.
             engine.record_approval_metric(run_id, principal.is_system());
-            (ResolveOutcome::Resumed(action), GateEventKind::Resolved)
+            ResolveOutcome::Resumed(action)
         }
         ApprovalDecision::Deny { reason } => {
-            let why = reason
-                .clone()
-                .unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
+            let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
             engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
-            (ResolveOutcome::Denied, GateEventKind::Resolved)
+            ResolveOutcome::Denied
         }
     };
-
-    // 4. Append the immutable ledger row (WHO/what/when) via B's append_event.
-    engine.record_gate_event(GateLedgerEntry {
-        run_id: run_id.to_string(),
-        step,
-        kind,
-        decision: Some(decision),
-        principal,
-        ts: now_iso8601(),
-    });
 
     Ok(outcome)
 }
@@ -83,12 +96,91 @@ mod tests {
     use super::*;
     use crate::sop::approval::principal::ApprovalPrincipal;
     use crate::sop::engine::SopEngine;
+    use crate::sop::store::model::{
+        ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SopEventRecord,
+    };
+    use crate::sop::store::{InMemoryRunStore, SopRunStore, StoreError};
     use crate::sop::types::{
         Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopStepKind,
         SopTrigger, SopTriggerSource,
     };
     use std::sync::Arc;
     use zeroclaw_config::schema::{ApprovalMode, SopConfig};
+
+    /// A store that fails every `append_event` (the gate ledger) but delegates
+    /// everything else to a real in-memory store - to prove gate resolution fails
+    /// closed when the audit-of-record row cannot be persisted.
+    struct FailingAppendStore {
+        inner: InMemoryRunStore,
+    }
+    impl FailingAppendStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRunStore::new(),
+            }
+        }
+    }
+    impl SopRunStore for FailingAppendStore {
+        fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.save_run(run)
+        }
+        fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.finish_run(run_id, terminal)
+        }
+        fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_active_runs()
+        }
+        fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
+            self.inner.load_run(run_id)
+        }
+        fn try_claim_run(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+            per_sop_cap: usize,
+            global_cap: usize,
+        ) -> Result<Option<ClaimToken>, StoreError> {
+            self.inner
+                .try_claim_run(run_id, sop_name, per_sop_cap, global_cap)
+        }
+        fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.heartbeat_claim(token)
+        }
+        fn release_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.release_claim(token)
+        }
+        fn expired_claims(&self, now_iso: &str) -> Result<Vec<ClaimToken>, StoreError> {
+            self.inner.expired_claims(now_iso)
+        }
+        // The one method under test: the gate ledger append always fails.
+        fn append_event(&self, _ev: &SopEventRecord) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
+        }
+        fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+            self.inner.list_events(run_id)
+        }
+        fn save_proposal(&self, p: &ProposalRecord) -> Result<(), StoreError> {
+            self.inner.save_proposal(p)
+        }
+        fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+            self.inner.load_proposal(id)
+        }
+        fn list_proposals(
+            &self,
+            status: Option<ProposalStatus>,
+        ) -> Result<Vec<ProposalRecord>, StoreError> {
+            self.inner.list_proposals(status)
+        }
+        fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+            self.inner.prune(policy)
+        }
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+        fn backend(&self) -> &'static str {
+            "failing-append-test"
+        }
+    }
 
     fn supervised_sop(name: &str) -> Sop {
         Sop {
@@ -323,6 +415,69 @@ mod tests {
             collector.get_metric_value("sop.human_intervention_count"),
             Some(json!(0u64)),
             "a system approval does not inflate the human counter"
+        );
+    }
+
+    #[test]
+    fn store_failure_aborts_resolution_and_leaves_gate_open() {
+        // Audit-first, fail-closed (the reviewer's invariant): if the gate ledger
+        // row cannot be persisted, resolution must abort and the gate must stay
+        // open - the system cannot clear a gate without recording who resolved it.
+        let cfg = SopConfig {
+            approval_mode: ApprovalMode::Both,
+            ..Default::default()
+        };
+        let mut e = SopEngine::new(cfg).with_store(Arc::new(FailingAppendStore::new()));
+        e.set_sops_for_test(vec![supervised_sop("deploy")]);
+        let id = start_waiting(&mut e);
+
+        let res = resolve_gate(
+            &mut e,
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("alice".into())),
+        );
+        assert!(
+            res.is_err(),
+            "a store append failure must abort the resolution, not swallow it"
+        );
+        assert!(
+            matches!(e.gate_state(&id), GateState::Waiting { .. }),
+            "the gate must remain WaitingApproval when its audit row could not be persisted"
+        );
+    }
+
+    #[test]
+    fn timeout_cancel_fails_closed_when_audit_unwritable() {
+        // The timeout path is fail-closed too: a cancel must not terminate a run
+        // unless its `gate_timed_out` row is durably recorded.
+        use crate::sop::types::SopRunStatus;
+        use zeroclaw_config::schema::ApprovalTimeoutAction;
+
+        let cfg = SopConfig {
+            approval_mode: ApprovalMode::Both,
+            approval_timeout_action: ApprovalTimeoutAction::Cancel,
+            ..Default::default()
+        };
+        let mut e = SopEngine::new(cfg).with_store(Arc::new(FailingAppendStore::new()));
+        e.set_sops_for_test(vec![supervised_sop("deploy")]);
+        let id = start_waiting(&mut e);
+
+        let action = crate::sop::approval::timeout::apply_timeout_action(
+            &mut e,
+            &id,
+            ApprovalTimeoutAction::Cancel,
+        );
+        assert!(
+            action.is_none(),
+            "cancel must be skipped when its audit row cannot be persisted"
+        );
+        assert!(
+            !matches!(
+                e.get_run(&id).map(|r| &r.status),
+                Some(SopRunStatus::Cancelled)
+            ),
+            "the run must NOT be cancelled without its durable timeout ledger row"
         );
     }
 }

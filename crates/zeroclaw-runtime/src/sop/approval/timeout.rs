@@ -28,16 +28,25 @@ pub fn apply_timeout_action(
     match action {
         // Default, fail-closed: keep the gate open, reset the clock so it
         // re-surfaces, record the escalation. The run does NOT self-approve.
+        // Audit-first: don't re-surface unless the escalation row is durably
+        // recorded; on a store failure skip this run (it retries next tick).
         ApprovalTimeoutAction::Escalate => {
             let entry = system_entry(engine, run_id, GateEventKind::Escalated);
+            if let Err(e) = engine.record_gate_event(entry) {
+                log_audit_skip(run_id, "escalate", &e);
+                return None;
+            }
             engine.restamp_waiting(run_id);
-            engine.record_gate_event(entry);
             None
         }
-        // Fail-safe terminal: cancel the run.
+        // Fail-safe terminal: cancel the run. Audit-first: do not cancel unless
+        // the timeout row is durably recorded; on a store failure skip (retries).
         ApprovalTimeoutAction::Cancel => {
             let entry = system_entry(engine, run_id, GateEventKind::TimedOut);
-            engine.record_gate_event(entry);
+            if let Err(e) = engine.record_gate_event(entry) {
+                log_audit_skip(run_id, "cancel", &e);
+                return None;
+            }
             Some(engine.finish_run(
                 run_id,
                 SopRunStatus::Cancelled,
@@ -57,6 +66,20 @@ pub fn apply_timeout_action(
             }
         }
     }
+}
+
+/// Warn that a timeout action was skipped because its audit row could not be
+/// persisted (fail-closed: the gate is left for the next tick to retry).
+fn log_audit_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "run_id": run_id, "action": action, "error": e.to_string()
+            })),
+        "SOP timeout: skipped, audit ledger append failed; gate left for retry"
+    );
 }
 
 /// A system-principal ledger entry for the run's current step.
