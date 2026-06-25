@@ -792,7 +792,7 @@ impl Logs {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
@@ -1208,56 +1208,51 @@ impl Logs {
 
 impl crate::widgets::HelpContext for Logs {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::help::entries_for;
+        use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {
-            HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-logs-help-apply-search")),
-                E::key("Esc", crate::i18n::t("zc-logs-help-cancel-search")),
-            ])
+            HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]))
         } else if self.detail_open {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["Esc", "Enter"],
-                    crate::i18n::t("zc-logs-help-close-detail"),
-                ),
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor"),
-                ),
-                E::new(
-                    vec!["J", "K", "Shift+↑↓"],
-                    crate::i18n::t("zc-logs-help-scroll-detail"),
-                ),
-                E::key("Shift+←→", crate::i18n::t("zc-logs-help-resize-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("y", crate::i18n::t("zc-logs-help-yank-detail")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-            ])
+            HelpNode::entries(entries_for([
+                L::CloseDetail,
+                L::Up,
+                L::Down,
+                L::DetailScrollUp,
+                L::DetailScrollDown,
+                L::DetailWidenLeft,
+                L::DetailWidenRight,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+                L::CopyDetail,
+            ]))
         } else {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor-list"),
-                ),
-                E::new(vec!["G", "End"], crate::i18n::t("zc-logs-help-jump-bottom")),
-                E::new(vec!["g", "Home"], crate::i18n::t("zc-logs-help-jump-top")),
-                E::key("PgDn / PgUp", crate::i18n::t("zc-logs-help-page")),
-                E::key("Enter", crate::i18n::t("zc-logs-help-open-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-                E::spacer(),
-                E::desc(format!(
-                    "{}: {}",
-                    crate::i18n::t("zc-logs-help-mouse-label"),
-                    crate::i18n::t("zc-logs-help-mouse-desc"),
-                )),
-            ])
+            let mut entries = entries_for([
+                L::Up,
+                L::Down,
+                L::JumpEnd,
+                L::JumpStart,
+                L::PageDown,
+                L::OpenDetail,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+            ]);
+            entries.push(E::spacer());
+            entries.push(E::desc(format!(
+                "{}: {}",
+                crate::i18n::t("zc-logs-help-mouse-label"),
+                crate::i18n::t("zc-logs-help-mouse-desc"),
+            )));
+            HelpNode::entries(entries)
         }
     }
 }

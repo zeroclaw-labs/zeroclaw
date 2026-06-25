@@ -38,4 +38,24 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) strict_tool_parsing: bool,
     pub(crate) channel: Option<&'a dyn Channel>,
     pub(crate) turn_id: &'a str,
+    pub(crate) agent_alias: Option<&'a str>,
+}
+
+/// Lightweight metadata for turn-level event emission.
+/// Derived on-demand from `TurnCtx` via `meta()` — not a cached duplicate.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnMeta<'a> {
+    pub(crate) agent_alias: Option<&'a str>,
+    pub(crate) turn_id: &'a str,
+    pub(crate) channel_name: &'a str,
+}
+
+impl<'a> TurnCtx<'a> {
+    pub(crate) fn meta(&self) -> TurnMeta<'a> {
+        TurnMeta {
+            agent_alias: self.agent_alias,
+            turn_id: self.turn_id,
+            channel_name: self.channel_name,
+        }
+    }
 }
