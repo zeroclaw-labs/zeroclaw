@@ -156,6 +156,33 @@ pub struct RpcContext {
 impl RpcContext {
     /// Minimal context for tests — only config and sessions, everything
     /// else `None`.
+    /// Lightweight context for external live integration tests — only config
+    /// and sessions are wired; everything else is `None`. Not `#[cfg(test)]`
+    /// because integration tests compile against the public surface.
+    pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let tui_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.data_dir.clone());
+        let data_dir = config.data_dir.clone();
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
+            acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         Arc::new(Self {

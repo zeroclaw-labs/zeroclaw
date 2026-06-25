@@ -80,7 +80,7 @@ skills and between bundles.
 | Value | Description |
 |-------|-------------|
 | `http_client` | Can make HTTP requests via `zc_http_request` |
-| `env_read` | Can read environment variables via `zc_env_read` |
+| `config_read` | Receives its own resolved per-plugin config section in the `execute` input under `__config` |
 | `file_read` | Can read files (not yet implemented) |
 | `file_write` | Can write files (not yet implemented) |
 | `memory_read` | Can read agent memory (not yet implemented) |
@@ -181,14 +181,25 @@ Timeout: 120 seconds.
 }
 ```
 
-### `zc_env_read`
+### Per-plugin config (`__config`)
 
-**Permission:** `env_read`
+**Permission:** `config_read`
 
-**Input:** Environment variable name (plain string, not JSON).
+A plugin does not read process environment variables. The host resolves the
+plugin's own config section from `[plugins.entries.<alias>]` and injects it into
+the `execute` input under the reserved `__config` key:
 
-**Output:** Environment variable value (plain string). Returns an error if the
-variable is not set.
+```json
+{
+  "prompt": "a sunset",
+  "__config": { "api_key": "...", "base_url": "..." }
+}
+```
+
+Operators set these through the schema-mirror override grammar, e.g.
+`ZEROCLAW_plugins__entries__<alias>__config__api_key=$FAL_KEY`. Values are
+secret and encrypt at rest under the adjacent `.secret_key`. A plugin only ever
+sees its own section.
 
 ## Writing a plugin in Rust for the current bridge
 
@@ -207,11 +218,12 @@ use extism_pdk::*;
 #[host_fn]
 extern "ExtismHost" {
     fn zc_http_request(input: String) -> String;
-    fn zc_env_read(input: String) -> String;
 }
 ```
 
-Call them with `unsafe { zc_http_request(json_string)? }`.
+Call them with `unsafe { zc_http_request(json_string)? }`. Per-plugin config
+arrives in the `execute` input under `__config`; read it from the parsed input
+rather than through a host call.
 
 ### Implementing exports
 
