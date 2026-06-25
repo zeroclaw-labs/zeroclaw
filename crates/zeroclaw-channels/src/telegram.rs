@@ -1253,7 +1253,9 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let result = data.get("result").context("missing result in getMe response")?;
+        let result = data
+            .get("result")
+            .context("missing result in getMe response")?;
         let username = result
             .get("username")
             .and_then(|u| u.as_str())
@@ -5875,10 +5877,7 @@ mod tests {
             "reply-to-bot caption should bypass mention_only gate"
         );
         let gated = result.unwrap();
-        assert!(
-            gated.is_some(),
-            "gate should return the normalized caption"
-        );
+        assert!(gated.is_some(), "gate should return the normalized caption");
         assert_eq!(gated.unwrap(), "enhance this");
     }
 
