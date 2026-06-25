@@ -2636,8 +2636,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_tools_none_returns_none() {
-        let result: Option<Vec<NativeToolSpec>> =
-            AnthropicModelProvider::convert_tools(None);
+        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
         assert!(result.is_none());
     }
 
