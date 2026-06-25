@@ -809,6 +809,26 @@ mod tests {
                 );
             }
 
+            // Test the new update-context-windows about key (no args)
+            let about_formatted = format_cli_string_with_args(
+                &sources,
+                "cli-doctor-update-context-windows-about",
+                &[],
+            )
+            .unwrap_or_else(|| {
+                panic!("{locale}: cli-doctor-update-context-windows-about should format")
+            });
+            assert!(
+                !about_formatted.is_empty(),
+                "{locale}: cli-doctor-update-context-windows-about should not be empty"
+            );
+            if locale == "zh-CN" {
+                assert!(
+                    about_formatted.contains("提供"),
+                    "{locale}: cli-doctor-update-context-windows-about should have Chinese text, got: {about_formatted}"
+                );
+            }
+
             let bar_formatted = format_cli_string_with_args(
                 &sources,
                 "cli-agent-context-bar",

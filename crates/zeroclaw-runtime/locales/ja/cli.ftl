@@ -128,6 +128,7 @@ cli-models-set-about = 設定でデフォルトモデルを設定
 cli-models-status-about = 現在のモデル設定とキャッシュステータスを表示
 cli-doctor-models-about = プロバイダー全体のモデルカタログをプローブして可用性を報告
 cli-doctor-traces-about = ランタイムトレースイベント (ツール診断とモデル応答) をクエリ
+cli-doctor-update-context-windows-about = プロバイダーの /models エンドポイントから config.toml の context_window を更新
 cli-hardware-discover-about = USB デバイスを列挙して既知のボードを表示
 cli-hardware-introspect-about = デバイスをそのシリアル番号またはデバイスパスで内省
 cli-hardware-info-about = ST-Link 経由 probe-rs を使用して USB でチップ情報を取得

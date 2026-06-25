@@ -128,6 +128,7 @@ cli-models-set-about = Establece el modelo predeterminado en la configuración
 cli-models-status-about = Muestra la configuración actual del modelo y el estado de la caché
 cli-doctor-models-about = Sondea catálogos de modelos en todos los proveedores e informa sobre la disponibilidad
 cli-doctor-traces-about = Consulta eventos de traza en tiempo de ejecución (diagnósticos de herramientas y respuestas de modelos)
+cli-doctor-update-context-windows-about = Actualiza context_window en config.toml desde los endpoints /models del proveedor
 cli-hardware-discover-about = Enumera dispositivos USB y muestra placas conocidas
 cli-hardware-introspect-about = Inspecciona un dispositivo por su número de serie o ruta de dispositivo
 cli-hardware-info-about = Obtiene información del chip vía USB usando probe-rs sobre ST-Link

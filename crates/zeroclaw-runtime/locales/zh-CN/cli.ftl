@@ -127,6 +127,7 @@ cli-models-set-about = 在配置中设置默认模型
 cli-models-status-about = 显示当前模型配置和缓存状态
 cli-doctor-models-about = 探测各提供商的模型目录并报告可用性
 cli-doctor-traces-about = 查询运行时跟踪事件（工具诊断和模型回复）
+cli-doctor-update-context-windows-about = 从提供商的 /models 端点更新 config.toml 中的 context_window
 cli-hardware-discover-about = 枚举 USB 设备并显示已知开发板
 cli-hardware-introspect-about = 通过序列号或设备路径检视设备
 cli-hardware-info-about = 通过 ST-Link 使用 probe-rs 经 USB 获取芯片信息
