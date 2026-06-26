@@ -132,6 +132,16 @@ struct Cli {
     #[arg(long)]
     relay_tofu: bool,
 
+    /// PEM client certificate to present to the relay on the OUTER TLS layer
+    /// (outer-mTLS variant), for a relay that requires outer client auth. Separate
+    /// from --tls-client-cert (the inner mTLS to the daemon).
+    #[arg(long, requires = "relay_client_key")]
+    relay_client_cert: Option<String>,
+
+    /// PEM private key for --relay-client-cert.
+    #[arg(long, requires = "relay_client_cert")]
+    relay_client_key: Option<String>,
+
     /// Enroll for a client certificate before connecting: prompt for the daemon
     /// pairing code, generate a key + CSR locally, fetch the signed cert, and
     /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
@@ -592,6 +602,8 @@ async fn run() -> anyhow::Result<()> {
                     relay_pin: relay_pin.clone(),
                     relay_tofu: cli.relay_tofu,
                     pin_store: Some(pin_store.clone()),
+                    outer_client_cert: cli.relay_client_cert.clone(),
+                    outer_client_key: cli.relay_client_key.clone(),
                 })
             }
             (None, None) => None,

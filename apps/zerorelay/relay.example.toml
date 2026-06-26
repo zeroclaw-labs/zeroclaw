@@ -27,6 +27,13 @@ allow = []
 deny = []
 # Optional shared-secret gate a daemon must present in its Hello.
 # relay_token = "change-me"
+# Outer-mTLS variant (additive admission on the OUTER TLS; the inner mTLS is
+# unaffected). "off" (default), "optional", or "required"; when on, outer_client_ca
+# verifies the peer's outer client cert. With route_by_client_cert, a client whose
+# outer cert CN names a node-id is routed to THAT node (else the Connect frame).
+# outer_client_auth = "off"
+# outer_client_ca = "/etc/zerorelay/outer-client-ca.pem"
+# route_by_client_cert = false
 
 [limits]
 # Cap on simultaneously-open client connections per node-id.

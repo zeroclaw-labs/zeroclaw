@@ -193,6 +193,24 @@ pub fn cert_sha256_fingerprint(cert_der: &[u8]) -> String {
     hex::encode(hash)
 }
 
+/// Read a relay node-id from an OUTER client certificate's subject Common Name.
+///
+/// Used only by the optional outer-mTLS relay variant: when an operator issues
+/// outer client certs whose CN is the target node-id, the relay binds which node
+/// a client may reach to its certificate (additive admission), falling back to the
+/// `Connect` frame's node-id when the cert carries none. Returns `None` for an
+/// unparseable cert or an empty CN. This never touches the inner mTLS.
+pub fn client_cert_node_id(cert_der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The enrollment short-auth-string binding a one-time pairing code to the daemon
 /// CA fingerprint (no blind TOFU at bootstrap; threats A1/A7).
 ///
@@ -432,6 +450,23 @@ mod tests {
     /// Ensure the rustls `CryptoProvider` is installed (idempotent).
     fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn client_cert_node_id_reads_cn() {
+        // The outer-mTLS variant binds the target node-id to the client cert CN.
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "nodeid-abc123");
+        params.distinguished_name = dn;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        assert_eq!(
+            client_cert_node_id(cert.der().as_ref()).as_deref(),
+            Some("nodeid-abc123")
+        );
+        // Garbage DER -> None, never a panic (the relay then uses the Connect frame).
+        assert!(client_cert_node_id(b"not a cert").is_none());
     }
 
     #[test]

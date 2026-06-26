@@ -18,6 +18,9 @@ serde_json = "1.0"
 # Certificate generation for the secure-by-default auto-gen + issuance paths.
 # Pinned to the `ring` backend to match the project's rustls provider.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# Read the subject CN from an outer client certificate for the optional
+# outer-mTLS relay variant (node-id-from-cert routing).
+x509-parser = "0.17"
 time = { version = "0.3", default-features = false, features = ["std"] }
 # CA private-key at-rest encryption (threat A4): scrypt KDF + XChaCha20-Poly1305
 # AEAD over the PKCS#8 PEM, key material zeroized on drop. All already vetted

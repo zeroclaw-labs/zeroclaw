@@ -83,6 +83,11 @@ pub struct RelayBridgeConfig {
     /// first leaf and record its pin to `<data_dir>/relay/relay_pin`, pinning it
     /// thereafter. Never silently enabled; a stored/explicit pin takes precedence.
     pub relay_tofu: bool,
+    /// Outer-mTLS variant: PEM cert/key the daemon presents to the relay on the
+    /// OUTER layer (needed when the relay sets `outer_client_auth = required`).
+    /// `None` presents no outer client cert. Separate from the inner mTLS.
+    pub outer_client_cert: Option<String>,
+    pub outer_client_key: Option<String>,
     /// Cap on simultaneously-bridged client connections (bridge-side DoS cap).
     pub max_conns: usize,
     /// Per-node `OPEN` handshake-rate cap (A6): burst allowance + steady refill
@@ -397,6 +402,8 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
         cfg.relay_insecure,
         stored_pin.as_deref(),
         cfg.relay_tofu,
+        cfg.outer_client_cert.as_deref(),
+        cfg.outer_client_key.as_deref(),
     )?;
     let connector = TlsConnector::from(tls_config);
     let tcp = TcpStream::connect(&cfg.relay_addr)
@@ -730,6 +737,8 @@ fn relay_client_config(
     insecure: bool,
     pin: Option<&str>,
     tofu: bool,
+    outer_cert: Option<&str>,
+    outer_key: Option<&str>,
 ) -> Result<(
     Arc<rustls::ClientConfig>,
     Option<Arc<zeroclaw_tls::RelayPinVerifier>>,
@@ -740,12 +749,12 @@ fn relay_client_config(
     .with_safe_default_protocol_versions()
     .context("ring provider supports default protocol versions")?;
 
-    let (config, verifier) = if insecure {
+    // Server verification choice -> a builder awaiting the client-auth choice.
+    let (verified, verifier) = if insecure {
         (
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
+                .with_custom_certificate_verifier(Arc::new(NoVerify)),
             None,
         )
     } else if let Some(pin) = pin.filter(|p| !p.is_empty()) {
@@ -753,8 +762,7 @@ fn relay_client_config(
         (
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(v.clone())
-                .with_no_client_auth(),
+                .with_custom_certificate_verifier(v.clone()),
             Some(v),
         )
     } else if tofu {
@@ -762,26 +770,33 @@ fn relay_client_config(
         (
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(v.clone())
-                .with_no_client_auth(),
-            None.or(Some(v)),
+                .with_custom_certificate_verifier(v.clone()),
+            Some(v),
         )
     } else if let Some(ca) = ca_path {
         let mut roots = rustls::RootCertStore::empty();
         for cert in zeroclaw_tls::load_certs(ca)? {
             roots.add(cert).context("adding relay CA to root store")?;
         }
-        (
-            builder.with_root_certificates(roots).with_no_client_auth(),
-            None,
-        )
+        (builder.with_root_certificates(roots), None)
     } else {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        (
-            builder.with_root_certificates(roots).with_no_client_auth(),
-            None,
-        )
+        (builder.with_root_certificates(roots), None)
+    };
+
+    // Outer-mTLS variant: present a client cert to the relay when configured (so a
+    // relay with outer_client_auth = required admits this daemon). Inner mTLS is
+    // separate and unaffected.
+    let config = match (outer_cert, outer_key) {
+        (Some(cert), Some(key)) => {
+            let chain = zeroclaw_tls::load_certs(cert)?;
+            let key = zeroclaw_tls::load_private_key(key)?;
+            verified
+                .with_client_auth_cert(chain, key)
+                .context("loading the relay outer client cert/key")?
+        }
+        _ => verified.with_no_client_auth(),
     };
     Ok((Arc::new(config), verifier))
 }

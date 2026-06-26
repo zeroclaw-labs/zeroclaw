@@ -129,6 +129,11 @@ pub struct RelayConfig {
     /// `Connect`s to one node-id get `rate_limited`.
     pub connect_burst_per_node: u32,
     pub connect_rate_per_node: f64,
+    /// Outer-mTLS variant: when an outer client cert is presented and its subject
+    /// CN names a node-id, route to THAT node, falling back to the `Connect` frame.
+    /// Off by default (a client cert whose CN is not a node-id would misroute). The
+    /// outer client-cert REQUIREMENT itself is configured on the TLS acceptor.
+    pub route_by_client_cert: bool,
 }
 
 impl RelayConfig {
@@ -157,6 +162,7 @@ impl Default for RelayConfig {
             accept_rate_per_ip: 10.0,
             connect_burst_per_node: 60,
             connect_rate_per_node: 20.0,
+            route_by_client_cert: false,
         }
     }
 }
@@ -263,6 +269,8 @@ struct Inner {
     accept_rate_per_ip: f64,
     connect_burst_per_node: u32,
     connect_rate_per_node: f64,
+    /// Outer-mTLS variant: read the target node-id from the client cert CN.
+    route_by_client_cert: bool,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
@@ -310,6 +318,7 @@ impl RelayServer {
                 accept_rate_per_ip: cfg.accept_rate_per_ip,
                 connect_burst_per_node: cfg.connect_burst_per_node,
                 connect_rate_per_node: cfg.connect_rate_per_node,
+                route_by_client_cert: cfg.route_by_client_cert,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
@@ -362,13 +371,25 @@ impl RelayServer {
                     Ok(t) => t,
                     Err(_) => return,
                 };
+                // Outer-mTLS variant: read a target node-id from the peer's outer
+                // client cert CN (when configured + a cert was presented), before
+                // the TlsStream is consumed by the WS handshake. None otherwise.
+                let cert_node_id = if inner.route_by_client_cert {
+                    tls.get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .and_then(|c| zeroclaw_tls::client_cert_node_id(c.as_ref()))
+                } else {
+                    None
+                };
                 // Echo our subprotocol so a client that offered it does not fail
                 // the handshake (RFC 6455 / tungstenite enforces this on the client).
                 let ws = match tokio_tungstenite::accept_hdr_async(tls, select_subprotocol).await {
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                let _ = handle_conn(inner, ws).await;
+                let _ = handle_conn(inner, ws, cert_node_id).await;
             });
         }
     }
@@ -404,8 +425,22 @@ fn select_subprotocol(
     Ok(resp)
 }
 
-/// Read the first control frame and dispatch by role.
-async fn handle_conn<S>(inner: Arc<Inner>, mut ws: WebSocketStream<S>) -> Result<()>
+/// The target node-id for a client: the outer client cert CN (outer-mTLS variant)
+/// when present, otherwise the `Connect` frame's node-id. Additive - the frame is
+/// always the fallback and the inner mTLS is never touched.
+fn resolve_target_node(cert_node_id: Option<String>, frame_node_id: String) -> String {
+    cert_node_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or(frame_node_id)
+}
+
+/// Read the first control frame and dispatch by role. `cert_node_id` is the
+/// outer-mTLS-derived target (outer client cert CN), used only on the client path.
+async fn handle_conn<S>(
+    inner: Arc<Inner>,
+    mut ws: WebSocketStream<S>,
+    cert_node_id: Option<String>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -415,7 +450,9 @@ where
             node_id,
             relay_token,
         }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token).await,
-        Some(Control::Connect { node_id }) => handle_client(inner, ws, node_id).await,
+        Some(Control::Connect { node_id }) => {
+            handle_client(inner, ws, resolve_target_node(cert_node_id, node_id)).await
+        }
         Some(other) => {
             let _ = send_control(
                 &mut ws,
@@ -881,4 +918,25 @@ where
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outer_cert_cn_routes_else_connect_frame() {
+        // Outer-mTLS variant: a cert CN names the target node, else the frame.
+        assert_eq!(
+            resolve_target_node(Some("from-cert".into()), "from-frame".into()),
+            "from-cert"
+        );
+        // No outer cert (or off) -> the Connect frame is the fallback.
+        assert_eq!(resolve_target_node(None, "from-frame".into()), "from-frame");
+        // An empty CN is ignored (falls back to the frame).
+        assert_eq!(
+            resolve_target_node(Some("".into()), "from-frame".into()),
+            "from-frame"
+        );
+    }
 }

@@ -6617,6 +6617,14 @@ pub struct RelayConfig {
     /// the RPC boundary (the inner mTLS is); see threat A2.
     #[serde(default)]
     pub tofu: bool,
+    /// PEM cert/key the daemon presents to the relay on the OUTER TLS layer
+    /// (outer-mTLS variant), required only when the relay sets
+    /// `outer_client_auth = required`. Empty presents no outer client cert. This is
+    /// separate from the inner mTLS client identity.
+    #[serde(default)]
+    pub outer_client_cert: String,
+    #[serde(default)]
+    pub outer_client_key: String,
     /// Auto-rotate the auto-minted node-id every N days (default 0 = never).
     /// Rotation mints a fresh id, registers it alongside the old one for a short
     /// grace window (so in-flight clients keep working), then retires the old id;

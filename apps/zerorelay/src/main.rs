@@ -139,6 +139,15 @@ struct AdmissionFile {
     #[serde(default)]
     deny: Vec<String>,
     relay_token: Option<String>,
+    /// Outer-mTLS variant (additive admission on the OUTER TLS): "off" (default),
+    /// "optional", or "required". When on, `outer_client_ca` verifies the peer's
+    /// outer client cert. The inner mTLS is unaffected.
+    outer_client_auth: Option<String>,
+    /// PEM CA verifying outer client certs (required when outer_client_auth is on).
+    outer_client_ca: Option<String>,
+    /// Route to the node-id named by the outer client cert's CN, falling back to
+    /// the `Connect` frame (default false; only meaningful with outer client auth).
+    route_by_client_cert: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -272,6 +281,11 @@ async fn main() -> Result<()> {
     };
     let admission = resolve_admission(&file.admission, &overlay)?;
 
+    // Outer-mTLS variant (additive): optionally require/accept an outer client
+    // cert, verified against outer_client_ca. The inner mTLS is untouched.
+    let outer_verifier = build_outer_client_verifier(&file.admission)?;
+    let route_by_client_cert = file.admission.route_by_client_cert.unwrap_or(false);
+
     // TLS material: CLI flag -> file [tls] -> self-provision.
     let tls_cert = cli.tls_cert.clone().or_else(|| file.tls.cert.clone());
     let tls_key = cli.tls_key.clone().or_else(|| file.tls.key.clone());
@@ -280,10 +294,12 @@ async fn main() -> Result<()> {
     tls_sans.extend(cli.tls_san.iter().cloned());
     let acceptor = match (tls_cert, tls_key) {
         // Bring-your-own (e.g. a public-CA cert for the relay's hostname).
-        (Some(cert), Some(key)) => build_tls_acceptor(&cert, &key)
+        (Some(cert), Some(key)) => build_tls_acceptor(&cert, &key, outer_verifier.clone())
             .with_context(|| format!("loading relay TLS material from {cert} / {key}"))?,
         // Self-provision a cert on first run - no openssl needed.
-        (None, None) => provision_tls_acceptor(tls_dir.as_deref(), &tls_sans)?,
+        (None, None) => {
+            provision_tls_acceptor(tls_dir.as_deref(), &tls_sans, outer_verifier.clone())?
+        }
         _ => {
             anyhow::bail!("tls cert and key must be given together (or neither, to self-provision)")
         }
@@ -317,6 +333,7 @@ async fn main() -> Result<()> {
         accept_rate_per_ip: file.limits.accept_rate_per_ip.unwrap_or(10.0),
         connect_burst_per_node: file.limits.connect_burst_per_node.unwrap_or(60),
         connect_rate_per_node: file.limits.connect_rate_per_node.unwrap_or(20.0),
+        route_by_client_cert,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -428,19 +445,53 @@ fn spawn_sighup_reloader(
 ) {
 }
 
+/// Build an outer client-cert verifier for the outer-mTLS variant, or `None` when
+/// `outer_client_auth` is off. "optional" accepts unauthenticated peers too;
+/// "required" rejects a peer without a valid outer client cert.
+fn build_outer_client_verifier(
+    admission: &AdmissionFile,
+) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>> {
+    let mode = admission.outer_client_auth.as_deref().unwrap_or("off");
+    match mode {
+        "off" => Ok(None),
+        "optional" | "required" => {
+            let ca = admission.outer_client_ca.clone().ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "[admission].outer_client_auth = {mode} requires [admission].outer_client_ca"
+                ))
+            })?;
+            let verifier = zeroclaw_tls::build_client_verifier(&zeroclaw_tls::ClientAuthParams {
+                ca_cert_path: ca,
+                require_client_cert: mode == "required",
+                pinned_certs: vec![],
+            })?;
+            Ok(Some(verifier))
+        }
+        other => {
+            anyhow::bail!("invalid [admission].outer_client_auth '{other}' (off|optional|required)")
+        }
+    }
+}
+
 /// Build the outer TLS acceptor from the relay's own server cert + key. Outer TLS
-/// is server-authenticated only: clients/daemons verify the relay; the relay does
-/// not require a client certificate on the outer layer (the inner mTLS is the RPC
-/// security boundary).
-fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+/// is server-authenticated; `client_verifier` adds the optional outer-mTLS variant
+/// (additive admission), but the inner mTLS stays the real RPC security boundary.
+fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .context("ring provider supports the default protocol versions")?
-    .with_no_client_auth()
+    .context("ring provider supports the default protocol versions")?;
+    let config = match client_verifier {
+        Some(v) => builder.with_client_cert_verifier(v),
+        None => builder.with_no_client_auth(),
+    }
     .with_single_cert(certs, key)
     .context("relay cert/key are not a valid pair")?;
     Ok(TlsAcceptor::from(Arc::new(config)))
@@ -449,7 +500,11 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
 /// Self-provision the relay's outer TLS cert (CA + server leaf with SANs) on first
 /// run, reusing the daemon's `zeroclaw-tls` machinery so no openssl is needed.
 /// Reused on later runs. Prints the CA path daemons/clients should trust.
-fn provision_tls_acceptor(tls_dir: Option<&str>, extra_sans: &[String]) -> Result<TlsAcceptor> {
+fn provision_tls_acceptor(
+    tls_dir: Option<&str>,
+    extra_sans: &[String],
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<TlsAcceptor> {
     let dir = tls_dir.map(PathBuf::from).unwrap_or_else(default_tls_dir);
     let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     for s in extra_sans {
@@ -462,6 +517,7 @@ fn provision_tls_acceptor(tls_dir: Option<&str>, extra_sans: &[String]) -> Resul
     let acceptor = build_tls_acceptor(
         &mats.server_cert_path.to_string_lossy(),
         &mats.server_key_path.to_string_lossy(),
+        client_verifier,
     )?;
     eprintln!("zerorelay: self-provisioned outer TLS in {}", dir.display());
     eprintln!("  SANs: {}", sans.join(", "));
@@ -529,6 +585,7 @@ mod tests {
             allow: vec!["from_file".into()],
             deny: vec!["bad_file".into()],
             relay_token: Some("file_tok".into()),
+            ..Default::default()
         };
         // CLI flips the mode + token and adds an allow entry.
         let pol = resolve_admission(

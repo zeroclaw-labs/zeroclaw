@@ -39,6 +39,10 @@ tokio = { version = "1.50", default-features = false, features = [
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+# Public roots for the outer-mTLS variant when a client also presents an outer
+# cert against a public-CA relay (the plain default still uses tungstenite's
+# built-in roots with no client cert).
+webpki-roots = "0.26"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 # Shared client enrollment helpers: P-256 CSR generation, the enrollment
 # short-auth-string, and the CA fingerprint used to confirm it.

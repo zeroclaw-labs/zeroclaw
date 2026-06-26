@@ -14721,6 +14721,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio-rustls",
+ "x509-parser 0.17.0",
  "zeroclaw-log",
  "zeroize",
 ]
@@ -14913,6 +14914,7 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "webpki-roots 0.26.11",
  "zeroclaw-relay-proto",
  "zeroclaw-tls",
  "zeroize",

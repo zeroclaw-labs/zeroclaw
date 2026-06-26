@@ -155,6 +155,8 @@ async fn zerocode_to_relay_to_daemon_full_path() {
             relay_ca_path: None,
             relay_insecure: true, // self-signed relay outer cert in the test
             relay_tofu: false,
+            outer_client_cert: None,
+            outer_client_key: None,
             max_conns: 16,
             open_burst: 60,
             open_rate_per_sec: 20.0,
