@@ -227,6 +227,18 @@ where
             }
         }
 
+        // Promote a recognized `trace_id` from the assembled attributes into
+        // the native OTel field so `?trace_id=` filters (reader.rs +
+        // gateway api_logs.rs) match. The id rode in via the call site's
+        // `with_attrs(json!({"trace_id": ..}))` or a `scope!(trace_id: ..)`
+        // ScopeExtra merge above. COPY (not move): the attributes mirror is
+        // still read by observer_bridge.rs, so leave it in place.
+        if log_event.trace_id.is_none()
+            && let Some(tid) = log_event.attributes.get("trace_id").and_then(Value::as_str)
+        {
+            log_event.trace_id = Some(tid.to_string());
+        }
+
         record_event(log_event);
     }
 }
@@ -681,6 +693,70 @@ mod e2e_tests {
         );
 
         // Clean up so subsequent parallel tests aren't affected.
+        crate::clear_broadcast_hook();
+    }
+
+    /// A `trace_id` carried in the call site's `with_attrs` payload must be
+    /// promoted by the layer into the native top-level `trace_id` field (so
+    /// `?trace_id=` filters match), while ALSO remaining inside `attributes`
+    /// for the observer bridge.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_attrs_trace_id_promoted_to_native_field() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        zeroclaw_log::record!(
+            INFO,
+            Event::new(module_path!(), Action::Receive)
+                .with_outcome(EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"trace_id": "trace-abc-123"})),
+            "trace-id promotion e2e test"
+        );
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("trace-id promotion e2e test"))
+                        .unwrap_or(false)
+                    {
+                        // Native top-level field is now populated.
+                        assert_eq!(
+                            value.get("trace_id").and_then(|v| v.as_str()),
+                            Some("trace-abc-123"),
+                            "trace_id should be promoted to the native field, got: {value:?}"
+                        );
+                        // And the attributes mirror is preserved (observer bridge reads it).
+                        assert_eq!(
+                            value
+                                .get("attributes")
+                                .and_then(|a| a.get("trace_id"))
+                                .and_then(|v| v.as_str()),
+                            Some("trace-abc-123"),
+                            "attributes.trace_id copy must remain"
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(found, "did not find the trace-id promotion test event");
+
         crate::clear_broadcast_hook();
     }
 }

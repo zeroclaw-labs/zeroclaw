@@ -130,13 +130,17 @@ pub struct Config {
     /// Model-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -842,6 +846,13 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, f64>,
+    /// Whether stored assistant reasoning should be replayed on outbound
+    /// assistant history messages. `Some(false)` strips `reasoning_content`
+    /// and `reasoning` before sending. `None` (default) honours the provider's
+    /// built-in default (true for most compat providers, false for Groq).
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
@@ -1045,7 +1056,9 @@ impl ModelEndpoint for MoonshotEndpoint {
         match self {
             Self::Cn => "https://api.moonshot.cn/v1",
             Self::Intl => "https://api.moonshot.ai/v1",
-            Self::Code => "https://api.moonshot.cn/coder/v1",
+            // Kimi Code (Kimi For Coding) moved to api.kimi.com — the old api.moonshot.cn/coder/v1 returns 404.
+            // See issue #8154: https://github.com/zeroclaw-labs/zeroclaw/issues/8154
+            Self::Code => "https://api.kimi.com/coding/v1",
         }
     }
 }
@@ -3278,6 +3291,20 @@ pub struct ResolvedRuntime {
     pub tool_receipts: ToolReceiptsConfig,
 }
 
+impl ResolvedRuntime {
+    /// Effective token budget for preemptive whole-turn history trimming.
+    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
+    /// trims earlier than the hard context ceiling; otherwise the ceiling is
+    /// the only trigger. Reuses the existing `history_pruning.*` idents.
+    pub fn effective_context_budget(&self) -> usize {
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            self.max_context_tokens.min(self.history_pruning.max_tokens)
+        } else {
+            self.max_context_tokens
+        }
+    }
+}
+
 impl Default for ResolvedRuntime {
     fn default() -> Self {
         Self {
@@ -5416,6 +5443,62 @@ pub enum SkillsPromptInjectionMode {
 ///
 /// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
 /// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ExternalRegistryKind {
+    #[default]
+    Git,
+    Unsupported(String),
+}
+
+impl ExternalRegistryKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Git => "git",
+            Self::Unsupported(kind) => kind.as_str(),
+        }
+    }
+}
+
+impl From<String> for ExternalRegistryKind {
+    fn from(kind: String) -> Self {
+        if kind == "git" {
+            Self::Git
+        } else {
+            Self::Unsupported(kind)
+        }
+    }
+}
+
+impl From<ExternalRegistryKind> for String {
+    fn from(kind: ExternalRegistryKind) -> Self {
+        kind.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for ExternalRegistryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ExternalRegistryKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalRegistryKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(String::deserialize(deserializer)?.into())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ExternalRegistry {
@@ -5425,8 +5508,9 @@ pub struct ExternalRegistry {
     pub url: String,
     /// Registry protocol. Only `"git"` is supported today; other protocols
     /// are reserved for a future additive release.
-    #[serde(default = "default_extra_registry_kind")]
-    pub kind: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
+    pub kind: ExternalRegistryKind,
     /// Whether this registry is eligible for installs. Default: `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -5444,10 +5528,6 @@ impl ExternalRegistry {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     }
-}
-
-fn default_extra_registry_kind() -> String {
-    "git".to_string()
 }
 
 /// Skills loading configuration (`[skills]` section).
@@ -6869,7 +6949,14 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`)
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
+    /// Exact and subdomain matches are supported. Listing a host skips the
+    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
+    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
+    /// wildcard permits any literal private/local host and lets a name already in
+    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
+    /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -7587,6 +7674,20 @@ fn default_linkedin_api_version() -> String {
     "202602".to_string()
 }
 
+/// Per-plugin config section keyed by plugin alias; values are secret so they
+/// encrypt at rest under the same adjacent `.secret_key` as every other secret.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plugins.entries"]
+pub struct PluginEntryConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub config: HashMap<String, String>,
+}
+
 /// Plugin system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -7608,6 +7709,20 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+    #[serde(default)]
+    #[nested]
+    #[natural_key = "name"]
+    pub entries: Vec<PluginEntryConfig>,
+}
+
+impl PluginsConfig {
+    #[must_use]
+    pub fn entry_config(&self, alias: &str) -> Option<&HashMap<String, String>> {
+        self.entries
+            .iter()
+            .find(|e| e.name == alias)
+            .map(|e| &e.config)
+    }
 }
 
 impl PluginsConfig {
@@ -7670,6 +7785,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            entries: Vec::new(),
         }
     }
 }
@@ -10047,6 +10163,32 @@ impl LogToolIo {
     }
 }
 
+/// LLM request payload capture policy. Mirrors [`LogToolIo`] but gates the
+/// prompt/messages sent on each `llm_request`. Defaults to `Off` because the
+/// full payload is the entire system prompt plus conversation every turn.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogLlmRequestPayload {
+    #[default]
+    Off,
+    Redacted,
+    Full,
+}
+
+impl LogLlmRequestPayload {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10120,6 +10262,22 @@ pub struct ObservabilityConfig {
     /// secret reads). Empty by default.
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
+
+    /// LLM request payload capture: "off" | "redacted" | "full".
+    /// - `off` (default): only `messages_count` lands on the `llm_request`
+    ///   event. No prompt or conversation content is persisted.
+    /// - `redacted`: the full message history (role + content) is leak-scanned
+    ///   and truncated at `log_tool_io_truncate_bytes` before persisting.
+    /// - `full`: full message history, still leak-scanned, untruncated. For
+    ///   operators who need replay fidelity and accept the disk cost.
+    ///
+    /// Opt-in (default off) because `full`/`redacted` capture the entire system
+    /// prompt and conversation on every turn.
+    #[serde(
+        default = "default_log_llm_request_payload",
+        deserialize_with = "deserialize_enum_lenient"
+    )]
+    pub log_llm_request_payload: LogLlmRequestPayload,
 }
 
 impl Default for ObservabilityConfig {
@@ -10135,6 +10293,7 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+            log_llm_request_payload: default_log_llm_request_payload(),
         }
     }
 }
@@ -10153,6 +10312,10 @@ fn default_log_persistence_max_entries() -> usize {
 
 fn default_log_tool_io() -> LogToolIo {
     LogToolIo::Redacted
+}
+
+fn default_log_llm_request_payload() -> LogLlmRequestPayload {
+    LogLlmRequestPayload::Off
 }
 
 fn default_log_tool_io_truncate_bytes() -> usize {
@@ -10256,7 +10419,7 @@ impl Default for WebhookAuditConfig {
 // contexts). Configs from older schema versions are folded into
 // `risk_profiles.default` by the migration in `schema/v2.rs`.
 
-fn default_auto_approve() -> Vec<String> {
+pub fn default_auto_approve() -> Vec<String> {
     vec![
         "file_read".into(),
         "memory_recall".into(),
@@ -10477,6 +10640,9 @@ pub struct RuntimeProfileConfig {
     /// Shell subprocess timeout in seconds. `0` inherits the global timeout.
     /// Parent-subset enforced for subagents.
     pub shell_timeout_secs: u64,
+    /// Shell and skill-tool subprocess memory ceiling in MiB. `0` disables
+    /// process-memory limiting. Parent-subset enforced for subagents.
+    pub shell_max_memory_mb: u64,
     // ── Delegation tuning ──
     /// Maximum delegation recursion depth. `0` inherits the default.
     pub max_delegation_depth: u32,
@@ -10530,6 +10696,7 @@ impl Default for RuntimeProfileConfig {
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
+            shell_max_memory_mb: 512,
             max_delegation_depth: 0,
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
@@ -10880,17 +11047,31 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "model_routes"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -10908,20 +11089,34 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "embedding_routes"]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted embedding-capable provider profile ref
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local embedding model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -16681,6 +16876,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
+        self.collect_a2a_exposed_skills_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -16700,6 +16896,41 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
+    /// `exposed_skills` is a narrowing filter over the agent's resolved skill
+    /// set, which comes from `skill_bundles`. An agent that lists
+    /// `a2a.exposed_skills` but declares no `skill_bundles` advertises an empty
+    /// `skills: []` array on its agent card with no error, because every wanted
+    /// id is dropped for belonging to a bundle the agent does not declare. The
+    /// same silent emptiness happens when a wanted id names no skill in any
+    /// declared bundle, or when the owning bundle's include/exclude filter
+    /// excludes it; those need disk resolution, so this offline check covers the
+    /// common structural case: exposed skills with zero declared bundles.
+    fn collect_a2a_exposed_skills_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (agent_alias, agent) in &self.agents {
+            if agent.a2a.exposed_skills.is_empty() {
+                continue;
+            }
+            if !agent.skill_bundles.is_empty() {
+                continue;
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "a2a_exposed_skills_without_bundles",
+                format!(
+                    "agent `{agent_alias}` lists a2a.exposed_skills but declares no \
+                     skill_bundles, so its agent card advertises no skills (skills: []). \
+                     exposed_skills is a filter over the agent's resolved skill set; add \
+                     the owning bundle(s) to agents.{agent_alias}.skill_bundles so the \
+                     listed skills resolve."
+                ),
+                format!("agents.{agent_alias}.a2a.exposed_skills"),
+            ));
+        }
     }
 
     /// Surface the #7964 cross-provider shape on a legacy config that has NOT
@@ -17806,7 +18037,7 @@ impl Config {
                         reg.name
                     );
                 }
-                if reg.kind != "git" {
+                if reg.kind != ExternalRegistryKind::Git {
                     anyhow::bail!(
                         "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
                         reg.name,
@@ -18339,7 +18570,17 @@ impl Config {
         self.dirty_paths.insert(path.to_string());
     }
 
-    pub fn ensure_map_key_for_path(&mut self, path: &str) {
+    /// Auto-create the parent map key for a dotted set-prop `path` when it does
+    /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
+    /// the entry first.
+    ///
+    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
+    /// set-prop surface should then surface a reserved-name error rather than the
+    /// generic "not configured" that the still-missing entry would otherwise
+    /// produce. Returns `false` in every other case (created, already existed, or
+    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
+    /// that do not distinguish the reserved case may ignore it.
+    pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -18355,19 +18596,44 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return;
+            return false;
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return;
+            return false;
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return;
+            return false;
+        }
+        // Never auto-vivify the reserved `default` agent from a set-prop path: a
+        // prop write under a nonexistent `agents.default` must not materialize the
+        // reserved runtime fallback (the operator would get an agent the rename
+        // guard then traps). This is the set-prop analogue of the create guard in
+        // `create_map_key_checked`. The migration that legitimately synthesizes
+        // `agents.default` calls `create_map_key` directly, not this path, and an
+        // already-present `default` is left untouched by the existence check above.
+        if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
+            // Make the refusal observable: callers that check the return surface a
+            // reserved-name error, and this WARN with a stable `error_key` lets an
+            // operator see why a set-prop on a fresh `agents.default` was dropped.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.reserved_agent_vivify_refused",
+                        "alias": alias,
+                        "path": path,
+                    })),
+                "refused to auto-create the reserved `default` agent from a set-prop path"
+            );
+            return true;
         }
         let _ = self.create_map_key(section, alias);
+        false
     }
 
     pub fn clear_dirty(&mut self) {
@@ -19486,10 +19752,43 @@ pub struct SopConfig {
     /// Oldest runs are evicted when over capacity. 0 = unlimited.
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
+
+    /// Persist run state durably across restarts. Default `false` keeps today's
+    /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
+    /// to `true`, `build_sop_engine` selects the configured backend and in-flight
+    /// runs survive a restart.
+    #[serde(default)]
+    pub persist_runs: bool,
+
+    /// Durable run-state backend when `persist_runs` is true: `sqlite` (default,
+    /// durable) or `memory` (explicitly non-durable, for tests/degraded).
+    #[serde(default)]
+    pub run_store_backend: SopRunStoreBackend,
+
+    /// Directory for the durable run store (created mode-0700). When omitted,
+    /// `<data_dir>/sop`. Never OS-temp.
+    #[serde(default)]
+    pub run_state_dir: Option<String>,
 }
 
 fn default_sop_execution_mode() -> String {
     "supervised".to_string()
+}
+
+/// Durable SOP run-state backend selector. A closed, compile-time-known set, so it
+/// is a serde enum rather than free text (mirrors `SandboxBackend` /
+/// `ObservabilityBackend` in this file); unknown values are rejected at parse time.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SopRunStoreBackend {
+    /// Durable WAL-mode SQLite store (default).
+    #[default]
+    Sqlite,
+    /// Ephemeral in-memory store: explicitly non-durable, for tests / degraded boot.
+    Memory,
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19512,6 +19811,9 @@ impl Default for SopConfig {
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
+            persist_runs: false,
+            run_store_backend: SopRunStoreBackend::Sqlite,
+            run_state_dir: None,
         }
     }
 }
@@ -19594,6 +19896,29 @@ mod tests {
             None
         );
         assert_eq!(super::cost_category_for_provider_section("models"), None);
+    }
+
+    #[test]
+    async fn plugin_entry_config_resolves_own_section_and_isolates_others() {
+        let mut plugins = super::PluginsConfig::default();
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "image_gen_fal".into(),
+            config: std::collections::HashMap::from([("api_key".into(), "secret-a".into())]),
+        });
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "sd_webui".into(),
+            config: std::collections::HashMap::from([("base_url".into(), "http://host".into())]),
+        });
+
+        let fal = plugins.entry_config("image_gen_fal").unwrap();
+        assert_eq!(fal.get("api_key").map(String::as_str), Some("secret-a"));
+        assert!(fal.get("base_url").is_none());
+
+        let sd = plugins.entry_config("sd_webui").unwrap();
+        assert_eq!(sd.get("base_url").map(String::as_str), Some("http://host"));
+        assert!(sd.get("api_key").is_none());
+
+        assert!(plugins.entry_config("unknown").is_none());
     }
 
     #[test]
@@ -20225,7 +20550,7 @@ enabled = true
         ExternalRegistry {
             name: name.to_string(),
             url: url.to_string(),
-            kind: kind.to_string(),
+            kind: kind.to_string().into(),
             enabled: true,
         }
     }
@@ -20462,6 +20787,12 @@ log_tool_io = "off"
         assert_eq!(ObservabilityBackend::Otel.as_wire(), "otel");
         assert_eq!(LogPersistence::Full.as_wire(), "full");
         assert_eq!(LogToolIo::Off.as_wire(), "off");
+
+        // log_llm_request_payload parses leniently and round-trips its wire form.
+        let payload: ObservabilityConfig =
+            toml::from_str("log_llm_request_payload = \"full\"").unwrap();
+        assert_eq!(payload.log_llm_request_payload, LogLlmRequestPayload::Full);
+        assert_eq!(LogLlmRequestPayload::Off.as_wire(), "off");
     }
 
     #[test]
@@ -20500,6 +20831,7 @@ log_tool_io = "off"
         assert_eq!(o.log_tool_io, LogToolIo::Redacted);
         assert_eq!(o.log_tool_io_truncate_bytes, 40960);
         assert!(o.log_tool_io_denylist.is_empty());
+        assert_eq!(o.log_llm_request_payload, LogLlmRequestPayload::Off);
     }
 
     #[test]
@@ -25512,6 +25844,44 @@ group_policy = "disabled"
         assert_eq!(anthropic.natural_key, None);
     }
 
+    /// `model_routes` and `embedding_routes` are `#[nested]` Vec fields
+    /// with `#[natural_key = "hint"]` — they must surface in
+    /// `map_key_sections()` as `List` entries so the dashboard and the
+    /// incremental TOML writer can address individual route entries.
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_model_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "model_routes")
+            .expect("model_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::model_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_embedding_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "embedding_routes")
+            .expect("embedding_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::embedding_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
     /// A dirty path with a kebab-shaped inner field (e.g.
     /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
     /// shared `resolve_dirty_segments` helper inside the natural-key
@@ -29059,13 +29429,37 @@ allowed_users = []
             class_for("channels.matrix.default.access_token"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
+        // model_routes and embedding_routes are now #[nested] Vec fields —
+        // they are surfaced via map_key_sections(), not as flat prop_fields.
+        // After adding a route entry, its api_key sub-field appears in
+        // prop_fields with EncryptedSecret classification (from #[secret]).
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_provider: "openai.default".into(),
+            model: "gpt-4".into(),
+            api_key: None,
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openai.embeddings".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        });
+        let nested_fields = config.prop_fields();
+        let nested_class_for = |name: &str| {
+            nested_fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.credential_class)
+        };
         assert_eq!(
-            class_for("model_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("model_routes.reasoning.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert_eq!(
-            class_for("embedding_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("embedding_routes.semantic.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert!(Config::prop_is_secret(
             "providers.tts.openai.default.api_key"
@@ -29804,6 +30198,69 @@ allowed_users = []
             w.message.contains("beta -> custom.p2"),
             "message names beta + provider: {}",
             w.message
+        );
+    }
+
+    // exposed_skills set with no skill_bundles -> the agent card resolves no
+    // skills (skills: []) silently; the diagnostic fires and names the agent.
+    #[tokio::test]
+    async fn collect_warnings_flags_exposed_skills_without_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get", "ucp_merchant_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "a2a_exposed_skills_without_bundles")
+            .expect("expected a2a_exposed_skills_without_bundles warning");
+        assert_eq!(w.path, "agents.merchant.a2a.exposed_skills");
+        assert!(
+            w.message.contains("merchant"),
+            "message names the agent: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("skill_bundles"),
+            "message points at skill_bundles: {}",
+            w.message
+        );
+    }
+
+    // exposed_skills set alongside at least one declared skill_bundle -> no
+    // structural diagnostic (disk resolution governs whether ids actually
+    // resolve; that is out of scope for this offline check).
+    #[tokio::test]
+    async fn collect_warnings_silent_for_exposed_skills_with_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+            skill_bundles = ["commerce"]
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "a2a_exposed_skills_without_bundles"),
+            "no exposed_skills warning when a bundle is declared: {warnings:?}"
         );
     }
 

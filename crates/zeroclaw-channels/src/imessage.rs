@@ -378,6 +378,15 @@ end tell"#
 
         db_path.exists()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API for third-party iMessage bots.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Get the current max ROWID from the messages table.

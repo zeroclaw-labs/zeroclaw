@@ -526,11 +526,12 @@ impl Channel for VoiceCallChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
-        Ok(()) // Not applicable for voice calls
+        // Typing indicator not applicable to voice channels.
+        Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        Ok(()) // Not applicable for voice calls
+        Ok(())
     }
 
     fn supports_draft_updates(&self) -> bool {

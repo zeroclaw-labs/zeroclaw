@@ -8,7 +8,21 @@ The smallest config that loads clean has four section headers: a provider entry,
 
 ## Field reference: provider entry
 
-Almost every family also takes:
+Almost every family also takes the shared fields from `ModelProviderConfig`:
+
+- `api_key`: credential for providers that use bearer or subscription-style API keys.
+- `uri`: full endpoint override. Leave unset to use the family's endpoint resolver.
+- `model`: model identifier sent to the provider.
+- `temperature`: optional sampling temperature.
+- `timeout_secs`: HTTP request timeout in seconds.
+- `max_tokens`: optional response length cap.
+- `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
+- `fallback_models`: alternate model IDs on the same provider alias.
+- `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
+- `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
+
+Family-specific entries add their own typed fields on top of these shared fields.
 
 ## Field resolution order
 
@@ -56,9 +70,37 @@ The `__` is the path separator; the example above sets `providers.models.ollama.
 
 ### Ollama
 
+Ollama defaults to the local endpoint, so a local alias only needs the model name:
+
+```toml
+[providers.models.ollama.local]
+model = "llama3.1"
+```
+
+Set `uri` when ZeroClaw is not running on the same host as Ollama:
+
+```toml
+[providers.models.ollama.host]
+model = "llama3.1"
+uri = "http://host.docker.internal:11434"
+```
+
+Ollama-specific optional fields are `num_ctx`, `num_predict`, and `temperature_override`.
+
 ### Azure OpenAI
 
-The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from environment variables.
+Azure OpenAI computes its endpoint from the typed Azure fields:
+
+```toml
+[providers.models.azure.work]
+api_key = "op://platform/azure-openai/api-key"
+model = "gpt-4o"
+resource = "example-resource"
+deployment = "gpt-4o-prod"
+api_version = "2024-10-21"
+```
+
+The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from Azure-specific environment variables. Use `uri` only when you need to override the computed endpoint completely.
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 

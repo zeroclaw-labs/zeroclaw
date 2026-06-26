@@ -354,6 +354,15 @@ impl Channel for NostrChannel {
             .values()
             .any(|r| r.is_connected())
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in any published NIP.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
