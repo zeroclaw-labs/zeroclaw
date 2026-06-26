@@ -526,7 +526,10 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::Message;
-    use zeroclaw_relay_proto::{Control, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data};
+    use zeroclaw_relay_proto::{
+        ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
+        encode_data,
+    };
 
     let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
         .await
@@ -607,12 +610,34 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
     // as DATA; inbound DATA payloads are written back for the inner TLS to read.
     let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
     tokio::spawn(async move {
+        // Per-conn credit flow control. `send_window` gates how much we ship to
+        // the relay before the daemon acks (so we never pin more than one window
+        // of unsent inner bytes); `recv_drained` counts daemon->client bytes we
+        // have handed to the inner stream so we can replenish the daemon's window.
+        let mut send_window = ConnWindow::new(INITIAL_WINDOW);
+        let mut recv_drained: u32 = 0;
+        // Grant the daemon our receive window up front.
+        let _ = sink
+            .send(Message::text(
+                Control::Window {
+                    conn_id,
+                    credit: INITIAL_WINDOW,
+                }
+                .to_json(),
+            ))
+            .await;
+
         let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
         loop {
             tokio::select! {
-                n = relay_io.read(&mut buf) => match n {
+                // When the send window is exhausted, stop reading the inner stream
+                // (back-pressure to the inner TLS) until a DataAck replenishes it.
+                n = relay_io.read(&mut buf), if !send_window.is_blocked() => match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // `n <= MAX_DATA_PAYLOAD` (buffer size) so this is already a
+                        // single bounded chunk; the relay rejects anything larger.
+                        send_window.debit(n);
                         if sink
                             .send(Message::binary(encode_data(conn_id, &buf[..n])))
                             .await
@@ -624,16 +649,33 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
                 },
                 msg = stream.next() => match msg {
                     Some(Ok(Message::Binary(b))) => {
-                        if let Some((_, payload)) = decode_data(&b)
-                            && relay_io.write_all(payload).await.is_err() {
+                        if let Some((_, payload)) = decode_data(&b) {
+                            if relay_io.write_all(payload).await.is_err() {
                                 break;
                             }
-                    }
-                    Some(Ok(Message::Text(t))) => {
-                        if let Ok(Control::Close { .. }) = Control::from_json(t.as_str()) {
-                            break;
+                            recv_drained = recv_drained.saturating_add(payload.len() as u32);
+                            // Replenish the daemon's window once we have drained
+                            // about half of it, amortizing the ack frames.
+                            if recv_drained >= INITIAL_WINDOW / 2 {
+                                let _ = sink
+                                    .send(Message::text(
+                                        Control::DataAck {
+                                            conn_id,
+                                            consumed: recv_drained,
+                                        }
+                                        .to_json(),
+                                    ))
+                                    .await;
+                                recv_drained = 0;
+                            }
                         }
                     }
+                    Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                        Ok(Control::Close { .. }) => break,
+                        Ok(Control::Window { credit, .. }) => send_window.set(credit),
+                        Ok(Control::DataAck { consumed, .. }) => send_window.ack(consumed),
+                        _ => {}
+                    },
                     Some(Ok(Message::Ping(p))) => {
                         let _ = sink.send(Message::Pong(p)).await;
                     }

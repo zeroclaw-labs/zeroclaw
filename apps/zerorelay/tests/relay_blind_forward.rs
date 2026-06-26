@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Message};
-use zeroclaw_relay_proto::{Control, SUBPROTOCOL};
+use zeroclaw_relay_proto::{Control, SUBPROTOCOL, decode_data, encode_data};
 use zerorelay::{Admission, RelayConfig, RelayServer};
 
 type RelayWs =
@@ -178,6 +178,202 @@ async fn handshake(
 
     let term = next_control(&mut ws).await.expect("terminal frame");
     (ws, term)
+}
+
+/// Open an outer TLS + WS connection to the relay WITHOUT registering (the client
+/// role: it only sends a `Connect`).
+async fn connect_ws(relay_addr: std::net::SocketAddr) -> RelayWs {
+    let tcp = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(sni, tcp).await.unwrap();
+    let req = ClientRequestBuilder::new("wss://localhost/".parse().unwrap())
+        .with_sub_protocol(SUBPROTOCOL);
+    let (ws, _) = tokio_tungstenite::client_async_with_config(req, tls, None)
+        .await
+        .unwrap();
+    ws
+}
+
+/// A wire message read off a relay socket: either a binary DATA frame
+/// `(conn_id, payload)` or a control frame.
+#[derive(Debug)]
+enum Wire {
+    Data(u64, Vec<u8>),
+    Ctrl(Control),
+}
+
+/// Read the next DATA or control message (answering pings), with a timeout so a
+/// stuck test fails fast instead of hanging.
+async fn next_wire(ws: &mut RelayWs) -> Option<Wire> {
+    let read = async {
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Text(t)) => return Control::from_json(t.as_str()).ok().map(Wire::Ctrl),
+                Ok(Message::Binary(b)) => {
+                    return decode_data(&b).map(|(c, p)| Wire::Data(c, p.to_vec()));
+                }
+                Ok(Message::Ping(p)) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Ok(Message::Pong(_)) => {}
+                _ => return None,
+            }
+        }
+        None
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .unwrap_or(None)
+}
+
+/// Register a daemon, connect a client, and drive the Connect -> Open -> Opened
+/// pairing. Returns the live daemon + client sockets and the paired `conn_id`.
+async fn pair_daemon_and_client(
+    relay_addr: std::net::SocketAddr,
+    node_id: &str,
+) -> (RelayWs, RelayWs, u64) {
+    let key = gen_key();
+    let (mut daemon, term) = handshake(relay_addr, node_id, &key, None, true).await;
+    assert!(matches!(term, Control::Registered { .. }), "got {term:?}");
+
+    let mut client = connect_ws(relay_addr).await;
+    client
+        .send(Message::text(
+            Control::Connect {
+                node_id: node_id.to_string(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+
+    // The relay asks the daemon to open a logical conn; accept it.
+    let conn_id = loop {
+        match next_wire(&mut daemon).await {
+            Some(Wire::Ctrl(Control::Open { conn_id, .. })) => break conn_id,
+            Some(_) => {}
+            None => panic!("daemon never received Open"),
+        }
+    };
+    daemon
+        .send(Message::text(Control::Opened { conn_id }.to_json()))
+        .await
+        .unwrap();
+    // Client must see the route open before exchanging bytes.
+    match next_wire(&mut client).await {
+        Some(Wire::Ctrl(Control::Opened { conn_id: c })) => assert_eq!(c, conn_id),
+        other => panic!("client did not see Opened: {other:?}"),
+    }
+    (daemon, client, conn_id)
+}
+
+#[tokio::test]
+async fn relay_forwards_flow_control_frames_both_ways() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let (mut daemon, mut client, conn_id) = pair_daemon_and_client(addr, "node-fc").await;
+
+    // Daemon -> client: a Window grant must reach the client unchanged.
+    daemon
+        .send(Message::text(
+            Control::Window {
+                conn_id,
+                credit: 8192,
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+    match next_wire(&mut client).await {
+        Some(Wire::Ctrl(Control::Window { conn_id: c, credit })) => {
+            assert_eq!(c, conn_id);
+            assert_eq!(credit, 8192);
+        }
+        other => panic!("client did not receive the forwarded Window: {other:?}"),
+    }
+
+    // Client -> daemon: a DATA frame is blind-forwarded with the authoritative
+    // conn_id, and a DataAck control frame is forwarded too.
+    client
+        .send(Message::binary(encode_data(conn_id, b"ping")))
+        .await
+        .unwrap();
+    client
+        .send(Message::text(
+            Control::DataAck {
+                conn_id,
+                consumed: 4,
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+
+    match next_wire(&mut daemon).await {
+        Some(Wire::Data(c, p)) => {
+            assert_eq!(c, conn_id, "conn_id re-stamped authoritatively");
+            assert_eq!(p, b"ping");
+        }
+        other => panic!("daemon did not receive forwarded DATA: {other:?}"),
+    }
+    match next_wire(&mut daemon).await {
+        Some(Wire::Ctrl(Control::DataAck {
+            conn_id: c,
+            consumed,
+        })) => {
+            assert_eq!(c, conn_id);
+            assert_eq!(consumed, 4);
+        }
+        other => panic!("daemon did not receive forwarded DataAck: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn relay_closes_a_client_that_floods_past_its_window() {
+    // A1/A6: a client that ships far more than its granted send window (the daemon
+    // never acks) is ignoring flow control. The relay tears the conn down rather
+    // than buffering unboundedly onto the shared daemon link.
+    let addr = start_relay(RelayConfig::default()).await;
+    let (_daemon, mut client, conn_id) = pair_daemon_and_client(addr, "node-flood").await;
+
+    // Flood ~1 MiB in 64 KiB frames without ever acking; the seeded window plus
+    // tolerance is 2 * INITIAL_WINDOW (512 KiB), so this must trip the guard.
+    let chunk = vec![0u8; 64 * 1024];
+    let mut tripped = false;
+    for _ in 0..20 {
+        if client
+            .send(Message::binary(encode_data(conn_id, &chunk)))
+            .await
+            .is_err()
+        {
+            tripped = true;
+            break;
+        }
+        if let Some(Wire::Ctrl(Control::Error { code, .. })) = next_wire_nowait(&mut client).await {
+            assert_eq!(code, "rate_limited");
+            tripped = true;
+            break;
+        }
+    }
+    assert!(
+        tripped,
+        "the relay must rate-limit / close a client that overruns its window"
+    );
+}
+
+/// A non-blocking peek for an already-queued frame (200ms budget), used to notice
+/// the relay's rate-limit error mid-flood without stalling the send loop.
+async fn next_wire_nowait(ws: &mut RelayWs) -> Option<Wire> {
+    let read = async {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => Control::from_json(t.as_str()).ok().map(Wire::Ctrl),
+            Some(Ok(Message::Binary(b))) => decode_data(&b).map(|(c, p)| Wire::Data(c, p.to_vec())),
+            _ => None,
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_millis(200), read)
+        .await
+        .unwrap_or(None)
 }
 
 #[tokio::test]

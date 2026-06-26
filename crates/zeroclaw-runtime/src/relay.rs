@@ -28,7 +28,21 @@ use tokio_rustls::TlsConnector;
 // The runtime depends on tokio-rustls (not rustls directly); use its re-export.
 use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_relay_proto::{Control, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data};
+use zeroclaw_relay_proto::{
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data,
+};
+
+/// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
+/// bytes, plus the credit-window control frames (forwarded by the relay) that
+/// govern how fast this conn may send.
+enum ConnMsg {
+    /// Inbound DATA payload to write to the loopback inner stream.
+    Data(Vec<u8>),
+    /// `Window { credit }`: (re)establish this conn's absolute send window.
+    Window(u32),
+    /// `DataAck { consumed }`: replenish this conn's send window.
+    Ack(u32),
+}
 
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -231,7 +245,7 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
 
     // Connection bookkeeping + the single outbound write path to the relay.
     let (to_relay, mut from_tasks) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
-    let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>> =
+    let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let link_dead = CancellationToken::new();
@@ -298,7 +312,7 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                                         }))
                                         .await;
                                 } else {
-                                    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+                                    let (tx, rx) = mpsc::channel::<ConnMsg>(256);
                                     cs.insert(conn_id, tx);
                                     drop(cs);
                                     let to_relay = to_relay.clone();
@@ -314,13 +328,25 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                             Ok(Control::Close { conn_id, .. }) => {
                                 conns.lock().await.remove(&conn_id);
                             }
+                            // Credit-window frames from the client (forwarded by
+                            // the relay): route to the conn's bridge task.
+                            Ok(Control::Window { conn_id, credit }) => {
+                                if let Some(tx) = conns.lock().await.get(&conn_id) {
+                                    let _ = tx.send(ConnMsg::Window(credit)).await;
+                                }
+                            }
+                            Ok(Control::DataAck { conn_id, consumed }) => {
+                                if let Some(tx) = conns.lock().await.get(&conn_id) {
+                                    let _ = tx.send(ConnMsg::Ack(consumed)).await;
+                                }
+                            }
                             _ => {}
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Binary(b)) => {
                         if let Some((conn_id, payload)) = decode_data(&b)
                             && let Some(tx) = conns.lock().await.get(&conn_id) {
-                                let _ = tx.send(payload.to_vec()).await;
+                                let _ = tx.send(ConnMsg::Data(payload.to_vec())).await;
                             }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(p)) => {
@@ -349,9 +375,9 @@ async fn bridge_conn(
     conn_id: u64,
     local_wss_addr: &str,
     to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<ConnMsg>,
     link_dead: CancellationToken,
-    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>>,
 ) {
     let local = match TcpStream::connect(local_wss_addr).await {
         Ok(s) => s,
@@ -370,15 +396,32 @@ async fn bridge_conn(
     let _ = to_relay
         .send(tungstenite_text(&Control::Opened { conn_id }))
         .await;
+    // Grant the client our receive window for this conn up front.
+    let _ = to_relay
+        .send(tungstenite_text(&Control::Window {
+            conn_id,
+            credit: INITIAL_WINDOW,
+        }))
+        .await;
+
+    // Per-conn credit flow control (mirrors the client pump): `send_window` gates
+    // loopback->relay bytes so one conn cannot monopolize the shared relay link
+    // (head-of-line); `recv_drained` counts client->daemon bytes written to the
+    // loopback so we replenish the client's window.
+    let mut send_window = ConnWindow::new(INITIAL_WINDOW);
+    let mut recv_drained: u32 = 0;
 
     let (mut lr, mut lw) = local.into_split();
     let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
     loop {
         tokio::select! {
             _ = link_dead.cancelled() => break,
-            n = lr.read(&mut buf) => match n {
+            // Pause reading the loopback when the send window is exhausted, until
+            // a DataAck replenishes it.
+            n = lr.read(&mut buf), if !send_window.is_blocked() => match n {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    send_window.debit(n);
                     if to_relay
                         .send(tokio_tungstenite::tungstenite::Message::binary(encode_data(conn_id, &buf[..n])))
                         .await
@@ -388,12 +431,24 @@ async fn bridge_conn(
                     }
                 }
             },
-            payload = inbound.recv() => match payload {
-                Some(p) => {
+            msg = inbound.recv() => match msg {
+                Some(ConnMsg::Data(p)) => {
                     if lw.write_all(&p).await.is_err() {
                         break;
                     }
+                    recv_drained = recv_drained.saturating_add(p.len() as u32);
+                    if recv_drained >= INITIAL_WINDOW / 2 {
+                        let _ = to_relay
+                            .send(tungstenite_text(&Control::DataAck {
+                                conn_id,
+                                consumed: recv_drained,
+                            }))
+                            .await;
+                        recv_drained = 0;
+                    }
                 }
+                Some(ConnMsg::Window(credit)) => send_window.set(credit),
+                Some(ConnMsg::Ack(consumed)) => send_window.ack(consumed),
                 None => break,
             },
         }

@@ -89,6 +89,16 @@ pub enum Control {
         reason: String,
     },
 
+    /// Receiver -> sender: (re)establish the absolute send window for one logical
+    /// connection (credit-based flow control). The sender may have at most
+    /// `credit` unacknowledged bytes in flight on this `conn_id` before it pauses,
+    /// so no single conn can monopolize the multiplexed daemon link (head-of-line
+    /// mitigation) or pin unbounded memory (A6). Sent once when the conn opens.
+    Window { conn_id: u64, credit: u32 },
+    /// Receiver -> sender: `consumed` bytes have been drained to the inner stream
+    /// on this `conn_id`; the sender replenishes its send window by that amount.
+    DataAck { conn_id: u64, consumed: u32 },
+
     /// Either side: a terminal error (e.g. `forbidden`, `node_taken`, `bad_sig`,
     /// `no_such_node`, `rate_limited`, `busy`).
     Error { code: String, msg: String },
@@ -130,6 +140,91 @@ pub fn decode_data(bytes: &[u8]) -> Option<(u64, &[u8])> {
     }
     let conn_id = u64::from_be_bytes(bytes[..8].try_into().expect("checked len >= 8"));
     Some((conn_id, &bytes[8..]))
+}
+
+/// Default per-`conn_id` send window in bytes (four max-size DATA frames). A
+/// sender may have at most this many unacknowledged bytes in flight on one
+/// logical connection before it must pause for a [`Control::DataAck`]. Bounds the
+/// memory and link share any single conn can take (head-of-line + A6). Both ends
+/// assume this default; a [`Control::Window`] frame can change it explicitly.
+pub const INITIAL_WINDOW: u32 = 4 * MAX_DATA_PAYLOAD as u32;
+
+/// Split `payload` into `<= MAX_DATA_PAYLOAD` slices for DATA framing, so one
+/// inner write can never produce an oversized frame that monopolizes the
+/// multiplexed link (the relay rejects frames larger than `MAX_DATA_PAYLOAD`).
+/// Yields a single (possibly empty) slice when the payload already fits.
+pub fn chunk_payload(payload: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut emitted_empty = false;
+    payload
+        .chunks(MAX_DATA_PAYLOAD)
+        .chain(std::iter::from_fn(move || {
+            // `[].chunks(_)` yields nothing; preserve a zero-length DATA frame
+            // (used as an inner half-close / flush signal) by emitting once.
+            if payload.is_empty() && !emitted_empty {
+                emitted_empty = true;
+                Some(&payload[..0])
+            } else {
+                None
+            }
+        }))
+}
+
+/// Credit-based send window for one logical connection in one direction.
+///
+/// The sender debits the window by each DATA chunk it transmits and pauses when
+/// it reaches zero; the receiver replenishes by sending [`Control::DataAck`] as it
+/// drains bytes to the inner stream. [`Control::Window`] re-establishes the
+/// absolute window. The relay reuses the same accountant as a blind guard: it
+/// debits on forwarding DATA and credits on forwarding a `DataAck`, and treats a
+/// window driven far negative as a flow-control violation to tear the conn down.
+#[derive(Debug, Clone)]
+pub struct ConnWindow {
+    credit: i64,
+}
+
+impl ConnWindow {
+    /// A window seeded with `initial` credit (use [`INITIAL_WINDOW`] by default).
+    pub fn new(initial: u32) -> Self {
+        Self {
+            credit: i64::from(initial),
+        }
+    }
+
+    /// Bytes the sender may still transmit before it must pause.
+    pub fn available(&self) -> u32 {
+        self.credit.clamp(0, i64::from(u32::MAX)) as u32
+    }
+
+    /// True when the sender has no credit and must pause reading its inner stream.
+    pub fn is_blocked(&self) -> bool {
+        self.credit <= 0
+    }
+
+    /// Debit the window for an outgoing chunk of `len` bytes.
+    pub fn debit(&mut self, len: usize) {
+        self.credit -= len as i64;
+    }
+
+    /// Replenish the window on a received [`Control::DataAck`] of `consumed` bytes.
+    pub fn ack(&mut self, consumed: u32) {
+        self.credit = self.credit.saturating_add(i64::from(consumed));
+    }
+
+    /// Re-establish the absolute window from a [`Control::Window`] grant.
+    pub fn set(&mut self, credit: u32) {
+        self.credit = i64::from(credit);
+    }
+
+    /// How far past zero the window has been driven. A well-behaved sender keeps
+    /// this within one in-flight chunk; the relay uses a larger tolerance to
+    /// detect a sender that ignores flow control entirely (A6).
+    pub fn overrun(&self) -> u64 {
+        if self.credit < 0 {
+            (-self.credit) as u64
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +270,14 @@ mod tests {
             Control::Close {
                 conn_id: 7,
                 reason: "client_gone".into(),
+            },
+            Control::Window {
+                conn_id: 7,
+                credit: INITIAL_WINDOW,
+            },
+            Control::DataAck {
+                conn_id: 7,
+                consumed: 4096,
             },
             Control::error("forbidden", "registration denied"),
         ];
@@ -241,5 +344,63 @@ mod tests {
         assert!(Control::from_json("not json").is_err());
         // Known tag but missing required field is a parse error, not a panic.
         assert!(Control::from_json("{\"t\":\"open\"}").is_err());
+    }
+
+    #[test]
+    fn chunk_payload_splits_at_max() {
+        let big = vec![0u8; MAX_DATA_PAYLOAD * 2 + 7];
+        let chunks: Vec<&[u8]> = chunk_payload(&big).collect();
+        assert_eq!(chunks.len(), 3, "two full chunks + remainder");
+        assert_eq!(chunks[0].len(), MAX_DATA_PAYLOAD);
+        assert_eq!(chunks[1].len(), MAX_DATA_PAYLOAD);
+        assert_eq!(chunks[2].len(), 7);
+        assert!(chunks.iter().all(|c| c.len() <= MAX_DATA_PAYLOAD));
+    }
+
+    #[test]
+    fn chunk_payload_small_and_empty() {
+        // A payload that already fits yields exactly one slice.
+        assert_eq!(chunk_payload(b"hi").count(), 1);
+        // An empty payload still yields one (zero-length) slice, preserving an
+        // explicit zero-length DATA frame as a flush/half-close signal.
+        let empty: Vec<&[u8]> = chunk_payload(&[]).collect();
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].is_empty());
+    }
+
+    #[test]
+    fn conn_window_blocks_at_zero_and_replenishes() {
+        let mut w = ConnWindow::new(MAX_DATA_PAYLOAD as u32);
+        assert!(!w.is_blocked());
+        assert_eq!(w.available(), MAX_DATA_PAYLOAD as u32);
+
+        w.debit(MAX_DATA_PAYLOAD); // exactly empties the window
+        assert!(w.is_blocked());
+        assert_eq!(w.available(), 0);
+        assert_eq!(w.overrun(), 0, "an exact debit is not an overrun");
+
+        w.ack(1024); // receiver drained some bytes
+        assert!(!w.is_blocked());
+        assert_eq!(w.available(), 1024);
+    }
+
+    #[test]
+    fn conn_window_tracks_overrun_for_relay_guard() {
+        // A sender that ignores flow control drives the window negative; the relay
+        // reads `overrun()` to decide a conn is abusive and tear it down (A6).
+        let mut w = ConnWindow::new(0);
+        w.debit(MAX_DATA_PAYLOAD);
+        assert!(w.is_blocked());
+        assert_eq!(w.overrun(), MAX_DATA_PAYLOAD as u64);
+    }
+
+    #[test]
+    fn conn_window_set_reestablishes_absolute() {
+        let mut w = ConnWindow::new(10);
+        w.debit(10);
+        assert!(w.is_blocked());
+        w.set(INITIAL_WINDOW);
+        assert!(!w.is_blocked());
+        assert_eq!(w.available(), INITIAL_WINDOW);
     }
 }

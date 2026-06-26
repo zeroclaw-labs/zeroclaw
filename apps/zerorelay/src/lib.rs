@@ -38,7 +38,14 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use zeroclaw_relay_proto::{Control, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data};
+use zeroclaw_relay_proto::{
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data,
+};
+
+/// How far a client may drive its send window negative before the relay treats it
+/// as ignoring flow control and tears the conn down. One full window of slack
+/// absorbs acks still in flight; beyond that the client is flooding (A6).
+const RELAY_OVERRUN_TOLERANCE: u64 = INITIAL_WINDOW as u64;
 
 /// How long a freshly connected client waits to be paired with the daemon before
 /// the relay gives up and drops it.
@@ -95,6 +102,11 @@ enum ConnEvent {
     Data(Vec<u8>),
     /// Daemon (or relay) is closing this connection.
     Close(String),
+    /// Daemon -> client `Window { credit }`: (re)establish the client's send
+    /// window for this conn (forwarded to the client; also seeds the relay guard).
+    Window(u32),
+    /// Daemon -> client `DataAck { consumed }`: replenish the client's send window.
+    Ack(u32),
 }
 
 /// A registered daemon's routing handle.
@@ -366,6 +378,18 @@ where
                         let _ = tx.send(ConnEvent::Close(reason)).await;
                     }
                 }
+                // Daemon -> client credit-window frames: route to the conn so the
+                // client task forwards them on (and the relay guard tracks them).
+                Ok(Control::Window { conn_id, credit }) => {
+                    if let Some(tx) = conns.lock().await.get(&conn_id) {
+                        let _ = tx.send(ConnEvent::Window(credit)).await;
+                    }
+                }
+                Ok(Control::DataAck { conn_id, consumed }) => {
+                    if let Some(tx) = conns.lock().await.get(&conn_id) {
+                        let _ = tx.send(ConnEvent::Ack(consumed)).await;
+                    }
+                }
                 _ => {}
             },
             Ok(Message::Binary(b)) => {
@@ -455,7 +479,8 @@ where
             match ev {
                 ConnEvent::Opened => return true,
                 ConnEvent::Close(_) => return false,
-                ConnEvent::Data(_) => {} // shouldn't precede Opened; ignore
+                // None of these should precede Opened; ignore until paired.
+                ConnEvent::Data(_) | ConnEvent::Window(_) | ConnEvent::Ack(_) => {}
             }
         }
         false
@@ -484,8 +509,18 @@ where
     sink.send(Message::text(Control::Opened { conn_id }.to_json()))
         .await?;
 
-    // Pump bytes both ways until either side closes or the conn goes idle.
+    // Pump bytes both ways until either side closes or the conn goes idle. The
+    // idle deadline is reset at the top of every iteration, so ANY frame -
+    // including a credit-window grant/ack while a conn is flow-control-paused -
+    // keeps the conn alive (idle is decoupled from window-block).
+    //
+    // `c2d_window` is a blind guard on the client->daemon direction: the daemon
+    // grants/replenishes it (forwarded ConnEvent::Window/Ack) and each client
+    // DATA frame debits it. A client that drives it far past zero is ignoring
+    // flow control and flooding the shared link, so the relay tears the conn
+    // down (A6). The relay never originates credit; it only forwards + watches.
     let idle = inner.cfg.idle_timeout;
+    let mut c2d_window = ConnWindow::new(INITIAL_WINDOW);
     loop {
         let deadline = tokio::time::Instant::now() + idle;
         tokio::select! {
@@ -493,6 +528,26 @@ where
             ev = conn_rx.recv() => match ev {
                 Some(ConnEvent::Data(payload)) => {
                     if sink.send(Message::binary(encode_data(conn_id, &payload))).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ConnEvent::Window(credit)) => {
+                    c2d_window.set(credit);
+                    if sink
+                        .send(Message::text(Control::Window { conn_id, credit }.to_json()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some(ConnEvent::Ack(consumed)) => {
+                    c2d_window.ack(consumed);
+                    if sink
+                        .send(Message::text(Control::DataAck { conn_id, consumed }.to_json()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -513,6 +568,16 @@ where
                     if payload.len() > MAX_DATA_PAYLOAD {
                         break;
                     }
+                    c2d_window.debit(payload.len());
+                    if c2d_window.overrun() > RELAY_OVERRUN_TOLERANCE {
+                        let _ = sink
+                            .send(Message::text(
+                                Control::error("rate_limited", "flow-control window exceeded")
+                                    .to_json(),
+                            ))
+                            .await;
+                        break;
+                    }
                     if to_daemon
                         .send(Message::binary(encode_data(conn_id, payload)))
                         .await
@@ -521,11 +586,32 @@ where
                         break;
                     }
                 }
-                Some(Ok(Message::Text(t))) => {
-                    if let Ok(Control::Close { .. }) = Control::from_json(&t) {
-                        break;
+                Some(Ok(Message::Text(t))) => match Control::from_json(&t) {
+                    Ok(Control::Close { .. }) => break,
+                    // Client -> daemon credit-window frames: re-stamp the conn_id
+                    // and forward so the daemon's send window stays in sync.
+                    Ok(Control::Window { credit, .. }) => {
+                        if to_daemon
+                            .send(Message::text(Control::Window { conn_id, credit }.to_json()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
+                    Ok(Control::DataAck { consumed, .. }) => {
+                        if to_daemon
+                            .send(Message::text(
+                                Control::DataAck { conn_id, consumed }.to_json(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    _ => {}
+                },
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sink.send(Message::Pong(p)).await;
                 }
