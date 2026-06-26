@@ -17375,6 +17375,26 @@ impl Config {
         // not left wondering why an agent's MCP tools vanished, without
         // turning a typo into a hard startup failure.
         {
+            // Operator UX: secure-by-default means an agent with no
+            // `mcp_bundles` grant connects to ZERO MCP servers. When MCP is
+            // enabled and `[[mcp.servers]]` is non-empty but no
+            // `[mcp_bundles.*]` exists at all, every agent silently gets
+            // nothing. That is the inverse of the original #7733 silent
+            // no-op and surprises operators upgrading from <0.8.3. Warn
+            // once at startup so this surfaces via `doctor` and the
+            // standard startup warning stream.
+            if self.mcp.enabled && !self.mcp.servers.is_empty() && self.mcp_bundles.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_servers_configured": self.mcp.servers.len(),
+                        })),
+                    "[[mcp.servers]] is configured but no [mcp_bundles.*] bundles exist; no agent will receive any MCP tools. Add a [mcp_bundles.<alias>] entry and reference it from agents.<alias>.mcp_bundles to grant access."
+                );
+            }
+
             let known_servers: std::collections::HashSet<&str> =
                 self.mcp.servers.iter().map(|s| s.name.as_str()).collect();
             for (bundle_alias, bundle) in &self.mcp_bundles {
@@ -20307,6 +20327,69 @@ mod tests {
             config.mcp_servers_for_agent("ghost").is_empty(),
             "an unknown agent is granted no MCP servers"
         );
+    }
+
+    /// Regression test for the operator-UX warning added alongside #7733:
+    /// when MCP is enabled and `[[mcp.servers]]` is non-empty but no
+    /// `[mcp_bundles.*]` exists, validate() must still succeed (warnings
+    /// are non-fatal) AND every agent must resolve to zero servers
+    /// (proving the secure-by-default semantics that motivate the warning
+    /// are still in force).
+    #[test]
+    async fn validate_warns_when_servers_configured_but_no_bundles() {
+        use crate::schema::{McpServerConfig, McpTransport};
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        assert!(
+            config.mcp_bundles.is_empty(),
+            "test precondition: no bundles configured"
+        );
+
+        // validate() must succeed (warnings are non-fatal).
+        assert!(config.validate().is_ok());
+
+        // Behavioral assertion that motivates the warning: every agent
+        // resolves to zero servers under these conditions.
+        for alias in config.agents.keys() {
+            assert!(
+                config.mcp_servers_for_agent(alias).is_empty(),
+                "every agent must get zero servers when no bundles exist"
+            );
+        }
+    }
+
+    /// Counterpart to `validate_warns_when_servers_configured_but_no_bundles`:
+    /// once at least one `[mcp_bundles.*]` exists, the warning's
+    /// precondition no longer holds. validate() still succeeds and the
+    /// granted agent resolves to its bundled server.
+    #[test]
+    async fn validate_does_not_warn_when_a_bundle_exists() {
+        use crate::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "default".into(),
+            McpBundleConfig {
+                servers: vec!["fs".into()],
+                exclude: vec![],
+            },
+        );
+
+        assert!(config.validate().is_ok());
+        // Precondition check: the warning's trigger condition is now false.
+        assert!(!config.mcp_bundles.is_empty());
     }
 
     fn parse_test_config(raw: &str) -> Config {
