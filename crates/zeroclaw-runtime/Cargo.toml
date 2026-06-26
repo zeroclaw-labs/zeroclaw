@@ -76,7 +76,7 @@ zeroclaw-macros.workspace = true
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 # Optional deps for specific features
 pdf-extract = { version = "0.10", optional = true }
