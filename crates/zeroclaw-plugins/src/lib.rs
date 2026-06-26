@@ -1,13 +1,15 @@
 //! WASM plugin system for ZeroClaw.
 //!
-//! Plugins are WebAssembly modules loaded via Extism that can extend
-//! ZeroClaw with custom tools and channels. Enable with `--features plugins-wasm`.
+//! Plugins are WebAssembly components loaded via wasmtime that can extend
+//! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
 pub mod error;
 pub mod host;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
 pub mod signature;
 pub mod wasm_channel;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_tool;
 
 use serde::{Deserialize, Serialize};
