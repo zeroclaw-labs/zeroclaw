@@ -352,6 +352,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = Vous n'êtes pas autorisé à utiliser cette commande ici.
 channel-discord-interaction-malformed = Commande inconnue ou mal formée.
 channel-discord-interaction-unavailable = Cette commande n'est plus disponible ou son entrée était vide.
+channel-discord-component-expired = Ce bouton ou ce menu a expiré ou a déjà été utilisé.
+channel-discord-approval-recorded = Votre décision a été enregistrée.
 channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
 channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
 channel-whatsapp-web-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} pièce jointe multimédia WhatsApp.)
@@ -624,7 +626,6 @@ cli-status-otp = {"  "}OTP activé :       {$v}
 cli-status-estop = {"  "}Arrêt d'urgence activé :    {$v}
 cli-status-peripherals-enabled = {"  "}Activé :   {$v}
 cli-status-boards = {"  "}Cartes :    {$v}
-cli-status-channel-not-compiled = 🚫 configuré, non compilé
 cli-status-word-enabled = activé
 cli-status-word-disabled = désactivé
 cli-status-word-yes = oui
@@ -634,6 +635,7 @@ cli-status-word-off = désactivé
 cli-status-word-none = (aucun)
 cli-status-word-configured = configuré
 cli-status-word-not-configured = non configuré
+cli-status-channel-not-compiled = 🚫 configuré, non compilé
 cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
 cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
 cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
@@ -718,11 +720,15 @@ cli-channels-build-hint = {"  "}Compilez depuis les sources avec `./install.sh -
 cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
 cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
 cli-channels-configure-hint = Pour configurer :      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = Modèle par défaut défini sur « { $model } » sur { $provider }.
+cli-models-status-current = Modèle par défaut : { $model } (fournisseur : { $provider })
+cli-models-status-none = Aucun modèle par défaut configuré.
 turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
 cli-alias-list-empty = (aucune entrée sous {$section})
@@ -779,23 +785,3 @@ cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config
 cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
 cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}
-cli-onboard-about = Initialiser votre espace de travail et votre configuration
-cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
-cli-memory-remove-about = Supprimer une entrée de mémoire par clé
-cli-note-show-about = Afficher un contenu de note par nom
-cli-note-update-about = Remplacer le contenu d'une note par son nom
-cli-prompt-list-about = Lister les invites disponibles
-cli-prompt-show-about = Montrer le contenu d'une invite par son nom
-cli-secret-get-about = Voir un secret
-cli-secret-list-about = Lister les secrets
-cli-secret-long-about =
-    Gérer les secrets chiffrés avec AES-256.
-
-    Lister, ajouter, mettre à jour, effacer et chiffrer les secrets stockés de manière sécurisée pour l'authentification et la configuration.
-
-    Exemples :
-    zeroclaw secret list
-    zeroclaw secret add OPENAI_API_KEY
-    zeroclaw secret update OPENAI_API_KEY
-    zeroclaw secret delete OPENAI_API_KEY
-    zeroclaw secret encrypt "chiffrer ce message"
