@@ -56,7 +56,9 @@ By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].sh
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. Defaults to `"sh"` when unset. Only applies to the native runtime kind; Docker and Windows runtimes are unaffected.
+The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. The value must be either a bare command name found on `PATH` (e.g. `"bash"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+
+Only applies to the native runtime kind. Docker uses its container's shell, and Windows (always `cmd.exe`) and Android (always `/system/bin/sh`) ignore the setting and do not validate it.
 
 ## Per-backend notes
 

@@ -10754,21 +10754,27 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
-    /// Shell binary to use for command execution on the native runtime.
+    /// Shell binary the native runtime uses for command execution.
     ///
-    /// When unset or `null`, the system default `sh` is used.
-    /// Set to `"bash"`, `"/bin/bash"`, `"/usr/bin/zsh"`, etc. to use a
-    /// different shell. The shell is invoked as `<shell> -c "<command>"`,
-    /// so the value must be a path to a POSIX-compatible shell binary.
+    /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
+    /// When unset or `null`, the system default `sh` is used. The shell is
+    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
+    /// shell binary.
     ///
-    /// On Unix the value is validated when the runtime is constructed: an
-    /// empty/whitespace value, a bare name not found on `PATH`, or a path
-    /// that does not exist or is not executable is rejected with an error
-    /// rather than failing later on the first shell command.
+    /// Accepted forms (Unix):
+    /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
+    /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
     ///
-    /// **Note:** Android always uses `/system/bin/sh` regardless of this
-    /// setting, because the Android shell path is not on `PATH` by default
-    /// for spawned processes.
+    /// The value is validated when the native runtime is constructed, so a bad
+    /// value is reported up front rather than failing on the first shell
+    /// command. Rejected: empty/whitespace; a relative path with separators
+    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
+    /// instead); a bare name not found on `PATH`; and a path that does not
+    /// exist or is not executable.
+    ///
+    /// **Ignored on Windows and Android** (and not validated there): Windows
+    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
+    /// (its shell is not on `PATH` for spawned processes).
     ///
     /// **Examples:**
     /// ```toml

@@ -26,9 +26,16 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 /// shell, so a bad value fails fast at startup with an actionable message
 /// instead of breaking every `tool:shell` invocation later.
 ///
-/// Bare names (e.g. `"sh"`, `"bash"`) are resolved against `PATH`; values that
-/// contain a path separator (e.g. `"/bin/zsh"`, `"./myshell"`) are checked
-/// directly. The resolved binary must exist and be executable.
+/// Bare names (e.g. `"sh"`, `"bash"`) are resolved against `PATH`; absolute
+/// paths (e.g. `"/bin/zsh"`) are checked directly. The resolved binary must
+/// exist and be executable.
+///
+/// Relative paths with separators (e.g. `"./myshell"`, `"bin/sh"`) are
+/// rejected: validation runs from the process working directory, but the
+/// runtime executes commands with `current_dir` set to the workspace, so a
+/// relative value could validate against one directory and execute against
+/// another (or resolve to a different workspace-local binary). Requiring a
+/// bare PATH name or an absolute path keeps selection workspace-independent.
 ///
 /// Unix-only: Windows ignores `runtime.shell` (always `cmd.exe`), so the call
 /// is `#[cfg(unix)]`-gated; Android (always `/system/bin/sh`) is skipped below.
@@ -47,8 +54,12 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
     }
 
     let path = std::path::Path::new(shell);
-    let resolved = if path.is_absolute() || path.components().count() > 1 {
+    let resolved = if path.is_absolute() {
         path.to_path_buf()
+    } else if path.components().count() > 1 {
+        anyhow::bail!(
+            "runtime.shell {shell:?} is a relative path; use a bare name resolved on PATH (e.g. \"bash\") or an absolute path (e.g. \"/bin/bash\")"
+        );
     } else {
         match std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|dir| dir.join(shell))
@@ -193,6 +204,22 @@ mod tests {
             err.to_string().contains("does not exist"),
             "error should name the missing path, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_shell_rejects_relative_path() {
+        // Relative path-style values are rejected purely by shape (before any
+        // filesystem access): they would validate from the process cwd but
+        // execute from the workspace dir, so the validated and executed
+        // binaries could differ. Bare names and absolute paths are unaffected.
+        for rel in ["./sh", "bin/sh", "../sh", "tools/bin/sh"] {
+            let err = validate_shell(rel).unwrap_err();
+            assert!(
+                err.to_string().contains("relative path"),
+                "relative shell {rel:?} should be rejected, got: {err}"
+            );
+        }
     }
 
     #[cfg(unix)]
