@@ -120,8 +120,8 @@ cli-cron-update-about = Update one or more fields of an existing scheduled task
 cli-cron-pause-about = Pause a scheduled task
 cli-cron-resume-about = Resume a paused task
 
-cli-auth-login-about = Login with OAuth (OpenAI Codex or Gemini)
-cli-auth-refresh-about = Refresh OpenAI Codex access token using refresh token
+cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
 cli-auth-list-about = List auth profiles
@@ -704,7 +704,13 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -744,6 +750,16 @@ cli-auth-active-for = Active profile for {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
+cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-xai-device-code-started = xAI device-code login started.
+cli-auth-oauth-visit = Visit: {$uri}
+cli-auth-oauth-code = Code:  {$code}
+cli-auth-oauth-fast-link = Fast link: {$uri}
+cli-auth-xai-open-oauth-url = Open this xAI OAuth URL in your browser and authorize access:
+cli-auth-callback-capture-failed = Callback capture failed: {$error}
+cli-auth-run-paste-redirect = Run `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.
+cli-auth-paste-redirect-requires-input = paste-redirect requires the redirect URL or OAuth code
 
 # ── locales fetch ──
 cli-locales-fetched = {"  "}fetched {$name} -> {$path}
@@ -784,6 +800,10 @@ cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
 
 # ── Agent turn-engine user-visible markers (#7415) ────────────────────
 # Appended to (or persisted as) assistant output when a turn is cut short;

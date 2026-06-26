@@ -1024,6 +1024,15 @@ impl Channel for LineChannel {
             .await;
         matches!(resp, Ok(r) if r.status().is_success())
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the LINE Messaging API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

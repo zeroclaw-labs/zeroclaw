@@ -130,9 +130,9 @@ pub(crate) async fn interpret_chat_response(
         error_message: None,
         input_tokens: resp_input_tokens,
         output_tokens: resp_output_tokens,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
     });
 
     // Record cost via the task-local tracker (no-op when not scoped) and keep
@@ -407,6 +407,7 @@ mod cost_usd_regression_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            agent_alias: None,
             turn_id: "turn-cost-regression",
         };
 
