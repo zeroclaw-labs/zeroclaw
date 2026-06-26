@@ -261,6 +261,28 @@ pub(crate) fn selected_inactive_style() -> Style {
     Style::default().fg(t.dim).bg(t.selection_bg)
 }
 
+/// Inactive ("you are here") selection without a foreground override: the
+/// selection background only, for rows whose spans carry their own meaningful
+/// colours (theme swatches) that a dim fg would flatten.
+pub(crate) fn selected_inactive_bg_style() -> Style {
+    Style::default().bg(active().selection_bg)
+}
+
+/// Canonical selection highlight resolver for every split-pane detail list.
+///
+/// `focused` is true when the cursor lives in the pane being drawn (active
+/// selection); false renders the dim "you are here" marker for the pane that
+/// has stepped back. `preserve_fg` is true for rows whose own span colours must
+/// survive (theme swatches), suppressing the foreground override.
+pub(crate) fn selection_highlight(focused: bool, preserve_fg: bool) -> Style {
+    match (focused, preserve_fg) {
+        (true, false) => selected_style(),
+        (true, true) => selected_bg_style(),
+        (false, false) => selected_inactive_style(),
+        (false, true) => selected_inactive_bg_style(),
+    }
+}
+
 pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }
@@ -299,6 +321,89 @@ pub(crate) fn code_inline_style() -> Style {
 /// Code block body lines.
 pub(crate) fn code_block_style() -> Style {
     Style::default().fg(active().body)
+}
+
+/// A syntax-highlight token category. Tree-sitter emits dotted scope strings
+/// (`keyword.function`, `string.special`, …); [`SyntaxScope::classify`] folds
+/// those into this fixed set so every colour decision keys off a typed variant,
+/// and the colours themselves come from the active [`Theme`] rather than a
+/// hardcoded palette — so highlighting tracks the theme (and per-agent
+/// overrides) live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyntaxScope {
+    Keyword,
+    StorageType,
+    StringLit,
+    Constant,
+    Type,
+    Function,
+    Variable,
+    Comment,
+    Operator,
+    Punctuation,
+    Attribute,
+    DiffPlus,
+    DiffMinus,
+    Plain,
+}
+
+impl SyntaxScope {
+    /// Fold a tree-sitter highlight name into a [`SyntaxScope`]. This is the
+    /// single place inkjet's string scopes cross into the typed world; every
+    /// downstream colour choice matches on the enum, never the raw string.
+    pub(crate) fn classify(name: &str) -> Self {
+        let head = name.split('.').next().unwrap_or(name);
+        let storage = name.starts_with("keyword.storage");
+        match head {
+            "keyword" if storage => Self::StorageType,
+            "keyword" => Self::Keyword,
+            "string" | "escape" => Self::StringLit,
+            "constant" => Self::Constant,
+            "type" | "constructor" => Self::Type,
+            "function" => Self::Function,
+            "variable" => Self::Variable,
+            "comment" => Self::Comment,
+            "operator" => Self::Operator,
+            "punctuation" => Self::Punctuation,
+            "attribute" | "tag" | "label" | "namespace" | "special" | "markup" => Self::Attribute,
+            "diff" if name.starts_with("diff.plus") => Self::DiffPlus,
+            "diff" if name.starts_with("diff.minus") => Self::DiffMinus,
+            _ => Self::Plain,
+        }
+    }
+
+    /// The active-theme foreground colour for this scope. Maps each token
+    /// category onto one of the nine theme roles so the palette follows the
+    /// theme registry instead of a second hardcoded colour set.
+    pub(crate) fn color(self) -> Color {
+        let t = active();
+        match self {
+            Self::Keyword => t.tool,
+            Self::StorageType => t.warn,
+            Self::StringLit => t.heading,
+            Self::Constant => t.accent,
+            Self::Type => t.title,
+            Self::Function => t.title,
+            Self::Variable => t.body,
+            Self::Comment => t.dim,
+            Self::Operator => t.body,
+            Self::Punctuation => t.dim,
+            Self::Attribute => t.warn,
+            Self::DiffPlus => t.heading,
+            Self::DiffMinus => t.accent,
+            Self::Plain => t.body,
+        }
+    }
+}
+
+/// Build the highlight-colour table indexed by inkjet's `Highlight.0`, mapping
+/// each `HIGHLIGHT_NAMES` scope through [`SyntaxScope`] onto a themed colour.
+/// Rebuilt per call so a live theme swap is reflected on the next render.
+pub(crate) fn syntax_colors(names: &[&str]) -> Vec<Color> {
+    names
+        .iter()
+        .map(|n| SyntaxScope::classify(n).color())
+        .collect()
 }
 
 /// Thought / thinking output.
