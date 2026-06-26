@@ -20,6 +20,7 @@ fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroc
         log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+        log_llm_request_payload: config.log_llm_request_payload.as_wire().to_string(),
     }
 }
 

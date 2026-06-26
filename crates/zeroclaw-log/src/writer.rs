@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::broadcast::current_broadcast_hook;
-use crate::config::{LogConfig, ResolvedPolicy, StoragePolicy};
+use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StoragePolicy};
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
@@ -63,6 +63,19 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
 /// `/api/logs` endpoint to know which file to stream.
 pub fn runtime_trace_path() -> Option<PathBuf> {
     current_state().map(|s| s.policy.path.clone())
+}
+
+/// Resolved LLM-request-payload capture policy + the truncate cap, for the
+/// turn engine's `announce_llm_request`. `None` when no writer is installed
+/// (the policy defaults to `off`, so callers treat "no writer" as "off").
+#[must_use]
+pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> {
+    current_state().map(|s| {
+        (
+            s.policy.llm_request_payload,
+            s.policy.tool_io_truncate_bytes,
+        )
+    })
 }
 
 /// Emit one event. Always fans out to the broadcast hook + tracing event.
