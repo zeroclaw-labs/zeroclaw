@@ -27,7 +27,7 @@ infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 nanohtml2text = "0.2"
 parking_lot = "0.12"
-pdf-extract = { version = "0.10", optional = true }
+pdf-extract = { version = "0.12", optional = true }
 probe-rs = { version = "0.31", optional = true }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
