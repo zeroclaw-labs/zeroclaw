@@ -9,7 +9,7 @@ pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
-pub use engine::SopEngine;
+pub use engine::{MaintenanceSummary, SopEngine};
 pub use metrics::SopMetricsCollector;
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,

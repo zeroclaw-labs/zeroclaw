@@ -3940,6 +3940,14 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // EPIC A1: drive the periodic SOP maintenance tick (approval
+                // timeouts, claim reaping, retention pruning). Spawned before the
+                // engine is moved into the registry; runs for the daemon's life.
+                let _sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
@@ -4670,6 +4678,11 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None)
                 };
+                // EPIC A1: SOP maintenance tick (same as the full daemon path).
+                let _sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
                 Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
@@ -7147,6 +7160,55 @@ fn gate_security_posture(
         }
     });
     Ok(Some(handle))
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1): on each interval it fires
+/// fail-closed approval timeouts, reaps expired concurrency-claim leases, and
+/// prunes terminal runs past the retention policy. Returns `None` (no task) when
+/// the tick is disabled (`interval_secs == 0`) or no SOP engine is configured.
+/// The task runs for the life of the daemon process, mirroring the daemon's other
+/// background tickers. The tick itself self-approves nothing - timeout handling
+/// follows `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let summary = match engine.lock() {
+                Ok(mut e) => e.run_maintenance_tick(),
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "SOP maintenance tick: engine lock poisoned; skipping this pass"
+                    );
+                    continue;
+                }
+            };
+            if !summary.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": summary.timed_out,
+                            "reaped_claims": summary.reaped_claims,
+                            "pruned_runs": summary.pruned_runs,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
 }
 
 #[cfg(feature = "gateway")]
