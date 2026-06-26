@@ -2442,7 +2442,7 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
 
     let plugins_dir = config.plugins.resolved_plugins_dir();
 
-    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
