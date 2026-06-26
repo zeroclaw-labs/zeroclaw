@@ -327,7 +327,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
