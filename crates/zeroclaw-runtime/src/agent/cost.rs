@@ -38,6 +38,23 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     pricing
 }
 
+pub fn tool_loop_cost_tracking_context_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> Option<ToolLoopCostTrackingContext> {
+    CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
+}
+
+pub fn tool_loop_cost_tracking_context_from_tracker(
+    config: &Config,
+    agent_alias: &str,
+    tracker: Arc<CostTracker>,
+) -> ToolLoopCostTrackingContext {
+    ToolLoopCostTrackingContext::new(tracker, Arc::new(build_model_provider_pricing(config)))
+        .with_agent_alias(agent_alias)
+}
+
 pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
@@ -315,7 +332,7 @@ pub fn record_tool_loop_cost_usage(
         && let Err(error) =
             tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
     {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
@@ -350,6 +367,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(
                     ::serde_json::json!({"model_provider": model_provider, "model": model})
@@ -364,9 +382,11 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
     } else {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"model_provider": model_provider, "model": model})
-            ),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(
+                    ::serde_json::json!({"model_provider": model_provider, "model": model})
+                ),
             "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
         );
     }

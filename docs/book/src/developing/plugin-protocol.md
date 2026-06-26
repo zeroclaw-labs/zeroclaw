@@ -1,8 +1,9 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-04-19
+last-reviewed: 2026-06-21
 relates-to:
+  - FND-001
   - ADR-003
   - crates/zeroclaw-plugins
 ---
@@ -11,6 +12,14 @@ relates-to:
 
 This document defines the protocol between ZeroClaw's plugin host and WASM
 plugin modules.
+
+## Implementation status
+
+The current runtime bridge is transitional. `crates/zeroclaw-plugins` still supports the Extism-era string/JSON tool protocol documented below so existing prototype plugins can keep running while the WIT host lands.
+
+The accepted target architecture is the next contract: #6943 and FND-001 move ZeroClaw plugins to WIT-defined WASI components, compiled for `wasm32-wasip2` and hosted through direct `wasmtime`. The WIT interfaces live under `wit/v0/`; see `wit/VERSIONING.md` for the current compatibility rules.
+
+Treat new plugin-host design work as WIT / `wasm32-wasip2` work. Additions to the Extism-specific protocol should be limited to compatibility fixes needed during the migration.
 
 ## Plugin structure
 
@@ -24,6 +33,77 @@ my-plugin/
 
 Plugins are discovered from `~/.zeroclaw/plugins/` (configurable via
 `plugins.plugins_dir` in config).
+
+## Registry search and install
+
+The local plugin install path remains the source of truth for installed
+plugins. A registry is only a JSON index used at command time to discover and
+download a plugin archive:
+
+```bash
+zeroclaw plugin search calendar
+zeroclaw plugin install team-calendar
+zeroclaw plugin install team-calendar@0.2.0
+zeroclaw plugin search calendar --registry https://example.invalid/registry.json
+zeroclaw plugin install team-calendar --registry https://example.invalid/registry.json
+```
+
+`zeroclaw plugin search` fetches registry metadata and matches the query against
+plugin names and descriptions. It does not install, enable, or execute plugin
+code.
+
+`zeroclaw plugin install <name>` resolves the name from the registry, downloads
+the selected zip archive, verifies the optional SHA-256 digest, safely extracts
+the archive, and then hands the extracted plugin directory to the existing
+`PluginHost::install` path. Local path installs are unchanged:
+
+When no version is pinned, ZeroClaw chooses the last matching entry in the
+registry index, so registry publishers should order repeated names
+intentionally.
+
+```bash
+zeroclaw plugin install ./my-plugin
+zeroclaw plugin install ./my-plugin/manifest.toml
+```
+
+The default registry URL is:
+
+```text
+https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json
+```
+
+For private or staged registries, use `--registry <url>` per command or set
+`ZEROCLAW_PLUGIN_REGISTRY_URL`.
+
+Registry entries use this shape:
+
+```json
+{
+  "plugins": [
+    {
+      "name": "team-calendar",
+      "version": "0.2.0",
+      "description": "Schedule meetings on a team calendar",
+      "author": "Example Team",
+      "capabilities": ["tool"],
+      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "sha256": "sha256:<hex digest of the zip>"
+    }
+  ]
+}
+```
+
+The archive must contain either a root-level `manifest.toml` or one nested
+plugin directory containing `manifest.toml`. Archives with traversal paths,
+absolute paths, Windows drive-prefixed paths, or more than one manifest are
+rejected before install. Downloads are capped while streaming, so a server
+without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
+Extraction is also capped, so a compressed archive cannot expand without bound
+in the temporary install area.
+
+Search is unauthenticated discovery. Install is the security boundary: registry
+installs use the configured plugin signature policy and trusted publisher keys,
+the same as local plugin installs through `PluginHost::install`.
 
 ### Skill-only plugin layout (markdown bundle)
 
@@ -71,13 +151,15 @@ skills and between bundles.
 | Value | Description |
 |-------|-------------|
 | `http_client` | Can make HTTP requests via `zc_http_request` |
-| `env_read` | Can read environment variables via `zc_env_read` |
+| `config_read` | Receives its own resolved per-plugin config section in the `execute` input under `__config` |
 | `file_read` | Can read files (not yet implemented) |
 | `file_write` | Can write files (not yet implemented) |
 | `memory_read` | Can read agent memory (not yet implemented) |
 | `memory_write` | Can write agent memory (not yet implemented) |
 
-## Required WASM exports
+## Current Extism bridge exports
+
+The exports below describe the current Extism bridge. WIT components use the interfaces in `wit/v0/`.
 
 ### `tool_metadata`
 
@@ -170,16 +252,29 @@ Timeout: 120 seconds.
 }
 ```
 
-### `zc_env_read`
+### Per-plugin config (`__config`)
 
-**Permission:** `env_read`
+**Permission:** `config_read`
 
-**Input:** Environment variable name (plain string, not JSON).
+A plugin does not read process environment variables. The host resolves the
+plugin's own config section from `[plugins.entries.<alias>]` and injects it into
+the `execute` input under the reserved `__config` key:
 
-**Output:** Environment variable value (plain string). Returns an error if the
-variable is not set.
+```json
+{
+  "prompt": "a sunset",
+  "__config": { "api_key": "...", "base_url": "..." }
+}
+```
 
-## Writing a plugin in Rust
+Operators set these through the schema-mirror override grammar, e.g.
+`ZEROCLAW_plugins__entries__<alias>__config__api_key=$FAL_KEY`. Values are
+secret and encrypt at rest under the adjacent `.secret_key`. A plugin only ever
+sees its own section.
+
+## Writing a plugin in Rust for the current bridge
+
+This section describes the current Extism bridge.
 
 ### Dependencies
 
@@ -194,11 +289,12 @@ use extism_pdk::*;
 #[host_fn]
 extern "ExtismHost" {
     fn zc_http_request(input: String) -> String;
-    fn zc_env_read(input: String) -> String;
 }
 ```
 
-Call them with `unsafe { zc_http_request(json_string)? }`.
+Call them with `unsafe { zc_http_request(json_string)? }`. Per-plugin config
+arrives in the `execute` input under `__config`; read it from the parsed input
+rather than through a host call.
 
 ### Implementing exports
 
@@ -234,6 +330,8 @@ pub fn execute(input: String) -> FnResult<String> {
 
 ### Building
 
+For the current Extism bridge, compile the plugin as a WASI Preview 1 module:
+
 <div class="os-tabs-src">
 
 #### sh
@@ -251,6 +349,8 @@ cargo build --target wasm32-wasip1 --release
 The output `.wasm` file is at
 `target/wasm32-wasip1/release/<crate_name>.wasm`. Copy it alongside your
 `manifest.toml`.
+
+For the accepted WIT / Component Model target, compile plugin components for `wasm32-wasip2` and use `wit/v0/` as the interface source.
 
 ### Installing
 
@@ -272,4 +372,4 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 Enable the plugin system via the `plugins` and `plugins.security` sections (gateway, zerocode, or `zeroclaw config set`): see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
 
-The `plugins-wasm` feature flag must be enabled at compile time (included in the default `ci-all` feature set).
+The `plugins-wasm` feature enables the current plugin runtime integration. The direct `wasmtime` host path uses `plugins-wasm-runtime-only`, `plugins-wasm-cranelift`, and `plugins-wasm-pulley` to choose the smallest execution strategy that matches the target platform.

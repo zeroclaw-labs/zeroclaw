@@ -14,6 +14,7 @@ import type {
   SessionMessagesResponse,
   TuiEntry,
 } from "../types/api";
+import type { components } from "./api-generated";
 import { clearToken, getToken, setToken } from "./auth";
 import { apiOrigin, basePath } from "./basePath";
 
@@ -49,6 +50,17 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/**
+ * Stable config-API error codes, sourced from the generated OpenAPI schema
+ * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
+ * a backend rename or a typo fails `tsc` here instead of silently regressing
+ * the behaviour that depends on the code.
+ */
+export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export const ConfigApiCodes = {
+  configChangedExternally: "config_changed_externally",
+} as const satisfies Record<string, ConfigApiCode>;
 
 // A response reduced to the plain data the downstream logic needs, so it can be
 // shared between coalesced callers (a Response body can only be read once).
@@ -495,10 +507,22 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
-export async function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
+export async function patchConfig(
+  ops: PatchOp[],
+  opts?: {
+    /** Send `X-ZeroClaw-Override-Drift: true` so the server overwrites the
+     *  on-disk file even when it has drifted from in-memory state on a patched
+     *  path (otherwise that returns 409 `config_changed_externally`). Use only
+     *  after the operator has chosen to overwrite a known drift. */
+    overrideDrift?: boolean;
+  },
+): Promise<PatchResponse> {
   const result = await apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
+    ...(opts?.overrideDrift
+      ? { headers: { "X-ZeroClaw-Override-Drift": "true" } }
+      : {}),
   });
   // Config structure changed: notify listeners (e.g. the ⌘K search index)
   // so they can invalidate caches. Decoupled via a browser event to avoid a
@@ -1238,6 +1262,11 @@ export interface SectionInfo {
     | "typed_family_map"
     | "backend_picker"
     | null;
+  /** Backend-owned cost-rate category for this section, emitted from
+   *  `cost_category_for_provider_section`. One of `models` / `tts` /
+   *  `transcription` for rate-bearing provider sections, or `""` otherwise.
+   *  Drives the Costs tab without a frontend section-key table. */
+  cost_category: string;
 }
 
 export interface SectionsResponse {
@@ -1946,8 +1975,18 @@ export interface LogEvent {
 
 export interface LogsResponse {
   events: LogEvent[];
-  /** `[timestamp, id]` to feed back as `until_ts` + `until_id` for older. */
+  /** Legacy cursor: `[timestamp, id]` to feed back as `until_ts` +
+   *  `until_id` for older. Tie-breaks same-timestamp events by
+   *  lexicographic id, which can drop earlier-written events when id
+   *  order diverges from file insertion order. Prefer
+   *  [`Self::next_cursor_line_offset`] when available — it is
+   *  independent of id ordering. */
   next_cursor: [string, string] | null;
+  /** Byte offset past the OLDEST event on the current page. Pass back
+   *  as [`LogsQueryParams::until_line_offset`] on the next request to
+   *  walk older pages deterministically regardless of id ordering.
+   *  `null` when the page is empty. */
+  next_cursor_line_offset: number | null;
   at_end: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
@@ -1962,6 +2001,11 @@ export interface LogsQueryParams {
   since_ts?: string;
   until_ts?: string;
   until_id?: string;
+  /** Byte offset cap passed back from the previous page's
+   *  `next_cursor_line_offset`. When set, the reader stops scanning at
+   *  this offset so the follow-up page only sees lines strictly older
+   *  than the previous one. Independent of id ordering. */
+  until_line_offset?: number;
   action?: string;
   category?: string;
   outcome?: string;

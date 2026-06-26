@@ -69,8 +69,9 @@ pub enum PluginPermission {
     FileRead,
     /// Can write to the filesystem (within sandbox)
     FileWrite,
-    /// Can access environment variables
-    EnvRead,
+    /// Can read its own resolved per-plugin config section
+    #[serde(alias = "env_read")]
+    ConfigRead,
     /// Can read agent memory
     MemoryRead,
     /// Can write agent memory
