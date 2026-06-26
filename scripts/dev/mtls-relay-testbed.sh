@@ -60,6 +60,7 @@ RELAY_PORT="${ZC_RELAY_PORT:-8459}"
 NODE_ID="${ZC_NODE_ID:-testbed-daemon}"
 PROFILE="${ZC_PROFILE:-release}"
 RELAY_TOKEN="testbed-token"
+RELAY_TLS_DIR="$TB/relay-tls"   # where the relay self-provisions its CA + cert
 
 case "$PROFILE" in
   release) BIN_DIR="$REPO_ROOT/target/release"; CARGO_PROFILE_FLAG="--release" ;;
@@ -120,15 +121,15 @@ port = $WSS_PORT
 
 # Outbound bridge to the nominated relay so a client can reach this daemon by
 # node-id without a direct route. Inert unless [wss] is also enabled. The relay
-# hop is wrapped in OUTER TLS; relay_insecure skips verifying the relay's own
-# self-signed cert (dev testbed only - the inner mTLS is still fully verified).
+# hop is wrapped in OUTER TLS; the daemon verifies the relay against the CA the
+# relay self-provisioned (relay_ca_path) - no insecure skip, no openssl.
 [relay]
 enabled = true
 url = "127.0.0.1:$RELAY_PORT"
 node_id = "$NODE_ID"
 token = "$RELAY_TOKEN"
 relay_host = "127.0.0.1"
-relay_insecure = true
+relay_ca_path = "$RELAY_TLS_DIR/ca.crt"
 TOML
 ok "wrote $TB/config.toml (wss :$WSS_PORT, relay :$RELAY_PORT, node '$NODE_ID')"
 
@@ -140,21 +141,13 @@ CLIENT_CONFIG_DIR="$TB/client"
 CLIENT_DIR="$CLIENT_CONFIG_DIR/tls"
 CLIENT_CRT="$CLIENT_DIR/client.crt"
 CLIENT_KEY="$CLIENT_DIR/client.key"
-RELAY_CRT="$TB/relay.crt"
-RELAY_KEY="$TB/relay.key"
 
-# --- 3. start the relay (open admission, with its own outer TLS cert) ---------
-say "generating the relay's outer TLS certificate (self-signed, SAN 127.0.0.1)"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -keyout "$RELAY_KEY" -out "$RELAY_CRT" -days 7 \
-  -subj "/CN=zerorelay-testbed" \
-  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1 \
-  || die "failed to generate relay TLS cert (openssl)"
-ok "relay cert $RELAY_CRT"
-
-say "starting zerorelay on 127.0.0.1:$RELAY_PORT (open admission, outer TLS)"
+# --- 3. start the relay (open admission; it SELF-PROVISIONS its outer TLS) ----
+# No openssl: with no --tls-cert the relay generates its own CA + server cert
+# (SAN localhost/127.0.0.1) into --tls-dir, the same machinery the daemon uses.
+say "starting zerorelay on 127.0.0.1:$RELAY_PORT (open admission, self-provisioned TLS)"
 "$ZERORELAY" --bind "127.0.0.1:$RELAY_PORT" --registration-mode open \
-  --tls-cert "$RELAY_CRT" --tls-key "$RELAY_KEY" \
+  --tls-dir "$RELAY_TLS_DIR" \
   > "$TB/relay.log" 2>&1 &
 RELAY_PID=$!
 for _ in $(seq 1 40); do
@@ -216,13 +209,13 @@ ok "daemon requires a client certificate (mandatory mTLS; rejection proven by ca
 #     cargo test -p zeroclaw-runtime --test relay_full_path
 # Here we assert the relay's OUTER TLS plane is live and the daemon bridge is up,
 # then hand you the exact zerocode command for the relay route.
-say "self-check C: relay outer TLS plane is live"
+say "self-check C: relay outer TLS verifies against its self-provisioned CA"
 out="$(echo Q | openssl s_client -connect "127.0.0.1:$RELAY_PORT" \
-  -servername 127.0.0.1 2>&1 || true)"
-echo "$out" | grep -qE 'New, TLS|Protocol *: *TLS|-----BEGIN CERTIFICATE-----|subject=' \
-  || { echo "$out" | tail -20 >&2; die "relay outer TLS did not come up"; }
+  -CAfile "$RELAY_TLS_DIR/ca.crt" -servername 127.0.0.1 2>&1 || true)"
+echo "$out" | grep -q "Verify return code: 0 (ok)" \
+  || { echo "$out" | tail -20 >&2; die "relay outer TLS did not verify against its self-provisioned CA"; }
 kill -0 "$DAEMON_PID" 2>/dev/null || die "daemon exited before the relay bridge could register"
-ok "relay outer TLS up; daemon bridge running (deep e2e: cargo test --test relay_full_path)"
+ok "relay outer TLS verified against its own CA; daemon bridge running (deep e2e: cargo test --test relay_full_path)"
 
 # --- 8. done -----------------------------------------------------------------
 echo
@@ -253,7 +246,7 @@ cat <<EOF
      --relay 127.0.0.1:$RELAY_PORT \\
      --relay-node $NODE_ID \\
      --relay-host 127.0.0.1 \\
-     --relay-insecure \\
+     --relay-ca $RELAY_TLS_DIR/ca.crt \\
      --agent <your-agent-alias>
 
  Logs:   daemon $TB/daemon.log   relay $TB/relay.log

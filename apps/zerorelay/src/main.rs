@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,13 +34,25 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:8443")]
     bind: String,
 
-    /// PEM certificate for the relay's own outer TLS identity (chain).
+    /// PEM certificate for the relay's own outer TLS identity (chain). When this
+    /// and --tls-key are omitted, the relay SELF-PROVISIONS a cert (no openssl).
     #[arg(long)]
     tls_cert: Option<String>,
 
     /// PEM private key for `--tls-cert`.
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// Directory for the self-provisioned TLS material (CA + server cert, written
+    /// on first run when --tls-cert/--tls-key are not given, reused after).
+    /// Default: $ZERORELAY_DATA_DIR or $HOME/.zerorelay, under tls/.
+    #[arg(long)]
+    tls_dir: Option<String>,
+
+    /// Extra Subject Alternative Name(s) for the self-provisioned cert (the relay's
+    /// public hostname / IP). localhost + 127.0.0.1 are always included. Repeatable.
+    #[arg(long = "tls-san")]
+    tls_san: Vec<String>,
 
     /// Admission mode: `open` (any signed daemon may register) or `allowlist`.
     #[arg(long, default_value = "open")]
@@ -98,14 +111,16 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("invalid --registration-mode '{other}' (open|allowlist)"),
     };
 
-    let tls_cert = cli
-        .tls_cert
-        .context("--tls-cert is required (the relay's own outer TLS certificate)")?;
-    let tls_key = cli
-        .tls_key
-        .context("--tls-key is required (the key for --tls-cert)")?;
-    let acceptor = build_tls_acceptor(&tls_cert, &tls_key)
-        .with_context(|| format!("loading relay TLS material from {tls_cert} / {tls_key}"))?;
+    let acceptor = match (cli.tls_cert, cli.tls_key) {
+        // Bring-your-own (e.g. a public-CA cert for the relay's hostname).
+        (Some(cert), Some(key)) => build_tls_acceptor(&cert, &key)
+            .with_context(|| format!("loading relay TLS material from {cert} / {key}"))?,
+        // Self-provision a cert on first run - no openssl needed.
+        (None, None) => provision_tls_acceptor(cli.tls_dir.as_deref(), &cli.tls_san)?,
+        _ => anyhow::bail!(
+            "--tls-cert and --tls-key must be given together (or neither, to self-provision)"
+        ),
+    };
 
     let cfg = RelayConfig {
         registration_mode,
@@ -145,6 +160,43 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     .with_single_cert(certs, key)
     .context("relay cert/key are not a valid pair")?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Self-provision the relay's outer TLS cert (CA + server leaf with SANs) on first
+/// run, reusing the daemon's `zeroclaw-tls` machinery so no openssl is needed.
+/// Reused on later runs. Prints the CA path daemons/clients should trust.
+fn provision_tls_acceptor(tls_dir: Option<&str>, extra_sans: &[String]) -> Result<TlsAcceptor> {
+    let dir = tls_dir.map(PathBuf::from).unwrap_or_else(default_tls_dir);
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    for s in extra_sans {
+        if !s.is_empty() && !sans.contains(s) {
+            sans.push(s.clone());
+        }
+    }
+    let mats = zeroclaw_tls::ensure_server_materials(&dir, &sans)
+        .with_context(|| format!("self-provisioning relay TLS in {}", dir.display()))?;
+    let acceptor = build_tls_acceptor(
+        &mats.server_cert_path.to_string_lossy(),
+        &mats.server_key_path.to_string_lossy(),
+    )?;
+    eprintln!("zerorelay: self-provisioned outer TLS in {}", dir.display());
+    eprintln!("  SANs: {}", sans.join(", "));
+    eprintln!("  Trust this relay on daemons/clients with its CA:");
+    eprintln!(
+        "    daemon  [relay] relay_ca_path = \"{}\"",
+        mats.ca_cert_path.display()
+    );
+    eprintln!("    zerocode  --relay-ca {}", mats.ca_cert_path.display());
+    Ok(acceptor)
+}
+
+/// Default location for self-provisioned relay TLS material.
+fn default_tls_dir() -> PathBuf {
+    std::env::var_os("ZERORELAY_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zerorelay")))
+        .unwrap_or_else(|| PathBuf::from("./zerorelay"))
+        .join("tls")
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
