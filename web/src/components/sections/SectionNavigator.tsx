@@ -123,9 +123,17 @@ export default function SectionNavigator({
       }
       if (section.shape === "typed_family_map") {
         // Configured/active provider or channel types under this section.
+        // Storage types badge as "created" (see storage_picker in
+        // api_sections.rs), so accept it alongside "configured"/"active" or
+        // configured storages render as "Nothing configured yet".
         const picker = await getSectionPicker(section.key);
         const configuredTypes = picker.items
-          .filter((i) => i.badge === "configured" || i.badge === "active")
+          .filter(
+            (i) =>
+              i.badge === "configured" ||
+              i.badge === "active" ||
+              i.badge === "created",
+          )
           .map((i) => i.key);
         const out: NavEntity[] = [];
         for (const type of configuredTypes) {
