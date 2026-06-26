@@ -2,10 +2,32 @@ tool-backup = Crear, listar, verificar y restaurar copias de seguridad del espac
 tool-browser = Automatización web/navegador con backends conectables (agent-browser, rust-native, computer_use). Admite acciones DOM más acciones opcionales a nivel de SO (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) a través de un sidecar de uso de computadora. Use 'snapshot' para mapear elementos interactivos a refs (@e1, @e2). Aplica browser.allowed_domains para acciones de apertura.
 tool-browser-delegate = Delegar tareas basadas en navegador a una CLI con capacidad de navegador para interactuar con aplicaciones web como Teams, Outlook, Jira, Confluence
 tool-browser-open = Abrir una URL HTTPS aprobada en el navegador del sistema. Restricciones de seguridad: solo dominios de la lista de permitidos, sin hosts locales/privados, sin scraping.
+tool-channel-room = Crea salas e invita usuarios a través de un canal activo. Proporciona una clave de canal como 'matrix.default', la acción 'create_room' o 'invite_user', y los campos de sala específicos de la acción.
+tool-channel-room-param-action = Acción de gestión de sala a realizar.
+tool-channel-room-param-channel = Clave de canal activo como 'matrix.default'.
+tool-channel-room-param-name = Nombre de sala opcional para create_room.
+tool-channel-room-param-topic = Tema de sala opcional para create_room.
+tool-channel-room-param-invites = IDs de usuario opcionales para invitar al crear la sala.
+tool-channel-room-param-visibility = Visibilidad de sala opcional para create_room.
+tool-channel-room-param-encryption = Si se debe solicitar el cifrado de la sala durante create_room.
+tool-channel-room-param-room-id = ID de sala existente para invite_user.
+tool-channel-room-param-user-id = ID de usuario a invitar para invite_user.
+tool-channel-room-error-security = Acción bloqueada: { $err }
+tool-channel-room-error-invalid-action = Acción no válida '{ $action }': debe ser 'create_room' o 'invite_user'.
+tool-channel-room-error-not-initialized = Aún no hay canales disponibles (los canales no están inicializados).
+tool-channel-room-error-channel-not-found = Canal '{ $channel }' no encontrado. Canales disponibles: { $available }
+tool-channel-room-error-create-failed = Error al crear la sala: { $err }
+tool-channel-room-error-invite-failed = Error al invitar al usuario: { $err }
+tool-channel-room-error-invites-array = 'invites' debe ser un array de cadenas.
+tool-channel-room-error-invites-item = 'invites' debe ser un array de cadenas no vacías.
+tool-channel-room-error-invalid-visibility = Visibilidad de sala no válida: { $err }
+tool-channel-room-error-missing-param = Falta el parámetro '{ $param }'.
+tool-channel-room-error-string-param = '{ $param }' debe ser una cadena.
+tool-channel-room-error-bool-param = '{ $param }' debe ser un valor booleano.
 tool-cloud-ops = Herramienta de asesoramiento de transformación en la nube. Analiza planes de IaC, evalúa rutas de migración, revisa costos y verifica la arquitectura frente a los pilares del Well-Architected Framework. Solo lectura: no crea ni modifica recursos en la nube.
 tool-cloud-patterns = Biblioteca de patrones de nube. Dada una descripción de carga de trabajo, sugiere patrones arquitectónicos nativos de la nube aplicables (contenedorización, serverless, modernización de bases de datos, etc.).
 tool-composio = Ejecutar acciones en más de 1000 aplicaciones a través de Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' para ver las acciones disponibles (incluye nombres de parámetros). action='execute' con action_name/tool_slug y params para ejecutar una acción. Si no está seguro de los parámetros exactos, pase 'text' en su lugar con una descripción en lenguaje natural de lo que desea (Composio resolverá los parámetros correctos mediante NLP). action='list_accounts' o action='connected_accounts' para listar cuentas conectadas por OAuth. action='connect' con app/auth_config_id para obtener la URL de OAuth. connected_account_id se resuelve automáticamente cuando se omite.
-tool-content-search = Buscar el contenido de archivos por patrón regex dentro del espacio de trabajo. Admite ripgrep (rg) con respaldo de grep. Modos de salida: 'content' (líneas coincidentes con contexto), 'files_with_matches' (solo rutas de archivo), 'count' (recuentos de coincidencias por archivo). Ejemplo: pattern='fn main', include='*.rs', output_mode='content'.
+tool-content-search = Buscar el contenido de archivos por patrón regex dentro del espacio de trabajo. Admite ripgrep (rg) con respaldo de grep o interno. Modos de salida: 'content' (líneas coincidentes con contexto), 'files_with_matches' (solo rutas de archivo), 'count' (recuentos de coincidencias por archivo). Ejemplo: pattern='fn main', include='*.rs', output_mode='content'.
 tool-cron-add = Crear un trabajo cron programado (shell o agente) con programaciones cron/at/every. Use job_type='agent' con un prompt para ejecutar el agente de IA según lo programado. Para entregar la salida a un canal (Discord, Telegram, Slack, Mattermost, Matrix), configure delivery={"{"}"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"{"}"}. Esta es la herramienta preferida para enviar mensajes programados/retrasados a los usuarios a través de canales.
 tool-cron-list = Listar todos los trabajos cron programados
 tool-cron-remove = Eliminar un trabajo cron por id
@@ -50,7 +72,7 @@ tool-hardware-memory-read = Leer valores reales de memoria/registro de Nucleo v�
 tool-http-request = Realizar solicitudes HTTP a APIs externas. Admite los métodos GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS. Restricciones de seguridad: solo dominios de la lista de permitidos, sin hosts locales/privados, tiempo de espera y límites de tamaño de respuesta configurables.
 tool-image-info = Leer los metadatos de un archivo de imagen (formato, dimensiones, tamaño) y opcionalmente devolver datos codificados en base64.
 tool-jira = Interactuar con Jira: leer tickets, buscar con JQL, agregar comentarios, listar proyectos y transiciones por incidencia, transicionar una incidencia a través de su flujo de trabajo y crear nuevas incidencias.
-tool-knowledge = Gestionar un grafo de conocimiento de decisiones de arquitectura, patrones de solución, lecciones aprendidas y expertos. Acciones: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
+tool-knowledge = Gestionar un grafo de conocimiento de decisiones de arquitectura, patrones de solución, lecciones aprendidas, expertos y vínculos de relación.
 tool-linkedin = Gestionar LinkedIn: crear publicaciones, listar tus publicaciones, comentar, reaccionar, eliminar publicaciones, ver la interacción, obtener información de perfil y leer la estrategia de contenido configurada. Requiere credenciales LINKEDIN_* en el archivo .env.
 tool-discord-search = Buscar el historial de mensajes de Discord almacenado en discord.db. Use para encontrar mensajes pasados, resumir la actividad del canal o consultar lo que dijeron los usuarios. Admite búsqueda por palabra clave y filtros opcionales: channel_id, since, until.
 tool-memory-forget = Eliminar una memoria por clave. Use para borrar datos obsoletos o sensibles. Devuelve si la memoria se encontró y eliminó.

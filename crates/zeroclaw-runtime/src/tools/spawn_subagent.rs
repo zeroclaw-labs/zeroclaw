@@ -216,6 +216,36 @@ impl Tool for SpawnSubagentTool {
             is_subagent: true,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
+
+        // EPIC-A supervision: register the subagent run for registry completeness + a
+        // crash-audit trail (a subagent left Running when the daemon dies surfaces as Lost
+        // on reboot). spawn_subagent is SYNCHRONOUS (the parent awaits the run below), so
+        // this is NOT for orphan recovery; the reaper's no-heartbeat same-boot skip
+        // prevents any false timeout of a legitimately long subagent. No-op when absent.
+        let cp_task_id = run_id.clone();
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .create(crate::control_plane::TaskRecord {
+                    id: cp_task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Subagent,
+                    agent: self.parent_alias.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: cp.boot_id.clone(),
+                    heartbeat_at: None,
+                    depth: u32::from(self.is_subagent_caller),
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                })
+                .await;
+        }
+
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
@@ -235,6 +265,26 @@ impl Tool for SpawnSubagentTool {
             )
         ))
         .await;
+
+        // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let (status, output, error) = match &run_result {
+                Ok(resp) => (
+                    crate::control_plane::TaskStatus::Completed,
+                    Some(resp.clone()),
+                    None,
+                ),
+                Err(e) => (
+                    crate::control_plane::TaskStatus::Failed,
+                    None,
+                    Some(format!("subagent run failed: {e}")),
+                ),
+            };
+            let _ = cp
+                .store
+                .update_status(&cp_task_id, status, output, error)
+                .await;
+        }
 
         match run_result {
             Ok(response) => Ok(ToolResult {

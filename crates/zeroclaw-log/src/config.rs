@@ -18,6 +18,7 @@ pub struct LogConfig {
     pub log_tool_io: String,
     pub log_tool_io_truncate_bytes: usize,
     pub log_tool_io_denylist: Vec<String>,
+    pub log_llm_request_payload: String,
 }
 
 impl Default for LogConfig {
@@ -29,6 +30,7 @@ impl Default for LogConfig {
             log_tool_io: "redacted".into(),
             log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
+            log_llm_request_payload: "off".into(),
         }
     }
 }
@@ -85,6 +87,34 @@ impl ToolIoPolicy {
     }
 }
 
+/// LLM request payload capture policy. Mirrors [`ToolIoPolicy`] but gates the
+/// prompt/messages on each `llm_request`. Unlike tool I/O, an unknown or
+/// empty value resolves to [`Self::Off`] so the prompt is never captured
+/// unless the operator explicitly opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmRequestPayloadPolicy {
+    /// Only `messages_count` on the request event. No payload.
+    Off,
+    /// Leak-scan + truncate to `truncate_bytes`.
+    Redacted,
+    /// Full payload, still leak-scanned. No truncation.
+    Full,
+}
+
+impl LlmRequestPayloadPolicy {
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "redacted" => Self::Redacted,
+            "full" => Self::Full,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn captures_payload(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// Resolved policy bundle the writer + tool-io capturers read at runtime.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
@@ -94,6 +124,7 @@ pub struct ResolvedPolicy {
     pub tool_io: ToolIoPolicy,
     pub tool_io_truncate_bytes: usize,
     pub tool_io_denylist: Vec<String>,
+    pub llm_request_payload: LlmRequestPayloadPolicy,
 }
 
 impl ResolvedPolicy {
@@ -105,6 +136,7 @@ impl ResolvedPolicy {
             tool_io: ToolIoPolicy::from_raw(&config.log_tool_io),
             tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
             tool_io_denylist: config.log_tool_io_denylist.clone(),
+            llm_request_payload: LlmRequestPayloadPolicy::from_raw(&config.log_llm_request_payload),
         }
     }
 
@@ -166,5 +198,54 @@ mod tests {
         let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
         assert!(p.is_tool_denylisted("memory_recall_personal"));
         assert!(!p.is_tool_denylisted("shell"));
+    }
+
+    #[test]
+    fn storage_policy_from_raw_trims_and_ignores_case() {
+        assert_eq!(
+            StoragePolicy::from_raw("  ROLLING  "),
+            StoragePolicy::Rolling
+        );
+        assert_eq!(StoragePolicy::from_raw("Full"), StoragePolicy::Full);
+    }
+
+    #[test]
+    fn storage_policy_is_enabled_only_when_persisting() {
+        assert!(!StoragePolicy::None.is_enabled());
+        assert!(StoragePolicy::Rolling.is_enabled());
+        assert!(StoragePolicy::Full.is_enabled());
+    }
+
+    #[test]
+    fn tool_io_policy_from_raw_trims_and_ignores_case() {
+        assert_eq!(ToolIoPolicy::from_raw("  OFF "), ToolIoPolicy::Off);
+        assert_eq!(ToolIoPolicy::from_raw("Full"), ToolIoPolicy::Full);
+    }
+
+    #[test]
+    fn tool_io_policy_captures_io_unless_off() {
+        assert!(!ToolIoPolicy::Off.captures_io());
+        assert!(ToolIoPolicy::Redacted.captures_io());
+        assert!(ToolIoPolicy::Full.captures_io());
+    }
+
+    #[test]
+    fn resolved_policy_clamps_max_entries_to_at_least_one() {
+        let mut c = make_config();
+        c.log_persistence_max_entries = 0;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(p.max_entries, 1);
+    }
+
+    #[test]
+    fn resolved_policy_maps_storage_and_tool_io_fields() {
+        let mut c = make_config();
+        c.log_persistence = "full".to_string();
+        c.log_tool_io = "off".to_string();
+        c.log_tool_io_truncate_bytes = 123;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(p.storage, StoragePolicy::Full);
+        assert_eq!(p.tool_io, ToolIoPolicy::Off);
+        assert_eq!(p.tool_io_truncate_bytes, 123);
     }
 }

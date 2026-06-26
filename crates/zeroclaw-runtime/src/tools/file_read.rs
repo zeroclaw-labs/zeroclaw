@@ -51,23 +51,7 @@ impl FileReadTool {
             anyhow::bail!("Path not allowed by security policy: {path}");
         }
 
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            return Ok(p.to_path_buf());
-        }
-
-        let workspace_dir = &self.security.workspace_dir;
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
-            && let Ok(stripped) = p.strip_prefix(workspace_rootless)
-        {
-            return Ok(if stripped.as_os_str().is_empty() {
-                workspace_dir.clone()
-            } else {
-                workspace_dir.join(stripped)
-            });
-        }
-
-        Ok(workspace_dir.join(p))
+        Ok(self.security.resolve_tool_path(path))
     }
 }
 
@@ -487,6 +471,24 @@ mod tests {
         FileReadTool::new_with_persistence(security, false)
     }
 
+    fn workspace_prefixed_relative_path_for_test(
+        workspace: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let mut relative = std::path::PathBuf::new();
+        for component in workspace.components() {
+            match component {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    panic!("test workspace path must not contain parent components")
+                }
+                std::path::Component::Normal(part) => relative.push(part),
+            }
+        }
+        relative
+    }
+
     #[test]
     fn file_read_name() {
         let tool = test_tool(std::env::temp_dir());
@@ -803,6 +805,36 @@ mod tests {
         assert!(result.output.contains("1: deep content"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_normalizes_workspace_prefixed_relative_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_workspace_prefixed");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join("notes.txt"), "prefixed content")
+            .await
+            .unwrap();
+
+        let tool = test_tool(workspace.clone());
+        let workspace_prefixed =
+            workspace_prefixed_relative_path_for_test(&workspace).join("nested/notes.txt");
+        let result = tool
+            .execute(json!({"path": workspace_prefixed.to_string_lossy()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "workspace-prefixed file_read path should resolve, error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("1: prefixed content"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[cfg(unix)]

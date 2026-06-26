@@ -142,6 +142,7 @@ jobs:
         with:
           ref: ${{ steps.version.outputs.TAG }}
           fetch-depth: 1
+          submodules: recursive
 
       # Always fetch the deploy-helper scripts from the commit that triggered
       # this workflow run (github.sha). For workflow_dispatch, github.sha is
