@@ -26,6 +26,7 @@ pub mod model_provider;
 pub mod observability_traits;
 pub mod peripherals_traits;
 pub mod platform;
+pub mod principal;
 pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;

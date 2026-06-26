@@ -1,6 +1,0 @@
-name = "office-tools"
-version = "0.1.0"
-description = "Extract text/Markdown from Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT) passed as base64"
-author = "ZeroClaw Labs"
-wasm_path = "office_tools.wasm"
-capabilities = ["tool"]

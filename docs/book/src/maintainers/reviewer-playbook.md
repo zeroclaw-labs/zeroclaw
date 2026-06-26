@@ -13,7 +13,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
-| Risk is high or unclear | Treat as `risk: high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
@@ -21,13 +21,13 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 
 | Risk label | Typical paths | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk: low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
-| `risk: medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk: high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
+| `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
+| `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
 
 When uncertain, treat as higher risk.
 
-Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk: manual` when a maintainer correction should not be overwritten on the next pushed update.
+Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk:manual` when a maintainer correction should not be overwritten on the next pushed update.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -58,7 +58,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 
 ### Deep-review checklist (high-risk only)
 
-For `risk: high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
+For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
 
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
@@ -125,7 +125,7 @@ If Discussions are not being reviewed on the documented cadence, do not present 
 
 When review demand exceeds capacity:
 
-1. Keep active bug and security PRs (`size: XS/S`) at the top of the queue.
+1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
 3. Mark dormant PRs as `stale-candidate` before stale closure window starts.
 4. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
@@ -134,7 +134,7 @@ When review demand exceeds capacity:
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk: manual`.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`.
 2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
 3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
 4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.
@@ -154,7 +154,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 ## Weekly queue hygiene
 
 - Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-routing-evidence): when accepted or otherwise long-lived work has a recorded reason to stay open, contributor-visible routing evidence, and no other stale exclusion already applies. Active release trackers and active RFC or design trackers may keep stale protection by default when the issue itself clearly identifies the active coordination or decision surface; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
-- Prioritize `size: XS/S` bug and security PRs first.
+- Prioritize `size:XS` or `size:S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 
 The goal is a queue where every open PR is either being actively reviewed, blocked on the author, or blocked on something external, never just sitting because nobody got to it.
