@@ -981,22 +981,49 @@ fn timestamp_channel_user_content(content: &str) -> String {
 }
 
 fn channel_history_content_for_user_turn(content: &str) -> String {
+    // First check if there are any image markers to process
     let (_cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
     if image_refs.is_empty() {
         return content.to_string();
     }
 
-    // Only strip inline base64 data URIs from history; keep filesystem path
-    // references so they can be re-loaded on later turns. This fixes the issue
-    // where deferred image attachments lose their re-loadable reference.
-    // See issue #8151.
-    let mut result = content.to_string();
-    for ref_path in &image_refs {
-        if ref_path.starts_with("data:") {
-            // Strip inline base64 payload (too large to keep in history)
-            result = result.replace(&format!("[IMAGE:{}]", ref_path), "");
+    // Rebuild the content, keeping only non-data: image markers.
+    // This uses the parser's structured output to correctly handle
+    // line-wrapped markers (common with long base64 payloads).
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = content[cursor..].find(zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX) {
+        let start = cursor + rel_start;
+        result.push_str(&content[cursor..start]);
+
+        let marker_start = start + zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX.len();
+        let Some(rel_end) = content[marker_start..].find(']') else {
+            result.push_str(&content[start..]);
+            cursor = content.len();
+            break;
+        };
+
+        let end = marker_start + rel_end;
+        let candidate = zeroclaw_providers::multimodal::collapse_wrapped_marker(&content[marker_start..end]);
+
+        if candidate.is_empty() || !zeroclaw_providers::multimodal::is_loadable_image_reference(&candidate) {
+            // Preserve placeholder markers as prose
+            result.push_str(&content[start..=end]);
+        } else if candidate.starts_with("data:") {
+            // Skip inline base64 payloads - they're too large for history
+            // Insert placeholder to maintain readability
+            result.push_str("[Image attachment omitted from history]");
+        } else {
+            // Keep filesystem path and URL markers for re-loading
+            result.push_str(&content[start..=end]);
         }
-        // Filesystem paths and URLs are kept as-is for re-loading
+
+        cursor = end + 1;
+    }
+
+    if cursor < content.len() {
+        result.push_str(&content[cursor..]);
     }
 
     let mut result = result.trim().to_string();
@@ -18481,6 +18508,62 @@ This is an example JSON object for profile settings."#;
             history_content,
             "[Image attachment processed by vision model]"
         );
+    }
+
+    #[test]
+    fn channel_history_content_preserves_filesystem_path_markers() {
+        // Regression test for #8151: filesystem path markers must survive
+        // in history so deferred images can be re-loaded on later turns.
+        let content = "[IMAGE:/tmp/media/screenshot.png] can you see this?";
+        let history_content = channel_history_content_for_user_turn(content);
+
+        assert_eq!(history_content, content);
+    }
+
+    #[test]
+    fn channel_history_content_strips_data_uri_markers() {
+        // Data URI markers should be stripped and replaced with placeholder
+        let content = "[IMAGE:data:image/png;base64,abcd1234] what is this?";
+        let history_content = channel_history_content_for_user_turn(content);
+
+        assert!(!history_content.contains("[IMAGE:data:"));
+        assert!(!history_content.contains("base64"));
+        assert!(history_content.contains("Image attachment omitted"));
+        assert!(history_content.contains("what is this?"));
+    }
+
+    #[test]
+    fn channel_history_content_handles_wrapped_data_uri_markers() {
+        // Regression test: line-wrapped data URI markers must be correctly
+        // identified and stripped. This is the case that actually bloats
+        // history (long base64 payloads get wrapped by terminals/logs).
+        let wrapped_content = "[IMAGE:data:image/png;base64,\n  AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CBgoOEhYaHiImKi4yNjo+QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3+Dh4uPk5ebn6Onq6+zt7u/w8fLz9PX29/j5+vv8/f7/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==] screenshot";
+        let history_content = channel_history_content_for_user_turn(wrapped_content);
+
+        assert!(
+            !history_content.contains("base64"),
+            "wrapped data URI payload must be stripped: {history_content}"
+        );
+        assert!(
+            history_content.contains("Image attachment omitted"),
+            "placeholder must be inserted: {history_content}"
+        );
+        assert!(
+            history_content.contains("screenshot"),
+            "surrounding text must be preserved: {history_content}"
+        );
+    }
+
+    #[test]
+    fn channel_history_content_filesystem_only_turn_shows_correct_placeholder() {
+        // When only filesystem path markers remain (after stripping data URIs),
+        // the content should not become empty - paths are kept for re-loading.
+        let content = "[IMAGE:/tmp/media/photo.png] look at this";
+        let history_content = channel_history_content_for_user_turn(content);
+
+        // Filesystem path markers are preserved, so content should remain
+        assert_eq!(history_content, content);
+        assert!(!history_content.contains("Image attachment processed"));
     }
 
     #[test]

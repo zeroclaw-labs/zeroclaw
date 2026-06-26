@@ -5,7 +5,7 @@ use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
-const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+pub(crate) const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 // MIME types we will inline for vision providers. Deliberately excludes
 // `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
 // inlining it would make the *entire* provider request fail rather than just
@@ -122,7 +122,7 @@ pub enum MultimodalError {
 /// Placeholder-style payloads like `...`, `<path>`, or `example.png` fail
 /// this check and are left as literal text by [`parse_image_markers`], so
 /// illustrative markdown in a conversation does not trigger loader errors.
-fn is_loadable_image_reference(candidate: &str) -> bool {
+pub(crate) fn is_loadable_image_reference(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("http://")
         || candidate.starts_with("https://")
@@ -178,7 +178,7 @@ fn is_windows_unc_path(candidate: &str) -> bool {
 /// immediately following them — are dropped; leading/trailing whitespace
 /// is trimmed. Legitimate paths may contain spaces but never newlines, so
 /// this only recovers corrupted markers and does not mangle real paths.
-fn collapse_wrapped_marker(raw: &str) -> String {
+pub(crate) fn collapse_wrapped_marker(raw: &str) -> String {
     if !raw.contains('\n') && !raw.contains('\r') {
         return raw.trim().to_string();
     }
