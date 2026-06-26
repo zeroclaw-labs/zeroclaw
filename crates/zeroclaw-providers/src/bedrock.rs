@@ -132,19 +132,16 @@ impl AwsCredentials {
             anyhow::Error::msg(format!("No credential_process in [{profile}]"))
         })?;
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "bedrock: failed to spawn credential_process"
-                );
-                anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
-            })?;
+        let output = run_credential_process_command(&cmd).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "bedrock: failed to spawn credential_process"
+            );
+            anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
+        })?;
         anyhow::ensure!(
             output.status.success(),
             "credential_process exited with {}: {}",
@@ -348,6 +345,25 @@ impl AwsCredentials {
             None => false,
         }
     }
+}
+
+#[cfg(windows)]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut command = std::process::Command::new("cmd.exe");
+    command
+        .raw_arg("/C")
+        .raw_arg(format!("\"{cmd}\""))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
+#[cfg(not(windows))]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sh").args(["-c", cmd]).output()
 }
 
 fn env_required(name: &str) -> anyhow::Result<String> {
@@ -2580,20 +2596,20 @@ credential_process=some-command
 
     #[test]
     fn from_credential_process_parses_json_output() {
-        // Verify config parsing + JSON shape by using `echo` as the command.
-        let config = "\
-[default]
-credential_process=echo '{\"Version\":1,\"AccessKeyId\":\"AKIA\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"tok\"}'
-region=ap-southeast-1
-";
-        let (cmd, region) = AwsCredentials::parse_aws_config(config, "default").unwrap();
-        assert!(cmd.starts_with("echo"));
+        let credential_json =
+            r#"{"Version":1,"AccessKeyId":"AKIA","SecretAccessKey":"secret","SessionToken":"tok"}"#;
+        #[cfg(windows)]
+        let credential_command = format!("echo {credential_json}");
+        #[cfg(not(windows))]
+        let credential_command = format!("printf '%s\\n' '{credential_json}'");
+        let config =
+            format!("[default]\ncredential_process={credential_command}\nregion=ap-southeast-1\n");
+
+        let (cmd, region) = AwsCredentials::parse_aws_config(&config, "default").unwrap();
+        assert_eq!(cmd, credential_command);
         assert_eq!(region.as_deref(), Some("ap-southeast-1"));
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .unwrap();
+        let output = run_credential_process_command(&cmd).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["AccessKeyId"].as_str(), Some("AKIA"));
         assert_eq!(json["SecretAccessKey"].as_str(), Some("secret"));

@@ -317,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn screenshot_command_contains_output_path() {
         let cmd = ScreenshotTool::screenshot_command("/tmp/my_screenshot.png").unwrap();
         let joined = cmd.join(" ");
@@ -324,5 +325,11 @@ mod tests {
             joined.contains("/tmp/my_screenshot.png"),
             "Command should contain the output path"
         );
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn screenshot_command_is_unsupported_on_other_platforms() {
+        assert!(ScreenshotTool::screenshot_command("screenshot.png").is_none());
     }
 }
