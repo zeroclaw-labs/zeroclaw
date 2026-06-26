@@ -7,7 +7,7 @@ provider (Anthropic, OpenAI, or any OpenAI-compatible API).
 
 - `oc` CLI authenticated to your OpenShift cluster
 - Container image pushed to an accessible registry
-- API key for your LLM provider
+- OpenRouter API key, or edit the sample provider alias/env var names for your LLM provider
 
 ## Quick start
 
@@ -17,12 +17,15 @@ provider (Anthropic, OpenAI, or any OpenAI-compatible API).
    for f in deploy-k8s/*-sample.yaml; do cp "$f" "${f/-sample/}"; done
    ```
 
-1. Edit `secret.yaml` and replace `REPLACE_WITH_YOUR_API_KEY` with
+1. Edit `secret.yaml` and replace `REPLACE_WITH_YOUR_OPENROUTER_API_KEY` with
    your actual API key
 1. Update the `image` field in `deployment.yaml` to point to your
    registry (e.g., `ghcr.io/youruser/zeroclaw:latest`)
 1. Update the `namespace` in all files if you want a different name
 1. Optionally edit `configmap.yaml` to change the provider or model
+1. If you enable a channel with `always_ask` tool approval, set
+   `approval_timeout_secs` explicitly in that channel block. The sample includes
+   commented Telegram and Discord blocks with safe timeout values.
 1. Apply all manifests:
 
    ```bash
@@ -65,13 +68,14 @@ risk profile) — substitute your own. Common edit points:
 
 | Setting | Path in `config.toml` | Sample value |
 | ------- | --------------------- | ------------ |
-| Model | `providers.models.anthropic.cloud.model` | `claude-sonnet-4-20250514` |
-| Temperature | `providers.models.anthropic.cloud.temperature` | `0.7` |
+| Model | `providers.models.openrouter.cloud.model` | `anthropic/claude-sonnet-4-20250514` |
+| Temperature | `providers.models.openrouter.cloud.temperature` | `0.7` |
 | Autonomy level | `risk_profiles.assistant.level` | `supervised` |
-| Agent → provider link | `agents.assistant.model_provider` | `anthropic.cloud` |
+| Runtime budget | `runtime_profiles.assistant.max_tool_iterations` | `8` |
+| Agent → provider link | `agents.assistant.model_provider` | `openrouter.cloud` |
 
-To swap to a different provider type (OpenAI, OpenRouter, Ollama, etc.),
-replace the `[providers.models.anthropic.cloud]` block with a
+To swap to a different provider type (OpenAI, Anthropic, Ollama, etc.),
+replace the `[providers.models.openrouter.cloud]` block with a
 `[providers.models.<type>.<alias>]` entry from
 [providers/catalog](../docs/book/src/providers/catalog.md) and update
 `agents.assistant.model_provider` to match.

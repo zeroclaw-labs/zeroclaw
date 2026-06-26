@@ -12,10 +12,9 @@ data:
   config.toml: |
     schema_version = 3
 
-    [providers.models.anthropic.cloud]   # type = anthropic; alias = cloud
-    model = "claude-sonnet-4-20250514"
+    [providers.models.openrouter.cloud]  # type = openrouter; alias = cloud
+    model = "anthropic/claude-sonnet-4-20250514"
     temperature = 0.7                    # omit this line entirely to not pass temperature to the provider
-    api_key = "sk-ant-..."
 
     # Alternate entry: claude-opus-4-7 rejects any temperature setting, so the
     # `temperature` line is left out. Point `agents.assistant.model_provider`
@@ -25,12 +24,34 @@ data:
     # api_key = "sk-ant-..."
 
     [agents.assistant]                   # alias = assistant
-    model_provider = "anthropic.cloud"   # <type>.<alias> reference
+    model_provider = "openrouter.cloud"  # <type>.<alias> reference
     risk_profile = "assistant"           # alias reference to the section below
+    runtime_profile = "assistant"        # alias reference to runtime budgets
 
     [risk_profiles.assistant]            # must match agents.assistant.risk_profile
     level = "supervised"
     auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]
+
+    [runtime_profiles.assistant]
+    max_tool_iterations = 8
+    max_cost_per_day_cents = 500
+    shell_timeout_secs = 60
+    max_tool_result_chars = 20000
+
+    # If enabling a channel with `always_ask` tool approval, set the timeout
+    # explicitly until the beta default-timeout issue is fixed.
+    #
+    # [channels.telegram.default]
+    # enabled = true
+    # agent = "assistant"
+    # bot_token = "set-via-secret-or-env"
+    # approval_timeout_secs = 120
+    #
+    # [channels.discord.default]
+    # enabled = true
+    # agent = "assistant"
+    # bot_token = "set-via-secret-or-env"
+    # approval_timeout_secs = 300
 
     [gateway]
     port = 42617

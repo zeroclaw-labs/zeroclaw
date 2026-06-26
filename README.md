@@ -115,8 +115,8 @@ curl -sSf https://raw.githubusercontent.com/rikitrader/zeroclaw-x0/main/bootstra
 ### Docker
 
 ```bash
-docker pull ghcr.io/rikitrader/zeroclaw-x0:latest
-docker run -v ./config.toml:/etc/zeroclaw/config.toml ghcr.io/rikitrader/zeroclaw-x0
+docker pull ghcr.io/zeroclaw-labs/zeroclaw:latest
+docker run -v ./config.toml:/etc/zeroclaw/config.toml ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
 ### Configuration

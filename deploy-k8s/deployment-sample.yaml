@@ -27,7 +27,7 @@ spec:
               containerPort: 42617
               protocol: TCP
           env:
-            - name: API_KEY
+            - name: ZEROCLAW_providers__models__openrouter__cloud__api_key
               valueFrom:
                 secretKeyRef:
                   name: zeroclaw-api-key
