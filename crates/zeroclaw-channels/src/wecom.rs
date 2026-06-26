@@ -66,6 +66,16 @@ impl ::zeroclaw_api::attribution::Attributable for WeComChannel {
 
 #[async_trait]
 impl Channel for WeComChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the WeCom API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the WeCom API.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "wecom"
     }

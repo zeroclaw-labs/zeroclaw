@@ -5,12 +5,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 
-// Diff background / foreground palette
+use crate::theme;
+
+// Diff background palette. Foregrounds come from the active theme via
+// `theme::syntax_colors`; only the add/delete row tints are diff-specific.
 const ADD_BG: Color = Color::Rgb(0, 40, 0);
-const ADD_FG: Color = Color::Rgb(140, 240, 140);
 const DEL_BG: Color = Color::Rgb(55, 0, 0);
-const DEL_FG: Color = Color::Rgb(240, 140, 140);
-const CTX_FG: Color = Color::Rgb(130, 130, 130);
 const SEP_FG: Color = Color::Rgb(70, 70, 70);
 
 const DIFF_CONTEXT: usize = 3;
@@ -36,110 +36,24 @@ fn gutter_blank(width: usize) -> String {
 
 // ── Syntax highlighting ──────────────────────────────────────────
 
-// Catppuccin Mocha palette constants.
-const CAT_BLUE: Color = Color::Rgb(137, 180, 250);
-const CAT_MAUVE: Color = Color::Rgb(203, 166, 247);
-const CAT_GREEN: Color = Color::Rgb(166, 227, 161);
-const CAT_PEACH: Color = Color::Rgb(250, 179, 135);
-const CAT_TEAL: Color = Color::Rgb(137, 220, 235);
-const CAT_SKY: Color = Color::Rgb(148, 226, 213);
-const CAT_YELLOW: Color = Color::Rgb(249, 226, 175);
-const CAT_OVERLAY0: Color = Color::Rgb(108, 112, 134);
-const CAT_OVERLAY1: Color = Color::Rgb(147, 153, 178);
-const CAT_ROSEWATER: Color = Color::Rgb(245, 224, 220);
-const CAT_RED: Color = Color::Rgb(243, 139, 168);
-const CAT_FLAMINGO: Color = Color::Rgb(242, 205, 205);
-const CAT_LAVENDER: Color = Color::Rgb(180, 190, 254);
-const CAT_SUBTEXT0: Color = Color::Rgb(166, 173, 200);
-const CAT_TEXT: Color = Color::Rgb(205, 214, 244);
-
-/// Map a `HIGHLIGHT_NAMES` entry to a Catppuccin Mocha foreground color.
-/// Called once at startup to build the lookup table.
-fn hl_color_for_name(name: &str) -> Color {
-    // Match the most specific prefix first. tree-sitter highlight names
-    // use dotted scopes; we match greedily.
-    match name {
-        // ── keywords ─────────────────────────────────────────────
-        "keyword.function" => CAT_MAUVE,
-        "keyword.storage.type" | "keyword.storage.modifier" | "keyword.storage" => CAT_YELLOW,
-        "keyword.directive" => CAT_YELLOW,
-        n if n.starts_with("keyword") => CAT_MAUVE,
-
-        // ── strings ──────────────────────────────────────────────
-        n if n.starts_with("string") => CAT_GREEN,
-        "escape" => CAT_GREEN,
-
-        // ── constants / numbers ──────────────────────────────────
-        "constant.builtin.boolean" => CAT_PEACH,
-        "constant.character.escape" => CAT_GREEN,
-        n if n.starts_with("constant") => CAT_PEACH,
-
-        // ── types ────────────────────────────────────────────────
-        "type.builtin" => CAT_YELLOW,
-        n if n.starts_with("type") => CAT_TEAL,
-        "constructor" => CAT_BLUE,
-
-        // ── variables ────────────────────────────────────────────
-        "variable.builtin" => CAT_RED,
-        "variable.parameter" => CAT_FLAMINGO,
-        "variable.other.member" => CAT_SKY,
-        n if n.starts_with("variable") => CAT_TEXT,
-
-        // ── functions ────────────────────────────────────────────
-        "function.macro" => CAT_TEAL,
-        "function.method" => CAT_BLUE,
-        n if n.starts_with("function") => CAT_BLUE,
-
-        // ── operators / punctuation ──────────────────────────────
-        "operator" => CAT_ROSEWATER,
-        "punctuation.bracket" | "punctuation.special" => CAT_OVERLAY1,
-        "punctuation.delimiter" => CAT_OVERLAY1,
-        n if n.starts_with("punctuation") => CAT_OVERLAY1,
-
-        // ── comments ─────────────────────────────────────────────
-        n if n.starts_with("comment") => CAT_OVERLAY0,
-
-        // ── tags / attributes / namespace ────────────────────────
-        "attribute" => CAT_YELLOW,
-        "tag.builtin" => CAT_MAUVE,
-        "tag" => CAT_MAUVE,
-        "namespace" => CAT_BLUE,
-        "label" => CAT_YELLOW,
-        "special" => CAT_LAVENDER,
-
-        // ── markup ───────────────────────────────────────────────
-        "markup.heading" | "markup.heading.marker" => CAT_BLUE,
-        n if n.starts_with("markup.heading") => CAT_BLUE,
-        "markup.bold" => CAT_PEACH,
-        "markup.italic" => CAT_YELLOW,
-        "markup.strikethrough" => CAT_OVERLAY0,
-        "markup.link.url" => CAT_TEAL,
-        "markup.link.text" | "markup.link.label" => CAT_BLUE,
-        n if n.starts_with("markup.link") => CAT_BLUE,
-        "markup.raw" | "markup.raw.inline" | "markup.raw.block" => CAT_GREEN,
-        "markup.quote" => CAT_OVERLAY1,
-        n if n.starts_with("markup.list") => CAT_MAUVE,
-        n if n.starts_with("markup") => CAT_TEXT,
-
-        // ── diff ─────────────────────────────────────────────────
-        "diff.plus" => CAT_GREEN,
-        "diff.minus" => CAT_RED,
-        n if n.starts_with("diff") => CAT_SUBTEXT0,
-
-        _ => CAT_TEXT,
-    }
+/// Diff-row foreground for plain (unhighlighted) text, derived from the active
+/// theme so it tracks the palette like every other colour.
+fn add_fg() -> Color {
+    theme::SyntaxScope::DiffPlus.color()
 }
 
-/// Build the color lookup table indexed by `Highlight.0`.
-fn hl_colors() -> &'static [Color] {
-    use std::sync::OnceLock;
-    static COLORS: OnceLock<Vec<Color>> = OnceLock::new();
-    COLORS.get_or_init(|| {
-        HIGHLIGHT_NAMES
-            .iter()
-            .map(|n| hl_color_for_name(n))
-            .collect()
-    })
+fn del_fg() -> Color {
+    theme::SyntaxScope::DiffMinus.color()
+}
+
+fn ctx_fg() -> Color {
+    theme::SyntaxScope::Comment.color()
+}
+
+/// Build the color lookup table indexed by `Highlight.0`. Colours come from the
+/// active theme, rebuilt per diff so a live theme swap is reflected.
+fn hl_colors() -> Vec<Color> {
+    theme::syntax_colors(HIGHLIGHT_NAMES)
 }
 
 /// Map a file extension to an inkjet `Language`. Returns `None` for
@@ -261,6 +175,82 @@ fn plain_line_spans(text: &str, bg: Color, fg: Color) -> Vec<Vec<Span<'static>>>
         .collect()
 }
 
+/// Syntax-highlight `code` for a markdown fence language token (e.g. `rust`,
+/// `python`, `sh`), returning one span vector per line. Colours come from the
+/// active theme via [`hl_colors`]; `plain_fg` styles tokens with no scope and is
+/// also the whole-line fallback when the token is unknown or highlighting
+/// fails. No background is forced, so the caller's code-block backdrop shows
+/// through. Returns `None` only when the token does not resolve to a built-in
+/// language, letting the caller render its existing plain code styling.
+pub fn highlight_code(
+    code: &str,
+    fence_token: &str,
+    plain_fg: Color,
+) -> Option<Vec<Line<'static>>> {
+    let language = Language::from_token(fence_token.to_ascii_lowercase())?;
+    let lines = highlight_all_no_bg(code, language, plain_fg)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    Some(lines)
+}
+
+/// Like [`highlight_all`] but without forcing a background colour on spans, for
+/// content rendered over the caller's own backdrop (markdown code fences).
+fn highlight_all_no_bg(text: &str, lang: Language, plain_fg: Color) -> Vec<Vec<Span<'static>>> {
+    let colors = hl_colors();
+
+    let events: Vec<HighlightEvent> = match with_highlighter(|hl| {
+        hl.highlight_raw(lang, &text)
+            .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+    }) {
+        Ok(Ok(v)) => v,
+        _ => return plain_line_spans_no_bg(text, plain_fg),
+    };
+
+    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Color> = Vec::new();
+
+    for event in events {
+        match event {
+            HighlightEvent::HighlightStart(h) => {
+                let fg = colors.get(h.0).copied().unwrap_or(plain_fg);
+                style_stack.push(fg);
+            }
+            HighlightEvent::HighlightEnd => {
+                style_stack.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                let fg = style_stack.last().copied().unwrap_or(plain_fg);
+                let style = Style::default().fg(fg);
+                let slice = &text[start..end];
+                for (i, segment) in slice.split('\n').enumerate() {
+                    if i > 0 {
+                        result.push(std::mem::take(&mut current_line));
+                    }
+                    if !segment.is_empty() {
+                        current_line.push(Span::styled(segment.to_string(), style));
+                    }
+                }
+            }
+        }
+    }
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+    if result.is_empty() {
+        return plain_line_spans_no_bg(text, plain_fg);
+    }
+    result
+}
+
+fn plain_line_spans_no_bg(text: &str, fg: Color) -> Vec<Vec<Span<'static>>> {
+    text.lines()
+        .map(|l| vec![Span::styled(l.to_string(), Style::default().fg(fg))])
+        .collect()
+}
+
 // ── Public diff API ──────────────────────────────────────────────
 
 /// Build ratatui `Line`s for a unified diff of `old` vs `new`.
@@ -291,10 +281,11 @@ pub fn diff_lines(
     let width = gutter_width(max_lineno);
 
     // Pre-highlight both sides in full so multi-line token state is correct.
+    let (del_fg, add_fg) = (del_fg(), add_fg());
     let (del_hl, add_hl) = match lang.and_then(ext_to_language) {
         Some(language) => (
-            Some(highlight_all(old, language, DEL_BG, DEL_FG)),
-            Some(highlight_all(new, language, ADD_BG, ADD_FG)),
+            Some(highlight_all(old, language, DEL_BG, del_fg)),
+            Some(highlight_all(new, language, ADD_BG, add_fg)),
         ),
         None => (None, None),
     };
@@ -316,7 +307,7 @@ pub fn diff_lines(
                             .and_then(|v| change.old_index().and_then(|i| v.get(i)))
                             .cloned()
                             .unwrap_or_else(|| {
-                                vec![Span::styled(text, Style::default().bg(DEL_BG).fg(DEL_FG))]
+                                vec![Span::styled(text, Style::default().bg(DEL_BG).fg(del_fg))]
                             });
                         let lineno = change
                             .old_index()
@@ -326,7 +317,7 @@ pub fn diff_lines(
                             lineno + "- ",
                             Style::default()
                                 .bg(DEL_BG)
-                                .fg(DEL_FG)
+                                .fg(del_fg)
                                 .add_modifier(Modifier::BOLD),
                         )];
                         spans.extend(content);
@@ -338,7 +329,7 @@ pub fn diff_lines(
                             .and_then(|v| change.new_index().and_then(|i| v.get(i)))
                             .cloned()
                             .unwrap_or_else(|| {
-                                vec![Span::styled(text, Style::default().bg(ADD_BG).fg(ADD_FG))]
+                                vec![Span::styled(text, Style::default().bg(ADD_BG).fg(add_fg))]
                             });
                         let lineno = change
                             .new_index()
@@ -348,7 +339,7 @@ pub fn diff_lines(
                             lineno + "+ ",
                             Style::default()
                                 .bg(ADD_BG)
-                                .fg(ADD_FG)
+                                .fg(add_fg)
                                 .add_modifier(Modifier::BOLD),
                         )];
                         spans.extend(content);
@@ -361,7 +352,7 @@ pub fn diff_lines(
                             .unwrap_or_else(|| gutter_blank(width));
                         Line::from(Span::styled(
                             format!("{lineno}  {text}"),
-                            Style::default().fg(CTX_FG),
+                            Style::default().fg(ctx_fg()),
                         ))
                     }
                 };
@@ -390,9 +381,10 @@ pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     let show = all.len().min(MAX_WRITE_LINES);
     let width = gutter_width(show);
 
+    let add_fg = add_fg();
     let hl = lang
         .and_then(ext_to_language)
-        .map(|language| highlight_all(content, language, ADD_BG, ADD_FG));
+        .map(|language| highlight_all(content, language, ADD_BG, add_fg));
     let mut out: Vec<Line<'static>> = Vec::with_capacity(show + 1);
 
     for (i, item) in all.iter().enumerate().take(show) {
@@ -403,14 +395,14 @@ pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
             .unwrap_or_else(|| {
                 vec![Span::styled(
                     item.to_string(),
-                    Style::default().bg(ADD_BG).fg(ADD_FG),
+                    Style::default().bg(ADD_BG).fg(add_fg),
                 )]
             });
         let mut spans = vec![Span::styled(
             gutter(i + 1, width) + "+ ",
             Style::default()
                 .bg(ADD_BG)
-                .fg(ADD_FG)
+                .fg(add_fg)
                 .add_modifier(Modifier::BOLD),
         )];
         spans.extend(content_spans);
@@ -619,7 +611,7 @@ mod tests {
     #[test]
     fn highlight_all_falls_back_on_unknown_language() {
         // Plaintext fallback — should produce one span per line.
-        let result = plain_line_spans("hello\nworld\n", ADD_BG, ADD_FG);
+        let result = plain_line_spans("hello\nworld\n", ADD_BG, add_fg());
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].len(), 1);
     }

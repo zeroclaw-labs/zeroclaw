@@ -241,7 +241,18 @@ detect_target_triple() {
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    # Apple Silicon reports arm64; Intel reports x86_64. A Rosetta-translated
+    # shell on Apple Silicon also reports x86_64 from `uname -m`, so consult
+    # `sysctl hw.optional.arm64` to recover the true CPU. Without this an Intel
+    # Mac (or an M-series Mac run under Rosetta) is handed the wrong-arch
+    # binary and hits "bad CPU type in executable".
+    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      echo "aarch64-apple-darwin"
+    else
+      echo "x86_64-apple-darwin"
+    fi
+    ;;
   Linux)
     libc=$(detect_libc)
     case "$arch" in
@@ -284,6 +295,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
+  info "Channels: pre-built binaries use the lean default bundle."
+  info "For Slack/Discord or all bundled channels, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -300,14 +313,11 @@ install_prebuilt() {
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
 
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
-    {
-      warn "Download failed — falling back to source build"
-      rm -rf "$tmp_dir"
-      return 1
-    }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
+  # Fetch the checksum manifest first — it lists every published asset, so we
+  # can tell "no pre-built binary for this platform" (e.g. Intel macOS, which
+  # ships no release tarball) from a genuine download failure, and we never
+  # pull a tarball we couldn't verify anyway. All failure modes fall back to
+  # source rather than install unverified.
   if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
     warn "Could not fetch SHA256SUMS — falling back to source build"
     rm -rf "$tmp_dir"
@@ -316,10 +326,17 @@ install_prebuilt() {
 
   expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
   if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
+    warn "No pre-built binary published for $triple — falling back to source build"
     rm -rf "$tmp_dir"
     return 1
   fi
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
+    {
+      warn "Download failed — falling back to source build"
+      rm -rf "$tmp_dir"
+      return 1
+    }
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
@@ -367,7 +384,7 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (default features). Source builds only.
+                       'full' (historical broad channel bundle). Source builds only.
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -378,6 +395,8 @@ Options:
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
+  --no-modify-path     Don't add ZeroClaw to PATH in your shell profile; just
+                       print the line to add manually
   --skip-quickstart       Skip the post-install quickstart prompt
   --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
@@ -389,6 +408,7 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
+  $0 --source --preset full                   # broad channel bundle
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -439,6 +459,21 @@ do_uninstall() {
     else
       info "Config preserved at $config_dir (non-interactive — use rm -rf to remove)"
     fi
+  fi
+
+  # Strip the PATH marker block this installer may have added to the profile.
+  local profile
+  profile=$(detect_shell_profile)
+  if [ -f "$profile" ] && grep -q "# >>> zeroclaw >>>" "$profile" 2>/dev/null; then
+    local tmp_profile
+    tmp_profile=$(mktemp)
+    if sed '/# >>> zeroclaw >>>/,/# <<< zeroclaw <<</d' "$profile" >"$tmp_profile" 2>/dev/null &&
+      cat "$tmp_profile" >"$profile" 2>/dev/null; then
+      info "Removed PATH entry from $profile"
+    else
+      warn "Could not edit $profile — remove the zeroclaw PATH block manually"
+    fi
+    rm -f "$tmp_profile"
   fi
 
   # Check if another zeroclaw still lurks in PATH
@@ -689,6 +724,7 @@ SKIP_QUICKSTART=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
+MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opts out
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
@@ -744,6 +780,7 @@ while [ $# -gt 0 ]; do
     PREFIX=$(echo "$1" | sed 's|/*$||')
     ;;
   --dry-run) DRY_RUN=true ;;
+  --no-modify-path) MODIFY_PATH=false ;;
   --skip-quickstart) SKIP_QUICKSTART=true ;;
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
@@ -1028,7 +1065,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the full default feature set."
+      info "--preset full: building from source with the historical broad channel bundle."
     fi
   fi
 
@@ -1154,21 +1191,19 @@ fi # end source build block
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
-# ── PATH guidance ─────────────────────────────────────────────────
+# ── PATH setup ────────────────────────────────────────────────────
 
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
-SHOW_PATH_HELP=false
-if [ "$PREFIX" != "$HOME" ]; then
-  SHOW_PATH_HELP=true
-elif [ -f "$PROFILE" ] && ! grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
-  SHOW_PATH_HELP=true
-elif [ ! -f "$PROFILE" ]; then
-  SHOW_PATH_HELP=true
+# Is our bin dir already on PATH via the profile — either pre-existing or
+# from a prior run of this installer? If so there's nothing to do.
+PATH_ALREADY_SET=false
+if [ -f "$PROFILE" ] && grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
+  PATH_ALREADY_SET=true
 fi
 
-if [ "$SHOW_PATH_HELP" = true ]; then
+print_path_help() {
   echo
   printf "  %s (%s):\n" "$(bold "Add to your shell profile")" "$PROFILE"
   echo
@@ -1178,6 +1213,29 @@ if [ "$SHOW_PATH_HELP" = true ]; then
   echo
   printf "    source %s\n" "$PROFILE"
   echo
+}
+
+if [ "$PATH_ALREADY_SET" = true ]; then
+  : # already on PATH — nothing to do
+elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
+  # Auto-append to the profile, wrapped in a marker block so re-installs
+  # stay idempotent and an uninstall can strip it cleanly.
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would add $CARGO_HOME/bin to PATH in $PROFILE"
+  elif {
+    printf '\n# >>> zeroclaw >>>\n'
+    printf '%s\n' "$EXPORT_LINE"
+    printf '# <<< zeroclaw <<<\n'
+  } >>"$PROFILE" 2>/dev/null; then
+    info "Added $CARGO_HOME/bin to PATH in $PROFILE"
+    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+  else
+    warn "Could not write to $PROFILE — add this line manually:"
+    print_path_help
+  fi
+else
+  # --no-modify-path, or a custom --prefix install we won't auto-edit for.
+  print_path_help
 fi
 
 # ── Quickstart prompt ─────────────────────────────────────────────
