@@ -713,6 +713,15 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Help-hint click: every pane renders the `?=help` indicator at
+                // the bottom-left of the content area; clicking it opens help,
+                // mirroring the `?` key.
+                if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && mouse::help_hint_click(mouse.column, mouse.row, content_area)
+                {
+                    show_help = true;
+                    continue;
+                }
                 // Forward to active pane (skip when disconnected).
                 if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
                     match mode {

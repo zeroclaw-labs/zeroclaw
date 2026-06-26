@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::autonomy::AutonomyLevel;
-use crate::autonomy::DelegationPolicy;
+use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
 use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -135,7 +135,9 @@ fn balanced_risk() -> RiskProfileConfig {
         auto_approve: vec![],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -159,10 +161,12 @@ fn yolo_risk() -> RiskProfileConfig {
         require_approval_for_medium_risk: false,
         block_high_risk_commands: false,
         shell_env_passthrough: vec![],
-        auto_approve: vec![],
+        auto_approve: vec!["*".to_string()],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
@@ -665,6 +669,43 @@ mod tests {
             assert!(
                 policy.is_command_allowed(cmd),
                 "yolo profile must allow `{cmd}` — it grants full autonomy with no denylist",
+            );
+        }
+    }
+
+    /// Regression: the `yolo` preset must declare unrestricted intent.
+    #[test]
+    fn yolo_risk_auto_approves_everything_with_no_forbidden_paths() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        assert_eq!(
+            values.auto_approve,
+            vec!["*".to_string()],
+            "yolo must auto-approve every tool via the `*` wildcard",
+        );
+        assert!(
+            values.forbidden_paths.is_empty(),
+            "yolo must have no forbidden paths",
+        );
+        assert!(
+            values.always_ask.is_empty(),
+            "yolo must never force an approval prompt",
+        );
+        assert!(
+            values.delegation_policy.permits(),
+            "yolo must permit delegation",
+        );
+    }
+
+    /// Regression: `yolo` and `balanced` both permit delegation.
+    #[test]
+    fn yolo_and_balanced_permit_delegation() {
+        for name in ["yolo", "balanced"] {
+            let preset = risk_preset(name).unwrap();
+            let values = (preset.values)();
+            assert!(
+                values.delegation_policy.permits(),
+                "{name} must permit delegation",
             );
         }
     }
