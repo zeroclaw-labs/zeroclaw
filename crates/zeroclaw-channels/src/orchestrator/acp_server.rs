@@ -778,11 +778,13 @@ impl AcpServer {
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let restore_alias = self
-            .config
-            .acp
-            .default_agent
-            .clone()
+        // Restore the agent the session was created with — its alias is
+        // persisted on the session row. Fall back to the ACP default (or sole
+        // agent, or "default") only when that agent no longer exists in config,
+        // so a deleted owner degrades gracefully instead of failing the restore.
+        let restore_alias = Some(data.agent_alias.clone())
+            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
                 if self.config.agents.len() == 1 {
@@ -986,11 +988,13 @@ impl AcpServer {
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let restore_alias = self
-            .config
-            .acp
-            .default_agent
-            .clone()
+        // Restore the agent the session was created with — its alias is
+        // persisted on the session row. Fall back to the ACP default (or sole
+        // agent, or "default") only when that agent no longer exists in config,
+        // so a deleted owner degrades gracefully instead of failing the restore.
+        let restore_alias = Some(data.agent_alias.clone())
+            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
                 if self.config.agents.len() == 1 {
@@ -3573,6 +3577,129 @@ mod tests {
             .expect_err("session/load for active session must fail");
 
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    /// `make_mcp_granting_test_config`, reshaped so the MCP-opted-in agent is
+    /// NOT the ACP default. `finance` owns the granted `b1` bundle and sets
+    /// `acp_enable_mcp = true`; the ACP default `test-agent` has neither. A
+    /// restored session owned by `finance` therefore loads MCP only if restore
+    /// resolves the stored alias rather than `acp.default_agent`.
+    fn make_cross_agent_restore_config(cwd: &std::path::Path, mock_uri: String) -> Config {
+        let mut cfg = make_mcp_granting_test_config(cwd, mock_uri);
+        // ACP default agent: no bundle, MCP off.
+        {
+            let ta = cfg.agents.get_mut("test-agent").expect("test-agent exists");
+            ta.mcp_bundles = vec![];
+            ta.acp_enable_mcp = false;
+        }
+        // Session owner: granted the bundle and opted into ACP MCP.
+        cfg.agents.insert(
+            "finance".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                risk_profile: "default".into(),
+                mcp_bundles: vec!["b1".into()],
+                acp_enable_mcp: true,
+                ..Default::default()
+            },
+        );
+        cfg.acp.default_agent = Some("test-agent".to_string());
+        cfg
+    }
+
+    /// A restored session must rebuild under the agent it was CREATED with
+    /// (`AcpSessionData.agent_alias`), not `acp.default_agent`, and apply that
+    /// agent's `acp_enable_mcp`. Here the owner `finance` opts into MCP while
+    /// the ACP default `test-agent` does not, so a correct restore means the
+    /// granted MCP server receives the `tools/list` handshake. Regression for
+    /// the restore-path review on #8237.
+    #[tokio::test]
+    async fn session_load_restores_owning_agent_and_its_mcp_optin() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mcp = start_mock_mcp_http_server("records.list").await;
+        let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cross-agent-load";
+        store
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let requests = mcp
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| std::str::from_utf8(&r.body)
+                .map(|b| b.contains("tools/list"))
+                .unwrap_or(false)),
+            "restored session must rebuild from its owning agent `finance` (acp_enable_mcp=true) \
+             and load its MCP bundles, not the ACP default `test-agent`; got {} request(s)",
+            requests.len()
+        );
+    }
+
+    /// Same restore-alias contract as the load test, exercised through
+    /// `session/resume` (which shares the restore path). Regression for the
+    /// restore-path review on #8237.
+    #[tokio::test]
+    async fn session_resume_restores_owning_agent_and_its_mcp_optin() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mcp = start_mock_mcp_http_server("records.list").await;
+        let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cross-agent-resume";
+        store
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        let requests = mcp
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| std::str::from_utf8(&r.body)
+                .map(|b| b.contains("tools/list"))
+                .unwrap_or(false)),
+            "resumed session must rebuild from its owning agent `finance` (acp_enable_mcp=true) \
+             and load its MCP bundles, not the ACP default `test-agent`; got {} request(s)",
+            requests.len()
+        );
     }
 
     #[test]
