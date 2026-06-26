@@ -484,8 +484,14 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
-    // Pagination
-    next_cursor: Option<(String, String)>,
+    // Pagination — prefer the byte-offset cursor (`next_cursor_line_offset`)
+    // because it is independent of event id ordering and avoids the
+    // legacy `(until_ts, until_id)` tie-break that can drop
+    // earlier-written events when ids are written in non-lexicographic
+    // order (UUID v4 in practice). The legacy cursor stays as a fallback
+    // for daemons that haven't been upgraded to expose the byte offset.
+    next_cursor_offset: Option<u64>,
+    next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
     loading: bool,
     // Viewport
@@ -514,7 +520,8 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
-            next_cursor: None,
+            next_cursor_offset: None,
+            next_cursor_legacy: None,
             at_end: false,
             loading: false,
             list_height: 0,
@@ -528,16 +535,21 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None).await;
+        self.load_page(None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
-    async fn load_page(&mut self, cursor: Option<(String, String)>) {
+    async fn load_page(
+        &mut self,
+        cursor_offset: Option<u64>,
+        cursor_legacy: Option<(String, String)>,
+    ) {
         self.loading = true;
         let params = LogsQueryParams {
-            until_ts: cursor.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor.as_ref().map(|(_, id)| id.clone()),
+            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
+            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
+            until_line_offset: cursor_offset,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
@@ -545,13 +557,14 @@ impl Logs {
                 Some(self.search_query.clone())
             },
             hide_internal: true,
-            limit: Some(if cursor.is_none() {
+            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
                 INITIAL_LOAD
             } else {
                 PAGE_SIZE
             }),
             ..Default::default()
         };
+        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 // Events come newest-first from the daemon; reverse to chronological
@@ -562,7 +575,7 @@ impl Logs {
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
-                if cursor.is_some() && prepended > 0 {
+                if has_cursor && prepended > 0 {
                     // Prepend older events before the existing buffer
                     let mut combined = new_entries;
                     combined.append(&mut self.events);
@@ -571,10 +584,14 @@ impl Logs {
                     if let Some(sel) = self.list_state.selected() {
                         self.list_state.select(Some(sel + prepended));
                     }
-                } else if cursor.is_none() {
+                } else if !has_cursor {
                     self.events = new_entries;
                 }
-                self.next_cursor = result.next_cursor;
+                // Prefer the byte-offset cursor (independent of id ordering);
+                // fall back to the legacy `[timestamp, id]` pair when the
+                // daemon has not been upgraded to expose it.
+                self.next_cursor_offset = result.next_cursor_line_offset;
+                self.next_cursor_legacy = result.next_cursor;
                 self.at_end = result.at_end;
             }
             Err(_) => {
@@ -601,7 +618,8 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
-        self.next_cursor = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
         self.at_end = false;
 
         let filtered = self.filtered_indices();
@@ -1057,9 +1075,10 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && let Some(cursor) = self.next_cursor.clone()
+            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
         {
-            self.load_page(Some(cursor)).await;
+            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
+                .await;
         }
     }
 
