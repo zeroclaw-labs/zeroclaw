@@ -387,6 +387,12 @@ pub struct RpcDispatcher {
     tui_id: Option<String>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
+    /// SHA-256 fingerprint of the client certificate presented on the mTLS
+    /// handshake (remote WSS plane only; `None` on the local socket). This is the
+    /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
+    /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
+    /// resolves from the registry.
+    peer_cert_fingerprint: Option<String>,
 }
 
 impl RpcDispatcher {
@@ -397,7 +403,21 @@ impl RpcDispatcher {
             authenticated: false,
             tui_id: None,
             peer_label,
+            peer_cert_fingerprint: None,
         }
+    }
+
+    /// Bind the client certificate fingerprint from the mTLS handshake (WSS).
+    /// Additive builder so the socket transport and tests need no change.
+    #[must_use]
+    pub fn with_peer_cert_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.peer_cert_fingerprint = fingerprint;
+        self
+    }
+
+    /// The presenting client certificate fingerprint, if this is an mTLS peer.
+    pub fn peer_cert_fingerprint(&self) -> Option<&str> {
+        self.peer_cert_fingerprint.as_deref()
     }
 
     /// TUI ID assigned during initialize, if any.
@@ -423,6 +443,7 @@ impl RpcDispatcher {
             authenticated: true,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
+            peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
 
@@ -731,6 +752,22 @@ impl RpcDispatcher {
                 env: req.env,
             });
         self.tui_id = Some(tui_id.clone());
+
+        // Bind the session's tui_id to the presenting client cert fingerprint
+        // (mTLS peers only). The cert is the transport identity; the renew RPC
+        // gates on its ledger status. Authorization still resolves from the
+        // registry - the cert is not a parallel permission store.
+        if let Some(fp) = self.peer_cert_fingerprint.as_deref() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "tui_id": tui_id,
+                        "cert_fingerprint": fp,
+                    })),
+                "WSS session bound to client certificate"
+            );
+        }
 
         self.authenticated = true;
 
