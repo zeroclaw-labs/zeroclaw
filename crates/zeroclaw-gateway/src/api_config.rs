@@ -1010,7 +1010,7 @@ pub async fn handle_delete_map_key(
         return e.into_response();
     }
     let working = state.config.read().clone();
-    match parse_alias_kind(&q.path) {
+    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             // Agent deletion is special: it must scrub config references
             // (heartbeat, peer-groups, delegates, workspace.access, …) via
@@ -1358,7 +1358,7 @@ pub async fn handle_delete_plan(
         path: s.path.clone(),
         raw_value: s.raw_value.clone(),
     };
-    let Some(kind) = parse_alias_kind(&q.path) else {
+    let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) else {
         // Non-aliased section (e.g. `mcp.servers`): generic key removal with no
         // reference cascade — nothing to preview.
         return axum::Json(DeletePlanResponse {
@@ -1438,42 +1438,6 @@ pub struct RenameMapKeyResponse {
     /// and provider/channel rename paths, which have no owned state).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-}
-
-/// Parse a rename `path` (the map-keyed *section*) into the typed
-/// [`AliasKind`](zeroclaw_config::alias_refs::AliasKind) whose rename needs the
-/// reference-rewrite cascade. Returns `None` for non-aliased sections (e.g.
-/// `mcp.servers`), which fall back to the generic key-swap rename.
-fn parse_alias_kind(path: &str) -> Option<zeroclaw_config::alias_refs::AliasKind> {
-    use zeroclaw_config::alias_refs::{AliasKind, ProviderCategory};
-    if path == "agents" {
-        return Some(AliasKind::Agent);
-    }
-    if let Some(rest) = path.strip_prefix("providers.") {
-        let (cat, family) = rest.split_once('.')?;
-        if family.is_empty() || family.contains('.') {
-            return None;
-        }
-        let category = match cat {
-            "models" => ProviderCategory::Models,
-            "tts" => ProviderCategory::Tts,
-            "transcription" => ProviderCategory::Transcription,
-            _ => return None,
-        };
-        return Some(AliasKind::Provider {
-            category,
-            family: family.to_string(),
-        });
-    }
-    if let Some(ty) = path.strip_prefix("channels.") {
-        if ty.is_empty() || ty.contains('.') {
-            return None;
-        }
-        return Some(AliasKind::Channel {
-            channel_type: ty.to_string(),
-        });
-    }
-    None
 }
 
 /// Map a [`RenameError`](zeroclaw_config::alias_refs::RenameError) to the HTTP
@@ -1558,7 +1522,7 @@ pub async fn handle_rename_map_key(
 
     let working = state.config.read().clone();
 
-    match parse_alias_kind(&body.path) {
+    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             rename_agent_cascade(&state, working, &body).await
         }

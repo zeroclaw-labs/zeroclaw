@@ -563,8 +563,8 @@ impl Observer for OtelObserver {
                 duration,
                 tokens_used,
                 cost_usd,
-                channel: _,
-                agent_alias: _,
+                channel,
+                agent_alias,
                 turn_id,
             } => {
                 if let Some(tid) = turn_id {
@@ -576,6 +576,14 @@ impl Observer for OtelObserver {
                     if let Some((mut span, _)) = entry {
                         let secs = duration.as_secs_f64();
                         span.set_attribute(KeyValue::new("duration_s", secs));
+                        span.set_attribute(KeyValue::new(
+                            "zeroclaw.channel",
+                            channel.clone().unwrap_or_default(),
+                        ));
+                        span.set_attribute(KeyValue::new(
+                            "gen_ai.agent.name",
+                            agent_alias.clone().unwrap_or_default(),
+                        ));
                         if let Some(usage) = tokens_used {
                             span.set_attribute(KeyValue::new(
                                 "gen_ai.usage.input_tokens",
@@ -599,6 +607,7 @@ impl Observer for OtelObserver {
                     &[
                         KeyValue::new("gen_ai.provider.name", model_provider.clone()),
                         KeyValue::new("gen_ai.request.model", model.clone()),
+                        KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     ],
                 );
             }
