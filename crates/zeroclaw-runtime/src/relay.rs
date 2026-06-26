@@ -96,6 +96,45 @@ pub fn ensure_signing_key(data_dir: &std::path::Path) -> Result<Vec<u8>> {
     Ok(pkcs8.as_ref().to_vec())
 }
 
+/// Resolve this daemon's relay node-id.
+///
+/// If the operator set `[relay].node_id` (`configured`), that wins. Otherwise read
+/// (or mint + persist) a random 128-bit value at `<data_dir>/relay/node_id`.
+///
+/// The node-id is an UNGUESSABLE routing CAPABILITY, not a name (design relay/02):
+/// high entropy + non-enumerability stops attackers probing which daemons are
+/// online or flooding a daemon's inner mTLS by guessing ids (A6/A10). It is kept
+/// DECOUPLED from the cert/identity so the relay (a metadata adversary) only ever
+/// learns an opaque handle, and so it can be rotated without reissuing certs.
+pub fn ensure_node_id(data_dir: &std::path::Path, configured: &str) -> Result<String> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Ok(configured.to_string());
+    }
+    let dir = data_dir.join("relay");
+    let path = dir.join("node_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|e| anyhow::Error::msg(format!("generating node_id: {e}")))?;
+    let id = hex::encode(bytes);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    std::fs::write(&path, &id).with_context(|| format!("writing {}", path.display()))?;
+    Ok(id)
+}
+
 /// Run the relay bridge until `cancel` fires, reconnecting with backoff.
 pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result<()> {
     let mut backoff = BACKOFF_INITIAL;

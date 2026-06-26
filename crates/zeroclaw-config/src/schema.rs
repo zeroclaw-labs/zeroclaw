@@ -6572,7 +6572,11 @@ pub struct RelayConfig {
     /// Relay address to connect to, as `host:port`.
     #[serde(default)]
     pub url: String,
-    /// Opaque node-id this daemon registers under (clients dial this id).
+    /// Opaque node-id this daemon registers under (clients dial this id). Leave
+    /// empty (recommended) to auto-mint and persist a random 128-bit capability at
+    /// `<data_dir>/relay/node_id`; set it only to pin a specific id. It must stay
+    /// unguessable and is decoupled from the cert - do NOT use a name or a cert
+    /// thumbprint (a guessable/derivable id lets attackers probe and flood you).
     #[serde(default)]
     pub node_id: String,
     /// Relay account token presented at registration (admission credential).

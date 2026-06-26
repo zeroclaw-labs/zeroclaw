@@ -2799,7 +2799,15 @@ fn issue_wss_client_cert(
     println!("  CA:   {}", ca_cert.display());
 
     let relay = &config.relay;
-    let relay_ready = relay.enabled && !relay.url.is_empty() && !relay.node_id.is_empty();
+    // node_id is auto-minted when unset, so resolve the real one (persisted) for
+    // the guidance rather than requiring the operator to have pinned it.
+    let relay_ready = relay.enabled && !relay.url.is_empty();
+    let relay_node = if relay_ready {
+        zeroclaw_runtime::relay::ensure_node_id(&config.data_dir, &relay.node_id)
+            .unwrap_or_else(|_| relay.node_id.clone())
+    } else {
+        relay.node_id.clone()
+    };
     if has_out_dir {
         println!();
         println!("Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /");
@@ -2814,13 +2822,13 @@ fn issue_wss_client_cert(
         if has_out_dir {
             println!(
                 "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}",
-                relay.url, relay.node_id
+                relay.url, relay_node
             );
         } else {
             println!(
                 "  zerocode --relay {} --relay-node {} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
                 relay.url,
-                relay.node_id,
+                relay_node,
                 ca_cert.display(),
                 cert_path.display(),
                 key_path.display()
@@ -4222,14 +4230,32 @@ async fn main() -> Result<()> {
                                  authenticated plane the relay tunnels).",
                             ));
                         }
-                        if relay_cfg.url.is_empty() || relay_cfg.node_id.is_empty() {
+                        if relay_cfg.url.is_empty() {
                             return Err(anyhow::Error::msg(
-                                "[relay] is enabled but relay.url and relay.node_id are required.",
+                                "[relay] is enabled but relay.url is required.",
                             ));
                         }
                         // Persistent Ed25519 identity the relay binds the node-id to.
                         let signing_key_pkcs8 =
                             zeroclaw_runtime::relay::ensure_signing_key(&data_dir)?;
+                        // node_id is an unguessable 128-bit capability: auto-minted +
+                        // persisted unless the operator pinned one in [relay].node_id.
+                        let node_id = zeroclaw_runtime::relay::ensure_node_id(
+                            &data_dir,
+                            &relay_cfg.node_id,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "node_id": node_id,
+                                "relay": relay_cfg.url,
+                            })),
+                            "relay bridge: node_id (give clients this as --relay-node)"
+                        );
                         // Default the relay's expected cert name to its host:port host.
                         let relay_host = if relay_cfg.relay_host.is_empty() {
                             relay_cfg
@@ -4243,7 +4269,7 @@ async fn main() -> Result<()> {
                         let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
                             relay_addr: relay_cfg.url,
                             relay_host,
-                            node_id: relay_cfg.node_id,
+                            node_id,
                             relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
                             local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
                             signing_key_pkcs8,
