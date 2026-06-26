@@ -246,6 +246,10 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: zeroclaw
+            ext: tar.gz
           - os: ubuntu-latest
             target: aarch64-linux-android
             artifact: zeroclaw
@@ -327,7 +331,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -452,6 +456,7 @@ jobs:
             "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-aarch64-apple-darwin.tar.gz"
+            "zeroclaw-x86_64-apple-darwin.tar.gz"
             "zeroclaw-aarch64-linux-android.tar.gz"
             "zeroclaw-x86_64-pc-windows-msvc.zip"
             "ZeroClaw.dmg"

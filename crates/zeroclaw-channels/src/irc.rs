@@ -723,6 +723,15 @@ impl Channel for IrcChannel {
             Err(_) => false,
         }
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No reliable server-supported typing indicator on IRC.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
