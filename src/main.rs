@@ -2822,12 +2822,12 @@ fn issue_wss_client_cert(
         // is a different trust root from the daemon CA (--tls-ca-cert).
         let mut relay_flags = String::new();
         if !relay.relay_host.is_empty() {
-            relay_flags.push_str(&format!(" --relay-host {}", relay.relay_host));
+            let _ = write!(relay_flags, " --relay-host {}", relay.relay_host);
         }
         if relay.relay_insecure {
             relay_flags.push_str(" --relay-insecure");
         } else if !relay.relay_ca_path.is_empty() {
-            relay_flags.push_str(&format!(" --relay-ca {}", relay.relay_ca_path));
+            let _ = write!(relay_flags, " --relay-ca {}", relay.relay_ca_path);
         } else {
             relay_flags.push_str(" --relay-ca <relay-ca.crt>");
         }
