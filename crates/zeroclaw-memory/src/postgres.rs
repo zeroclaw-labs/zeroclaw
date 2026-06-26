@@ -690,6 +690,24 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn count_agent(&self, agent_alias: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
+            // residue is the presence of that alias row (0 or 1), NOT the memory-
+            // row count (which would miss an agents-row-only lag).
+            let stmt = format!("SELECT COUNT(*) FROM {qualified_agents} WHERE alias = $1");
+            let row = client.query_one(&stmt, &[&alias])?;
+            let count: i64 = row.get(0);
+            usize::try_from(count).context("PostgreSQL returned an oversized agent count")
+        })
+        .await
+    }
+
     async fn count(&self) -> Result<usize> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();

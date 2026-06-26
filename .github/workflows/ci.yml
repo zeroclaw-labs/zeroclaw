@@ -346,6 +346,10 @@ jobs:
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
+      - name: Docs link gate (added links)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_links_gate.sh
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary

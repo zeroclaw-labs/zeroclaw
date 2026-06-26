@@ -8,7 +8,8 @@
   `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
   `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
 - **Labels:** Snapshot the current GitHub labels after labels are applied, for
-  example `type: docs`, `risk: low`, `size: S`, `docs`.
+  example `type: docs`, `risk: low`, `size: S`, `docs`. During label-spelling
+  migration, copy the exact live label spelling from the GitHub UI.
 
 ## Validation Evidence (required)
 
@@ -42,7 +43,7 @@ Yes/No for each. Answer any `Yes` with a 1–2 sentence explanation.
 - Config / env / CLI surface changed? (`Yes/No`)
 - If `No` or `Yes` to either: exact upgrade steps for existing users:
 
-## Rollback (required for `risk: medium` and `risk: high`)
+## Rollback (required for medium/high-risk PRs)
 
 Low-risk PRs: `git revert <sha>` is the plan unless otherwise noted.
 
@@ -61,7 +62,7 @@ Medium/high-risk PRs must fill:
 
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment.
+**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment. Canonical colon-scoped labels use no-space spelling; during migration, copy exact live label spelling from the GitHub UI.
 
 **Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
 or `Created with Claude Code` to the PR body or commit-message tail. Human

@@ -30,5 +30,6 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
 
 [dev-dependencies]
+filetime = "0.2"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

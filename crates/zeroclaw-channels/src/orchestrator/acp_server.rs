@@ -1237,6 +1237,19 @@ impl AcpServer {
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
+        // Cost-tracking inputs, resolved before the spawn while `self.config`
+        // is in scope. `turn_streamed` reuses the outer cost scope set below;
+        // without it the turn falls back to a tracker-less `usage_only` context
+        // and model cost is silently dropped (#5221). Mirrors the gateway WS
+        // path. The process-global tracker is shared with the gateway/daemon.
+        let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
+            self.config.cost.clone(),
+            &self.config.data_dir,
+        );
+        let cost_pricing = std::sync::Arc::new(
+            zeroclaw_runtime::agent::cost::build_model_provider_pricing(&self.config),
+        );
+
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
@@ -1245,6 +1258,15 @@ impl AcpServer {
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
+            // Stamp the resolved per-turn alias so `/api/cost?agent=<alias>`
+            // attributes this spend.
+            let cost_context = cost_tracker.map(|tracker| {
+                zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+                    tracker,
+                    cost_pricing,
+                )
+                .with_agent_alias(&turn_alias)
+            });
             let span_session = session_id_for_task.clone();
             let result = {
                 use ::zeroclaw_log::Instrument as _;
@@ -1259,10 +1281,13 @@ impl AcpServer {
                 );
                 zeroclaw_runtime::agent::loop_::scope_session_key(
                     Some(session_id_for_task),
-                    session
-                        .agent
-                        .turn_streamed(&prompt, event_tx, Some(cancel_token))
-                        .instrument(span),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_context,
+                        session
+                            .agent
+                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .instrument(span),
+                    ),
                 )
                 .await
             };
@@ -2015,6 +2040,23 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // WS is registered to handle them; on ACP-only sessions they should
         // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "history_trimmed",
+                    "droppedMessages": dropped_messages,
+                    "keptTurns": kept_turns,
+                    "reason": reason,
+                }
+            }),
+        },
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.
@@ -2031,27 +2073,6 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
-            if chat.is_pruned_tool_exchange_summary() {
-                return vec![JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": format!("history-pruner-{session_id}"),
-                            "name": "history-pruner",
-                            "title": "history-pruner",
-                            "kind": "think",
-                            "status": "completed",
-                            "content": [{
-                                "type": "content",
-                                "content": { "type": "text", "text": &chat.content }
-                            }]
-                        }
-                    }),
-                }];
-            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -3388,37 +3409,6 @@ mod tests {
             update["content"][0]["content"]["text"]
                 .as_str()
                 .is_some_and(|t| !t.is_empty())
-        );
-    }
-
-    #[test]
-    fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-        let marker = ChatMessage::pruned_tool_exchange_summary(3);
-        let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
-        let notes = history_notifications_for_message("sess-x", &msg);
-        assert_eq!(notes.len(), 1);
-        let update = &notes[0].params["update"];
-        assert_eq!(update["sessionUpdate"], "tool_call");
-        assert_eq!(update["name"], "history-pruner");
-        assert_eq!(update["content"][0]["content"]["text"], marker);
-
-        let plain = ConversationMessage::Chat(ChatMessage::assistant("normal reply"));
-        let plain_notes = history_notifications_for_message("sess-x", &plain);
-        assert_eq!(
-            plain_notes[0].params["update"]["sessionUpdate"],
-            "agent_message_chunk"
-        );
-
-        // Sessions pruned before #7684 carry the legacy marker; they must still
-        // replay as the styled tool_call, not leak the raw marker as agent text.
-        let legacy = ConversationMessage::Chat(ChatMessage::assistant(
-            "[Tool exchange: 3 tool call(s) results collapsed]",
-        ));
-        let legacy_notes = history_notifications_for_message("sess-x", &legacy);
-        assert_eq!(
-            legacy_notes[0].params["update"]["sessionUpdate"],
-            "tool_call"
         );
     }
 

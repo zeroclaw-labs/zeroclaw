@@ -39,7 +39,7 @@ import {
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
 import ToolPicker from "@/components/ToolPicker";
-import { Badge, Button, ComboBox } from "@/components/ui";
+import { Badge, Button, ComboBox, Select } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
 import {
@@ -570,6 +570,9 @@ const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   "skill_bundles": "skill_bundles",
   "knowledge_bundles": "knowledge_bundles",
   "mcp_bundles": "mcp_bundles",
+  // Delegates is a subset of the configured agents — give it the same themed
+  // multi-select (with agent suggestions) as the bundle fields, not free text.
+  delegates: "agents",
 };
 
 // Peer-groups carry the same alias-ref shape as agents do: a single
@@ -623,6 +626,31 @@ const LEAF_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
 function leafSingleAliasKind(path: string): keyof AgentOptionsResponse | null {
   const leaf = path.split(".").pop() ?? "";
   return LEAF_SINGLE_ALIAS_FIELDS[leaf] ?? null;
+}
+
+// `kind:"alias-ref"` fields carry a `<Type>Ref` type_hint naming the section
+// they reference. Map it to the `resolve-alias-source` query value (the backend
+// AliasSource variants). Used to DERIVE the source when the daemon emits the
+// kind but omits `alias_source` (older builds): the generic resolver still works
+// — covering provider refs (incl. tts/transcription/classifier) that have no
+// AgentOptionsResponse list, so they get a real dropdown, not a stuck spinner.
+const ALIAS_REF_TYPE_TO_SOURCE: Record<string, string> = {
+  ModelProviderRef: "model_providers",
+  TtsProviderRef: "tts_providers",
+  TranscriptionProviderRef: "transcription_providers",
+  RiskProfileRef: "risk_profiles",
+  RuntimeProfileRef: "runtime_profiles",
+  ChannelRef: "channels",
+};
+
+// The `resolve-alias-source` query value for an alias-ref entry: prefer the
+// daemon-declared `alias_source`; else derive it from the `<Type>Ref` type_hint.
+// Returns null for non-alias-ref entries or unmapped ref types.
+function aliasRefSource(entry: ListResponseEntry): string | null {
+  if (entry.kind !== "alias-ref") return null;
+  if (entry.alias_source) return entry.alias_source;
+  const m = entry.type_hint?.match(/(\w+Ref)\b/);
+  return (m && ALIAS_REF_TYPE_TO_SOURCE[m[1] ?? ""]) ?? null;
 }
 
 // Cross-section navigation map for agent alias-ref fields. Each entry
@@ -1406,8 +1434,7 @@ function FieldRow({
   // `aliasSource` is undefined and the effect is a no-op, leaving the maps
   // above to resolve refs. When the backend does declare it, the
   // `renderer === 'alias-ref'` branch takes precedence over those maps.
-  const aliasSource =
-    entry.kind === "alias-ref" ? entry.alias_source : undefined;
+  const aliasSource = aliasRefSource(entry);
   const [aliasValues, setAliasValues] = useState<string[] | null>(null);
   useEffect(() => {
     if (!aliasSource) return;
@@ -1423,6 +1450,20 @@ function FieldRow({
       cancelled = true;
     };
   }, [aliasSource]);
+
+  // Resolve the option list for an `alias-ref` field. Prefer the resolver values
+  // (keyed off `aliasSource`, which `aliasRefSource` derives from the type_hint
+  // when the daemon omits `alias_source`); else fall back to the agent/leaf alias
+  // map (`/api/config/agent-options`). `null` = no options yet.
+  const aliasRefOptions: string[] | null =
+    aliasValues ??
+    (agentSingleAliasKind && agentOptions
+      ? (agentOptions[agentSingleAliasKind] ?? [])
+      : null);
+  // Distinguish "actively resolving" (a source IS being fetched, show a spinner)
+  // from "unresolvable" (no source AND no fallback — render an empty, usable
+  // picker rather than a spinner that never finishes).
+  const aliasRefResolving = aliasSource !== null && aliasRefOptions === null;
 
   if (tombstoned) {
     return (
@@ -1525,43 +1566,51 @@ function FieldRow({
             onChange={(next) => onChange(next ? "true" : "false")}
           />
         ) : renderer === "select" ? (
-          <select
+          // Themed locked dropdown for enum variants (no browser-styled <option>
+          // list). The leading "—" is the empty/unset choice.
+          <Select
             id={entry.path}
             value={value}
-            onChange={(e) => onChange(e.target.value)}
-            className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
-          >
-            <option value="">—</option>
-            {(entry.enum_variants ?? []).map((v) => (
-              <option key={v} value={v}>
-                {v}
-              </option>
-            ))}
-          </select>
+            onChange={onChange}
+            aria-label={fieldShortLabel(entry)}
+            options={[
+              { value: "", label: "—" },
+              ...(entry.enum_variants ?? []).map((v) => ({
+                value: v,
+                label: v,
+              })),
+            ]}
+          />
         ) : renderer === "alias-ref" ? (
-          // Schema-driven alias-ref picker (zeroclaw-labs/zeroclaw#7594):
-          // a free-typeable input backed by a <datalist> of the live values
-          // resolved from `entry.alias_source`. Takes precedence over the
-          // per-section maps below; dormant until the backend emits this kind.
-          <>
+          // Schema-driven alias-ref picker (zeroclaw-labs/zeroclaw#7594): a
+          // themed, click-to-open ComboBox of the live values (resolved from
+          // `entry.alias_source`, with an agent-options fallback — see
+          // `aliasRefOptions`). Uses the same primitive as the model-field picker
+          // so it matches the rest of the page instead of a browser-styled native
+          // <select>. `openOnFocus` makes clicking the field open the list, since
+          // the configured aliases ARE the expected input. Free text is still
+          // accepted verbatim (and validated on save) so an existing or
+          // not-yet-created alias is never dropped. Precedes the per-section maps.
+          aliasRefResolving ? (
             <input
               id={entry.path}
-              list={`alias-${entry.path}`}
               value={value}
-              onChange={(e) => onChange(e.target.value)}
+              disabled
+              readOnly
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder={
-                aliasValues === null
-                  ? t("fieldform.alias_loading")
-                  : t("fieldform.alias_pick_or_type")
-              }
+              placeholder={t("fieldform.alias_loading")}
             />
-            <datalist id={`alias-${entry.path}`}>
-              {(aliasValues ?? []).map((v) => (
-                <option key={v} value={v} />
-              ))}
-            </datalist>
-          </>
+          ) : (
+            <ComboBox
+              id={entry.path}
+              value={value}
+              onChange={onChange}
+              options={aliasRefOptions ?? []}
+              openOnFocus
+              placeholder={t("fieldform.alias_pick_or_type")}
+              aria-label={fieldShortLabel(entry)}
+            />
+          )
         ) : isProviderModelField &&
           providerModels !== null &&
           providerModels.length > 0 ? (
@@ -1573,6 +1622,7 @@ function FieldRow({
             value={value}
             onChange={onChange}
             options={providerModels}
+            openOnFocus
             placeholder={t("fieldform.model_combo_placeholder")}
             emptyText={t("fieldform.model_combo_empty")}
             aria-label={t("fieldform.model_aria")}
@@ -1932,6 +1982,7 @@ function ArrayFieldEditor({
                       value={row}
                       onChange={(v) => setRow(i, v)}
                       options={suggestions}
+                      openOnFocus
                       placeholder={t("fieldform.value_combo_placeholder")}
                       emptyText={t("fieldform.value_combo_empty")}
                     />

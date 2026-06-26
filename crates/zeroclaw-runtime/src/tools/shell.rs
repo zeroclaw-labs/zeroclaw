@@ -650,6 +650,43 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    #[cfg(windows)]
+    fn stdin_reader_command() -> &'static str {
+        "more"
+    }
+
+    #[cfg(not(windows))]
+    fn stdin_reader_command() -> &'static str {
+        "cat"
+    }
+
+    #[cfg(windows)]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out && echo warn 1>&2"
+    }
+
+    #[cfg(not(windows))]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out; echo warn >&2"
+    }
+
+    #[cfg(windows)]
+    fn medium_risk_write_command() -> &'static str {
+        "copy /Y NUL zeroclaw_shell_approval_test"
+    }
+
+    #[cfg(not(windows))]
+    fn medium_risk_write_command() -> &'static str {
+        "touch zeroclaw_shell_approval_test"
+    }
+
+    fn medium_risk_write_base() -> &'static str {
+        medium_risk_write_command()
+            .split_whitespace()
+            .next()
+            .expect("medium-risk test command should have a base command")
+    }
+
     /// Returns the fully-wrapped shell tool as it is composed in production:
     /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
     /// rate-limiting behaviour must use this helper so they exercise the wrappers.
@@ -694,17 +731,21 @@ mod tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["cat".into()],
+            allowed_commands: vec![stdin_reader_command().into()],
             ..SecurityPolicy::default()
         });
         let tool = ShellTool::new(security, test_runtime());
-        let fut = tool.execute(json!({"command": "cat"}));
+        let fut = tool.execute(json!({"command": stdin_reader_command()}));
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
         assert!(
             res.is_ok(),
             "a stdin-reading command hung — stdin is not null and may reach the terminal"
         );
-        assert!(res.unwrap().expect("cat should return a result").success);
+        assert!(
+            res.unwrap()
+                .expect("stdin reader should return a result")
+                .success
+        );
     }
 
     #[tokio::test]
@@ -836,7 +877,7 @@ mod tests {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
             .with_persistent_writes(false);
         let result = tool
-            .execute(json!({"command": "echo out; echo warn >&2"}))
+            .execute(json!({"command": success_with_stderr_command()}))
             .await
             .expect("command should run");
         assert!(
@@ -876,7 +917,7 @@ mod tests {
     async fn shell_blocks_absolute_path_argument() {
         let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
-            .execute(json!({"command": "cat /etc/passwd"}))
+            .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .expect("absolute path argument should be blocked");
         assert!(!result.success);
@@ -893,7 +934,7 @@ mod tests {
     async fn shell_blocks_option_assignment_path_argument() {
         let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
-            .execute(json!({"command": "grep --file=/etc/passwd root ./src"}))
+            .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("option-assigned forbidden path should be blocked");
         assert!(!result.success);
@@ -910,7 +951,7 @@ mod tests {
     async fn shell_blocks_short_option_attached_path_argument() {
         let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
-            .execute(json!({"command": "grep -f/etc/passwd root ./src"}))
+            .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("short option attached forbidden path should be blocked");
         assert!(!result.success);
@@ -941,6 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn shell_blocks_input_redirection_path_bypass() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
@@ -961,7 +1003,7 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into(), "echo".into()],
+            allowed_commands: vec![env_print_command().into(), "echo".into()],
             ..SecurityPolicy::default()
         })
     }
@@ -970,10 +1012,64 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into()],
+            allowed_commands: vec![env_print_command().into()],
             shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn env_print_command() -> &'static str {
+        "set"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn env_print_command() -> &'static str {
+        "env"
+    }
+
+    #[cfg(target_os = "windows")]
+    fn home_env_key() -> &'static str {
+        "USERPROFILE"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn home_env_key() -> &'static str {
+        "HOME"
+    }
+
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
+    fn env_output_contains_key(output: &str, key: &str) -> bool {
+        output.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(name, _)| env_key_eq(name, key))
+        })
+    }
+
+    fn env_output_contains_assignment(output: &str, key: &str, value: &str) -> bool {
+        output.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(name, actual)| env_key_eq(name, key) && actual == value)
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn env_key_eq(actual: &str, expected: &str) -> bool {
+        actual.eq_ignore_ascii_case(expected)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn env_key_eq(actual: &str, expected: &str) -> bool {
+        actual == expected
     }
 
     /// RAII guard that restores an environment variable to its original state on drop,
@@ -1010,9 +1106,9 @@ mod tests {
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command execution should succeed");
+            .expect("environment print command should succeed");
         assert!(result.success);
         assert!(
             !result.output.contains("sk-test-secret-12345"),
@@ -1029,21 +1125,23 @@ mod tests {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
         assert!(result.success);
         assert!(
-            result.output.contains("HOME="),
-            "HOME should be available in shell environment"
+            env_output_contains_key(&result.output, home_env_key()),
+            "{} should be available in shell environment",
+            home_env_key()
         );
         assert!(
-            result.output.contains("PATH="),
+            env_output_contains_key(&result.output, "PATH"),
             "PATH should be available in shell environment"
         );
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn shell_blocks_plain_variable_expansion() {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
@@ -1069,15 +1167,15 @@ mod tests {
         );
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command execution should succeed");
+            .expect("environment print command should succeed");
         assert!(result.success);
-        assert!(
-            result
-                .output
-                .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test")
-        );
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "ZEROCLAW_TEST_PASSTHROUGH",
+            "db://unit-test"
+        ));
     }
 
     #[test]
@@ -1102,14 +1200,14 @@ mod tests {
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
+            allowed_commands: vec![medium_risk_write_base().into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": medium_risk_write_command()}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -1123,7 +1221,7 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": medium_risk_write_command(),
                 "approved": true
             }))
             .await
@@ -1249,6 +1347,7 @@ mod tests {
     // ── Non-UTF8 binary output tests ────────────────────
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn decode_output_valid_utf8_roundtrips() {
         let input = "hello 世界 🌍".as_bytes();
         assert_eq!(super::decode_output(input), "hello 世界 🌍");
@@ -1465,13 +1564,13 @@ mod tests {
             }));
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
 
         assert!(result.success);
         assert!(
-            result.output.contains("ZC_TUI_TEST_VAR=tui_injected"),
+            env_output_contains_assignment(&result.output, "ZC_TUI_TEST_VAR", "tui_injected"),
             "tui_env var should appear in subprocess env, got:\n{}",
             result.output
         );
@@ -1483,9 +1582,9 @@ mod tests {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
 
         assert!(result.success);
         assert!(
@@ -1498,19 +1597,20 @@ mod tests {
     async fn shell_tui_env_overrides_safe_var() {
         // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
-        let _guard = EnvGuard::set("HOME", "/daemon-home");
+        let home_key = home_env_key();
+        let _guard = EnvGuard::set(home_key, "daemon-home");
 
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
-                m.insert("HOME".to_string(), "/tui-home".to_string());
+                m.insert(home_key.to_string(), "tui-home".to_string());
                 m
             }));
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
 
         assert!(
             result.success,
@@ -1518,13 +1618,13 @@ mod tests {
             result.output, result.error
         );
         assert!(
-            result.output.contains("HOME=/tui-home"),
-            "tui_env HOME should override daemon HOME, got:\n{}",
+            env_output_contains_assignment(&result.output, home_key, "tui-home"),
+            "tui_env {home_key} should override daemon {home_key}, got:\n{}",
             result.output
         );
         assert!(
-            !result.output.contains("HOME=/daemon-home"),
-            "daemon HOME must not leak through when tui_env overrides it, got:\n{}",
+            !env_output_contains_assignment(&result.output, home_key, "daemon-home"),
+            "daemon {home_key} must not leak through when tui_env overrides it, got:\n{}",
             result.output
         );
     }
@@ -1536,9 +1636,9 @@ mod tests {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
 
         assert!(result.success);
         assert!(
@@ -1566,13 +1666,13 @@ mod tests {
         );
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": env_print_command()}))
             .await
-            .expect("env command should succeed");
+            .expect("environment print command should succeed");
 
         assert!(result.success);
         assert!(
-            result.output.contains("SSH_AUTH_SOCK=/tmp/fake.sock"),
+            env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
         );
     }
