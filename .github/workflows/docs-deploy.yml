@@ -93,8 +93,9 @@ jobs:
             exit 1
           fi
           if ! git ls-remote --exit-code --tags "$REPO_URL" "refs/tags/${PTR_TAG}" >/dev/null 2>&1; then
-            echo "::error::stable pointer names '${PTR_TAG}' but that git tag does not exist. Cut and push the release tag (which deploys its docs) before flipping the pointer."
-            exit 1
+            echo "::warning::stable pointer names '${PTR_TAG}' but that git tag does not exist yet. This is expected when the version bump that flips the pointer lands on master before the release tag is cut from that same commit. The pointer target is verified at deploy time, when the tag's docs dir must be present on gh-pages."
+          else
+            echo "Stable pointer tag '${PTR_TAG}' exists."
           fi
           if ! git ls-remote --exit-code "$REPO_URL" "refs/heads/gh-pages" >/dev/null 2>&1; then
             echo "gh-pages does not exist yet; pointer target presence is checked at deploy time."
