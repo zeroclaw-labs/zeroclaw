@@ -183,6 +183,24 @@ fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
         .unwrap_or_default()
 }
 
+fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
+    match kind {
+        PropKind::Integer => value
+            .parse::<i64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-integer"),
+        PropKind::Float => value
+            .parse::<f64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-float"),
+        _ => None,
+    }
+}
+
+fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<String> {
+    scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
+}
+
 /// Joined up/down display chords for list navigation footers.
 fn nav_keys() -> String {
     use crate::keymap::ConfigTabAction as A;
@@ -458,9 +476,9 @@ impl App {
             return;
         }
 
-        // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
+        // Unified bottom-left action hint, matching the Dashboard/Logs panes.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(self.bottom_hint(), theme::dim_style())),
             chunks[2],
         );
 
@@ -522,15 +540,124 @@ impl App {
         }
     }
 
-    /// Highlight style + symbol for the right (detail) pane lists: active while
-    /// focus is in the detail, dimmed "you are here" while the section list holds
-    /// focus and the detail is just a preview.
-    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        if self.zeroclaw_pane == ZeroclawPane::Detail {
-            (theme::selected_style(), "› ")
-        } else {
-            (theme::selected_inactive_style(), "  ")
+    fn bottom_hint(&self) -> String {
+        use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
+
+        let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
+
+        match &self.screen {
+            Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
+                if self.filter.is_some() {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}  {}={}  {}={}  ?={}",
+                        nav_keys(),
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::Back),
+                        crate::i18n::t("zc-config-footer-action-clear-filter"),
+                        help,
+                    )
+                } else if self.is_composite_tab() {
+                    match self.tab_names.get(self.active_tab) {
+                        Some(ConfigTab::Personality) if self.personality_active_file.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-files"),
+                            )
+                        }
+                        Some(ConfigTab::Skills) if self.skills_active.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-skills"),
+                            )
+                        }
+                        _ => default(),
+                    }
+                } else {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}={}  {}={}  ?={}",
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::DeleteRow),
+                        crate::i18n::t("zc-config-footer-action-reset"),
+                        help,
+                    )
+                }
+            }
+            Screen::AliasCreate { .. } => {
+                format!(
+                    " {}={}  {}={}",
+                    editor_key(E::Confirm),
+                    crate::i18n::t("zc-config-footer-action-create"),
+                    editor_key(E::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                )
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                if self.is_select_edit() {
+                    if self.filter.is_some() {
+                        let help = crate::i18n::t("zc-config-footer-action-help");
+                        format!(
+                            " {}  {}={}  {}={}  ?={}",
+                            nav_keys(),
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-clear-filter"),
+                            help,
+                        )
+                    } else {
+                        format!(
+                            " {}={}  {}={}",
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-cancel"),
+                        )
+                    }
+                } else if self.fields[*field_idx].kind == PropKind::StringArray {
+                    format!(
+                        " {}={}  {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-new-line"),
+                        editor_key(E::Save),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                } else {
+                    format!(
+                        " {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                }
+            }
+            _ => default(),
         }
+    }
+
+    /// Highlight style + symbol for the right (detail) pane lists, mirroring
+    /// `zerocode_pane::ZerocodePane::detail_highlight`: the active selection
+    /// style and "› " gutter when the detail pane holds focus, the dim "you
+    /// are here" marker when focus has stepped back to the section list.
+    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
+        let focused = matches!(
+            (&self.screen, self.zeroclaw_pane),
+            (Screen::FieldEdit { .. }, _) | (_, ZeroclawPane::Detail)
+        );
+        let symbol = if focused { "\u{203a} " } else { "  " };
+        (theme::selection_highlight(focused, false), symbol)
     }
 
     fn draw_section_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -573,19 +700,26 @@ impl App {
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-            self.cycle_section(1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
-        }
-        if key.code == KeyCode::BackTab {
-            self.cycle_section(-1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
+        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+            use crate::keymap::ConfigTabAction;
+            if action == ConfigTabAction::SectionNext {
+                self.cycle_section(1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
+            if action == ConfigTabAction::SectionPrev {
+                self.cycle_section(-1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
         }
 
         if self.section == ConfigSection::Zerocode {
-            self.zerocode.handle_key(key);
+            if !self.zerocode.handle_key(key) {
+                // Left/Back at the zerocode section level was not consumed:
+                // cross back to the outer left (zeroclaw) pane.
+                self.cycle_section(-1);
+            }
             self.sync_zerocode_locales().await;
             return Ok(false);
         }
@@ -1710,15 +1844,14 @@ impl App {
         let has_tabs = self.alias_list_has_tabs();
 
         // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
-        // the FieldList tab bar uses. On these screens those chords no longer
-        // mean back/into; Back is the only way out to the type list.
+        // the FieldList tab bar uses. TabRight steps into Costs; TabLeft steps
+        // back toward Aliases, then on the leftmost tab walks out to the type
+        // list (the opposite of "into"), mirroring the FieldList sub-tab gesture.
         if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
             match action {
-                ConfigTabAction::TabLeft => {
-                    if self.alias_tab > 0 {
-                        self.alias_tab -= 1;
-                        self.deactivate_filter();
-                    }
+                ConfigTabAction::TabLeft if self.alias_tab > 0 => {
+                    self.alias_tab -= 1;
+                    self.deactivate_filter();
                     return Ok(());
                 }
                 ConfigTabAction::TabRight => {
@@ -1760,15 +1893,12 @@ impl App {
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
-        // With tabs present, TabLeft no longer doubles as Back.
-        let back = if has_tabs {
-            matches!(action, Some(ConfigTabAction::Back))
-        } else {
-            matches!(
-                action,
-                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
-            )
-        };
+        // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
+        // it only reaches here on the leftmost tab, where it walks out like Back.
+        let back = matches!(
+            action,
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+        );
         let into = if has_tabs {
             matches!(action, Some(ConfigTabAction::Enter))
         } else {
@@ -2917,28 +3047,21 @@ impl App {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
-        use crate::keymap::Chord;
+        use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
-            return match key.code {
-                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.activate_filter();
-                    FilterAction::Consumed
-                }
-                _ => FilterAction::Passthrough,
-            };
+            if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
+                self.activate_filter();
+                return FilterAction::Consumed;
+            }
+            return FilterAction::Passthrough;
         }
-        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
-            Some(FilterEditAction::Cancel)
-        } else if Chord::key(KeyCode::Enter).matches(&key) {
-            Some(FilterEditAction::Accept)
-        } else if Chord::key(KeyCode::Backspace).matches(&key) {
-            Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) {
-            Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) {
-            Some(FilterEditAction::CursorDown)
-        } else {
-            None
+        let editor_chord = match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Cancel) => Some(FilterEditAction::Cancel),
+            Some(SearchBoxAction::Accept) => Some(FilterEditAction::Accept),
+            Some(SearchBoxAction::Backspace) => Some(FilterEditAction::Backspace),
+            Some(SearchBoxAction::Up) => Some(FilterEditAction::CursorUp),
+            Some(SearchBoxAction::Down) => Some(FilterEditAction::CursorDown),
+            None => None,
         };
         match editor_chord {
             Some(FilterEditAction::Cancel) => {
@@ -3058,6 +3181,12 @@ impl App {
                 } = &self.screen
                 {
                     let field = &self.fields[*field_idx];
+                    if let Some(status) =
+                        scalar_validation_status(field.kind, &self.edit_buf, &field.path)
+                    {
+                        self.status_msg = Some(status);
+                        return Ok(());
+                    }
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
                     let prefix = prefix.clone();
@@ -3310,9 +3439,9 @@ impl App {
         }
 
         let (style, symbol) = if active {
-            (theme::selected_style(), "› ")
+            (theme::selection_highlight(true, false), "\u{203a} ")
         } else {
-            (theme::selected_inactive_style(), "  ")
+            (theme::selection_highlight(false, false), "  ")
         };
 
         frame.render_stateful_widget(
@@ -3429,17 +3558,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_list(
@@ -3552,17 +3671,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     /// Costs-tab body: the resource rate sheets under
@@ -3607,7 +3716,7 @@ impl App {
         self.last_main_area = r.main;
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
-        self.draw_footer(frame, r, "?=help");
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -3634,14 +3743,7 @@ impl App {
         .block(theme::panel_block(" Alias name "));
         frame.render_widget(input, r.main);
 
-        let footer = format!(
-            "{}={}  {}={}",
-            editor_key(crate::keymap::ConfigEditorAction::Confirm),
-            crate::i18n::t("zc-config-footer-action-create"),
-            editor_key(crate::keymap::ConfigEditorAction::Cancel),
-            crate::i18n::t("zc-config-footer-action-cancel"),
-        );
-        self.draw_footer(frame, r, &footer);
+        self.draw_status(frame, r);
     }
 
     fn draw_field_list(
@@ -3725,6 +3827,16 @@ impl App {
             );
         }
 
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible
+                .iter()
+                .position(|&i| i == self.field_cursor)
+                .unwrap_or(0)
+        };
+        let selected_field = visible.get(cursor).copied();
+
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&i| {
@@ -3744,7 +3856,25 @@ impl App {
                 };
 
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
-                let line = format!("{short_name} = {val_display}{env_marker}");
+                // In the field list (selection) screen, the row is only
+                // *selected*; it is not yet editable. Make this explicit so the
+                // affordance no longer mimics an active text input. The press
+                // hint is derived from the same row used for ListState
+                // selection, so it stays aligned with the highlight even when
+                // a field-list filter is active. The key name is resolved from
+                // the current keymap so rebinding ConfigTabAction::Enter is
+                // reflected here, and the prose is rendered through Fluent for
+                // localization.
+                let press_hint = if Some(i) == selected_field {
+                    let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
+                    format!(
+                        "  \u{2500}\u{2192} {}",
+                        crate::i18n::t_args("zc-config-field-edit-hint", &[("keys", &enter_key)])
+                    )
+                } else {
+                    String::new()
+                };
+                let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
 
                 let style = if f.populated {
                     theme::body_style()
@@ -3754,15 +3884,6 @@ impl App {
                 ListItem::new(Line::from(Span::styled(line, style)))
             })
             .collect();
-
-        let cursor = if self.filter.is_some() {
-            self.filter_cursor
-        } else {
-            visible
-                .iter()
-                .position(|&i| i == self.field_cursor)
-                .unwrap_or(0)
-        };
 
         let mut state = ListState::default();
         if !items.is_empty() {
@@ -3782,17 +3903,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=edit  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     // ── Composite tab draw methods ──────────────────────────────
@@ -3832,14 +3943,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-files"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // File picker mode.
             frame.render_widget(
@@ -3894,8 +3998,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -3933,14 +4036,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-skills"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // Skill picker mode.
             frame.render_widget(
@@ -3991,8 +4087,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -4055,8 +4150,8 @@ impl App {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&title))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(theme::selection_highlight(true, false))
+                    .highlight_symbol("\u{203a} "),
                 r.main,
                 &mut state,
             );
@@ -4064,17 +4159,7 @@ impl App {
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
-            let hints = if self.filter.is_some() {
-                format!(
-                    "{}  {}=save  {}=clear filter",
-                    nav_keys(),
-                    tab_key(crate::keymap::ConfigTabAction::Enter),
-                    tab_key(crate::keymap::ConfigTabAction::Back),
-                )
-            } else {
-                "?=help".to_string()
-            };
-            self.draw_footer(frame, r, &hints);
+            self.draw_status(frame, r);
         } else {
             // Text input (masked for secrets) — help text always visible.
             frame.render_widget(
@@ -4118,16 +4203,7 @@ impl App {
                     ))),
                     r.main,
                 );
-                let footer = format!(
-                    "{}={}  {}={}  {}={}",
-                    editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                    crate::i18n::t("zc-config-footer-action-new-line"),
-                    editor_key(crate::keymap::ConfigEditorAction::Save),
-                    crate::i18n::t("zc-config-footer-action-save"),
-                    editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                    crate::i18n::t("zc-config-footer-action-cancel"),
-                );
-                self.draw_footer(frame, r, &footer);
+                self.draw_status(frame, r);
                 return;
             }
 
@@ -4145,21 +4221,13 @@ impl App {
 
             frame.render_widget(input, r.main);
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-cancel"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
-    fn draw_footer(&self, frame: &mut Frame, r: Regions, _hints: &str) {
-        // The help indicator is unified at the pane bottom (draw_into); per-screen
-        // hint strings are no longer rendered here. Only the transient status
-        // message remains inline.
+    fn draw_status(&self, frame: &mut Frame, r: Regions) {
+        // The action hint is unified at the pane bottom; only transient status
+        // messages render inline with the active detail pane.
         if let Some(msg) = &self.status_msg {
             frame.render_widget(
                 Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
@@ -4252,10 +4320,11 @@ impl App {
 
 impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
-            vec!["Tab", "Shift+Tab"],
+            [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
             crate::i18n::t("zc-config-help-switch-section"),
         );
         if self.section == ConfigSection::Zerocode {
@@ -4277,8 +4346,18 @@ impl App {
         // All chords resolve from the live keymap so overrides/vim/emacs show.
         let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
         let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
-        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
-        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let help = || {
+            E::new(
+                crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+                crate::i18n::t("zc-config-help-this-help"),
+            )
+        };
+        let filter = || {
+            E::new(
+                tab_keys(A::BeginSearch),
+                crate::i18n::t("zc-config-help-filter"),
+            )
+        };
         let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
@@ -4530,12 +4609,18 @@ impl App {
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
         ));
-        entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
+        entries.push(E::new(
+            tab_keys(A::BeginSearch),
+            crate::i18n::t("zc-config-help-filter"),
+        ));
         entries.push(E::new(
             tab_keys(A::Back),
             crate::i18n::t("zc-config-help-back"),
         ));
-        entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
+        entries.push(E::new(
+            crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+            crate::i18n::t("zc-config-help-this-help"),
+        ));
         entries.push(E::spacer());
         let mouse = if has_tabs {
             crate::i18n::t("zc-config-help-mouse-tabs-edit")
@@ -4669,11 +4754,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_scalar_validation_rejects_invalid_integer() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Integer, "20a"),
+            Some("zc-config-status-invalid-integer")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Integer, "20"), None);
+    }
+
+    #[test]
+    fn config_scalar_validation_rejects_invalid_float() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Float, "0.7x"),
+            Some("zc-config-status-invalid-float")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+    }
+
+    #[test]
     fn keyboard_enhancement_flags_disambiguate_modified_enter() {
         assert!(
             keyboard_enhancement_flags()
                 .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
+    }
+
+    fn test_manager() -> App {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            shape: None,
+            cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn left_on_leftmost_alias_tab_walks_back_to_type_list() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut mgr = test_manager();
+        mgr.sections = vec![entry_with_cost("providers.models", "models")];
+        mgr.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.models.anthropic".to_string(),
+            breadcrumb: vec!["providers.models".to_string(), "anthropic".to_string()],
+        };
+        mgr.alias_tab = 0;
+
+        assert!(
+            mgr.alias_list_has_tabs(),
+            "Aliases/Costs tabs must be present for this scenario"
+        );
+
+        mgr.handle_alias_list(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
+            "Left on the leftmost alias tab walks out to the type list like Back"
         );
     }
 }

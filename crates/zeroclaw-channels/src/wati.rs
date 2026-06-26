@@ -522,12 +522,12 @@ impl Channel for WatiChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 }
