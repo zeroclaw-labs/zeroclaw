@@ -50,6 +50,8 @@ pub struct Identity {
 }
 
 const SIGNUP_NOTE: &str = "Setting up a ZeroClaw agent on Inkbox.";
+/// Agent host reported to Inkbox at signup, so it can tailor post-verify guidance.
+const HARNESS: &str = "zeroclaw";
 
 /// Run a blocking SDK call off the tokio runtime.
 ///
@@ -90,7 +92,16 @@ pub fn signup(base_url: &str, human_email: &str, handle: &str) -> anyhow::Result
         base_url.to_string(),
     );
     let resp = off_runtime(move || {
-        Inkbox::signup(&email, SIGNUP_NOTE, None, Some(&h), None, Some(&base), None)
+        Inkbox::signup(
+            &email,
+            SIGNUP_NOTE,
+            None,
+            Some(&h),
+            None,
+            Some(HARNESS),
+            Some(&base),
+            None,
+        )
     })?;
     Ok(Signup {
         api_key: resp.api_key,
