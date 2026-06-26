@@ -51,6 +51,72 @@ pub fn pot_file(root: &Path) -> PathBuf {
     root.join("docs/book/po/messages.pot")
 }
 
+/// Ensure the `docs/book/po` translations submodule is initialized and checked
+/// out before the sync writes `.po`/`.pot` files into it. A bare clone leaves
+/// the gitlink path as an empty directory with no `.git`; writing catalogs there
+/// lands them in the parent worktree instead of the translations repo, so the
+/// translations silently never reach the submodule. `git submodule update
+/// --init` is idempotent: a no-op when the submodule is already populated.
+///
+/// A prior broken sync may have already scattered generated catalogs
+/// (`.po`/`.pot`/`.failures.log`) into the empty gitlink directory, which makes
+/// `git submodule update --init` abort with "destination path already exists and
+/// is not an empty directory". When the directory holds only those generated
+/// artifacts and no `.git`, clear them first so the clone can proceed; refuse to
+/// touch anything else.
+pub fn ensure_po_submodule(root: &Path) -> anyhow::Result<()> {
+    let po = po_dir(root);
+    if po.join(".git").exists() {
+        return Ok(());
+    }
+    if po.is_dir() {
+        clear_stray_po_artifacts(&po)?;
+    }
+    println!("==> initializing translations submodule → {}", po.display());
+    run_cmd(
+        Command::new("git")
+            .args(["submodule", "update", "--init", "--", "docs/book/po"])
+            .current_dir(root),
+    )?;
+    if !po.join(".git").exists() {
+        anyhow::bail!(
+            "translations submodule still not checked out at {}\n  \
+             run manually: git submodule update --init -- docs/book/po",
+            po.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only generated catalog artifacts from an uninitialized gitlink
+/// directory so the submodule clone can populate it. Bails if the directory
+/// holds any other file, so unexpected content is never silently deleted.
+fn clear_stray_po_artifacts(po: &Path) -> anyhow::Result<()> {
+    let generated = |name: &str| {
+        name.ends_with(".po") || name.ends_with(".pot") || name.ends_with(".failures.log")
+    };
+    let mut stray = vec![];
+    for entry in std::fs::read_dir(po)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if generated(&name) {
+            stray.push(entry.path());
+        } else {
+            anyhow::bail!(
+                "translations submodule path {} is not checked out but holds \
+                 unexpected file '{name}'; refusing to clear it. Resolve manually, then \
+                 run: git submodule update --init -- docs/book/po",
+                po.display()
+            );
+        }
+    }
+    for path in stray {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
 pub struct LocaleEntry {
     pub code: String,
     pub label: String,
@@ -332,6 +398,30 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_stray_po_artifacts_removes_only_generated() {
+        let dir = std::env::temp_dir().join(format!("zc-po-stray-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["fr.po", "messages.pot", "ja.failures.log"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        clear_stray_po_artifacts(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_stray_po_artifacts_refuses_unknown_files() {
+        let dir = std::env::temp_dir().join(format!("zc-po-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fr.po"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let err = clear_stray_po_artifacts(&dir).unwrap_err();
+        assert!(err.to_string().contains("notes.txt"));
+        assert!(dir.join("fr.po").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn peer_groups_env_key_matches_mdbook_mapping() {
