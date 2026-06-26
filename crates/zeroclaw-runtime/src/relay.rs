@@ -53,6 +53,12 @@ const ESTABLISHED: Duration = Duration::from_secs(5);
 const KEEPALIVE: Duration = Duration::from_secs(20);
 /// Declare the link dead if nothing has been heard for this long.
 const DEAD_AFTER: Duration = Duration::from_secs(60);
+/// During a node-id rotation, keep the OLD id's link alive this long after the
+/// NEW id registers, so clients mid-session on the old id are not cut off.
+const ROTATION_GRACE: Duration = Duration::from_secs(600);
+/// How often the supervisor polls for an on-demand rotation trigger / checks the
+/// scheduled-rotation deadline.
+const ROTATE_POLL: Duration = Duration::from_secs(15);
 
 /// Everything the bridge needs to register with, and verify, a relay.
 #[derive(Clone)]
@@ -81,6 +87,15 @@ pub struct RelayBridgeConfig {
     /// the only line of defense.
     pub open_burst: u32,
     pub open_rate_per_sec: f64,
+    /// Daemon data dir; the node-id + rotation-trigger files live under `relay/`.
+    pub data_dir: std::path::PathBuf,
+    /// Auto-rotate the node-id every N days (0 = never). Only meaningful when the
+    /// id is auto-minted (`rotation_allowed`).
+    pub node_id_rotation_days: u64,
+    /// Whether node-id rotation is permitted: true only when the operator did not
+    /// pin `[relay].node_id` (a pinned id is fixed). Gates both scheduled and
+    /// on-demand rotation.
+    pub rotation_allowed: bool,
 }
 
 /// Load (or create + persist) the daemon's Ed25519 relay-registration key.
@@ -132,32 +147,170 @@ pub fn ensure_node_id(data_dir: &std::path::Path, configured: &str) -> Result<St
     if !configured.is_empty() {
         return Ok(configured.to_string());
     }
-    let dir = data_dir.join("relay");
-    let path = dir.join("node_id");
+    let path = data_dir.join("relay").join("node_id");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let existing = existing.trim().to_string();
         if !existing.is_empty() {
             return Ok(existing);
         }
     }
+    let id = mint_node_id()?;
+    persist_node_id(data_dir, &id)?;
+    Ok(id)
+}
+
+/// Mint a fresh, unguessable 128-bit node-id (hex). Decoupled from the cert so a
+/// relay compromise leaks only a routing handle, and rotatable without reissuing
+/// certs.
+pub fn mint_node_id() -> Result<String> {
     use ring::rand::SecureRandom;
     let mut bytes = [0u8; 16];
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|e| anyhow::Error::msg(format!("generating node_id: {e}")))?;
-    let id = hex::encode(bytes);
+    Ok(hex::encode(bytes))
+}
+
+/// Atomically persist the effective node-id to `<data_dir>/relay/node_id` (temp +
+/// rename), so a concurrent reader (`ensure_node_id` / `relay_profile`) never sees
+/// a half-written value. This is what makes a rotated id flow to clients in-band
+/// on their next renewal.
+pub fn persist_node_id(data_dir: &std::path::Path, id: &str) -> Result<()> {
+    let dir = data_dir.join("relay");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    std::fs::write(&path, &id).with_context(|| format!("writing {}", path.display()))?;
-    Ok(id)
+    let tmp = dir.join("node_id.tmp");
+    std::fs::write(&tmp, id).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, dir.join("node_id")).context("atomically replacing node_id")?;
+    Ok(())
 }
 
-/// Run the relay bridge until `cancel` fires, reconnecting with backoff.
+/// The on-demand rotation trigger file. `zeroclaw security relay-rotate-node-id`
+/// touches it; the running bridge polls for it and rotates when it appears.
+pub fn rotate_trigger_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("relay").join("rotate-now")
+}
+
+/// Request an on-demand node-id rotation by touching the trigger file. The running
+/// daemon's bridge picks it up within its poll interval (auto-mint mode only).
+pub fn request_node_id_rotation(data_dir: &std::path::Path) -> Result<()> {
+    let dir = data_dir.join("relay");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = rotate_trigger_path(data_dir);
+    std::fs::write(&path, b"rotate\n").with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Run the relay bridge until `cancel` fires.
+///
+/// When node-id rotation is permitted (auto-mint mode) this is a supervisor: it
+/// keeps one live link and, on a scheduled cadence or an on-demand trigger, mints
+/// a fresh id, registers it ALONGSIDE the old one for a grace window (the relay
+/// binds both ids to the same pubkey, so A10 is preserved and clients mid-session
+/// on the old id keep working), persists the new id atomically (so it reaches
+/// clients in-band on their next renewal), then retires the old link. With
+/// rotation off (or an operator-pinned id) it is just a single link.
 pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result<()> {
+    if !cfg.rotation_allowed {
+        return serve_link(cfg, cancel).await;
+    }
+
+    let mut current_id = cfg.node_id.clone();
+    let mut link_cancel = cancel.child_token();
+    let mut link = {
+        let c = cfg.clone();
+        let lc = link_cancel.clone();
+        zeroclaw_spawn::spawn!(async move { serve_link(c, lc).await })
+    };
+
+    loop {
+        let Some(new_id) = wait_for_rotation(&cfg, &cancel).await else {
+            // Cancelled: retire the live link and exit.
+            link_cancel.cancel();
+            let _ = link.await;
+            return Ok(());
+        };
+
+        // Bring the new id up alongside the old (grace-window overlap).
+        let new_cancel = cancel.child_token();
+        let new_link = {
+            let mut c = cfg.clone();
+            c.node_id = new_id.clone();
+            let lc = new_cancel.clone();
+            zeroclaw_spawn::spawn!(async move { serve_link(c, lc).await })
+        };
+        // Persist immediately so `relay_profile` (the in-band push) and a restart
+        // both use the new id from now on.
+        if let Err(e) = persist_node_id(&cfg.data_dir, &new_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+                "relay node-id rotation: failed to persist the new id"
+            );
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "old": current_id, "new": new_id })),
+            "relay node-id rotating (old id kept alive for the grace window)"
+        );
+
+        // Hold the overlap for the grace window (or until cancellation).
+        tokio::select! {
+            _ = tokio::time::sleep(ROTATION_GRACE) => {}
+            _ = cancel.cancelled() => {}
+        }
+
+        // Retire the old link; promote the new one.
+        link_cancel.cancel();
+        let _ = link.await;
+        current_id = new_id;
+        link = new_link;
+        link_cancel = new_cancel;
+
+        if cancel.is_cancelled() {
+            link_cancel.cancel();
+            let _ = link.await;
+            return Ok(());
+        }
+    }
+}
+
+/// Wait for the next rotation, returning the freshly minted id; `None` on cancel.
+/// Fires on an on-demand trigger file or, when `node_id_rotation_days > 0`, on the
+/// scheduled cadence.
+async fn wait_for_rotation(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Option<String> {
+    let trigger = rotate_trigger_path(&cfg.data_dir);
+    let scheduled_deadline = (cfg.node_id_rotation_days > 0).then(|| {
+        Instant::now() + Duration::from_secs(cfg.node_id_rotation_days.saturating_mul(86_400))
+    });
+    let mut poll = tokio::time::interval(ROTATE_POLL);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = poll.tick() => {
+                if trigger.exists() {
+                    let _ = std::fs::remove_file(&trigger);
+                    return mint_node_id().ok();
+                }
+                if let Some(dl) = scheduled_deadline
+                    && Instant::now() >= dl
+                {
+                    return mint_node_id().ok();
+                }
+            }
+        }
+    }
+}
+
+/// One relay link for `cfg.node_id`: reconnect with capped backoff until `cancel`.
+async fn serve_link(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     loop {
         if cancel.is_cancelled() {
@@ -576,5 +729,57 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::*;
+
+    #[test]
+    fn mint_node_id_is_128_bit_hex_and_unique() {
+        let a = mint_node_id().unwrap();
+        let b = mint_node_id().unwrap();
+        assert_eq!(a.len(), 32, "16 bytes => 32 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "ids must be unguessable / distinct");
+    }
+
+    #[test]
+    fn persist_then_ensure_reads_back_the_rotated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = mint_node_id().unwrap();
+        persist_node_id(dir.path(), &id).unwrap();
+        // Auto-mint mode (empty configured) reads the persisted id - this is the
+        // path relay_profile() uses, so a rotated id flows to clients.
+        assert_eq!(ensure_node_id(dir.path(), "").unwrap(), id);
+
+        // A rotation overwrites it atomically; ensure_node_id sees the new value.
+        let rotated = mint_node_id().unwrap();
+        persist_node_id(dir.path(), &rotated).unwrap();
+        assert_eq!(ensure_node_id(dir.path(), "").unwrap(), rotated);
+    }
+
+    #[test]
+    fn pinned_node_id_ignores_the_persisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_node_id(dir.path(), "0123456789abcdef0123456789abcdef").unwrap();
+        // A pinned id wins, so a pinned daemon is never rotated.
+        assert_eq!(
+            ensure_node_id(dir.path(), "pinned-id").unwrap(),
+            "pinned-id"
+        );
+    }
+
+    #[test]
+    fn rotation_trigger_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = rotate_trigger_path(dir.path());
+        assert!(!path.exists());
+        request_node_id_rotation(dir.path()).unwrap();
+        assert!(path.exists(), "the CLI request creates the trigger file");
+        // The supervisor consumes it by removing it.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
     }
 }

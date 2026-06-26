@@ -2725,6 +2725,12 @@ enum SecurityCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Request an on-demand relay node-id rotation. The running daemon mints a
+    /// fresh id, registers it alongside the old one for a grace window, then
+    /// retires the old id; the new id reaches clients in-band on their next
+    /// certificate renewal. Only applies when `[relay].node_id` is auto-minted.
+    RelayRotateNodeId,
 }
 
 /// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
@@ -4337,6 +4343,10 @@ async fn main() -> Result<()> {
                         } else {
                             relay_cfg.relay_host.clone()
                         };
+                        // Rotation is permitted only for an auto-minted id (a
+                        // pinned [relay].node_id is fixed).
+                        let rotation_allowed = relay_cfg.node_id.trim().is_empty();
+                        let node_id_rotation_days = relay_cfg.node_id_rotation_days;
                         let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
                             relay_addr: relay_cfg.url,
                             relay_host,
@@ -4353,6 +4363,9 @@ async fn main() -> Result<()> {
                             // force unbounded loopback mTLS handshakes.
                             open_burst: 60,
                             open_rate_per_sec: 20.0,
+                            data_dir: data_dir.clone(),
+                            node_id_rotation_days,
+                            rotation_allowed,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })
@@ -5022,6 +5035,21 @@ async fn main() -> Result<()> {
                 out_dir,
                 force,
             } => issue_wss_client_cert(&config, &name, out_dir, force),
+            SecurityCommands::RelayRotateNodeId => {
+                if !config.relay.node_id.trim().is_empty() {
+                    anyhow::bail!(
+                        "[relay].node_id is pinned, so the node-id is fixed and not rotatable. \
+                         Clear it to auto-mint (and enable rotation)."
+                    );
+                }
+                zeroclaw_runtime::relay::request_node_id_rotation(&config.data_dir)?;
+                println!(
+                    "Requested a relay node-id rotation. A running daemon will rotate within ~{}s; \
+                     the new id reaches clients in-band on their next certificate renewal.",
+                    15
+                );
+                Ok(())
+            }
         },
 
         Commands::Estop {

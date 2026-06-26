@@ -6610,6 +6610,13 @@ pub struct RelayConfig {
     /// Skip verification of the relay's outer certificate (self-signed dev only).
     #[serde(default)]
     pub relay_insecure: bool,
+    /// Auto-rotate the auto-minted node-id every N days (default 0 = never).
+    /// Rotation mints a fresh id, registers it alongside the old one for a short
+    /// grace window (so in-flight clients keep working), then retires the old id;
+    /// the new id reaches clients in-band on their next certificate renewal. Only
+    /// applies when `node_id` is empty (an operator-pinned id is never rotated).
+    #[serde(default)]
+    pub node_id_rotation_days: u64,
 }
 
 fn default_wss_bind() -> String {

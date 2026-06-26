@@ -157,6 +157,9 @@ async fn zerocode_to_relay_to_daemon_full_path() {
             max_conns: 16,
             open_burst: 60,
             open_rate_per_sec: 20.0,
+            data_dir: std::path::PathBuf::from("/nonexistent-rotation-off"),
+            node_id_rotation_days: 0,
+            rotation_allowed: false,
         },
         cancel.clone(),
     ));
