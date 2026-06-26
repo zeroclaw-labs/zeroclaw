@@ -98,6 +98,7 @@ async fn zerocode_to_relay_to_daemon_full_path() {
         mats.server_key_path.to_str().unwrap(),
         mats.ca_cert_path.to_str().unwrap(),
         &[],
+        "",
     )
     .unwrap();
 

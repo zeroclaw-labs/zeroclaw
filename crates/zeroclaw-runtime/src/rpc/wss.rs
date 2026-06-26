@@ -171,8 +171,9 @@ pub fn build_tls_acceptor(
     key_path: &str,
     ca_cert_path: &str,
     pinned_certs: &[String],
+    crl_path: &str,
 ) -> Result<TlsAcceptor> {
-    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs)
+    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs, crl_path)
 }
 
 // ── Listener ─────────────────────────────────────────────────────

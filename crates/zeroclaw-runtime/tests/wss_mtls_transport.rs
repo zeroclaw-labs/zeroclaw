@@ -120,6 +120,7 @@ async fn valid_client_cert_completes_tls_and_ws_handshake() {
         mats.server_key_path.to_str().unwrap(),
         mats.ca_cert_path.to_str().unwrap(),
         &[],
+        "",
     )
     .unwrap();
 
@@ -168,6 +169,7 @@ async fn missing_client_cert_is_rejected() {
         mats.server_key_path.to_str().unwrap(),
         mats.ca_cert_path.to_str().unwrap(),
         &[],
+        "",
     )
     .unwrap();
 

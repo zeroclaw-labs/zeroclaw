@@ -6485,6 +6485,11 @@ pub struct GatewayClientAuthConfig {
     /// When non-empty, only client certs matching one of these fingerprints are accepted.
     #[serde(default)]
     pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty disables the check.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 impl Default for GatewayClientAuthConfig {
@@ -6494,6 +6499,7 @@ impl Default for GatewayClientAuthConfig {
             ca_cert_path: String::new(),
             require_client_cert: default_true(),
             pinned_certs: Vec::new(),
+            crl_path: String::new(),
         }
     }
 }
@@ -6524,6 +6530,12 @@ pub struct WssClientAuthConfig {
     /// only client certs matching one of these fingerprints are accepted.
     #[serde(default)]
     pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty (default) makes the daemon use
+    /// its ledger-materialized list at `<data_dir>/tls/revoked`.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 /// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).

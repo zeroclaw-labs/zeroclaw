@@ -100,6 +100,15 @@ pub struct LedgerEntry {
 pub struct CertLedger {
     conn: Mutex<Connection>,
     audit: Option<Arc<AuditLogger>>,
+    /// Where revocations are materialized for the WSS verifier to read
+    /// (`<data_dir>/tls/revoked`). `None` for an in-memory ledger.
+    revoked_path: Option<std::path::PathBuf>,
+}
+
+/// The revoked-fingerprint list the daemon's WSS mTLS verifier reads for
+/// connect-time revocation refusal (A5). The ledger materializes it on revoke.
+pub fn revoked_list_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("tls").join("revoked")
 }
 
 impl CertLedger {
@@ -112,7 +121,7 @@ impl CertLedger {
         let db_path = tls_dir.join("ledger.db");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open cert ledger DB: {}", db_path.display()))?;
-        Self::init(conn, audit)
+        Self::init(conn, audit, Some(revoked_list_path(data_dir)))
     }
 
     /// In-memory ledger for unit tests.
@@ -120,10 +129,15 @@ impl CertLedger {
         Self::init(
             Connection::open_in_memory().context("open in-memory cert ledger")?,
             audit,
+            None,
         )
     }
 
-    fn init(conn: Connection, audit: Option<Arc<AuditLogger>>) -> Result<Self> {
+    fn init(
+        conn: Connection,
+        audit: Option<Arc<AuditLogger>>,
+        revoked_path: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -148,10 +162,46 @@ impl CertLedger {
              CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);",
         )
         .context("create cert-ledger schema")?;
-        Ok(Self {
+        let ledger = Self {
             conn: Mutex::new(conn),
             audit,
-        })
+            revoked_path,
+        };
+        // Refresh the materialized revocation list so it reflects the ledger at
+        // startup (covers a missing/stale file).
+        if let Err(e) = ledger.materialize_revocations() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+                "cert ledger: failed to materialize the revocation list at open"
+            );
+        }
+        Ok(ledger)
+    }
+
+    /// Rewrite the revoked-fingerprint file from the SQLite truth (atomic temp +
+    /// rename). This is what makes a revoke take effect at the next handshake -
+    /// the WSS verifier re-reads the file when its mtime changes. No-op for an
+    /// in-memory ledger.
+    fn materialize_revocations(&self) -> Result<()> {
+        let Some(path) = &self.revoked_path else {
+            return Ok(());
+        };
+        let revoked = self.revoked_fingerprints()?;
+        let body = if revoked.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", revoked.join("\n"))
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).context("atomically replace the revocation list")?;
+        Ok(())
     }
 
     /// Record a freshly issued (or renewed) certificate and write the matching
@@ -240,11 +290,14 @@ impl CertLedger {
             )
             .context("revoke cert")?
         };
-        if changed > 0
-            && let Some(mut entry) = self.lookup_by_fingerprint(fingerprint)?
-        {
-            entry.actor = actor.to_string();
-            self.audit_cert(AuditEventType::CertRevoked, &entry);
+        if changed > 0 {
+            if let Some(mut entry) = self.lookup_by_fingerprint(fingerprint)? {
+                entry.actor = actor.to_string();
+                self.audit_cert(AuditEventType::CertRevoked, &entry);
+            }
+            // Materialize so the WSS verifier refuses this cert on the next
+            // connect (drives the A5 refusal from the real revoke action).
+            self.materialize_revocations()?;
         }
         Ok(changed > 0)
     }
@@ -399,6 +452,38 @@ mod tests {
         assert!(!led.mark_revoked("fp1", "operator").unwrap());
         // Revoking an unknown fingerprint is a no-op.
         assert!(!led.mark_revoked("nope", "operator").unwrap());
+    }
+
+    #[test]
+    fn revoke_materializes_the_crl_file_for_the_wss_verifier() {
+        // P1 contract: revoking in the ledger writes <data_dir>/tls/revoked so the
+        // WSS verifier refuses that cert on the next connect (A5).
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fpA", "dev1"), false).unwrap();
+        led.record_issued(&entry("fpB", "dev2"), false).unwrap();
+
+        let crl = revoked_list_path(dir.path());
+        // Nothing revoked yet -> the file exists (materialized at open) but is empty.
+        let before = std::fs::read_to_string(&crl).unwrap_or_default();
+        assert!(before.trim().is_empty());
+
+        led.mark_revoked("fpA", "operator").unwrap();
+        let after = std::fs::read_to_string(&crl).unwrap();
+        let revoked: Vec<&str> = after
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            revoked,
+            vec!["fpA"],
+            "the revoked fingerprint is materialized"
+        );
+        // The verifier sees it as revoked, the other does not.
+        let set = zeroclaw_tls::load_revoked_fingerprints(&crl);
+        assert!(set.contains("fpa")); // load normalizes to lowercase
+        assert!(!set.contains("fpb"));
     }
 
     #[test]

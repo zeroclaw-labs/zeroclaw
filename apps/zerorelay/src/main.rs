@@ -464,6 +464,7 @@ fn build_outer_client_verifier(
                 ca_cert_path: ca,
                 require_client_cert: mode == "required",
                 pinned_certs: vec![],
+                crl_path: String::new(),
             })?;
             Ok(Some(verifier))
         }

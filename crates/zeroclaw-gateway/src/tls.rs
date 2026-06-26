@@ -37,6 +37,7 @@ fn to_params(config: &GatewayTlsConfig) -> ServerConfigParams {
             ca_cert_path: ca.ca_cert_path.clone(),
             require_client_cert: ca.require_client_cert,
             pinned_certs: ca.pinned_certs.clone(),
+            crl_path: ca.crl_path.clone(),
         });
 
     ServerConfigParams {
@@ -131,6 +132,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: true,
                 pinned_certs: vec![],
+                crl_path: String::new(),
             }),
         };
 
@@ -157,6 +159,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: false,
                 pinned_certs: vec![],
+                crl_path: String::new(),
             }),
         };
 
@@ -205,6 +208,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: true,
                 pinned_certs: vec!["aabbccdd".to_string()],
+                crl_path: String::new(),
             }),
         };
 
@@ -231,6 +235,7 @@ mod tests {
                 ca_cert_path: "/nonexistent".to_string(),
                 require_client_cert: true,
                 pinned_certs: vec![],
+                crl_path: String::new(),
             }),
         };
 

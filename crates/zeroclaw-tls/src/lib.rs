@@ -38,7 +38,7 @@ pub mod testing;
 /// Construct this only when client authentication should be enabled; pass it as
 /// [`ServerConfigParams::client_auth`]. A `None` client-auth means server-only
 /// TLS.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientAuthParams {
     /// Path to the PEM CA certificate(s) used to verify client certificates.
     pub ca_cert_path: String,
@@ -46,6 +46,12 @@ pub struct ClientAuthParams {
     pub require_client_cert: bool,
     /// Optional SHA-256 fingerprints to pin. Colons and case are ignored.
     pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line).
+    /// When set, a client certificate whose fingerprint appears in the file is
+    /// REFUSED at the handshake (A5). The file is re-read when it changes, so a
+    /// revoke takes effect on the next connection (the daemon materializes it from
+    /// the issued-cert ledger on every revoke). Empty disables the check.
+    pub crl_path: String,
 }
 
 /// Server TLS parameters (transport-neutral).
@@ -109,19 +115,23 @@ pub fn build_mtls_acceptor(
     key_path: &str,
     ca_cert_path: &str,
     pinned_certs: &[String],
+    crl_path: &str,
 ) -> Result<TlsAcceptor> {
-    let server_config = build_mtls_server_config(cert_path, key_path, ca_cert_path, pinned_certs)?;
+    let server_config =
+        build_mtls_server_config(cert_path, key_path, ca_cert_path, pinned_certs, crl_path)?;
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
 /// Build a TLS 1.3-only [`rustls::ServerConfig`] that always requires and
 /// verifies a client certificate. See [`build_mtls_acceptor`]; this is the
 /// inner config builder. There is no no-client-auth branch here by design.
+/// `crl_path`, when non-empty, refuses a revoked client certificate (A5).
 pub fn build_mtls_server_config(
     cert_path: &str,
     key_path: &str,
     ca_cert_path: &str,
     pinned_certs: &[String],
+    crl_path: &str,
 ) -> Result<rustls::ServerConfig> {
     let certs = load_certs(cert_path)
         .with_context(|| format!("failed to load server certificate from {cert_path}"))?;
@@ -134,6 +144,7 @@ pub fn build_mtls_server_config(
         ca_cert_path: ca_cert_path.to_string(),
         require_client_cert: true,
         pinned_certs: pinned_certs.to_vec(),
+        crl_path: crl_path.to_string(),
     })
     .context("failed to build client certificate verifier")?;
 
@@ -170,19 +181,45 @@ pub fn build_client_verifier(params: &ClientAuthParams) -> Result<Arc<dyn Client
             .context("failed to build WebPKI client verifier (optional auth)")?
     };
 
-    if params.pinned_certs.is_empty() {
-        Ok(base_verifier)
-    } else {
+    // Layer the checks outward: WebPKI -> pin -> revocation. A revoked cert is
+    // refused even if it passes the CA chain and the pin set.
+    let mut verifier = base_verifier;
+    if !params.pinned_certs.is_empty() {
         let normalized: Vec<String> = params
             .pinned_certs
             .iter()
             .map(|fp| fp.replace(':', "").to_lowercase())
             .collect();
-        Ok(Arc::new(PinnedCertVerifier {
-            inner: base_verifier,
+        verifier = Arc::new(PinnedCertVerifier {
+            inner: verifier,
             pinned_fingerprints: normalized,
-        }))
+        });
     }
+    if !params.crl_path.trim().is_empty() {
+        verifier = Arc::new(RevocationCheckVerifier::new(
+            verifier,
+            params.crl_path.trim().into(),
+        ));
+    }
+    Ok(verifier)
+}
+
+/// Read a revoked-fingerprint file (one SHA-256 hex per line; blank lines and
+/// `#` comments ignored) into a normalized set. A missing file is an empty set
+/// (no revocations), not an error - so revocation simply has no effect until the
+/// first revoke materializes the file.
+pub fn load_revoked_fingerprints(path: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let fp = line.trim();
+            if fp.is_empty() || fp.starts_with('#') {
+                continue;
+            }
+            set.insert(fp.replace(':', "").to_lowercase());
+        }
+    }
+    set
 }
 
 /// Compute the SHA-256 fingerprint of a DER-encoded certificate.
@@ -275,6 +312,104 @@ impl ClientCertVerifier for PinnedCertVerifier {
                 "client certificate fingerprint {fingerprint} is not in the pinned set"
             )))
         }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// A client-certificate verifier that delegates to a base verifier and then
+/// REFUSES a certificate whose SHA-256 fingerprint is in a revoked-fingerprint
+/// file (threat A5: a stolen-but-unexpired cert is rejected at the handshake).
+///
+/// The file is the daemon's materialized revocation list (the issued-cert ledger
+/// rewrites it on every revoke). It is re-read only when its modification time
+/// changes, so the steady state is a cheap stat per handshake and a revoke takes
+/// effect on the next connection without restarting the listener.
+#[derive(Debug)]
+struct RevocationCheckVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    crl_path: std::path::PathBuf,
+    cache: std::sync::Mutex<RevokedCache>,
+}
+
+#[derive(Default, Debug)]
+struct RevokedCache {
+    mtime: Option<std::time::SystemTime>,
+    set: std::collections::HashSet<String>,
+}
+
+impl RevocationCheckVerifier {
+    fn new(inner: Arc<dyn ClientCertVerifier>, crl_path: std::path::PathBuf) -> Self {
+        Self {
+            inner,
+            crl_path,
+            cache: std::sync::Mutex::new(RevokedCache::default()),
+        }
+    }
+
+    /// True if `fingerprint` (normalized) is currently revoked, reloading the file
+    /// only when its mtime changed since the last read.
+    fn is_revoked(&self, fingerprint: &str) -> bool {
+        let mtime = std::fs::metadata(&self.crl_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut cache = self.cache.lock().expect("revocation cache lock");
+        if cache.mtime != mtime {
+            cache.set = load_revoked_fingerprints(&self.crl_path);
+            cache.mtime = mtime;
+        }
+        cache.set.contains(fingerprint)
+    }
+}
+
+impl ClientCertVerifier for RevocationCheckVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        let fingerprint = cert_sha256_fingerprint(end_entity.as_ref());
+        if self.is_revoked(&fingerprint) {
+            return Err(rustls::Error::General(
+                "client certificate has been revoked".to_string(),
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -470,6 +605,72 @@ mod tests {
     }
 
     #[test]
+    fn load_revoked_fingerprints_normalizes_and_skips_comments() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            "# a comment\nAA:BB:CC\n\n  deadBEEF  \n# another\n",
+        )
+        .unwrap();
+        let set = load_revoked_fingerprints(f.path());
+        assert!(set.contains("aabbcc"), "colons + case normalized");
+        assert!(set.contains("deadbeef"), "trimmed + lowercased");
+        assert_eq!(set.len(), 2, "comments + blanks skipped");
+        // A missing file is an empty set, not an error.
+        assert!(load_revoked_fingerprints(std::path::Path::new("/no/such/crl")).is_empty());
+    }
+
+    #[test]
+    fn revocation_verifier_refuses_a_revoked_client_cert() {
+        ensure_crypto_provider();
+        // A real CA + a clientAuth leaf it issued (so WebPKI validation passes and
+        // the ONLY thing that can reject is revocation).
+        let (ca_crt, ca_key) = testing::gen_ca();
+        let (csr, _key) = testing::gen_client_csr("dev_revoke");
+        let leaf = sign_csr(&ca_crt, &ca_key, "dev_revoke", &csr).unwrap();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let fp = cert_sha256_fingerprint(leaf_der.as_ref());
+
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &ca_crt).unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+
+        // CRL lists this fingerprint -> the handshake is refused (A5).
+        let revoked_crl = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(revoked_crl.path(), format!("{fp}\n")).unwrap();
+        let revoking = build_client_verifier(&ClientAuthParams {
+            ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
+            require_client_cert: true,
+            pinned_certs: vec![],
+            crl_path: revoked_crl.path().to_str().unwrap().to_string(),
+        })
+        .unwrap();
+        assert!(
+            revoking.verify_client_cert(&leaf_der, &[], now).is_err(),
+            "a revoked client cert must be refused"
+        );
+
+        // An empty CRL -> the same cert is accepted (revocation is the only gate
+        // that changed). A separate verifier avoids any mtime-cache timing.
+        let empty_crl = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(empty_crl.path(), "").unwrap();
+        let allowing = build_client_verifier(&ClientAuthParams {
+            ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
+            require_client_cert: true,
+            pinned_certs: vec![],
+            crl_path: empty_crl.path().to_str().unwrap().to_string(),
+        })
+        .unwrap();
+        assert!(
+            allowing.verify_client_cert(&leaf_der, &[], now).is_ok(),
+            "an un-revoked client cert passes"
+        );
+    }
+
+    #[test]
     fn relay_pin_verifier_matches_rejects_and_tofu_records() {
         use rustls::client::danger::ServerCertVerifier as _;
         ensure_crypto_provider();
@@ -644,6 +845,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: true,
                 pinned_certs: vec![],
+                crl_path: String::new(),
             }),
         ))
         .unwrap();
@@ -667,6 +869,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: false,
                 pinned_certs: vec![],
+                crl_path: String::new(),
             }),
         ))
         .unwrap();
@@ -719,6 +922,7 @@ mod tests {
                 ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
                 require_client_cert: true,
                 pinned_certs: vec!["aabbccdd".to_string()],
+                crl_path: String::new(),
             }),
         ))
         .unwrap();
@@ -851,6 +1055,7 @@ mod tests {
             key_f.path().to_str().unwrap(),
             ca_f.path().to_str().unwrap(),
             pinned,
+            "",
         )
         .unwrap();
         (cfg, cert_f, key_f, ca_f)
@@ -1082,6 +1287,7 @@ mod tests {
             mats.server_key_path.to_str().unwrap(),
             mats.ca_cert_path.to_str().unwrap(),
             &[],
+            "",
         )
         .unwrap();
 

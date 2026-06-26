@@ -4267,11 +4267,28 @@ async fn main() -> Result<()> {
                                 )
                             }
                         };
+                        // Connect-time revocation refusal (A5): default to the
+                        // ledger-materialized list under <data_dir>/tls/revoked
+                        // (the daemon rewrites it on every revoke), overridable by
+                        // [wss.client_auth].crl_path.
+                        let crl_path = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .map(|c| c.crl_path.clone())
+                            .filter(|p| !p.is_empty())
+                            .unwrap_or_else(|| {
+                                zeroclaw_runtime::security::cert_ledger::revoked_list_path(
+                                    &data_dir,
+                                )
+                                .to_string_lossy()
+                                .into_owned()
+                            });
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
                             &cert_path,
                             &key_path,
                             &ca_cert_path,
                             &pinned,
+                            &crl_path,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
