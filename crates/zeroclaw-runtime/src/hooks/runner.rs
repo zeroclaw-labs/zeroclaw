@@ -482,4 +482,342 @@ mod tests {
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
     }
+
+    // ── Panic recovery + cancellation propagation (#7688) ────────────────────
+    //
+    // Pinned regression: a hook that panics must not abort the runner or
+    // prevent subsequent handlers in the same `run_*` call from running, and
+    // a hook that returns `HookResult::Cancel(_)` must short-circuit the
+    // remaining handlers in the same call. These contracts are spelled out
+    // at lines 144–156 (cancel) and 148–156 (panic recovery) for
+    // `run_before_model_resolve`, and duplicated in every other `run_*`
+    // method on `HookRunner`. Without focused tests, a future refactor that
+    // drops the catch_unwind arm as "seems redundant because hook code
+    // shouldn't panic" would silently regress runtime control flow.
+    //
+    // We deliberately cover a small representative set of hook families
+    // rather than all six, matching the issue acceptance criteria ("tests
+    // document any intentional asymmetry between hook families").
+
+    /// A hook that panics on a configurable method. Records nothing; its
+    /// only role is to exercise the `catch_unwind` branch in the runner.
+    struct PanickingHook {
+        name: String,
+        priority: i32,
+    }
+
+    #[async_trait]
+    impl HookHandler for PanickingHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_model_resolve(
+            &self,
+            _model_provider: String,
+            _model: String,
+        ) -> HookResult<(String, String)> {
+            panic!("simulated before_model_resolve panic");
+        }
+
+        async fn before_tool_call(
+            &self,
+            _name: String,
+            _args: Value,
+        ) -> HookResult<(String, Value)> {
+            panic!("simulated before_tool_call panic");
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            panic!("simulated before_llm_call panic");
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: ChannelMessage,
+        ) -> HookResult<ChannelMessage> {
+            panic!("simulated on_message_received panic");
+        }
+    }
+
+    /// A hook that cancels the run on a configurable method.
+    struct CancelNonPromptHook {
+        name: String,
+        priority: i32,
+    }
+
+    #[async_trait]
+    impl HookHandler for CancelNonPromptHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            HookResult::Cancel("blocked by non-prompt cancel hook".into())
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: ChannelMessage,
+        ) -> HookResult<ChannelMessage> {
+            HookResult::Cancel("blocked by non-prompt cancel hook".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_before_model_resolve_does_not_break_subsequent_handler() {
+        let mut runner = HookRunner::new();
+        // Higher priority panics first; lower priority must still run.
+        runner.register(Box::new(PanickingHook {
+            name: "panicker".into(),
+            priority: 10,
+        }));
+        runner.register(Box::new(UppercasePromptHook {
+            name: "upper".into(),
+            priority: 0,
+        }));
+
+        // `before_model_resolve` returns the (provider, model) tuple; the
+        // panicker yields no value so the runner falls back to the prior
+        // (input) values and the subsequent UppercasePromptHook ... wait,
+        // UppercasePromptHook only overrides before_prompt_build. Use a
+        // hook that does override before_model_resolve so the "subsequent
+        // handler ran" assertion is meaningful.
+        struct ModelConstHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for ModelConstHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_model_resolve(
+                &self,
+                _provider: String,
+                _model: String,
+            ) -> HookResult<(String, String)> {
+                HookResult::Continue(("const_provider".into(), "const_model".into()))
+            }
+        }
+
+        runner.register(Box::new(ModelConstHook {
+            name: "const".into(),
+            priority: 0,
+        }));
+
+        let result = runner
+            .run_before_model_resolve("openai".into(), "gpt-4o".into())
+            .await;
+        // The panicker panics (catch_unwind recovers), the const hook runs
+        // and overrides the values. Final tuple is the const values.
+        match result {
+            HookResult::Continue((p, m)) => {
+                assert_eq!(p, "const_provider");
+                assert_eq!(m, "const_model");
+            }
+            HookResult::Cancel(_) => panic!("panicking hook must not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_before_tool_call_does_not_break_subsequent_handler() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(PanickingHook {
+            name: "panicker".into(),
+            priority: 10,
+        }));
+
+        // A modifying hook that renames the tool call so we can verify it
+        // ran after the panicker.
+        struct RenameToolHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for RenameToolHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_tool_call(
+                &self,
+                name: String,
+                _args: Value,
+            ) -> HookResult<(String, Value)> {
+                HookResult::Continue((format!("{name}_renamed"), Value::Null))
+            }
+        }
+
+        runner.register(Box::new(RenameToolHook {
+            name: "renamer".into(),
+            priority: 0,
+        }));
+
+        let result = runner
+            .run_before_tool_call("shell".into(), Value::Null)
+            .await;
+        match result {
+            HookResult::Continue((name, _)) => {
+                assert_eq!(
+                    name, "shell_renamed",
+                    "hook after panicker must run and apply its modification"
+                );
+            }
+            HookResult::Cancel(_) => panic!("panicking hook must not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_llm_call_short_circuits_remaining_handlers() {
+        let mut runner = HookRunner::new();
+        // CancelNonPromptHook overrides before_llm_call to return Cancel.
+        runner.register(Box::new(CancelNonPromptHook {
+            name: "blocker".into(),
+            priority: 10,
+        }));
+
+        // A second hook that overrides before_llm_call; we count its calls
+        // to verify it did NOT run after the canceller.
+        struct LlmCallCounterHook {
+            name: String,
+            priority: i32,
+            count: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl HookHandler for LlmCallCounterHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        runner.register(Box::new(LlmCallCounterHook {
+            name: "counter".into(),
+            priority: 0,
+            count: Arc::clone(&count),
+        }));
+
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let mut model = "gpt-4o".into();
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+
+        assert!(
+            result.is_cancel(),
+            "canceller must short-circuit the run with HookResult::Cancel"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "hooks after the canceller must NOT run"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_on_message_received_short_circuits_remaining_handlers() {
+        // Same contract verified on a non-modifying-family hook to pin
+        // consistent cancellation behavior across hook families.
+        struct CancelMessageHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for CancelMessageHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn on_message_received(
+                &self,
+                _message: ChannelMessage,
+            ) -> HookResult<ChannelMessage> {
+                HookResult::Cancel("blocked by on_message_received cancel".into())
+            }
+        }
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(CancelMessageHook {
+            name: "blocker".into(),
+            priority: 10,
+        }));
+
+        // A no-op subsequent handler counted to confirm short-circuit.
+        struct PassThroughMessageHook {
+            name: String,
+            priority: i32,
+            count: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl HookHandler for PassThroughMessageHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn on_message_received(
+                &self,
+                message: ChannelMessage,
+            ) -> HookResult<ChannelMessage> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(message)
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        runner.register(Box::new(PassThroughMessageHook {
+            name: "passthrough".into(),
+            priority: 0,
+            count: Arc::clone(&count),
+        }));
+
+        let result = runner
+            .run_on_message_received(ChannelMessage::default())
+            .await;
+
+        assert!(
+            result.is_cancel(),
+            "on_message_received canceller must short-circuit"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "pass-through hook after the canceller must NOT run"
+        );
+    }
 }

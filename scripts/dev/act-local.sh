@@ -3,11 +3,19 @@
 #
 # Powers the release-runbook "Step 3 — Dry-run the release workflows
 # locally" instruction. Walks .github/workflows/, lets a maintainer pick
-# a job (or --all), pre-fetches pinned action SHAs that act's shallow
-# clone can't resolve, ensures .secrets exists, and threads
+# a job (or --all), ensures .secrets exists, and threads
 # --artifact-server-path plus a real GITHUB_TOKEN into every run. The
 # token is exported into the environment so act resolves it via
 # `-s GITHUB_TOKEN` (no token value lands in argv or process tables).
+#
+# Pinned action SHAs: workflows pin `uses:` to full 40-char commit SHAs,
+# and many of those commits are NOT ref tips (they're reachable only by
+# walking history, e.g. dtolnay/rust-toolchain@631a55b1...). act's
+# default on-disk action cache shells a shallow `git clone`/checkout that
+# can't resolve a non-tip SHA and dies with "reference not found". We run
+# act with its GoGitActionCache (--use-new-action-cache), which resolves
+# pinned non-tip SHAs correctly, plus --action-offline-mode so a cached
+# action is reused instead of re-fetched on every job in an --all sweep.
 #
 # --all enforces a hardcoded allowlist of dry-run-safe jobs. Anything
 # off the allowlist (publish, docker push, gh-pages deploys, external
@@ -30,7 +38,6 @@
 #   ./scripts/dev/act-local.sh --all                 # every dry-run-safe job (allowlist enforced)
 #   ./scripts/dev/act-local.sh --all --no-allowlist
 #                                                    # combined: also runs jobs not on the allowlist
-#   ./scripts/dev/act-local.sh --no-prefetch         # skip the SHA pre-fetch
 #   ./scripts/dev/act-local.sh --help
 
 set -eu
@@ -38,7 +45,6 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
 ACT_CACHE_DIR="${HOME}/.cache/act"
-PREFETCH=true
 NO_ALLOWLIST=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
 # back to `gh act` (the gh-act extension) — that's the install path
@@ -75,7 +81,7 @@ log()  { printf '==> %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '4,33p' "$0" | sed 's/^#//; s/^ //'
+  sed -n '4,41p' "$0" | sed 's/^#//; s/^ //'
   exit 0
 }
 
@@ -188,43 +194,6 @@ resolve_job() {
   esac
 }
 
-# ── Action SHA pre-fetch ───────────────────────────────────────────
-#
-# Extract every `uses: <owner>/<repo>@<sha>` line from the workflow
-# files, dedupe, and pre-clone each into ~/.cache/act/<owner>-<repo>@<sha>.
-# act's default shallow clone fails on arbitrary SHAs (we hit this live
-# with dtolnay/rust-toolchain@631a55b1...). Idempotent: pre-fetch is a
-# no-op when the cache dir already has action.yml.
-
-prefetch_actions() {
-  [ "$PREFETCH" = true ] || return 0
-
-  mkdir -p "$ACT_CACHE_DIR"
-  grep -hoE 'uses:[[:space:]]+[a-zA-Z0-9_./-]+@[a-f0-9]{40}' \
-    "$REPO_ROOT"/.github/workflows/*.yml \
-    | awk '{ print $2 }' \
-    | sort -u \
-    | while IFS=@ read -r action sha; do
-        slug=$(printf '%s' "$action" | tr '/' '-')
-        target="$ACT_CACHE_DIR/${slug}@${sha}"
-        if [ -f "$target/action.yml" ] || [ -f "$target/action.yaml" ]; then
-          continue
-        fi
-        short=$(printf '%s' "$sha" | cut -c1-7)
-        log "pre-fetch ${action}@${short}"
-        mkdir -p "$target"
-        (
-          cd "$target"
-          if [ ! -d .git ]; then
-            git init --quiet
-            git remote add origin "https://github.com/${action}.git"
-          fi
-          git fetch --quiet --depth 1 origin "$sha"
-          git checkout --quiet "$sha"
-        ) || die "pre-fetch failed for ${action}@${short}"
-      done
-}
-
 # ── Run a single job ───────────────────────────────────────────────
 
 cargo_toml_version() {
@@ -269,10 +238,19 @@ run_one() {
   fi
 
   # Build the act command via positional params (POSIX sh has no arrays).
+  # --use-new-action-cache selects act's GoGitActionCache, the only cache
+  # backend that resolves pinned non-tip action SHAs (the default on-disk
+  # cache shells a shallow clone and 400s on them). --action-offline-mode
+  # reuses an already-cached action instead of re-fetching it on every job
+  # of an --all sweep, and --action-cache-path keeps that cache in a
+  # predictable location.
   set -- workflow_dispatch \
          -j "$job" \
          -W "$workflow_file" \
          -s GITHUB_TOKEN \
+         --use-new-action-cache \
+         --action-offline-mode \
+         --action-cache-path "$ACT_CACHE_DIR" \
          --artifact-server-path "$ARTIFACT_DIR"
 
   if workflow_has_version_input "$workflow_file"; then
@@ -320,7 +298,6 @@ interactive_pick() {
   esac
   selected=$(printf '%s\n' "$pairs" | awk -v n="$choice" 'NR == n')
   [ -n "$selected" ] || die "no job at index $choice"
-  prefetch_actions
   run_one "$selected"
 }
 
@@ -337,9 +314,6 @@ main() {
     case "$1" in
       -h|--help)
         usage
-        ;;
-      --no-prefetch)
-        PREFETCH=false
         ;;
       --no-allowlist)
         NO_ALLOWLIST=true
@@ -368,16 +342,13 @@ main() {
       list_jobs
       ;;
     -a|--all)
-      prefetch_actions
       run_all
       ;;
     '')
-      prefetch_actions
       interactive_pick
       ;;
     *)
       pair=$(resolve_job "$action")
-      prefetch_actions
       run_one "$pair"
       ;;
   esac

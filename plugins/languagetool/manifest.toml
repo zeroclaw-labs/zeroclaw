@@ -1,7 +1,0 @@
-name = "languagetool"
-version = "0.1.0"
-description = "Check text for grammar, spelling, and style via LanguageTool (self-hostable)"
-author = "ZeroClaw Labs"
-wasm_path = "languagetool.wasm"
-capabilities = ["tool"]
-permissions = ["http_client", "env_read"]

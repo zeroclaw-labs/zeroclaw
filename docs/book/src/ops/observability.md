@@ -11,7 +11,8 @@ the shape of the events, and how to query them.
 ## Config (`[observability]`)
 
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
-`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`. A fresh
+`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`,
+`log_llm_request_payload = "off"`. A fresh
 install produces a 200-event rolling JSONL at
 `~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
@@ -19,6 +20,26 @@ works without further configuration.
 `log_persistence = "none"` disables persistence entirely. The broadcast
 stream (dashboard SSE) and the typed `Observer` bridge still receive
 events; only the JSONL writer is gated.
+
+### LLM request payload capture (`log_llm_request_payload`)
+
+`log_llm_request_payload` controls whether the `llm_request` event records the
+outbound prompt and conversation in addition to its `messages_count`. It is
+**off by default** and is a privacy-sensitive surface: when enabled, ZeroClaw
+persists the full system prompt plus the entire conversation history on every
+turn.
+
+| Value | What is captured |
+| --- | --- |
+| `off` (default) | Only `messages_count`. No message content is recorded; existing behavior. |
+| `redacted` | Full message history (role + content), credential-scanned with the same `scrub_credentials` pass used for `raw_response` and tool I/O, then truncated at `log_tool_io_truncate_bytes`. Truncation is flagged with `request_messages_truncated` and `request_messages_original_bytes`. |
+| `full` | Same credential scrubbing as `redacted`, but untruncated (replay fidelity, mirroring `raw_response`). |
+
+Both `redacted` and `full` always run credential scrubbing; the only difference
+between them is truncation. The capture reuses the existing
+`log_tool_io_truncate_bytes` cap rather than introducing a second one. Set or
+leave `log_llm_request_payload = "off"` to disable capture instantly, with no
+redeploy.
 
 ## On-disk format
 
