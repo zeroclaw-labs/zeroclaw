@@ -1660,8 +1660,9 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+export function getTools(agent?: string): Promise<ToolSpec[]> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
     (data) => {
       const result = unwrapField(data, "tools");
       return Array.isArray(result) ? result : [];
@@ -1975,8 +1976,18 @@ export interface LogEvent {
 
 export interface LogsResponse {
   events: LogEvent[];
-  /** `[timestamp, id]` to feed back as `until_ts` + `until_id` for older. */
+  /** Legacy cursor: `[timestamp, id]` to feed back as `until_ts` +
+   *  `until_id` for older. Tie-breaks same-timestamp events by
+   *  lexicographic id, which can drop earlier-written events when id
+   *  order diverges from file insertion order. Prefer
+   *  [`Self::next_cursor_line_offset`] when available — it is
+   *  independent of id ordering. */
   next_cursor: [string, string] | null;
+  /** Byte offset past the OLDEST event on the current page. Pass back
+   *  as [`LogsQueryParams::until_line_offset`] on the next request to
+   *  walk older pages deterministically regardless of id ordering.
+   *  `null` when the page is empty. */
+  next_cursor_line_offset: number | null;
   at_end: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
@@ -1991,6 +2002,11 @@ export interface LogsQueryParams {
   since_ts?: string;
   until_ts?: string;
   until_id?: string;
+  /** Byte offset cap passed back from the previous page's
+   *  `next_cursor_line_offset`. When set, the reader stops scanning at
+   *  this offset so the follow-up page only sees lines strictly older
+   *  than the previous one. Independent of id ordering. */
+  until_line_offset?: number;
   action?: string;
   category?: string;
   outcome?: string;
