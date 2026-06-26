@@ -41,21 +41,8 @@ pub mod plugin_routes {
                 // runtime tool path exactly: a plugin the agent refuses to load
                 // in strict mode must not appear here as `loaded: true`. An
                 // unrecognized value fails safe to strict, same as the runtime.
-                let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
-                    &signature_mode_raw,
-                )
-                .unwrap_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "signature_mode": signature_mode_raw.clone()
-                            })),
-                        "Unrecognized plugins.security.signature_mode; failing safe to strict"
-                    );
-                    zeroclaw_plugins::signature::SignatureMode::Strict
-                });
+                let signature_mode =
+                    zeroclaw_plugins::host::PluginHost::resolve_signature_mode(&signature_mode_raw);
                 match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
                     &plugin_path,
                     signature_mode,

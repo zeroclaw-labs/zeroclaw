@@ -2613,7 +2613,7 @@ enum PluginCommands {
 fn plugin_host_with_configured_security(
     config: &crate::config::schema::Config,
 ) -> Result<zeroclaw::plugins::host::PluginHost> {
-    let mode = zeroclaw::plugins::host::PluginHost::parse_signature_mode(
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted = config.plugins.security.trusted_publisher_keys.clone();

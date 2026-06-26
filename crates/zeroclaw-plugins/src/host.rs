@@ -89,6 +89,39 @@ impl PluginHost {
         }
     }
 
+    /// Resolve a `[plugins.security] signature_mode` config string into a
+    /// [`SignatureMode`], failing safe to [`SignatureMode::Strict`] on any
+    /// unrecognized value. The misconfiguration WARN is emitted under a
+    /// plugin-role attribution span so the record carries role context even
+    /// from context-free config call sites.
+    #[must_use]
+    pub fn resolve_signature_mode(mode: &str) -> SignatureMode {
+        Self::parse_signature_mode(mode).unwrap_or_else(|| {
+            let span = ::zeroclaw_log::__private::tracing::info_span!(
+                target: "zeroclaw_log_internal_attribution",
+                "zeroclaw_attribution",
+                zc_role_family = %::zeroclaw_api::attribution::Role::System.family_str(),
+                zc_role_type = "",
+                zc_attribution_field = %::zeroclaw_api::attribution::Role::System
+                    .attribution_field()
+                    .unwrap_or(""),
+                zc_composite_prefix = "",
+                zc_default_category = %::zeroclaw_api::attribution::Role::System.default_category(),
+                zc_alias = "plugins",
+            );
+            span.in_scope(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "signature_mode": mode })),
+                    "Unrecognized plugins.security.signature_mode; failing safe to strict"
+                );
+            });
+            SignatureMode::Strict
+        })
+    }
+
     /// Discover plugins in the plugins directory.
     fn discover(&mut self) -> Result<(), PluginError> {
         if !self.plugins_dir.exists() {
