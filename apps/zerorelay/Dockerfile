@@ -7,9 +7,12 @@
 # or via compose:
 #   cd apps/zerorelay && podman compose up --build
 #
-# The relay is stateless, holds no keys, and never decrypts the inner mTLS.
-# Outer TLS for the relay endpoint and file-based allow/deny lists are hardening
-# follow-ons; today admission is configured via --registration-mode/--allow/--deny.
+# The relay is stateless, holds no inner-session keys, and never decrypts the
+# inner mTLS. It DOES terminate an outer TLS + WebSocket session, so it needs its
+# own server certificate: mount one and point --tls-cert/--tls-key at it (see the
+# default CMD below and compose.yaml). Admission is --registration-mode open|
+# allowlist with --allow/--deny keyed on the daemon pubkey FINGERPRINT (sha256
+# hex), plus an optional shared-secret gate via --relay-token.
 
 # ── Stage 1: build only the relay binary ───────────────────────
 FROM rust:1.94-slim AS builder
@@ -27,4 +30,5 @@ COPY --from=builder /usr/local/bin/zerorelay /usr/local/bin/zerorelay
 EXPOSE 8443
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/zerorelay"]
-CMD ["--bind", "0.0.0.0:8443"]
+# Outer TLS material is required; mount it at /etc/zerorelay/certs (see compose).
+CMD ["--bind", "0.0.0.0:8443", "--tls-cert", "/etc/zerorelay/certs/relay.crt", "--tls-key", "/etc/zerorelay/certs/relay.key"]

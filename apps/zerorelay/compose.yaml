@@ -12,10 +12,16 @@ services:
     restart: unless-stopped
     ports:
       - "8443:8443"
-    # Admission defaults to `open` (any daemon may register). For an approved-only
-    # relay, switch to allowlist and pass the accepted relay token(s):
-    #   command: ["--bind", "0.0.0.0:8443", "--registration-mode", "allowlist", "--allow", "<relay-token>"]
-    command: ["--bind", "0.0.0.0:8443", "--registration-mode", "open"]
+    # The relay terminates an outer TLS session, so it needs its own server cert.
+    # Drop relay.crt + relay.key in ./certs (e.g. a Let's Encrypt cert for the
+    # relay's public hostname, or a self-signed cert the daemons/clients pin/trust).
+    volumes:
+      - ./certs:/etc/zerorelay/certs:ro
+    # Admission defaults to `open` (any signed daemon may register). For an
+    # approved-only relay switch to allowlist and pass the accepted daemon pubkey
+    # FINGERPRINT(s) (sha256 hex); the shared-secret gate is --relay-token:
+    #   command: ["--bind", "0.0.0.0:8443", "--tls-cert", "/etc/zerorelay/certs/relay.crt", "--tls-key", "/etc/zerorelay/certs/relay.key", "--registration-mode", "allowlist", "--allow", "<daemon-pubkey-fingerprint>"]
+    command: ["--bind", "0.0.0.0:8443", "--tls-cert", "/etc/zerorelay/certs/relay.crt", "--tls-key", "/etc/zerorelay/certs/relay.key", "--registration-mode", "open"]
     healthcheck:
       # distroless has no shell; probe via the binary's own subcommand.
       test: ["CMD", "/usr/local/bin/zerorelay", "healthcheck", "--addr", "127.0.0.1:8443"]
