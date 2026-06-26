@@ -217,3 +217,52 @@ fn memory_map_static(board: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn execute_with_empty_boards_returns_error() {
+        let tool = HardwareBoardInfoTool::new(Vec::new());
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("No peripherals configured"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_returns_static_info_for_default_board() {
+        let tool = HardwareBoardInfoTool::new(vec!["arduino-uno".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("ATmega328P"));
+    }
+
+    #[tokio::test]
+    async fn execute_unknown_board_reports_configured_fallback() {
+        let tool = HardwareBoardInfoTool::new(vec!["custom-board".into()]);
+        let result = tool
+            .execute(json!({"board": "custom-board"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("custom-board"));
+        assert!(result.output.contains("No static info available"));
+    }
+
+    #[cfg(feature = "probe")]
+    #[tokio::test]
+    async fn execute_nucleo_probe_failure_falls_back_to_static_info() {
+        let tool = HardwareBoardInfoTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("probe-rs attach failed"));
+        assert!(result.output.contains("STM32F401RET6"));
+    }
+}
