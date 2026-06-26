@@ -165,9 +165,78 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
+/// Cross-check OpenAI Codex (OAuth/subscription) credentials against the
+/// OpenAI provider slots that opt into them via `requires_openai_auth`.
+///
+/// Pure — separated for unit testing. Takes the already-resolved fact "is a
+/// Codex credential present?" plus the live `Config`, reads slot state on
+/// demand, and stores nothing (single-source-of-truth rule).
+fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<DiagItem> {
+    const CAT: &str = "providers.auth";
+
+    let auth_slots: Vec<String> = config
+        .providers
+        .models
+        .openai
+        .iter()
+        .filter(|(_, cfg)| cfg.base.requires_openai_auth)
+        .map(|(alias, _)| format!("openai.{alias}"))
+        .collect();
+
+    let mut items = Vec::new();
+    match (codex_profile_present, auth_slots.is_empty()) {
+        // Credential imported, but nothing references it — silent until the
+        // operator wires a slot and points an agent at it.
+        (true, true) => items.push(DiagItem::warn(
+            CAT,
+            crate::i18n::get_required_cli_string("cli-doctor-codex-auth-profile-no-slot"),
+        )),
+        // Slot opts into Codex auth, but no credential is signed in — fails at
+        // the first model call.
+        (false, false) => items.push(DiagItem::warn(
+            CAT,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-codex-auth-slot-no-profile",
+                &[("slots", &auth_slots.join(", "))],
+            ),
+        )),
+        // Both present — wiring is consistent.
+        (true, false) => items.push(DiagItem::ok(
+            CAT,
+            crate::i18n::get_required_cli_string("cli-doctor-codex-auth-ok"),
+        )),
+        // Codex unused on both sides — stay silent (no noise for users who
+        // never touch Codex).
+        (false, true) => {}
+    }
+    items
+}
+
+/// Load Codex auth profiles on demand and report any profile/slot wiring
+/// mismatch. Async because the profile store lives on disk; appended to the
+/// report from `run_structured`, mirroring `probe_models`.
+async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
+    let auth = zeroclaw_providers::auth::AuthService::from_config(config);
+    let codex_profile_present = match auth.load_profiles().await {
+        Ok(data) => data
+            .profiles
+            .keys()
+            .any(|id| id.starts_with("openai-codex:")),
+        // Store unreadable: skip rather than emit a "no credentials" warning we
+        // cannot substantiate.
+        Err(_) => return Vec::new(),
+    };
+
+    codex_auth_wiring_items(codex_profile_present, config)
+        .into_iter()
+        .map(DiagItem::into_result)
+        .collect()
+}
+
 /// Run the full Doctor suite and return the structured result used by CLI and RPC.
 pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     let mut results = diagnose(config);
+    results.extend(check_codex_auth_wiring(config).await);
     results.extend(probe_models(config).await);
     results
 }
@@ -1906,6 +1975,61 @@ mod tests {
                 .any(|item| item.message.contains("gateway.web_dist_dir")),
             "literal web_dist_dir paths should produce no doctor diagnostic"
         );
+    }
+
+    fn openai_codex_slot() -> zeroclaw_config::schema::OpenAIModelProviderConfig {
+        let mut slot = zeroclaw_config::schema::OpenAIModelProviderConfig::default();
+        slot.base.requires_openai_auth = true;
+        slot
+    }
+
+    #[test]
+    fn codex_wiring_warns_when_profile_has_no_slot() {
+        // Credential imported, no slot opts into it — the silent gap.
+        let config = Config::default();
+        let items = codex_auth_wiring_items(true, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Warn);
+        assert_eq!(items[0].category, "providers.auth");
+    }
+
+    #[test]
+    fn codex_wiring_warns_when_slot_has_no_profile() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("codex".to_string(), openai_codex_slot());
+        let items = codex_auth_wiring_items(false, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Warn);
+        assert!(
+            items[0].message.contains("openai.codex"),
+            "slot warning should name the offending slot; got: {:?}",
+            items[0].message
+        );
+    }
+
+    #[test]
+    fn codex_wiring_ok_when_profile_and_slot_present() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("codex".to_string(), openai_codex_slot());
+        let items = codex_auth_wiring_items(true, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn codex_wiring_silent_when_codex_unused() {
+        // No credential and no requiring slot — the common case; no noise.
+        let config = Config::default();
+        let items = codex_auth_wiring_items(false, &config);
+        assert!(items.is_empty());
     }
 
     #[test]
