@@ -98,7 +98,13 @@ mod tests {
         // owned by a LIVE pid must NOT be reaped via the boot-mismatch path — fail closed.
         let me = std::process::id();
         assert!(!is_authoritative(&rec(me, ""), "boot-NEW"));
-        // …but an empty boot_id whose pid is dead is still reclaimable.
+        // Linux can prove this fake pid is dead via `/proc/<pid>`, so an empty
+        // boot_id with a dead owner remains reclaimable there.
+        #[cfg(target_os = "linux")]
         assert!(is_authoritative(&rec(999_999, ""), "boot-NEW"));
+        // Other platforms deliberately fail closed for nonzero pids because
+        // `pid_is_alive` cannot prove liveness with the current implementation.
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_authoritative(&rec(999_999, ""), "boot-NEW"));
     }
 }
