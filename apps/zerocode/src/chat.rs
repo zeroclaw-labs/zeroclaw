@@ -4351,6 +4351,32 @@ impl ChatState {
         (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
     }
 
+    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), 0);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), 0);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        (
+            self.cached_lines[line_lo..line_hi].to_vec(),
+            self.cached_screen_ranges[first].1,
+        )
+    }
+
     /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
     /// each entry's `Line`s individually, so screen row positions reflect
     /// markdown wrapping (code blocks, tables, etc.). Called after every
@@ -4376,20 +4402,12 @@ impl ChatState {
         }
     }
 
-    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
-    /// tracking its wrapped screen-row offset, and for each code fence records
-    /// the `[Copy]` label cells on both the header and footer bars plus the
-    /// fence's source text, re-wrapped in its Markdown fence (language tag and
-    /// backticks) from the recovered body lines so a copied fence round-trips.
-    /// `scroll` and `body` map global wrapped rows onto screen cells; labels
-    /// scrolled out of view are dropped.
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
-        let mut screen_cursor = 0u16;
-        // (header_row, header_label_col, header_label_cells, lang, accumulated_body)
+        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
         let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
-        for line in &self.cached_lines {
+        for line in &lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 let lang = header_fence_lang(line);
@@ -6306,6 +6324,38 @@ mod tests {
         assert_eq!(
             state.copy_hit_regions[0].text, "```\nplain text\n```",
             "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+        );
+    }
+
+    #[test]
+    fn copy_regions_track_scroll_with_history_above_viewport() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        let pad = "filler line\n".repeat(200);
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(pad.as_str())));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```rust\nfn main() {}\n```\n",
+        )));
+        state.dirty = LinesDirty::Full;
+        state.rebuild_lines(60);
+
+        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
+        let body = Rect::new(0, 0, 60, 20);
+
+        state.rebuild_copy_regions(60, fence_entry.1, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```rust\nfn main() {}\n```",
+            "scrolled-to fence registers a copy region through the bounded scan"
+        );
+
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "fence far below the viewport registers nothing"
         );
     }
 
