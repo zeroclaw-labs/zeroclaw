@@ -199,6 +199,9 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         p = p.with_tls_ca_cert_path(cert_path);
     }
+    if opts.replay_assistant_reasoning == Some(false) {
+        p = p.without_assistant_reasoning_replay();
+    }
     if let Some(extra) = &opts.provider_extra {
         if extra.is_object() {
             p = p.with_extra_body(extra.clone());
@@ -743,11 +746,50 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
     }
 }
 
-impl CompatFamilySpec for XaiModelProviderConfig {
-    const DISPLAY: &'static str = "xAI";
-    const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
-    const AUTH: AuthStyle = AuthStyle::Bearer;
-    const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
+impl FamilyProviderFactory for XaiModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url.or(Some("https://api.x.ai/v1")),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
+
+        let mut p = OpenAiCompatibleModelProvider::new(
+            alias,
+            "xAI",
+            api_url.unwrap_or("https://api.x.ai/v1"),
+            key,
+            AuthStyle::Bearer,
+        )
+        .with_models_dev_key("xai");
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            p = p.with_auth_profile("xai", auth_service, opts.auth_profile_override.clone());
+        }
+
+        Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
@@ -843,6 +885,33 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nvidia");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("nvidia");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        // NVIDIA NIM exposes vision-capable models (e.g. `nvidia/llama-3.2-90av`,
+        // `google/deepseek-r1`). Compose the catalog-conf'd base with vision flag
+        // override via the constructor variant; we replay both consts manually
+        // since this constructor path doesn't fold through `build_compat_base`.
+        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
+            Self::DISPLAY,
+            api_url.unwrap_or(Self::DEFAULT_URL),
+            key,
+            Self::AUTH,
+            true,
+        );
+        if let Some(catalog_key) = Self::MODELS_DEV_KEY {
+            p = p.with_models_dev_key(catalog_key);
+        }
+        if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
+            p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        p
+    }
 }
 
 impl CompatFamilySpec for QianfanModelProviderConfig {
@@ -1229,7 +1298,8 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
             key,
             AuthStyle::Bearer,
         )
-        .with_models_dev_key("groq");
+        .with_models_dev_key("groq")
+        .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
         // via `[providers.models.groq.<alias>] native_tools = true`.

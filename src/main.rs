@@ -231,6 +231,7 @@ fn pause_after_no_command_help() {
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
 #[cfg(feature = "agent-runtime")]
@@ -283,10 +284,14 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
+#[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
 mod security;
+#[cfg(feature = "agent-runtime")]
+mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
@@ -310,9 +315,9 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands, SkillCommands,
-    SopCommands,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
+    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
+    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -641,6 +646,13 @@ Examples:
         format: Option<String>,
     },
 
+    /// Inspect the active security posture derived from local config and host detection
+    #[cfg(feature = "agent-runtime")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -704,8 +716,15 @@ Examples:
         model_command: ModelCommands,
     },
 
-    /// List supported AI model_providers
-    Providers,
+    /// List supported AI model providers, or manage provider aliases.
+    ///
+    /// With no subcommand, prints the catalog of supported provider types. With
+    /// `create`/`list`/`rename`/`delete`, manages configured provider aliases
+    /// under `[providers.<category>.<family>.<alias>]`.
+    Providers {
+        #[command(subcommand)]
+        providers_command: Option<ProvidersCommands>,
+    },
 
     /// Manage channels (telegram, discord, slack)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -726,6 +745,19 @@ Examples:
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
+    },
+
+    /// Manage agent aliases (create/list/rename/delete). Distinct from `agent`,
+    /// which runs an agent.
+    Agents {
+        #[command(subcommand)]
+        agents_command: AgentsCommands,
+    },
+
+    /// Manage channel aliases (create/list/rename/delete)
+    Channels {
+        #[command(subcommand)]
+        channels_command: ChannelsCommands,
     },
 
     /// Browse 50+ integrations
@@ -886,7 +918,7 @@ Examples:
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Skip confirmation prompt
+        /// Install even if the target is not newer (reinstall or downgrade/pin to --version)
         #[arg(long)]
         force: bool,
         /// Target version (default: latest)
@@ -2547,10 +2579,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search an installable plugin registry
+    Search {
+        /// Query to match against plugin names and descriptions
+        query: String,
+        /// Registry JSON URL to search
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory/manifest or registry name
     Install {
-        /// Path to plugin directory or manifest
+        /// Path to plugin directory/manifest, or registry name/version
         source: String,
+        /// Registry JSON URL used for install-by-name
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2564,6 +2607,23 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_host_with_configured_security(
+    config: &crate::config::schema::Config,
+) -> Result<zeroclaw::plugins::host::PluginHost> {
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted = config.plugins.security.trusted_publisher_keys.clone();
+    Ok(
+        zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            &config.plugins.resolved_plugins_dir(),
+            mode,
+            trusted,
+        )?,
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -2662,6 +2722,21 @@ enum ConfigCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show security posture for the default or selected agent risk profile
+    Status {
+        /// Agent alias whose effective runtime security posture should be inspected.
+        #[arg(long)]
+        agent: String,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
     /// Print current estop status.
@@ -2685,9 +2760,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2697,13 +2772,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2737,9 +2812,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -2768,6 +2843,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3860,7 +3944,7 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -3870,7 +3954,7 @@ async fn main() -> Result<()> {
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
                                 sop_engine,
@@ -4390,6 +4474,34 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            let uncompiled =
+                zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-not-compiled-header",
+                        "  Configured but not compiled in this binary:"
+                    )
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "  {:9} {}",
+                        entry.name,
+                        t(
+                            "cli-status-channel-not-compiled",
+                            "🚫 configured, not compiled"
+                        )
+                    );
+                }
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-build-hint",
+                        "  Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature."
+                    )
+                );
+            }
             println!();
             println!("{}", t("cli-status-peripherals", "Peripherals:"));
             let peripherals_enabled = if config.peripherals.enabled {
@@ -4418,6 +4530,19 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        #[cfg(feature = "agent-runtime")]
+        Commands::Security {
+            security_command: SecurityCommands::Status { agent, json },
+        } => {
+            let report = security_status::build_report(&config, &agent)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                security_status::print_report(&report);
+            }
+            Ok(())
+        }
+
         Commands::Estop {
             estop_command,
             level,
@@ -4427,18 +4552,32 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match &model_command {
-            ModelCommands::List {
-                model_provider,
-                check,
-            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
-            ModelCommands::Refresh { model_provider, .. } => {
-                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+        Commands::Models { model_command } => {
+            #[cfg(feature = "agent-runtime")]
+            {
+                dispatch_models_command(model_command, &mut config).await
             }
-            _ => doctor::run_models(&config, None, false, false).await,
-        },
+            #[cfg(not(feature = "agent-runtime"))]
+            {
+                match model_command {
+                    ModelCommands::List {
+                        model_provider,
+                        check,
+                    } => {
+                        doctor::run_configured_models(&config, model_provider.as_deref(), check)
+                            .await
+                    }
+                    ModelCommands::Refresh { model_provider, .. } => {
+                        doctor::run_models(&config, model_provider.as_deref(), false, false).await
+                    }
+                    _ => doctor::run_models(&config, None, false, false).await,
+                }
+            }
+        }
 
-        Commands::Providers => {
+        Commands::Providers {
+            providers_command: None,
+        } => {
             let model_providers = zeroclaw_providers::list_model_providers();
             let configured_types: std::collections::HashSet<&str> = config
                 .providers
@@ -4475,6 +4614,10 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+
+        Commands::Providers {
+            providers_command: Some(providers_command),
+        } => Box::pin(alias_cli::handle_providers(providers_command, &mut config)).await,
 
         Commands::Service {
             service_command,
@@ -4535,6 +4678,13 @@ async fn main() -> Result<()> {
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
+
+        Commands::Agents { agents_command } => {
+            Box::pin(alias_cli::handle_agents(agents_command, &mut config)).await
+        }
+        Commands::Channels { channels_command } => {
+            Box::pin(alias_cli::handle_channels(channels_command, &mut config)).await
+        }
 
         Commands::Integrations {
             integration_command,
@@ -4758,15 +4908,22 @@ async fn main() -> Result<()> {
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(
@@ -4780,7 +4937,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                commands::update::run(version.as_deref(), force).await
             }
         }
 
@@ -5594,9 +5751,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5625,25 +5780,100 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
-                    )
-                );
+            PluginCommands::Search { query, registry } => {
+                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                let matches = plugin_registry::search_entries(&index, &query);
+                if matches.is_empty() {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-none",
+                            &[("query", &query)],
+                            "No matching plugins."
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-results",
+                            &[("query", &query), ("count", &matches.len().to_string())],
+                            "Plugins matching query:"
+                        )
+                    );
+                    for plugin in &matches {
+                        let missing_description;
+                        let description = if let Some(description) = plugin.description.as_deref() {
+                            description
+                        } else {
+                            missing_description =
+                                t("cli-plugin-no-description", "(no description)");
+                            &missing_description
+                        };
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-search-result",
+                                &[
+                                    ("name", &plugin.name),
+                                    ("version", &plugin.version),
+                                    ("description", description),
+                                ],
+                                "Plugin search result"
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source, registry } => {
+                if plugin_registry::looks_like_url(&source) {
+                    bail!(
+                        "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
+                    );
+                }
+                let mut host = plugin_host_with_configured_security(&config)?;
+                if plugin_registry::is_local_plugin_source(&source) {
+                    host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                } else {
+                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-install-resolving",
+                            &[("source", &source)],
+                            "Resolving plugin from registry..."
+                        )
+                    );
+                    let downloaded =
+                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    host.install(&plugin_dir)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-name-version",
+                            &[
+                                ("name", &downloaded.manifest().name),
+                                ("version", &downloaded.manifest().version),
+                            ],
+                            "Plugin installed"
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let mut host = plugin_host_with_configured_security(&config)?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5652,9 +5882,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -6411,6 +6639,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6425,6 +6655,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6443,6 +6674,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6539,6 +6771,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
@@ -6663,6 +6896,51 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
+            }
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
+            Ok(())
+        }
     }
 }
 
@@ -6740,9 +7018,10 @@ async fn run_gateway_if_enabled(
     .await;
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
+            let restart_port = available_gateway_restart_hint_port(host, port);
             anyhow::bail!(
                 "{}",
-                gateway_addr_in_use_message(host, port, &default_host, default_port)
+                gateway_addr_in_use_message(host, port, &default_host, default_port, restart_port)
             );
         }
         other => other,
@@ -6777,6 +7056,7 @@ fn gateway_addr_in_use_message(
     port: u16,
     default_host: &str,
     default_port: u16,
+    restart_port: Option<u16>,
 ) -> String {
     let mut lines = vec![
         format!("Port {port} is already in use, so the gateway could not start."),
@@ -6796,16 +7076,27 @@ fn gateway_addr_in_use_message(
         default_host,
         default_port,
     ));
-    lines.push(format!(
-        "    zeroclaw gateway start --port {}",
-        next_gateway_port(port)
-    ));
+    if let Some(restart_port) = restart_port {
+        lines.push(gateway_restart_recovery_command(
+            host,
+            restart_port,
+            default_host,
+        ));
+    }
     lines.extend([
         String::new(),
         "To inspect the listener:".to_string(),
         format!("    lsof -nP -iTCP:{port} -sTCP:LISTEN"),
     ]);
     lines.join("\n")
+}
+
+fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
+    let mut command = format!("    zeroclaw gateway start --port {port}");
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
 }
 
 fn gateway_paircode_recovery_command(
@@ -6825,14 +7116,109 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-fn next_gateway_port(port: u16) -> u16 {
-    port.checked_add(1).unwrap_or(port)
+fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
+    const SCAN_LIMIT: u16 = 20;
+
+    for offset in 1..=SCAN_LIMIT {
+        let Some(candidate) = port.checked_add(offset) else {
+            break;
+        };
+        if std::net::TcpListener::bind(zeroclaw_infra::effective_gateway_bind_socket_addr(
+            host, candidate,
+        ))
+        .is_ok()
+        {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Persist `model` as the default for the first configured provider.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let (type_key, alias) = {
+        let entry = config
+            .providers
+            .models
+            .iter_entries()
+            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "No model provider configured. Run `zeroclaw config init` first.",
+                )
+            })?;
+        (entry.0, entry.1.to_string())
+    };
+    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    config.set_prop_persistent(&prop_path, model)?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-models-set-ok",
+            &[
+                ("model", model),
+                ("provider", &format!("{type_key}.{alias}")),
+            ]
+        )
+    );
+    Ok(())
+}
+
+/// Dispatch `ModelCommands` variants to their handlers.
+///
+/// Extracted from `main()` so that the #7087 regression test enters the
+/// same dispatch boundary that `zeroclaw models set <model>` uses.  If
+/// someone changes the `Set` arm back to the read-only doctor path, the
+/// test will fail.
+#[cfg(feature = "agent-runtime")]
+async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
+    match model_command {
+        ModelCommands::List {
+            model_provider,
+            check,
+        } => doctor::run_configured_models(config, model_provider.as_deref(), check).await,
+        ModelCommands::Refresh { model_provider, .. } => {
+            doctor::run_models(config, model_provider.as_deref(), false, false).await
+        }
+        ModelCommands::Set { model } => handle_models_set(config, &model).await,
+        ModelCommands::Status => {
+            match config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            {
+                Some((ty, alias, entry)) => {
+                    let model = entry.model.as_deref().unwrap_or("unknown");
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-models-status-current",
+                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string("cli-models-status-none")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::net::TcpListener;
 
     #[test]
     #[cfg(feature = "agent-runtime")]
@@ -7056,6 +7442,27 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn security_status_cli_requires_agent_and_parses_json_form() {
+        let err = Cli::try_parse_from(["zeroclaw", "security", "status"])
+            .expect_err("security status requires --agent");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "security", "status", "--agent", "ops", "--json"])
+                .expect("security status --agent --json should parse");
+        match cli.command {
+            Commands::Security {
+                security_command: SecurityCommands::Status { agent, json },
+            } => {
+                assert_eq!(agent, "ops");
+                assert!(json);
+            }
+            other => panic!("expected security status command, got {other:?}"),
+        }
+    }
+
     /// `--rotate` parses and is mutually exclusive with `--new` and
     /// `--rotate-device` so the destructive path cannot be silently combined
     /// with "add another client".
@@ -7211,7 +7618,13 @@ mod tests {
     #[test]
     fn gateway_addr_in_use_message_guides_default_gateway_recovery() {
         let default = config::GatewayConfig::default();
-        let msg = gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port);
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            Some(42618),
+        );
 
         assert!(msg.contains("Port 42617 is already in use"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -7223,21 +7636,79 @@ mod tests {
     #[test]
     fn gateway_addr_in_use_message_keeps_non_default_host_context() {
         let default = config::GatewayConfig::default();
-        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, &default.host, default.port);
+        let msg =
+            gateway_addr_in_use_message("0.0.0.0", 9001, &default.host, default.port, Some(9002));
 
         assert!(!msg.contains("open http://127.0.0.1:42617"));
-        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 192.168.1.20"));
-        assert!(msg.contains("zeroclaw gateway start --port 9002"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
+        assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
     }
 
     #[test]
+    fn gateway_addr_in_use_message_omits_restart_when_no_available_port() {
+        let default = config::GatewayConfig::default();
+        let msg =
+            gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port, None);
+
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("zeroclaw gateway start --port"));
+        assert!(msg.contains("lsof -nP -iTCP:42617 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_skips_occupied_restart_hint_port() {
+        let default = config::GatewayConfig::default();
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        let restart_port = available_gateway_restart_hint_port("127.0.0.1", port);
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            port,
+            &default.host,
+            default.port,
+            restart_port,
+        );
+
+        assert!(
+            !msg.contains(&format!("zeroclaw gateway start --port {}", port + 1)),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("zeroclaw gateway start --port {available_port}")),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn gateway_addr_in_use_message_uses_configured_default_gateway_recovery() {
-        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001);
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001, None);
 
         assert!(msg.contains("open http://192.168.1.20:9001"));
         assert!(msg.contains("zeroclaw gateway get-paircode\n"));
         assert!(!msg.contains("get-paircode --port 9001"));
+    }
+
+    #[test]
+    fn gateway_restart_hint_uses_gateway_bind_fallback_for_hostnames() {
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        assert_eq!(
+            available_gateway_restart_hint_port("localhost", port),
+            Some(available_port)
+        );
+    }
+
+    #[test]
+    fn gateway_bind_addr_resolver_accepts_bracketed_ipv6_hosts() {
+        let addr = zeroclaw_infra::effective_gateway_bind_socket_addr("[::1]", 9001);
+
+        assert_eq!(addr.port(), 9001);
+        assert!(addr.is_ipv6());
     }
 
     #[test]
@@ -7246,6 +7717,36 @@ mod tests {
         let err = anyhow::Error::new(err).context("gateway bind failed");
 
         assert!(is_addr_in_use_error(&err));
+    }
+
+    fn reserve_consecutive_local_ports(count: u16) -> (u16, Vec<TcpListener>) {
+        for _ in 0..100 {
+            let Ok(first) = TcpListener::bind(("127.0.0.1", 0)) else {
+                continue;
+            };
+            let port = first.local_addr().expect("listener has local addr").port();
+            if port > u16::MAX - count {
+                continue;
+            }
+
+            let mut listeners = vec![first];
+            let mut reserved_all = true;
+            for offset in 1..count {
+                match TcpListener::bind(("127.0.0.1", port + offset)) {
+                    Ok(listener) => listeners.push(listener),
+                    Err(_) => {
+                        reserved_all = false;
+                        break;
+                    }
+                }
+            }
+
+            if reserved_all {
+                return (port, listeners);
+            }
+        }
+
+        panic!("could not reserve {count} consecutive local ports");
     }
 
     #[test]
@@ -7710,6 +8211,100 @@ mod tests {
         assert!(
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
+        );
+    }
+
+    /// Regression for #7087: `ModelCommands::Set` must write config, not
+    /// route silently to the read-only `doctor::run_models()` path.
+    /// Covers a normal model ID and a slash-bearing (OpenRouter-style) ID.
+    ///
+    /// Calls `dispatch_models_command` — the same function `main()` uses —
+    /// so changing the `Set` arm back to the read-only doctor path will fail
+    /// this test.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-opus-4-7".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // ── Test 1: Normal model ID persists via the dispatch boundary ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "claude-sonnet-4-6".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("normal model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("claude-sonnet-4-6"),
+            "normal model ID must be persisted to config.toml; got:\n{contents}"
+        );
+
+        // ── Test 2: Slash-bearing model ID preserved as-is ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("slash-bearing model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("anthropic/claude-sonnet-4-20250514"),
+            "slash-bearing model ID must be stored as-is; got:\n{contents}"
+        );
+
+        // ── Test 3: No configured provider → error surfaced by dispatch ──
+        let mut empty_config = Config {
+            config_path: tmp.path().join("empty.toml"),
+            data_dir: tmp.path().join("empty_workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        let err = dispatch_models_command(
+            ModelCommands::Set {
+                model: "any-model".to_string(),
+            },
+            &mut empty_config,
+        )
+        .await
+        .expect_err("empty config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No model provider configured"),
+            "error must mention missing provider; got: {msg}"
         );
     }
 }

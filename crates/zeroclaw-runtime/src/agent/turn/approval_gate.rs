@@ -61,9 +61,10 @@ pub(crate) async fn gate_tool_approval(
                             WARN,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
+                                ::zeroclaw_log::Action::Fail
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                             "Channel approval request failed"
                         );
@@ -108,6 +109,7 @@ pub(crate) async fn gate_tool_approval(
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": ctx.model,
@@ -147,7 +149,8 @@ pub(crate) async fn gate_tool_approval(
             }
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model": ctx.model,

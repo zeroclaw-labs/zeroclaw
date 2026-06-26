@@ -89,17 +89,49 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
     if not path_without_fragment:
         return None
 
-    if path_without_fragment.startswith("/"):
-        resolved = path_without_fragment.lstrip("/")
-    else:
-        resolved = os.path.normpath(
-            os.path.join(os.path.dirname(source_path) or ".", path_without_fragment)
-        )
+    # Keep this changed-line gate aligned with the built-book link checker:
+    # site-absolute links and generated rustdoc API paths are assembled outside
+    # authored Markdown, so this script should not fail CI before mdBook builds.
+    if (
+        path_without_fragment.startswith("/")
+        or path_without_fragment.startswith("api/")
+        or "/api/" in path_without_fragment
+    ):
+        return None
+
+    resolved = os.path.normpath(
+        os.path.join(os.path.dirname(source_path) or ".", path_without_fragment)
+    )
 
     if not resolved or resolved == ".":
         return None
 
     return resolved
+
+
+def split_link_targets(targets: list[str]) -> tuple[list[str], list[str]]:
+    http_links: list[str] = []
+    local_links: list[str] = []
+    for target in targets:
+        if target.startswith(("http://", "https://")):
+            http_links.append(target)
+        else:
+            local_links.append(target)
+    return http_links, local_links
+
+
+def check_local_targets(local_links: list[str]) -> bool:
+    if local_links:
+        print(f"Checked {len(local_links)} local docs link target(s).")
+
+    missing_links = [target for target in local_links if not Path(target).exists()]
+    if not missing_links:
+        return True
+
+    print("Broken local docs link target(s):")
+    for target in missing_links:
+        print(f"  {target}")
+    return False
 
 
 def extract_links(text: str, source_path: str) -> list[str]:
@@ -141,14 +173,28 @@ def added_lines_for_file(base_sha: str, path: str) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Collect HTTP(S) links added in changed docs lines")
+    parser = argparse.ArgumentParser(description="Collect links added in changed docs lines")
     parser.add_argument("--base", default="", help="Base commit SHA")
     parser.add_argument(
         "--docs-files",
         default="",
         help="Newline-separated docs files list",
     )
-    parser.add_argument("--output", required=True, help="Output file for unique URLs")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Output file for unique link targets",
+    )
+    parser.add_argument(
+        "--http-output",
+        default="",
+        help="Output file for unique HTTP(S) link targets",
+    )
+    parser.add_argument(
+        "--check-local-targets",
+        action="store_true",
+        help="Fail if any added source-relative docs link target is missing",
+    )
     args = parser.parse_args()
 
     base_sha = infer_base_sha(args.base)
@@ -160,17 +206,28 @@ def main() -> int:
         print("No docs files available for link collection.")
         return 0
 
-    unique_urls: list[str] = []
+    unique_links: list[str] = []
     seen: set[str] = set()
     for path in existing_files:
         for line in added_lines_for_file(base_sha, path):
             for link in extract_links(line, path):
                 if link not in seen:
                     seen.add(link)
-                    unique_urls.append(link)
+                    unique_links.append(link)
 
-    Path(args.output).write_text("\n".join(unique_urls) + ("\n" if unique_urls else ""), encoding="utf-8")
-    print(f"Collected {len(unique_urls)} added link(s) from {len(existing_files)} docs file(s).")
+    http_links, local_links = split_link_targets(unique_links)
+
+    Path(args.output).write_text(
+        "\n".join(unique_links) + ("\n" if unique_links else ""), encoding="utf-8"
+    )
+    if args.http_output:
+        Path(args.http_output).write_text(
+            "\n".join(http_links) + ("\n" if http_links else ""), encoding="utf-8"
+        )
+
+    print(f"Collected {len(unique_links)} added link(s) from {len(existing_files)} docs file(s).")
+    if args.check_local_targets and not check_local_targets(local_links):
+        return 1
     return 0
 
 

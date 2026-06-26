@@ -1,4 +1,7 @@
-use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
+};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -577,7 +580,21 @@ impl DelegateTool {
         resolved
     }
 
-    /// Materialize the tool gate from the named risk profile.
+    /// Materialize the tool gate from the named risk profile (authorization).
+    ///
+    /// Returns `None` when the risk profile is unnamed or not configured.
+    /// `allowed_tools = Some(vec![])` means "deny all" and is preserved as
+    /// `Some(empty)` so the caller can distinguish it from "no risk profile."
+    ///
+    /// The resulting `SecurityPolicy` only carries the tool authorization
+    /// fields (`allowed_tools` and `excluded_tools`). Callers in
+    /// `execute_agentic` must use [`Self::delegate_admits_with_mcp`] — not the
+    /// raw `SecurityPolicy::is_tool_allowed` — to filter `parent_tools`,
+    /// because the delegate path applies the MCP `<server>__<tool>`
+    /// auto-admit exception described on `RiskProfileConfig::allowed_tools`.
+    /// The exception is intentionally scoped to the risk-profile gate; it
+    /// does not apply to caller-supplied per-run allow-lists (cron jobs and
+    /// other narrowers) — see PR #7547 review.
     fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
             return None;
@@ -597,6 +614,38 @@ impl DelegateTool {
             },
             ..SecurityPolicy::default()
         })
+    }
+
+    /// MCP-aware admission check used to filter `parent_tools` in
+    /// `execute_agentic`.
+    ///
+    /// Same contract as `SecurityPolicy::is_tool_allowed`, with one
+    /// addition that the delegate path needs: when the risk profile's
+    /// `allowed_tools` is `Some(non-empty)`, any name containing `__`
+    /// (the `<server>__<tool>` MCP wrapper convention) is auto-admitted
+    /// even if it is not explicitly listed in `allowed_tools`. The
+    /// `excluded_tools` deny-list always applies last, so destructive
+    /// MCP capabilities like `filesystem__write_file` can be blocked
+    /// individually.
+    ///
+    /// This auto-admit applies only to the risk-profile gate. Callers
+    /// that need a per-run narrowing (cron jobs, narrowed delegate
+    /// invocations) intersect their own allow-list against this result
+    /// with a strict `list.contains(name)` check — see
+    /// `ToolAccessPolicy::is_tool_allowed` and PR #7547.
+    fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
+        let denied = policy
+            .excluded_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == name));
+        if denied {
+            return false;
+        }
+        match policy.allowed_tools.as_ref() {
+            None => true,
+            Some(list) if list.is_empty() => false,
+            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+        }
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -1058,6 +1107,23 @@ impl DelegateTool {
             }
         };
 
+        // Runaway backstop: refuse a new background delegation once too many are already in
+        // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
+        if Self::at_background_capacity(
+            Self::background_task_cancels().lock().len(),
+            Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS,
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Too many background delegations in flight (limit {}). Wait for some to \
+                     finish (check_result) or cancel one (cancel_task) before starting more.",
+                    Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS
+                )),
+            });
+        }
+
         let task_id = uuid::Uuid::new_v4().to_string();
         let results_dir = self.results_dir();
         tokio::fs::create_dir_all(&results_dir).await?;
@@ -1089,16 +1155,51 @@ impl DelegateTool {
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
+        // EPIC-A supervision: register the task in the durable control-plane BEFORE the
+        // spawn, so a crash between here and the spawn is recoverable by the reaper. A
+        // no-op when not running under a booted daemon (the plane is absent).
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .create(crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Delegate,
+                    agent: agent_name_owned.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: cp.boot_id.clone(),
+                    heartbeat_at: None,
+                    depth: self.depth,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: started_at.clone(),
+                    finished_at: None,
+                })
+                .await;
+        }
+
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        let depth = self.depth;
+        // Monotonic descent: was `self.depth` (verbatim copy), which left the
+        // `self.depth >= max_depth` check inert — a chain of background delegations never
+        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
+        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
+        let depth = self.depth + 1;
         let parent_tools = Arc::clone(&self.parent_tools);
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
+        // Register the live token so `cancel_task` can actually abort THIS task (removed
+        // when it settles, in the spawned closure below).
+        Self::background_task_cancels()
+            .lock()
+            .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
         let providers_models = Arc::clone(&self.providers_models);
         let risk_profiles = Arc::clone(&self.risk_profiles);
@@ -1193,6 +1294,36 @@ impl DelegateTool {
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                // EPIC-A supervision: mirror the terminal state into the control-plane so
+                // the registry reflects the real outcome (and the reaper never reclaims a
+                // finished task). No-op when the plane is absent. The store's
+                // terminal-state guard makes a late write after a reaper TimedOut a safe
+                // no-op.
+                if let Some(cp) = crate::control_plane::control_plane() {
+                    let cp_status = match final_result.status {
+                        BackgroundTaskStatus::Completed => {
+                            crate::control_plane::TaskStatus::Completed
+                        }
+                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
+                        BackgroundTaskStatus::Cancelled => {
+                            crate::control_plane::TaskStatus::Cancelled
+                        }
+                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+                    };
+                    let _ = cp
+                        .store
+                        .update_status(
+                            &task_id_clone,
+                            cp_status,
+                            final_result.output.clone(),
+                            final_result.error.clone(),
+                        )
+                        .await;
+                }
+
+                // Drop the live cancel token now the task has settled.
+                Self::background_task_cancels().lock().remove(&task_id_clone);
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1316,7 +1447,10 @@ impl DelegateTool {
                 .unwrap_or_else(|| Arc::clone(&self.security));
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            let depth = self.depth;
+            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
+            // leaving the `>= max_depth` check inert (see the background path above).
+            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
+            let depth = self.depth + 1;
             let parent_tools = Arc::clone(&self.parent_tools);
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
@@ -1423,6 +1557,37 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
+    /// When a background task's flat-file status still reads `Running` but the durable
+    /// control-plane has reconciled it to a terminal-loss state — the owning daemon died
+    /// (`Lost`) or it exceeded its runtime (`TimedOut`) — return the loss label so result
+    /// readers surface the truth instead of a task that will never finish. `None` when
+    /// there is no loss to report: the control-plane is absent, has no record, or the
+    /// flat file is already authoritative (the task wrote its own terminal state).
+    async fn reconciled_loss_label(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+    ) -> Option<&'static str> {
+        let cp = crate::control_plane::control_plane()?;
+        Self::reconciled_loss_label_with(task_id, file_status, cp.store.as_ref()).await
+    }
+
+    /// Store-injected core of [`Self::reconciled_loss_label`] — kept separate from the
+    /// process-global accessor so it is unit-testable against an in-memory store.
+    async fn reconciled_loss_label_with(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+        store: &dyn crate::control_plane::TaskRegistry,
+    ) -> Option<&'static str> {
+        if *file_status != BackgroundTaskStatus::Running {
+            return None;
+        }
+        match store.get(task_id).await.ok().flatten()?.status {
+            crate::control_plane::TaskStatus::Lost => Some("lost"),
+            crate::control_plane::TaskStatus::TimedOut => Some("timed_out"),
+            _ => None,
+        }
+    }
+
     /// Retrieve the result of a background delegate task by task_id.
     async fn handle_check_result(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1460,6 +1625,24 @@ impl DelegateTool {
         let content = tokio::fs::read_to_string(&result_path).await?;
         let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
+        // Overlay the control-plane's reconciled view: a crashed/timed-out task whose
+        // flat file still says `Running` is surfaced as lost/timed_out, so the agent
+        // stops polling a task that will never complete.
+        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "task_id": task_id,
+                    "agent": result.agent,
+                    "status": label,
+                    "started_at": result.started_at,
+                    "note": "the owning daemon exited or the task exceeded its max runtime; \
+                             reconciled by the supervision reaper",
+                }))?,
+                error: Some(format!("background task is {label} and will not complete")),
+            });
+        }
+
         Ok(ToolResult {
             success: result.status == BackgroundTaskStatus::Completed,
             output: serde_json::to_string_pretty(&result)?,
@@ -1491,10 +1674,17 @@ impl DelegateTool {
                 && let Ok(content) = tokio::fs::read_to_string(&path).await
                 && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
             {
+                // Surface the reconciled loss state (lost/timed_out) for a task whose flat
+                // file still says `Running` but whose owning daemon died / timed out.
+                let status =
+                    match Self::reconciled_loss_label(&result.task_id, &result.status).await {
+                        Some(label) => json!(label),
+                        None => json!(result.status),
+                    };
                 results.push(json!({
                     "task_id": result.task_id,
                     "agent": result.agent,
-                    "status": result.status,
+                    "status": status,
                     "started_at": result.started_at,
                     "finished_at": result.finished_at,
                 }));
@@ -1514,6 +1704,31 @@ impl DelegateTool {
             output: serde_json::to_string_pretty(&results)?,
             error: None,
         })
+    }
+
+    /// Live cancellation tokens for in-flight background delegate tasks, keyed by task_id.
+    /// `execute_background` registers a task's child token here before the detached spawn
+    /// and removes it when the task settles; `cancel_task` looks it up to ACTUALLY abort
+    /// the run. (The prior implementation only marked the result file, so a "cancelled"
+    /// task kept running.) Process-global because a background task outlives the tool
+    /// instance that spawned it.
+    fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
+    {
+        static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// Runaway backstop: the maximum number of background delegations allowed in flight at
+    /// once across the process. Each is a full agent loop, so this guards against a model
+    /// (or a runaway loop) spawning unbounded background agent runs; normal use stays well
+    /// under it.
+    const MAX_CONCURRENT_BACKGROUND_DELEGATIONS: usize = 128;
+
+    /// Pure predicate for the runaway backstop — separated from the live token-map read so
+    /// it is unit-testable. `cap == 0` disables the backstop.
+    fn at_background_capacity(in_flight: usize, cap: usize) -> bool {
+        cap != 0 && in_flight >= cap
     }
 
     /// Cancel a running background task by task_id.
@@ -1565,19 +1780,40 @@ impl DelegateTool {
             });
         }
 
-        // Cancel via the parent token — this will cascade to all child tokens
-        // Note: individual task cancellation uses the shared parent token, which
-        // cancels all background tasks. For per-task cancellation, each background
-        // task uses a child token, and the parent token cancels all.
-        // We update the result file to reflect the cancellation request.
+        // Actually abort the running task by signalling its registered cancel token —
+        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
+        // Falls back to file-marking when the task already settled (token absent).
+        let aborted = Self::background_task_cancels()
+            .lock()
+            .remove(task_id)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+
         result.status = BackgroundTaskStatus::Cancelled;
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
 
+        // Reconcile the durable supervision registry so the supervised view agrees.
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .update_status(
+                    task_id,
+                    crate::control_plane::TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled by user request".into()),
+                )
+                .await;
+        }
+
         Ok(ToolResult {
             success: true,
-            output: format!("Task '{task_id}' cancellation requested."),
+            output: if aborted {
+                format!("Task '{task_id}' cancelled — the running task was aborted.")
+            } else {
+                format!("Task '{task_id}' marked cancelled (it had already settled).")
+            },
             error: None,
         })
     }
@@ -1739,7 +1975,8 @@ impl DelegateTool {
             let parent_tools = self.parent_tools.read();
             parent_tools.iter().any(|tool| {
                 zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
-                    && tool_policy.is_tool_allowed(tool.name())
+                    && self.security.is_tool_allowed(tool.name())
+                    && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
             })
         };
         let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools {
@@ -1768,7 +2005,8 @@ impl DelegateTool {
             parent_tools
                 .iter()
                 .filter(|tool| tool.name() != Self::NAME)
-                .filter(|tool| tool_policy.is_tool_allowed(tool.name()))
+                .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                 .map(|tool| {
                     target_memory_tools
                         .remove(tool.name())
@@ -1840,46 +2078,62 @@ impl DelegateTool {
             .flatten();
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
-                model_provider,
-                &mut history,
-                &sub_tools,
-                &noop_observer,
-                provider_type,
-                model,
-                temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                loop_runtime.max_tool_iterations,
-                Some(self.cancellation_token.child_token()),
-                None,
-                None,
-                &[],
-                tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                loop_runtime.strict_tool_parsing,
-                loop_runtime.parallel_tools,
-                loop_runtime.max_tool_result_chars,
-                // Keep delegate subagent context pruning aligned with top-level
-                // agents instead of preserving the old disabled-by-zero path.
-                loop_runtime.max_context_tokens,
-                None, // shared_budget: TODO thread from parent in future
-                None, // channel: delegate subagents don't support approval
-                receipt_generator,
+            run_tool_call_loop(ToolLoop {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
+                        model_provider,
+                        provider_name: provider_type,
+                        model,
+                        temperature,
+                    },
+                    ResolvedIo {
+                        tools_registry: &sub_tools,
+                        observer: &noop_observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &self.multimodal_config,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        // delegate subagents don't support approval
+                        receipt_generator,
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: loop_runtime.max_tool_iterations,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                        parallel_tools: loop_runtime.parallel_tools,
+                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                        // Keep delegate subagent context pruning aligned with top-level
+                        // agents instead of preserving the old disabled-by-zero path.
+                        context_token_budget: loop_runtime.max_context_tokens,
+                        knobs: &LoopKnobs::default(),
+                    },
+                ),
+                history: &mut history,
+                channel_name: "delegate",
+                channel_reply_target: None,
+                cancellation_token: Some(self.cancellation_token.child_token()),
+                on_delta: None,
+                shared_budget: None,
+                // TODO thread from parent in future
+                channel: None,
                 collected_receipts,
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &LoopKnobs::default(),
-                None,
-            )
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(agent_name),
+                turn_id: &turn_id,
+            })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
@@ -1988,6 +2242,134 @@ mod tests {
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+
+    #[tokio::test]
+    async fn reconciled_loss_label_surfaces_registry_truth() {
+        use crate::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let rec = |id: &str, status: TaskStatus| TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Delegate,
+            agent: "main".into(),
+            status,
+            owner_pid: 0,
+            owner_boot_id: "b".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            started_at: "2026-06-21T00:00:00Z".into(),
+            finished_at: None,
+        };
+        store.create(rec("lost", TaskStatus::Lost)).await.unwrap();
+        store
+            .create(rec("timed", TaskStatus::TimedOut))
+            .await
+            .unwrap();
+        store
+            .create(rec("alive", TaskStatus::Running))
+            .await
+            .unwrap();
+
+        // Flat file says Running + registry reconciled to a loss state → surface the loss.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("lost")
+        );
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "timed",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("timed_out")
+        );
+        // Registry still Running → nothing to overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "alive",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+        // The flat file already wrote a terminal state → it is authoritative, no overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Completed,
+                &store
+            )
+            .await,
+            None
+        );
+        // Unknown task → None.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "missing",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn background_cancel_token_aborts_and_clears() {
+        let token = CancellationToken::new();
+        let key = "test-cancel-unique-1";
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(key.into(), token.clone());
+        // cancel_task-style lookup: remove + signal the live token
+        let aborted = DelegateTool::background_task_cancels()
+            .lock()
+            .remove(key)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+        assert!(aborted, "a registered task token is found and aborted");
+        assert!(
+            token.is_cancelled(),
+            "the running task's token is signalled"
+        );
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(key)
+                .is_none(),
+            "the token is gone after cancellation"
+        );
+        // An unknown id is a no-op (cancel_task falls back to file-marking).
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove("test-cancel-missing")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn background_capacity_backstop() {
+        assert!(!DelegateTool::at_background_capacity(0, 128));
+        assert!(!DelegateTool::at_background_capacity(127, 128));
+        assert!(DelegateTool::at_background_capacity(128, 128));
+        assert!(DelegateTool::at_background_capacity(200, 128));
+        // cap 0 disables the backstop
+        assert!(!DelegateTool::at_background_capacity(10_000, 0));
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -3922,6 +4304,114 @@ mod tests {
         );
     }
 
+    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
+    /// convention must be auto-admitted by the delegate filter even when
+    /// the risk profile's explicit `allowed_tools` list does not mention
+    /// the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
+    /// fixture uses `mcp_fake` (no double underscore) so it exercises the
+    /// explicit allow-list path, not the new auto-admit branch. This test
+    /// pins the new branch via the resolve_tool_policy + delegate_admits_with_mcp
+    /// pair that replaces the pre-#7608 resolve_allowed_tools helper.
+    #[test]
+    fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        // The explicit allow-list entry is admitted.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "explicit allow-list entry must be admitted"
+        );
+        // A runtime-discovered MCP wrapper (matching `<server>__<tool>`) is
+        // auto-admitted even though it is not in `allowed_tools`. This is
+        // the destructive capability the reviewer called out.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "double-underscore MCP name must be auto-admitted"
+        );
+        // Non-MCP names outside the allow-list still get rejected.
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-MCP names outside allow-list must be rejected"
+        );
+    }
+
+    /// PR #7547 review (Audacity88) — blocking comment: the PR body
+    /// claims MCP tools can still be blocked via `excluded_tools`. A
+    /// target profile that allow-lists `shell` and excludes
+    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
+    /// agentic delegate even though it matches the `__` auto-admit
+    /// heuristic.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                excluded_tools: vec!["filesystem__write_file".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "non-excluded allow-list entry must be admitted"
+        );
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "excluded_tools must block auto-admitted MCP name"
+        );
+    }
+
+    /// Companion to the test above: `excluded_tools` must also subtract
+    /// from explicit allow-list entries, not just from the
+    /// double-underscore auto-admit set. delegate.rs previously ignored
+    /// `excluded_tools` entirely on the agentic path; this pins the fix
+    /// so it cannot regress.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "memory_recall".to_string()],
+                excluded_tools: vec!["shell".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "excluded entry must be rejected even when allow-listed"
+        );
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-excluded entry must be admitted"
+        );
+    }
+
     #[tokio::test]
     async fn deferred_mcp_activation_updates_delegate_parent_tools() {
         let config = agentic_agent_config();
@@ -5055,6 +5545,296 @@ mod tests {
         assert!(
             !stale_is_responses,
             "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+        );
+    }
+
+    struct FileReadTool;
+    #[async_trait]
+    impl Tool for FileReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+        fn description(&self) -> &str {
+            "Read a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "read".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileReadTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct FileWriteTool;
+    #[async_trait]
+    impl Tool for FileWriteTool {
+        fn name(&self) -> &str {
+            "file_write"
+        }
+        fn description(&self) -> &str {
+            "Write a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "written".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileWriteTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct MockShellTool;
+    #[async_trait]
+    impl Tool for MockShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "Execute shell commands."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Shell)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct ToolListInspector {
+        forbidden_names: Vec<String>,
+    }
+    #[async_trait]
+    impl ModelProvider for ToolListInspector {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tools) = request.tools {
+                for tool in tools {
+                    if self.forbidden_names.iter().any(|f| f == &tool.name) {
+                        return Ok(ChatResponse {
+                            text: Some(format!("forbidden_tool_seen:{}", tool.name)),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ToolListInspector {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolListInspector"
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_filters_parent_tools_through_parent_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".to_string(), "delegate".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent policy should have filtered out file_write, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_honors_parent_excluded_tools() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "shell".to_string(),
+                "file_read".to_string(),
+            ]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(MockShellTool),
+                Arc::new(FileReadTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["shell".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent excluded_tools should have filtered out shell, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_parent_none_unrestricted_passes_target_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: None,
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["file_read".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "target policy should have filtered out file_write, but got: {}",
+            result.output
         );
     }
 }

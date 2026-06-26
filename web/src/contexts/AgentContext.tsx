@@ -29,6 +29,13 @@ export interface ChatMessage {
    *  that happens to start with a bracketed datetime would be clipped. Only
    *  server-sourced messages (live stream + hydrated history) can be prefixed. */
   local?: boolean;
+  /**
+   * Locally-generated info/system message produced by web slash-command
+   * handlers (`/help`, `/model`, unknown-command notices). Excluded from
+   * persistence so command output does not pollute localStorage and reappear
+   * as fake assistant replies on reload. See #7137.
+   */
+  ephemeral?: boolean;
 }
 
 interface AgentContextValue {
@@ -47,6 +54,13 @@ interface AgentContextValue {
   refreshModels: () => void;
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
+  /**
+   * Append a locally-generated info/system message to the transcript without
+   * sending anything to the gateway. Used by web slash-command handlers
+   * (`/help`, `/model`, unknown-command notices) to surface feedback inline.
+   * See #7137.
+   */
+  addLocalMessage: (content: string) => void;
   abortSession: () => Promise<void>;
   /**
    * Pending supervised-mode tool-approval prompt, or null. Populated when the
@@ -743,6 +757,21 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     })();
   }, [agentAlias, attachSocketCallbacks]);
 
+  const addLocalMessage = useCallback((content: string) => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content,
+        markdown: true,
+        timestamp: new Date(),
+        ephemeral: true,
+      },
+    ]);
+  }, []);
+
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {
       if (!current) return null;
@@ -770,6 +799,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     refreshModels: () => setModelInfoVersion((v) => v + 1),
     deleteMessage,
     clearAllMessages,
+    addLocalMessage,
     abortSession: async () => {
       // Clear local approval state immediately — the in-flight request_id
       // belongs to the turn we're cancelling and will be rejected by the

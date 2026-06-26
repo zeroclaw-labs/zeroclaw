@@ -11,7 +11,7 @@ const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Ok,
@@ -20,7 +20,7 @@ pub enum Severity {
 }
 
 /// Structured diagnostic result for programmatic consumption (web dashboard, API).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiagResult {
     pub severity: Severity,
     pub category: String,
@@ -143,7 +143,6 @@ fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     out
 }
 
-/// Run diagnostics and print human-readable report to stdout.
 async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut probes = Vec::with_capacity(targets.len());
@@ -166,9 +165,16 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
-pub async fn run(config: &Config) -> Result<()> {
+/// Run the full Doctor suite and return the structured result used by CLI and RPC.
+pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     let mut results = diagnose(config);
     results.extend(probe_models(config).await);
+    results
+}
+
+/// Run diagnostics and print human-readable report to stdout.
+pub async fn run(config: &Config) -> Result<()> {
+    let results = run_structured(config).await;
 
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
@@ -441,7 +447,8 @@ pub async fn run_models(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    create_doctor_model_provider(config, provider_ref)?
+    let provider = create_doctor_model_provider(config, provider_ref)?;
+    zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
         .list_models()
         .await
 }
@@ -675,7 +682,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+            if let Some(reason) = provider_validation_error(config, &label) {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -750,7 +757,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        if let Some(reason) = provider_validation_error(config, &route.model_provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -841,18 +848,15 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        let provider_type = agent
-            .model_provider
-            .split_once('.')
-            .map_or(agent.model_provider.as_str(), |(t, _)| t);
-        if provider_type.is_empty() {
+        let provider_ref = agent.model_provider.as_str();
+        if provider_ref.is_empty() {
             continue;
         }
-        if let Some(reason) = provider_validation_error(provider_type) {
+        if let Some(reason) = provider_validation_error(config, provider_ref) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "agent \"{name}\" uses invalid model_provider \"{provider_type}\": {reason}",
+                    "agent \"{name}\" uses invalid model_provider \"{provider_ref}\": {reason}",
                 ),
             ));
         }
@@ -912,8 +916,8 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_model_provider(name, None) {
+fn provider_validation_error(config: &Config, name: &str) -> Option<String> {
+    match create_doctor_model_provider(config, name) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -1387,15 +1391,47 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let config = Config::default();
+        assert!(provider_validation_error(&config, "openrouter").is_none());
+        assert!(provider_validation_error(&config, "custom:https://example.com").is_none());
+        assert!(
+            provider_validation_error(&config, "anthropic-custom:https://example.com").is_none()
+        );
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = provider_validation_error(&config, "custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown =
+            provider_validation_error(&config, "totally-fake").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown model_provider"));
+    }
+
+    #[test]
+    fn provider_validation_accepts_custom_with_uri_in_config() {
+        // Regression: the Doctor previously called create_model_provider(name, None)
+        // without config, causing custom providers with uri defined in config to
+        // fail validation with "Custom model_provider requires `uri`".
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("known model_provider type");
+        profile.uri = Some("http://10.0.0.15:8000/v1".to_string());
+        profile.model = Some("Qwen3.6-27B".to_string());
+
+        // Full label (type.alias) should validate successfully when uri is in config.
+        assert!(
+            provider_validation_error(&config, "custom.vllm").is_none(),
+            "custom.vllm should be valid when uri is defined in config"
+        );
+
+        // Bare "custom" without alias should still fail (no config entry to resolve).
+        let bare_error = provider_validation_error(&config, "custom").unwrap_or_default();
+        assert!(
+            bare_error.contains("requires `uri`"),
+            "bare 'custom' without alias should require uri"
+        );
     }
 
     #[test]
@@ -1484,6 +1520,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn structured_run_includes_model_probe_results() {
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("redacted-test-key".to_string());
+        profile.uri = Some("http://127.0.0.1:9/v1".to_string());
+
+        let baseline = diagnose(&config);
+        assert!(
+            !baseline
+                .iter()
+                .any(|item| item.category == "providers.models")
+        );
+
+        let full = run_structured(&config).await;
+        assert!(
+            full.iter().any(|item| item.category == "providers.models"),
+            "shared structured runner should include the same model probe rows as the CLI"
+        );
+    }
+
     #[test]
     fn config_validation_catches_unknown_provider() {
         // Typed slots can only hold canonical family names, so an unknown
@@ -1503,7 +1564,7 @@ mod tests {
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| {
             i.message
-                .contains("agent \"broken\" uses invalid model_provider \"totally-fake\"")
+                .contains("agent \"broken\" uses invalid model_provider \"totally-fake.default\"")
         });
         assert!(
             prov_item.is_some(),

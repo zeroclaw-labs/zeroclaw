@@ -1673,7 +1673,13 @@ fn apply_agent(
     }
 
     let prefix = format!("agents.{}", identity.name);
-    if let Err(err) = config.create_map_key("agents", &identity.name) {
+    // Operator-facing surface: route through the shared guard so onboarding an
+    // agent literally named `default` is refused (the reserved runtime fallback),
+    // symmetric with the create/RPC/CLI surfaces. Non-`default` names create as
+    // before.
+    if let Err(err) =
+        zeroclaw_config::alias_refs::create_map_key_checked(config, "agents", &identity.name)
+    {
         errors.push(QuickstartError::new(
             QuickstartStep::Agent,
             "name",
