@@ -30,6 +30,7 @@ pub struct Plugin {
 
 fn linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
+    crate::component::add_wasi(&mut linker)?;
     let options = crate::component::bindings::tool::LinkOptions::default();
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
@@ -50,7 +51,7 @@ fn tool_linker() -> &'static Linker<PluginState> {
 /// Compile and instantiate a tool plugin. Permissions gate config at call time.
 pub async fn create_plugin(wasm_path: &Path, _permissions: &[PluginPermission]) -> Result<Plugin> {
     let component = load_component(wasm_path)?;
-    let mut store = Store::new(engine(), PluginState);
+    let mut store = Store::new(engine(), PluginState::default());
     let bindings = wt(
         ToolPlugin::instantiate_async(&mut store, &component, tool_linker()).await,
         "failed to instantiate tool plugin",

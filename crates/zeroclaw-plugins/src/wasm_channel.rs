@@ -46,6 +46,7 @@ impl Attributable for WasmChannel {
 
 fn linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
+    crate::component::add_wasi(&mut linker)?;
     let options = crate::component::bindings::channel::LinkOptions::default();
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
@@ -64,7 +65,7 @@ impl WasmChannel {
     pub async fn from_wasm(alias: impl Into<String>, wasm_path: &Path) -> Result<Self> {
         let component = load_component(wasm_path)?;
         let linker = linker()?;
-        let mut store = Store::new(engine(), PluginState);
+        let mut store = Store::new(engine(), PluginState::default());
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",
