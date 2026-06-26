@@ -280,15 +280,35 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
+/// Estimate the token cost of a single message using the ~4 chars/token
+/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
+/// history and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    message.content.len().div_ceil(4) + 4
+}
+
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    history.iter().map(estimate_message_tokens).sum()
+}
+
+/// Estimate the irreducible token floor of a history: the content trimming can
+/// never drop. That is every `system` message (system prompt + inlined tool
+/// definitions), which whole-turn trimming always keeps.
+///
+/// When this floor alone meets or exceeds the context budget, no amount of
+/// conversation trimming can bring the request under budget — trimming only
+/// sheds whole turns, never the protected system content (#5808). Callers use
+/// this to detect that condition and surface an actionable remediation hint
+/// (raise `agent.max_context_tokens` or disable unused integrations) instead of
+/// a generic overflow error. Mirrors `estimate_history_tokens`' heuristic
+/// exactly.
+pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
-        .map(|m| {
-            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
-            m.content.len().div_ceil(4) + 4
-        })
+        .filter(|m| m.role == "system")
+        .map(estimate_message_tokens)
         .sum()
 }
 
@@ -478,6 +498,25 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_system_floor_counts_only_system_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars -> 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // counted by history, not floor
+            ChatMessage::assistant("A language."),   // counted by history, not floor
+        ];
+        // Floor = system message only; conversation turns are prunable.
+        assert_eq!(estimate_system_floor_tokens(&history), 8);
+        assert!(estimate_system_floor_tokens(&history) < estimate_history_tokens(&history));
+    }
+
+    #[test]
+    fn estimate_system_floor_empty_and_no_system() {
+        assert_eq!(estimate_system_floor_tokens(&[]), 0);
+        let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
+        assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
 
     #[test]
     fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {

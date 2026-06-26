@@ -135,14 +135,34 @@ pub(crate) async fn try_recover_context_overflow(
             return true;
         }
 
-        // Nothing left to trim — truly unrecoverable
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            "Context overflow unrecoverable: only one turn left, cannot trim further"
-        );
+        // Nothing left to trim — truly unrecoverable. When the system prompt +
+        // inlined tool definitions alone dominate the budget, the single
+        // remaining turn can never fit no matter how much history is dropped;
+        // surface the actionable root cause and remedy instead of a generic
+        // unrecoverable error (#5808).
+        let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+        if system_floor >= budget {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "system_floor": system_floor,
+                        "budget": budget,
+                        "error_key": "context_floor_exceeds_budget",
+                    })),
+                crate::i18n::get_required_cli_string("history-trim-floor-exceeds-budget")
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Context overflow unrecoverable: only one turn left, cannot trim further"
+            );
+        }
     }
     false
 }
@@ -197,6 +217,42 @@ mod tests {
             }
             other => panic!("expected HistoryTrimmed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn floor_exceeds_budget_single_turn_does_not_recover() {
+        // #5808 regression: the system prompt + tool definitions alone dominate
+        // the budget and only one turn exists. Recovery must NOT loop — it
+        // returns false (nothing left to drop) so the caller breaks instead of
+        // re-running the same turn forever.
+        let big = "x".repeat(8000);
+        let mut history = vec![
+            ChatMessage::system(format!("system {big}").as_str()),
+            ChatMessage::user("only turn"),
+            ChatMessage::assistant("reply"),
+        ];
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+
+        assert!(
+            !recovered,
+            "single-turn floor overflow must not retry (no #5808 loop)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no trim event when nothing can be dropped"
+        );
+        // The system floor must dominate the recovery budget — this is what
+        // makes the new remediation branch fire.
+        assert!(
+            crate::agent::history::estimate_system_floor_tokens(&history)
+                >= estimate_history_tokens(&history) * 2 / 3,
+            "system floor should dominate the recovery budget in the #5808 case"
+        );
     }
 
     #[tokio::test]
