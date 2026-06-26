@@ -44,6 +44,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # short-auth-string, and the CA fingerprint used to confirm it.
 zeroclaw-tls = { workspace = true }
 zeroclaw-relay-proto = { workspace = true }
+# Wipe the in-memory client private key on drop (it is generated locally, written
+# 0600, and never transmitted).
+zeroize = "1.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 mime_guess = "2"

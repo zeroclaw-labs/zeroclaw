@@ -23,6 +23,9 @@ pub use certgen::{
     sign_csr,
 };
 
+pub mod csr;
+pub use csr::{ClientCsr, ClientKey, CsrSigner, SoftwareP256Signer};
+
 /// Shared certificate / CSR generation helpers for downstream test code. Public
 /// under the `testing` feature so the daemon enrollment and relay integration
 /// tests reuse one set of fixtures rather than duplicating rcgen boilerplate;

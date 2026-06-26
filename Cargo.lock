@@ -14915,6 +14915,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "zeroclaw-relay-proto",
  "zeroclaw-tls",
+ "zeroize",
 ]
 
 [[package]]

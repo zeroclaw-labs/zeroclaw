@@ -20,6 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use zeroclaw_tls::{ClientKey, CsrSigner, SoftwareP256Signer};
 
 /// The daemon's default enrollment endpoint port (`[enroll].port`).
 pub const DEFAULT_ENROLL_PORT: u16 = 9782;
@@ -63,9 +64,9 @@ pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
         anyhow::bail!("no pairing code entered");
     }
 
-    // The private key stays here; only the CSR is sent.
-    let (csr_pem, key_pem) =
-        zeroclaw_tls::generate_client_csr("zerocode").context("generating client CSR")?;
+    // The private key stays here; only the CSR is sent. Desktop generates a
+    // software P-256 key; a mobile build swaps in a hardware-keystore CsrSigner.
+    let (csr_pem, key_pem) = software_csr("zerocode")?;
 
     let resp = post_enroll(host, port, &code, &csr_pem)
         .await
@@ -102,6 +103,22 @@ pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Generate a CSR and its software private key via the desktop signer seam
+/// ([`SoftwareP256Signer`]). A mobile build swaps in a hardware-keystore
+/// [`CsrSigner`] here so the key is non-exportable (A5); the desktop path expects
+/// an extractable software key it can persist to `client.key`.
+fn software_csr(subject_hint: &str) -> Result<(String, zeroize::Zeroizing<String>)> {
+    let csr = SoftwareP256Signer
+        .generate_csr(subject_hint)
+        .context("generating client CSR")?;
+    match csr.key {
+        ClientKey::Software(key_pem) => Ok((csr.csr_pem, key_pem)),
+        ClientKey::HardwareAlias(_) => {
+            anyhow::bail!("desktop enrollment expects a software key from the CSR signer")
+        }
+    }
+}
+
 /// The client-cert TTL we assume to place the 50% renewal point. The daemon
 /// issues 30-day client certs; we renew once past the half-life so an
 /// intermittently-connected client never lets its cert silently expire.
@@ -133,8 +150,7 @@ pub async fn maybe_renew(client: &crate::client::RpcClient, config_dir: &Path) {
 /// Generate a fresh keypair + CSR, renew over `cert/renew`, and re-cache the
 /// result (including any rotated relay node-id the daemon hands back).
 async fn renew(client: &crate::client::RpcClient, config_dir: &Path) -> Result<i64> {
-    let (csr_pem, key_pem) =
-        zeroclaw_tls::generate_client_csr("zerocode").context("generating renewal CSR")?;
+    let (csr_pem, key_pem) = software_csr("zerocode").context("generating renewal CSR")?;
     let resp: EnrollResponse = client
         .call("cert/renew", serde_json::json!({ "csr_pem": csr_pem }))
         .await

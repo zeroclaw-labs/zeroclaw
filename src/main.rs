@@ -4379,11 +4379,16 @@ async fn main() -> Result<()> {
                                  certificates for the mutually authenticated WSS plane; enable [wss].",
                             ));
                         }
-                        // Issuance needs the daemon CA private key. The only
-                        // bring-your-own form the config expresses is a CA cert
-                        // with no key, which cannot sign - fail closed: do not
-                        // open the endpoint (BYO-CA-without-key mode; provision
-                        // client certs out of band).
+                        // Issuance needs the daemon CA *private key*. Two
+                        // bring-your-own forms exist:
+                        //   1. BYO-CA with key (in-band): the operator drops
+                        //      ca.crt + ca.key into <data_dir>/tls; the issuer
+                        //      loads and signs against them (handled below by
+                        //      ensure_server_materials_protected's load path).
+                        //   2. BYO-CA without key (external CA): the WSS verifier
+                        //      trusts an external CA cert whose key the daemon does
+                        //      not hold. It cannot sign - fail closed: do not open
+                        //      the endpoint (provision client certs out of band).
                         let byo_ca = wss_cfg
                             .client_auth
                             .as_ref()
@@ -4403,15 +4408,33 @@ async fn main() -> Result<()> {
                             cancel.cancelled().await;
                             return Ok(());
                         }
-                        // Auto-generated per-daemon CA + server cert (secure by
-                        // default). Same passphrase source as the WSS gen + CLI
-                        // read paths, so the on-disk CA-key form always matches.
+                        // Per-daemon CA + server cert. Loaded when the operator has
+                        // provisioned their own ca.{crt,key} (BYO-CA with key),
+                        // otherwise auto-generated (secure by default). Same
+                        // passphrase source as the WSS gen + CLI read paths, so the
+                        // on-disk CA-key form always matches.
+                        let tls_dir = data_dir.join("tls");
+                        let ca_provided =
+                            tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
                         let protection = ca_key_protection_from_env();
                         let mats = zeroclaw_tls::ensure_server_materials_protected(
-                            &data_dir.join("tls"),
+                            &tls_dir,
                             &[],
                             &protection,
                         )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            ),
+                            if ca_provided {
+                                "enrollment signing against an operator-provided CA \
+                                 (<data_dir>/tls/ca.*)"
+                            } else {
+                                "enrollment signing against the auto-generated per-daemon CA"
+                            }
+                        );
                         let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path)?;
                         let ca_key_pem =
                             zeroclaw_tls::load_ca_key_pem(&mats.ca_key_path, &protection)?;
