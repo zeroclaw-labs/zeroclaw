@@ -175,4 +175,46 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0], "1");
     }
+
+    #[test]
+    fn jaccard_deduplicates_repeated_words() {
+        // Token sets ignore repeats: {a, b} vs {a, b} are identical.
+        assert!((jaccard_similarity("a a b", "a b b") - 1.0).abs() < f64::EPSILON);
+        // {a, b} vs {a} -> intersection 1 / union 2.
+        assert!((jaccard_similarity("a a b", "a") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn find_text_conflicts_skips_superseded_and_identical() {
+        let entry = |id: &str, content: &str, superseded: Option<String>| MemoryEntry {
+            id: id.into(),
+            key: "k".into(),
+            content: content.into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.7),
+            superseded_by: superseded,
+            agent_alias: None,
+            agent_id: None,
+        };
+        let entries = vec![
+            entry("active", "User prefers Rust for systems work", None),
+            entry(
+                "old",
+                "User prefers Rust for systems work",
+                Some("x".into()),
+            ),
+        ];
+
+        // The already-superseded "old" entry is skipped; only "active" conflicts.
+        let conflicts = find_text_conflicts(&entries, "User now prefers Go for systems work", 0.3);
+        assert_eq!(conflicts, vec!["active".to_string()]);
+
+        // An identical new_content is an update, not a conflict.
+        let none = find_text_conflicts(&entries, "User prefers Rust for systems work", 0.3);
+        assert!(none.is_empty());
+    }
 }

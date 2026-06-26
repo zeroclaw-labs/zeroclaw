@@ -8,6 +8,10 @@ use super::context::RpcContext;
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
+
+const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -254,6 +258,7 @@ impl Method {
 }
 
 type RpcResult = Result<Value, JsonRpcError>;
+type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
@@ -326,6 +331,52 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     }
 }
 
+fn rename_error_to_rpc(
+    path: &str,
+    from: &str,
+    err: zeroclaw_config::alias_refs::RenameError,
+) -> JsonRpcError {
+    use zeroclaw_config::alias_refs::RenameError;
+    let code = match err {
+        RenameError::PostCondition(_) => INTERNAL_ERROR,
+        _ => INVALID_PARAMS,
+    };
+    rpc_err(code, format!("{path}.{from}: {err}"))
+}
+
+async fn move_renamed_agent_workspace(
+    old_workspace: &std::path::Path,
+    new_workspace: &std::path::Path,
+) -> Option<String> {
+    if old_workspace == new_workspace || !old_workspace.exists() {
+        return None;
+    }
+    if let Some(parent) = new_workspace.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::rename(old_workspace, new_workspace).await {
+        Ok(()) => None,
+        Err(err) => Some(format!(
+            "workspace move {} -> {} failed: {err}",
+            old_workspace.display(),
+            new_workspace.display()
+        )),
+    }
+}
+
+/// Whether a TUI session should eagerly initialize the agent's MCP servers when
+/// the agent is built for `session/new`.
+///
+/// ACP (Code) sessions skip MCP initialization so `session/new` returns
+/// promptly: user-configured MCP servers are external processes/services that
+/// can block startup while they connect or time out. Chat sessions initialize
+/// MCP so the Zerocode TUI exposes the same MCP tools — and, under deferred
+/// loading, the `tool_search` built-in — that the gateway already exposes for
+/// the same agent (#8193).
+fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
+    !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -386,6 +437,53 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
         *self.ctx.config.write() = snapshot;
         Ok(())
+    }
+
+    async fn save_and_swap_config(
+        &self,
+        mut snapshot: zeroclaw_config::schema::Config,
+    ) -> Result<(), JsonRpcError> {
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        *self.ctx.config.write() = snapshot;
+        Ok(())
+    }
+
+    async fn agent_rename_residue_exists(
+        &self,
+        config: &zeroclaw_config::schema::Config,
+        from: &str,
+    ) -> bool {
+        if config.agent_workspace_dir(from).exists() {
+            return true;
+        }
+        if crate::cron::list_jobs_by_agent(config, from)
+            .map(|jobs| !jobs.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(store) = self.ctx.acp_session_store.as_ref()
+            && store
+                .list_sessions_by_agent(from)
+                .map(|sessions| !sessions.is_empty())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(mem) = self.ctx.memory.as_ref()
+            && mem.count_agent(from).await.unwrap_or(0) > 0
+        {
+            return true;
+        }
+        if let Some(backend) = self.ctx.session_backend.as_ref()
+            && backend.count_agent_attribution(from).unwrap_or(0) > 0
+        {
+            return true;
+        }
+        false
     }
 
     /// Read frames from transport, dispatch, repeat.
@@ -721,6 +819,13 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
+    /// Drive a full JSON-RPC request line through the dispatcher from an
+    /// external integration test, including notification emission on the
+    /// outbound channel. Mirrors the transport `process_line` path.
+    pub async fn process_line_for_test(&mut self, line: &str) {
+        self.process_line(line).await;
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
@@ -782,11 +887,15 @@ impl RpcDispatcher {
         // session. A non-ACP caller may still opt in explicitly.
         let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             || req.exclude_memory == Some(true);
+        // Chat sessions initialize MCP so the TUI sees the same MCP tools the
+        // gateway exposes for this agent; ACP (Code) sessions skip it to keep
+        // `session/new` prompt (#8193).
+        let initialize_mcp = session_should_initialize_mcp(&chat_mode);
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &req.agent_alias,
             cwd_path,
-            false,
+            initialize_mcp,
             exclude_memory,
             tui_env,
             self.ctx.sop_engine.clone(),
@@ -1181,6 +1290,8 @@ impl RpcDispatcher {
         // session — otherwise session recovery silently restores the
         // long-term-memory backend and tools the ACP invariant forbids.
         let exclude_memory = true;
+        // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
+        // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &data.agent_alias,
@@ -2349,11 +2460,22 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let job = crate::cron::get_job(&config, &req.id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
-        let (success, output) = crate::cron::scheduler::execute_job_now(&config, &job).await;
+        let event_tx = self.ctx.event_tx.clone();
+        let result = crate::cron::scheduler::run_manual_job(
+            &config,
+            &job,
+            crate::cron::scheduler::CronDeliveryContext::RpcManual,
+            &event_tx,
+        )
+        .await;
         to_result(CronTriggerResult {
-            id: req.id,
-            success,
-            output,
+            id: result.job_id,
+            success: result.success,
+            status: result.status,
+            output: result.output,
+            duration_ms: result.duration_ms,
+            started_at: result.started_at.to_rfc3339(),
+            finished_at: result.finished_at.to_rfc3339(),
         })
     }
 
@@ -2391,7 +2513,14 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
-            config.ensure_map_key_for_path(&req.prop);
+            if config.ensure_map_key_for_path(&req.prop) {
+                // Refused to vivify the reserved `default` agent: return a
+                // reserved error rather than a downstream "Unknown property".
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "alias `default` is reserved and cannot be created",
+                ));
+            }
             let info = config
                 .prop_fields()
                 .into_iter()
@@ -2571,15 +2700,33 @@ impl RpcDispatcher {
     }
 
     fn handle_config_reload(&self) -> RpcResult {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if !self.schedule_daemon_reload("config") {
             return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
-        };
-        // Delay so the RPC reply flushes before the daemon tears down.
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-        });
+        }
         to_result(ConfigReloadResult { reloading: true })
+    }
+
+    fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            return false;
+        };
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+                let _ = gateway_shutdown_tx.send(true);
+                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+            }
+            let _ = reload_tx.send(true);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({ "surface": surface })),
+                "daemon reload dispatched"
+            );
+        });
+        true
     }
 
     fn handle_config_list(&self, params: &Value) -> RpcResult {
@@ -2653,9 +2800,15 @@ impl RpcDispatcher {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let created = {
             let mut config = self.ctx.config.write();
-            let created = config
-                .create_map_key(&req.path, &req.key)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            // Shared guarded boundary: enforces the reserved-agent rule (the
+            // `default` runtime fallback) on this surface too, so the RPC create
+            // path cannot author an `agents.default` the rename guard then traps.
+            let created = zeroclaw_config::alias_refs::create_map_key_checked(
+                &mut config,
+                &req.path,
+                &req.key,
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
@@ -2693,28 +2846,169 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_config_map_key_rename(&self, params: &Value) -> RpcResult {
-        let req: ConfigMapKeyRenameParams = parse_params(params)?;
-        let renamed = {
-            let mut config = self.ctx.config.write();
-            let renamed = config
-                .rename_map_key(&req.path, &req.from, &req.to)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
-            if renamed {
-                config.mark_dirty(&format!("{}.{}", req.path, req.from));
-                config.mark_dirty(&format!("{}.{}", req.path, req.to));
-            }
-            renamed
+    fn handle_config_map_key_rename<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        let req: ConfigMapKeyRenameParams = match parse_params(params) {
+            Ok(req) => req,
+            Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
-        if renamed {
-            self.flush_config().await?;
+        if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
+            return self.handle_config_alias_rename(req, kind);
         }
-        to_result(ConfigMapKeyRenameResult {
-            path: req.path,
-            from: req.from,
-            to: req.to,
-            renamed,
+
+        Box::pin(async move {
+            let renamed = {
+                let mut config = self.ctx.config.write();
+                let renamed = config
+                    .rename_map_key(&req.path, &req.from, &req.to)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+                if renamed {
+                    config.mark_dirty(&format!("{}.{}", req.path, req.from));
+                    config.mark_dirty(&format!("{}.{}", req.path, req.to));
+                }
+                renamed
+            };
+            if renamed {
+                self.flush_config().await?;
+            }
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed,
+                warnings: Vec::new(),
+            })
         })
+    }
+
+    fn handle_config_alias_rename<'a>(
+        &'a self,
+        req: ConfigMapKeyRenameParams,
+        kind: zeroclaw_config::alias_refs::AliasKind,
+    ) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
+            if is_agent {
+                // Live RPC sessions hold the selected agent alias in memory; refuse
+                // rather than letting them recreate old-alias state after the rename.
+                let active = self
+                    .ctx
+                    .sessions
+                    .count_by_agent()
+                    .await
+                    .get(&req.from)
+                    .copied()
+                    .unwrap_or(0);
+                if active > 0 {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "{}.{}: cannot rename agent with {active} active RPC session(s); close those sessions first",
+                            req.path, req.from
+                        ),
+                    ));
+                }
+            }
+
+            let mut working = self.ctx.config.read().clone();
+            let old_workspace = is_agent.then(|| working.agent_workspace_dir(&req.from));
+            // If a prior call saved config as `to` but crashed before side effects,
+            // re-running `from -> to` should converge lagging owned state instead
+            // of failing because `from` is no longer a config key.
+            let resume_committed_to = is_agent
+                && working.agent(&req.from).is_none()
+                && working.agent(&req.to).is_some()
+                && self.agent_rename_residue_exists(&working, &req.from).await;
+
+            if !resume_committed_to {
+                let report = zeroclaw_config::alias_refs::rename_with_cascade(
+                    &mut working,
+                    &kind,
+                    &req.from,
+                    &req.to,
+                )
+                .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
+                for path in &report.dirty_paths {
+                    working.mark_dirty(path);
+                }
+                self.save_and_swap_config(working.clone()).await?;
+            }
+            let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
+
+            let mut warnings = Vec::new();
+            if let (Some(old_workspace), Some(new_workspace)) = (old_workspace, new_workspace) {
+                warnings.extend(move_renamed_agent_workspace(&old_workspace, &new_workspace).await);
+                warnings.extend(
+                    self.rename_agent_owned_state(&working, &req.from, &req.to)
+                        .await,
+                );
+            }
+
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed: true,
+                warnings,
+            })
+        })
+    }
+
+    async fn rename_agent_owned_state(
+        &self,
+        config: &zeroclaw_config::schema::Config,
+        from: &str,
+        to: &str,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut memory_rows = 0usize;
+        let mut cron_jobs = 0usize;
+        let mut acp_sessions = 0usize;
+        let mut sessions_repointed = 0usize;
+
+        if let Some(mem) = &self.ctx.memory {
+            match mem.rename_agent(from, to).await {
+                Ok(n) => memory_rows = n,
+                Err(e) => warnings.push(format!("memory rename: {e}")),
+            }
+        }
+
+        match crate::cron::rename_jobs_by_agent(config, from, to) {
+            Ok(n) => cron_jobs = n,
+            Err(e) => warnings.push(format!("cron rename: {e}")),
+        }
+
+        match &self.ctx.acp_session_store {
+            Some(store) => match store.rename_sessions_by_agent(from, to) {
+                Ok(n) => acp_sessions = n,
+                Err(e) => warnings.push(format!("acp rename: {e}")),
+            },
+            None => warnings.push("acp store unavailable".to_string()),
+        }
+
+        if let Some(backend) = &self.ctx.session_backend {
+            match backend.rename_agent_attribution(from, to) {
+                Ok(n) => sessions_repointed = n,
+                Err(e) => warnings.push(format!("session attribution rename: {e}")),
+            }
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "memory": memory_rows,
+                    "cron": cron_jobs,
+                    "acp": acp_sessions,
+                    "sessions": sessions_repointed,
+                    "warnings": warnings.clone(),
+                })
+            ),
+            "agent renamed with RPC owned-state cascade"
+        );
+
+        warnings
     }
 
     fn handle_config_templates(&self) -> RpcResult {
@@ -3160,6 +3454,11 @@ impl RpcDispatcher {
                         .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
+                    cost_category: zeroclaw_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
                     label,
                     key,
                 }
@@ -3250,6 +3549,7 @@ impl RpcDispatcher {
         to_result(LogsSubscribeResult { subscribed: true })
     }
 
+    #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
@@ -3260,6 +3560,7 @@ impl RpcDispatcher {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
             until_id: p.until_id,
+            until_line_offset: p.until_line_offset,
             action: p.action,
             category: p.category,
             outcome: p.outcome,
@@ -3284,6 +3585,7 @@ impl RpcDispatcher {
         to_result(LogsQueryResult {
             events,
             next_cursor: page.next_cursor,
+            next_cursor_line_offset: page.next_cursor_line_offset,
             at_end: page.at_end,
         })
     }
@@ -3462,7 +3764,7 @@ impl RpcDispatcher {
     /// use. Returns `true` when the supervisor was notified, `false`
     /// when no supervisor is attached (e.g. test harness).
     fn signal_daemon_reload(&self) -> bool {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if self.ctx.reload_tx.is_none() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3484,22 +3786,7 @@ impl RpcDispatcher {
             ),
             "quickstart: daemon reload signalled"
         );
-        let started = std::time::Instant::now();
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "surface": crate::quickstart::Surface::Tui.as_str(),
-                    })),
-                "quickstart: daemon reload dispatched"
-            );
-        });
-        true
+        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
 }
 
@@ -3578,6 +3865,16 @@ fn notification_for_turn_event(
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
         },
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => SessionUpdateEvent::HistoryTrimmed {
+            session_id: session_id.to_string(),
+            dropped_messages: *dropped_messages,
+            kept_turns: *kept_turns,
+            reason: reason.clone(),
+        },
         TurnEvent::Usage {
             input_tokens,
             cached_input_tokens: _,
@@ -3611,6 +3908,216 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    #[test]
+    fn session_initializes_mcp_for_chat_but_not_acp() {
+        use crate::rpc::types::ChatMode;
+        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // MCP tools (and the deferred-loading `tool_search`) the gateway
+        // already exposes for the agent (#8193).
+        assert!(
+            session_should_initialize_mcp(&ChatMode::Chat),
+            "Chat sessions must eagerly initialize MCP"
+        );
+        // ACP (Code) sessions intentionally skip eager MCP init to keep
+        // `session/new` prompt.
+        assert!(
+            !session_should_initialize_mcp(&ChatMode::Acp),
+            "ACP sessions must skip eager MCP init"
+        );
+    }
+
+    // ── #8193: behavioral `session/new` MCP coverage ─────────────────────────
+    //
+    // These drive the real `handle_session_new` path against a mock MCP server
+    // (HTTP transport, so the harness stays cross-platform — no stdio scripts)
+    // and assert on the resulting agent's tool list. They guard the call-site
+    // wiring, not just the `session_should_initialize_mcp` seam: reverting the
+    // `session/new` argument back to a hard-coded `false` makes the two Chat
+    // tests fail.
+
+    /// Spin up a wiremock server that speaks the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) and advertises
+    /// a single tool. The dotted `tool_name` exercises spec-valid names that
+    /// must survive `<server>__<tool>` prefixing (#8193).
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List domains",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_acp_test_config` plus an MCP server granted to `test-agent` via an
+    /// `mcp_bundles` grant, pointed at `mock_uri`. `deferred` selects
+    /// deferred-loading (`tool_search`) vs eager registration.
+    fn make_mcp_granting_config(
+        tmp: &tempfile::TempDir,
+        mock_uri: String,
+        deferred: bool,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut config = make_acp_test_config(tmp);
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = deferred;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_tool_search_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            names.contains(&"tool_search"),
+            "Chat session with deferred MCP must expose `tool_search`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), false);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        // Eager mode registers the MCP tool directly; the dotted suffix keeps
+        // its `<server>__<tool>` prefix.
+        assert!(
+            names.contains(&"remote__domains.list"),
+            "Chat session with eager MCP must expose `remote__domains.list`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_skips_mcp_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        // Deferred mode would register `tool_search` for a Chat session; an ACP
+        // session must skip MCP init entirely regardless. ACP `session/new`
+        // requires the persistence dispatcher (it touches the ACP store).
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-mcp-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-mcp-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
+            "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
     fn make_approval_test_dispatcher() -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -3641,6 +4148,130 @@ mod tests {
     fn doctor_run_method_is_registered() {
         assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn config_reload_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
+
+        let result = dispatcher.handle_config_reload();
+        assert!(
+            result.is_ok(),
+            "config/reload should accept reload-capable contexts"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("gateway shutdown must be signalled before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            config,
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+
+        let result = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .await
+            .expect("quickstart/apply should accept reload-capable contexts");
+        assert_eq!(
+            result["kind"], "applied",
+            "quickstart/apply result: {result:#?}"
+        );
+        assert_eq!(result["daemon_restarted"], true);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("quickstart/apply must signal gateway shutdown before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "quickstart/apply daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("quickstart/apply daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
     }
 
     #[test]
@@ -3820,6 +4451,23 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_notification() {
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "history_trimmed");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["kept_turns"], 1);
+        assert_eq!(v["params"]["reason"], "context token budget exceeded");
+    }
+
+    #[test]
     fn usage_event_emits_context_usage_notification() {
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
@@ -3985,13 +4633,167 @@ mod tests {
     fn make_acp_test_dispatcher(
         config: zeroclaw_config::schema::Config,
     ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        make_acp_test_dispatcher_with_events(config, None)
+    }
+
+    fn make_acp_test_dispatcher_with_events(
+        config: zeroclaw_config::schema::Config,
+        event_tx: Option<tokio::sync::broadcast::Sender<Value>>,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        ctx.event_tx = event_tx;
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         (dispatcher, sessions)
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_persists_run_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-ok",
+            None,
+            true,
+        )
+        .expect("test cron job should be created");
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "ok");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+
+        let updated = crate::cron::get_job(&config, &job.id).expect("job should still exist");
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .is_some_and(|output| output.contains("rpc-trigger-ok"))
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_reports_degraded_status_and_broadcasts() {
+        crate::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger-degraded".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-degraded",
+            Some(crate::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .expect("test cron job should be created");
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let (dispatcher, _sessions) =
+            make_acp_test_dispatcher_with_events(config.clone(), Some(event_tx));
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "degraded");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+        assert!(value["duration_ms"].as_i64().is_some());
+        assert!(value["started_at"].as_str().unwrap_or("").contains('T'));
+        assert!(value["finished_at"].as_str().unwrap_or("").contains('T'));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("cron trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], true);
+        assert_eq!(event["manual"], true);
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
     }
 
     #[tokio::test]
@@ -4137,6 +4939,204 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = "alpha".to_string();
+        config.acp.default_agent = Some("alpha".to_string());
+
+        let mut alpha = AliasedAgentConfig {
+            delegates: vec!["alpha".to_string()],
+            ..Default::default()
+        };
+        alpha
+            .workspace
+            .access
+            .insert(AgentAlias::new("alpha"), AccessMode::Read);
+        config.agents.insert("alpha".to_string(), alpha);
+
+        let mut reviewer = AliasedAgentConfig {
+            delegates: vec!["alpha".to_string()],
+            ..Default::default()
+        };
+        reviewer
+            .workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha"));
+        config.agents.insert("reviewer".to_string(), reviewer);
+
+        let mut group = PeerGroupConfig::default();
+        group.agents.push(AgentAlias::new("alpha"));
+        config.peer_groups.insert("crew".to_string(), group);
+
+        config
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_uses_agent_cascade() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("agent rename must succeed");
+
+        assert_eq!(result["renamed"], true);
+        assert_eq!(result["path"], "agents");
+        assert_eq!(result["from"], "alpha");
+        assert_eq!(result["to"], "beta");
+        assert!(
+            result.get("warnings").is_none(),
+            "test stores should make owned-state cascade warning-free: {result:?}"
+        );
+
+        let config = dispatcher.ctx.config.read().clone();
+        assert!(!config.agents.contains_key("alpha"));
+        assert!(config.agents.contains_key("beta"));
+        assert_eq!(config.heartbeat.agent, "beta");
+        assert_eq!(config.acp.default_agent.as_deref(), Some("beta"));
+        assert_eq!(config.agents["beta"].delegates, vec!["beta".to_string()]);
+        assert!(
+            config.agents["beta"]
+                .workspace
+                .access
+                .contains_key(&zeroclaw_config::multi_agent::AgentAlias::new("beta"))
+        );
+        assert_eq!(
+            config.agents["reviewer"].delegates,
+            vec!["beta".to_string()]
+        );
+        assert_eq!(
+            config.agents["reviewer"].workspace.read_memory_from,
+            vec![zeroclaw_config::multi_agent::AgentAlias::new("beta")]
+        );
+        assert_eq!(
+            config.peer_groups["crew"].agents,
+            vec![zeroclaw_config::multi_agent::AgentAlias::new("beta")]
+        );
+
+        let written = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(written.contains("[agents.beta]"), "{written}");
+        assert!(!written.contains("[agents.alpha]"), "{written}");
+        assert!(written.contains("agent = \"beta\""), "{written}");
+        assert!(written.contains("default_agent = \"beta\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_resumes_committed_agent_rename_side_effects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_rename_test_config(&tmp);
+        let old_workspace = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&old_workspace).unwrap();
+        std::fs::write(old_workspace.join("marker.txt"), "lagged workspace").unwrap();
+
+        zeroclaw_config::alias_refs::rename_with_cascade(
+            &mut config,
+            &zeroclaw_config::alias_refs::AliasKind::Agent,
+            "alpha",
+            "beta",
+        )
+        .expect("seed config already committed to beta");
+        let new_workspace = config.agent_workspace_dir("beta");
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("re-issued rename must converge lagging side effects");
+
+        assert_eq!(result["renamed"], true);
+        assert_eq!(result["from"], "alpha");
+        assert_eq!(result["to"], "beta");
+        assert!(
+            !old_workspace.exists(),
+            "old workspace should be moved on resume"
+        );
+        assert!(
+            new_workspace.join("marker.txt").exists(),
+            "workspace residue should converge onto the renamed alias"
+        );
+    }
+
+    #[test]
+    fn config_alias_rename_future_is_small_enough_for_rpc_task_stack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let future = dispatcher.handle_config_map_key_rename(&params);
+        let future_size = std::mem::size_of_val(&future);
+        drop(future);
+
+        assert!(
+            future_size < 16 * 1024,
+            "agent alias rename future is {future_size} bytes; keep large config snapshots \
+             out of the RPC task stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_refuses_active_agent_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "live-agent-session"
+            }))
+            .await
+            .expect("session/new should succeed");
+        assert_eq!(sessions.count_by_agent().await.get("test-agent"), Some(&1));
+
+        let err = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "test-agent",
+                "to": "renamed-agent"
+            }))
+            .await
+            .expect_err("agent rename must refuse active sessions");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("active RPC session"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
     /// chat_mode=acp creates a row in acp-sessions.db, sessions.db stays empty
     /// for that session_id.
     #[tokio::test]
@@ -4222,6 +5222,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::AssistantToolCalls {
                         text: None,
@@ -4236,6 +5237,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),

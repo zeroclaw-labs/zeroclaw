@@ -81,8 +81,18 @@ impl NotionChannel {
                 anyhow::Error::msg(format!("Invalid Notion API key header value: {e}"))
             })?,
         );
-        headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Notion-Version",
+            NOTION_VERSION.parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Notion-Version header value: {e}"))
+            })?,
+        );
+        headers.insert(
+            "Content-Type",
+            "application/json".parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Content-Type header value: {e}"))
+            })?,
+        );
         Ok(headers)
     }
 

@@ -37,7 +37,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-pub(super) fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -541,73 +541,23 @@ pub async fn handle_api_cron_run(
         }
     };
 
-    let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
-    let finished_at = chrono::Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+    let event_tx = Some(state.event_tx.clone());
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
         &config,
         &job,
-        success,
-        output,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        &event_tx,
     )
     .await;
-    success = outcome.success;
-
-    if let Err(e) = zeroclaw_runtime::cron::record_run(
-        &config,
-        &job.id,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
-    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
-        &config,
-        &job.id,
-        finished_at,
-        &outcome.status,
-        &outcome.output,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to update last_run state"
-        );
-    }
-
-    // Broadcast the result so dashboard/SSE clients refresh in real time,
-    // matching the scheduler's automatic-execution behavior.
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "cron_result",
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "manual": true,
-        "timestamp": finished_at.to_rfc3339(),
-    }));
 
     Json(serde_json::json!({
-        "status": &outcome.status,
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "duration_ms": duration_ms,
-        "started_at": started_at.to_rfc3339(),
-        "finished_at": finished_at.to_rfc3339(),
+        "status": result.status,
+        "job_id": result.job_id,
+        "success": result.success,
+        "output": result.output,
+        "duration_ms": result.duration_ms,
+        "started_at": result.started_at.to_rfc3339(),
+        "finished_at": result.finished_at.to_rfc3339(),
     }))
     .into_response()
 }
@@ -4149,5 +4099,84 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    #[cfg(feature = "a2a")]
+    mod a2a_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "a2a-test-token";
+
+        fn paired_state() -> AppState {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.a2a.server.enabled = true;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("maker".to_string(), agent);
+            let mut state = test_state(config);
+            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state
+        }
+
+        async fn status_of(
+            router: axum::Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> StatusCode {
+            router.oneshot(req).await.expect("router response").status()
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unauthenticated_request() {
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#,
+                ))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn catalog_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_with_valid_token() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
     }
 }

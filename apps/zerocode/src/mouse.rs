@@ -14,6 +14,27 @@ pub(crate) fn in_rect(col: u16, row: u16, rect: Rect) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+/// The bottom-left help indicator text shared by every pane footer.
+pub(crate) const HELP_HINT: &str = " ?=help";
+
+/// Returns `true` when `(col, row)` falls on the help hint that panes render
+/// at the bottom-left of `content_area`. The clickable zone spans the hint
+/// width on the area's last row, tolerant of the leading space / border cell.
+pub(crate) fn help_hint_click(col: u16, row: u16, content_area: Rect) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    if content_area.height == 0 {
+        return false;
+    }
+    let row_y = content_area.y + content_area.height - 1;
+    let hint = Rect {
+        x: content_area.x,
+        y: row_y,
+        width: UnicodeWidthStr::width(HELP_HINT) as u16,
+        height: 1,
+    };
+    in_rect(col, row, hint)
+}
+
 // ── List helpers ─────────────────────────────────────────────────
 
 /// Map a mouse click row to the item index in a bordered `List` widget.
@@ -200,7 +221,7 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{mode_bar_click, tab_click_index};
+    use super::{help_hint_click, mode_bar_click, tab_click_index};
     use ratatui::layout::Rect;
 
     fn bar(width: u16) -> Rect {
@@ -251,5 +272,20 @@ mod tests {
         assert_eq!(mode_bar_click(8, 0, bar(30), &labels), Some(1));
         assert_eq!(mode_bar_click(9, 0, bar(30), &labels), Some(2));
         assert_eq!(mode_bar_click(15, 0, bar(30), &labels), Some(2));
+    }
+
+    #[test]
+    fn help_hint_click_hits_bottom_left() {
+        let area = Rect {
+            x: 4,
+            y: 2,
+            width: 40,
+            height: 10,
+        };
+        let bottom = area.y + area.height - 1;
+        assert!(help_hint_click(area.x, bottom, area), "left edge");
+        assert!(help_hint_click(area.x + 5, bottom, area), "within hint");
+        assert!(!help_hint_click(area.x + 20, bottom, area), "past hint");
+        assert!(!help_hint_click(area.x, bottom - 1, area), "wrong row");
     }
 }
