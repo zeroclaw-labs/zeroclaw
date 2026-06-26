@@ -175,6 +175,19 @@ fn resolve_wss_target(
     Some((uri, skip_verify))
 }
 
+/// In relay mode the inner WSS terminates at the daemon's own loopback listener
+/// (the relay tunnels to it), so the inner server name is always the daemon's
+/// self-SAN `127.0.0.1` and the port is cosmetic. When `--connect` is omitted on
+/// a relay route we default to this so the common case is just `--relay`.
+const DEFAULT_RELAY_INNER_URL: &str = "wss://127.0.0.1:9781";
+
+/// A default client-TLS file under `<config_dir>/tls/<name>`, if it exists, so a
+/// client provisioned the conventional way needs no explicit `--tls-*` flags.
+fn default_tls_path(config_dir: &std::path::Path, name: &str) -> Option<String> {
+    let p = config_dir.join("tls").join(name);
+    p.exists().then(|| p.to_string_lossy().into_owned())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     install_panic_hook();
@@ -301,16 +314,24 @@ async fn run() -> anyhow::Result<()> {
 
     let target = {
         let cfg_wss = &loaded_config.connection.wss;
-        if let Some((uri, skip_verify)) =
-            resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
-        {
-            // CLI flags override config for the relay route and the mutual-TLS
-            // material.
-            let relay_addr = cli.relay.clone().or_else(|| cfg_wss.relay_url.clone());
-            let relay_node = cli
-                .relay_node
-                .clone()
-                .or_else(|| cfg_wss.relay_node.clone());
+        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+
+        // Relay route (CLI overrides config).
+        let relay_addr = cli.relay.clone().or_else(|| cfg_wss.relay_url.clone());
+        let relay_node = cli
+            .relay_node
+            .clone()
+            .or_else(|| cfg_wss.relay_node.clone());
+        let relay_configured = relay_addr.is_some() || relay_node.is_some();
+
+        // A WSS route is chosen when --connect / [wss].uri is set, OR a relay is
+        // configured (then the inner URL defaults to the daemon's loopback SAN).
+        let wss_target = resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
+            .or_else(|| {
+                relay_configured.then(|| (DEFAULT_RELAY_INNER_URL.to_string(), cli.tls_skip_verify))
+            });
+
+        if let Some((uri, skip_verify)) = wss_target {
             let relay = match (relay_addr, relay_node) {
                 (Some(relay_addr), Some(node_id)) => {
                     // Default the relay's expected cert name to its host:port host.
@@ -336,25 +357,29 @@ async fn run() -> anyhow::Result<()> {
                     ));
                 }
             };
+            // Mutual-TLS material: CLI flag -> config -> conventional default path
+            // under <config_dir>/tls, so a provisioned client needs no --tls-* flags.
             let tls = client::ClientTls {
                 skip_verify,
                 ca_cert_path: cli
                     .tls_ca_cert
                     .clone()
-                    .or_else(|| opt_path(&cfg_wss.tls.ca_cert_path)),
+                    .or_else(|| opt_path(&cfg_wss.tls.ca_cert_path))
+                    .or_else(|| default_tls_path(&config_dir, "ca.crt")),
                 client_cert_path: cli
                     .tls_client_cert
                     .clone()
-                    .or_else(|| opt_path(&cfg_wss.tls.client_cert_path)),
+                    .or_else(|| opt_path(&cfg_wss.tls.client_cert_path))
+                    .or_else(|| default_tls_path(&config_dir, "client.crt")),
                 client_key_path: cli
                     .tls_client_key
                     .clone()
-                    .or_else(|| opt_path(&cfg_wss.tls.client_key_path)),
+                    .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
+                    .or_else(|| default_tls_path(&config_dir, "client.key")),
                 relay,
             };
             ConnectTarget::Wss { url: uri, tls }
         } else {
-            let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
             let socket = client::resolve_socket_path(&config_dir)?;
             ConnectTarget::LocalSocket(socket)
         }

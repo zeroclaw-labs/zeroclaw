@@ -133,9 +133,13 @@ TOML
 ok "wrote $TB/config.toml (wss :$WSS_PORT, relay :$RELAY_PORT, node '$NODE_ID')"
 
 CA="$TB/data/tls/ca.crt"
-CLIENT_DIR="$TB/clientcerts"
-CLIENT_CRT="$CLIENT_DIR/client-zerocode.crt"
-CLIENT_KEY="$CLIENT_DIR/client-zerocode.key"
+# issue-client-cert into a drop-in client TLS dir: with --out-dir it also writes
+# the generic ca.crt/client.crt/client.key that zerocode finds by default under
+# <config-dir>/tls, so the relay command needs no --tls-* flags.
+CLIENT_CONFIG_DIR="$TB/client"
+CLIENT_DIR="$CLIENT_CONFIG_DIR/tls"
+CLIENT_CRT="$CLIENT_DIR/client.crt"
+CLIENT_KEY="$CLIENT_DIR/client.key"
 RELAY_CRT="$TB/relay.crt"
 RELAY_KEY="$TB/relay.key"
 
@@ -242,12 +246,10 @@ cat <<EOF
      --tls-client-key $CLIENT_KEY \\
      --agent <your-agent-alias>
 
- VIA RELAY (zerocode -> relay -> daemon):
+ VIA RELAY (zerocode -> relay -> daemon) - short form, certs picked up from
+ <config-dir>/tls and --connect defaulted to the daemon loopback:
    $ZEROCODE \\
-     --connect wss://127.0.0.1:$WSS_PORT \\
-     --tls-ca-cert $CA \\
-     --tls-client-cert $CLIENT_CRT \\
-     --tls-client-key $CLIENT_KEY \\
+     --config-dir $CLIENT_CONFIG_DIR \\
      --relay 127.0.0.1:$RELAY_PORT \\
      --relay-node $NODE_ID \\
      --relay-host 127.0.0.1 \\

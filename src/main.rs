@@ -2756,6 +2756,7 @@ fn issue_wss_client_cert(
             }
         })
         .collect();
+    let has_out_dir = out_dir.is_some();
     let dest = out_dir.unwrap_or(tls_dir);
     let cert_path = dest.join(format!("client-{slug}.crt"));
     let key_path = dest.join(format!("client-{slug}.key"));
@@ -2782,18 +2783,58 @@ fn issue_wss_client_cert(
     std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
     zeroclaw_tls::certgen::write_private_pem(&key_path, &issued.key_pem)?;
 
+    // When issuing into a separate out-dir, also lay it out as a drop-in client
+    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // exactly these names under its <config-dir>/tls, so a client that copies this
+    // directory needs no --tls-* flags at all.
+    if has_out_dir {
+        let _ = std::fs::copy(&ca_cert, dest.join("ca.crt"));
+        let _ = std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes());
+        let _ = zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem);
+    }
+
     println!("Issued client certificate for '{name}':");
     println!("  cert: {}", cert_path.display());
     println!("  key:  {}", key_path.display());
     println!("  CA:   {}", ca_cert.display());
+
+    let relay = &config.relay;
+    let relay_ready = relay.enabled && !relay.url.is_empty() && !relay.node_id.is_empty();
+    if has_out_dir {
+        println!();
+        println!("Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /");
+        println!("  client.key). Copy it to the client as <config-dir>/tls and zerocode finds");
+        println!("  the material automatically - no --tls-* flags needed.");
+    }
     println!();
-    println!("Connect with zerocode:");
-    println!(
-        "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
-        ca_cert.display(),
-        cert_path.display(),
-        key_path.display()
-    );
+    if relay_ready {
+        // The relay tunnels to the daemon's loopback listener, so the client does
+        // not name a host: --connect defaults to wss://127.0.0.1 in relay mode.
+        println!("Reach this daemon THROUGH its configured relay:");
+        if has_out_dir {
+            println!(
+                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}",
+                relay.url, relay.node_id
+            );
+        } else {
+            println!(
+                "  zerocode --relay {} --relay-node {} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                relay.url,
+                relay.node_id,
+                ca_cert.display(),
+                cert_path.display(),
+                key_path.display()
+            );
+        }
+    } else {
+        println!("Connect with zerocode (direct):");
+        println!(
+            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            ca_cert.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+    }
     Ok(())
 }
 
