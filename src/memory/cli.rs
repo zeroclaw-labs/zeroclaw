@@ -75,6 +75,7 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
         config.resolve_active_storage(),
         &config.data_dir,
         None,
+        Some(&config.providers.models),
     )
 }
 

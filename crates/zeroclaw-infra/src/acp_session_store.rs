@@ -386,6 +386,11 @@ impl AcpSessionStore {
                     "out" => outs.push(ToolResultMessage {
                         tool_call_id,
                         content: payload,
+                        // Carry the producing tool name (looked up from the
+                        // matching 'in' row on write) so a resumed session
+                        // stays provenance-aware for media-marker
+                        // canonicalization (PR #7345).
+                        tool_name,
                     }),
                     other => {
                         ::zeroclaw_log::record!(
@@ -925,6 +930,7 @@ mod tests {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc-1".into(),
                 content: "file.txt\n".into(),
+                tool_name: String::new(),
             }]),
             ConversationMessage::Chat(ChatMessage::assistant("done")),
         ];
@@ -1076,6 +1082,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "ok".into(),
+                        tool_name: String::new(),
                     }]),
                 ],
             )

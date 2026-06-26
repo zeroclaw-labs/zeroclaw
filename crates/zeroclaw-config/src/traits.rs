@@ -238,6 +238,9 @@ impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
         crate::schema::ModelRouteConfig::secret_field_terminals()
     }
 }
+impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
 impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
