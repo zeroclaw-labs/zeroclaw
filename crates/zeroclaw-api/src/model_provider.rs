@@ -24,6 +24,10 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
+pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
@@ -51,6 +55,48 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
         }
+    }
+
+    pub fn pruned_tool_exchange_summary(tool_count: usize) -> String {
+        format!(
+            "{PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX} {tool_count} tool call(s) — {PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX}"
+        )
+    }
+
+    pub fn pruned_context_separator() -> Self {
+        Self::user(PRUNED_CONTEXT_SEPARATOR)
+    }
+
+    pub fn is_pruned_tool_exchange_summary(&self) -> bool {
+        self.role == "assistant"
+            && self
+                .content
+                .starts_with(PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX)
+            && self.content.contains(PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX)
+    }
+
+    pub fn is_pruned_context_separator(&self) -> bool {
+        self.role == "user" && self.content.trim() == PRUNED_CONTEXT_SEPARATOR
+    }
+
+    /// Returns true when a provider payload should omit an internal history-pruning marker.
+    ///
+    /// Summaries always drop because they would otherwise reach the model as its
+    /// own prior reply. Separators only drop when they directly follow a summary
+    /// in the input, so a stray separator-shaped user turn is preserved instead
+    /// of silently discarding possible user content.
+    pub fn should_skip_internal_pruning_marker(messages: &[Self], index: usize) -> bool {
+        let Some(msg) = messages.get(index) else {
+            return false;
+        };
+        if msg.is_pruned_tool_exchange_summary() {
+            return true;
+        }
+        msg.is_pruned_context_separator()
+            && index
+                .checked_sub(1)
+                .and_then(|previous| messages.get(previous))
+                .is_some_and(Self::is_pruned_tool_exchange_summary)
     }
 }
 
@@ -140,6 +186,16 @@ pub struct ChatRequest<'a> {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub content: String,
+    /// Name of the tool that produced this result, retained so downstream
+    /// media-marker canonicalization stays provenance-aware: path-listing
+    /// tools (`content_search`, `glob_search`) must not have incidental image
+    /// paths promoted to routable `[IMAGE:...]` markers (PR #7345). Empty when
+    /// the producing tool is unknown (e.g. results reconstructed from a
+    /// provider-wire `tool` message that never carried the name), in which case
+    /// the blind canonicalizer runs exactly as before (PR #6183).
+    /// `#[serde(default)]` keeps older serialized session records readable.
+    #[serde(default)]
+    pub tool_name: String,
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
