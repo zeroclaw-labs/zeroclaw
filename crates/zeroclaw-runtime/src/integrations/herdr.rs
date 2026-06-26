@@ -4,6 +4,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
 use zeroclaw_api::observability_traits::ObserverMetric;
 
 use crate::observability::{
@@ -24,6 +27,14 @@ pub fn try_install_hook() -> Option<BroadcastHookGuard> {
     }
     let socket_path = std::env::var("HERDR_SOCKET_PATH").ok()?;
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
+
+    // UDS is Unix-only; silently skip on other platforms.
+    #[cfg(not(unix))]
+    {
+        let _ = (socket_path, pane_id);
+        return None;
+    }
+
     let client = HerdrClient::new(socket_path, pane_id);
     // Clear any stale state from a previous crashed session before installing
     // the observer. The timestamp-based seq ensures this call is accepted even
@@ -122,18 +133,29 @@ impl HerdrClient {
         map.insert("params".into(), serde_json::Value::Object(params_map));
 
         let request = serde_json::Value::Object(map);
-
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket_path)?;
         let msg = serde_json::to_string(&request)?;
-        stream.write_all(msg.as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
 
-        // Read and discard response (fire-and-forget, but drain the socket)
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        #[cfg(unix)]
+        {
+            let mut stream = UnixStream::connect(&self.socket_path)?;
+            stream.write_all(msg.as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
 
-        Ok(())
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = msg;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "UDS requires a Unix platform",
+            ))
+        }
     }
 
     fn report_state(&self, state: &str, session_id: Option<&str>) {
