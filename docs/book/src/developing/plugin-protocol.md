@@ -34,6 +34,77 @@ my-plugin/
 Plugins are discovered from `~/.zeroclaw/plugins/` (configurable via
 `plugins.plugins_dir` in config).
 
+## Registry search and install
+
+The local plugin install path remains the source of truth for installed
+plugins. A registry is only a JSON index used at command time to discover and
+download a plugin archive:
+
+```bash
+zeroclaw plugin search calendar
+zeroclaw plugin install team-calendar
+zeroclaw plugin install team-calendar@0.2.0
+zeroclaw plugin search calendar --registry https://example.invalid/registry.json
+zeroclaw plugin install team-calendar --registry https://example.invalid/registry.json
+```
+
+`zeroclaw plugin search` fetches registry metadata and matches the query against
+plugin names and descriptions. It does not install, enable, or execute plugin
+code.
+
+`zeroclaw plugin install <name>` resolves the name from the registry, downloads
+the selected zip archive, verifies the optional SHA-256 digest, safely extracts
+the archive, and then hands the extracted plugin directory to the existing
+`PluginHost::install` path. Local path installs are unchanged:
+
+When no version is pinned, ZeroClaw chooses the last matching entry in the
+registry index, so registry publishers should order repeated names
+intentionally.
+
+```bash
+zeroclaw plugin install ./my-plugin
+zeroclaw plugin install ./my-plugin/manifest.toml
+```
+
+The default registry URL is:
+
+```text
+https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json
+```
+
+For private or staged registries, use `--registry <url>` per command or set
+`ZEROCLAW_PLUGIN_REGISTRY_URL`.
+
+Registry entries use this shape:
+
+```json
+{
+  "plugins": [
+    {
+      "name": "team-calendar",
+      "version": "0.2.0",
+      "description": "Schedule meetings on a team calendar",
+      "author": "Example Team",
+      "capabilities": ["tool"],
+      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "sha256": "sha256:<hex digest of the zip>"
+    }
+  ]
+}
+```
+
+The archive must contain either a root-level `manifest.toml` or one nested
+plugin directory containing `manifest.toml`. Archives with traversal paths,
+absolute paths, Windows drive-prefixed paths, or more than one manifest are
+rejected before install. Downloads are capped while streaming, so a server
+without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
+Extraction is also capped, so a compressed archive cannot expand without bound
+in the temporary install area.
+
+Search is unauthenticated discovery. Install is the security boundary: registry
+installs use the configured plugin signature policy and trusted publisher keys,
+the same as local plugin installs through `PluginHost::install`.
+
 ### Skill-only plugin layout (markdown bundle)
 
 A plugin whose only capability is `skill` ships skills under a `skills/`
