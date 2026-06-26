@@ -2818,22 +2818,38 @@ fn issue_wss_client_cert(
     if relay_ready {
         // The relay tunnels to the daemon's loopback listener, so the client does
         // not name a host: --connect defaults to wss://127.0.0.1 in relay mode.
+        // The OUTER hop to the relay needs the relay's OWN ca (--relay-ca), which
+        // is a different trust root from the daemon CA (--tls-ca-cert).
+        let mut relay_flags = String::new();
+        if !relay.relay_host.is_empty() {
+            relay_flags.push_str(&format!(" --relay-host {}", relay.relay_host));
+        }
+        if relay.relay_insecure {
+            relay_flags.push_str(" --relay-insecure");
+        } else if !relay.relay_ca_path.is_empty() {
+            relay_flags.push_str(&format!(" --relay-ca {}", relay.relay_ca_path));
+        } else {
+            relay_flags.push_str(" --relay-ca <relay-ca.crt>");
+        }
         println!("Reach this daemon THROUGH its configured relay:");
         if has_out_dir {
             println!(
-                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}",
-                relay.url, relay_node
+                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                relay.url, relay_node, relay_flags
             );
         } else {
             println!(
-                "  zerocode --relay {} --relay-node {} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
                 relay.url,
                 relay_node,
+                relay_flags,
                 ca_cert.display(),
                 cert_path.display(),
                 key_path.display()
             );
         }
+        println!("  (--relay-ca is the RELAY's CA - copy it from the relay to the client;");
+        println!("   --tls-ca-cert is the DAEMON's CA, already in the bundle.)");
     } else {
         println!("Connect with zerocode (direct):");
         println!(
