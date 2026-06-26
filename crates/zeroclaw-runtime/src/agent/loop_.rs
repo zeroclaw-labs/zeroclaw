@@ -274,7 +274,32 @@ pub(crate) fn filter_channel_builtin_tools(
     security: &zeroclaw_config::policy::SecurityPolicy,
 ) {
     let before_filter = tools_registry.len();
-    apply_policy_tool_filter(tools_registry, Some(security), None);
+
+    // At non-Full autonomy, the known default read-only auto-approve
+    // tools (web_search_tool, web_fetch, calculator, etc.) are always
+    // accessible on channels so the bot can fetch real-time information.
+    // Only the canonical builtin default set bypasses allowed_tools;
+    // operator-added auto_approve entries (e.g. shell) still require
+    // explicit allowlisting via allowed_tools.
+    if security.autonomy != AutonomyLevel::Full {
+        let defaults = zeroclaw_config::schema::default_auto_approve();
+        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
+        tools_registry.retain(|t| {
+            let name = t.name();
+            if safe_defaults.contains(name) {
+                // Builtin read-only tool: admit past allowed_tools but
+                // still respect the excluded_tools denylist.
+                return security
+                    .excluded_tools
+                    .as_ref()
+                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
+            }
+            security.is_tool_allowed(name)
+        });
+    } else {
+        apply_policy_tool_filter(tools_registry, Some(security), None);
+    }
+
     if tools_registry.len() != before_filter {
         ::zeroclaw_log::record!(
             INFO,
@@ -14170,5 +14195,142 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    // ── filter_channel_builtin_tools safe-default bypass ─────────
+    //
+    // At non-Full autonomy the known read-only defaults
+    // (web_search_tool, web_fetch, calculator, etc.) bypass
+    // allowed_tools so the bot can always fetch real-time info.
+    // Operator-added auto_approve entries (e.g. shell) do NOT get
+    // the same bypass — they must be explicitly allowlisted.
+
+    #[test]
+    fn channel_safe_defaults_survive_restrictive_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Restrict allowed_tools to shell only — nothing else is
+        // admitted by the policy itself.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"web_search_tool"),
+            "precondition: web_search_tool in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            filtered.contains(&"web_search_tool"),
+            "safe default web_search_tool must survive restrictive allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"shell"),
+            "shell in allowed_tools must survive, got {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn channel_operator_auto_approve_gated_by_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Operator added shell to auto_approve but allowed_tools
+        // only lists file_read. Under the safe-defaults gate,
+        // shell (NOT a canonical safe default) must still pass
+        // is_tool_allowed — which means it's dropped.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            auto_approve: vec!["shell".into()],
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"file_read"),
+            "precondition: file_read in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            !filtered.contains(&"shell"),
+            "operator-added auto_approve shell must be dropped when not in allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"file_read"),
+            "file_read in allowed_tools must survive, got {filtered:?}"
+        );
     }
 }

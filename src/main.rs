@@ -4522,16 +4522,28 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match &model_command {
-            ModelCommands::List {
-                model_provider,
-                check,
-            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
-            ModelCommands::Refresh { model_provider, .. } => {
-                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+        Commands::Models { model_command } => {
+            #[cfg(feature = "agent-runtime")]
+            {
+                dispatch_models_command(model_command, &mut config).await
             }
-            _ => doctor::run_models(&config, None, false, false).await,
-        },
+            #[cfg(not(feature = "agent-runtime"))]
+            {
+                match model_command {
+                    ModelCommands::List {
+                        model_provider,
+                        check,
+                    } => {
+                        doctor::run_configured_models(&config, model_provider.as_deref(), check)
+                            .await
+                    }
+                    ModelCommands::Refresh { model_provider, .. } => {
+                        doctor::run_models(&config, model_provider.as_deref(), false, false).await
+                    }
+                    _ => doctor::run_models(&config, None, false, false).await,
+                }
+            }
+        }
 
         Commands::Providers {
             providers_command: None,
@@ -7022,6 +7034,85 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     None
 }
 
+/// Persist `model` as the default for the first configured provider.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let (type_key, alias) = {
+        let entry = config
+            .providers
+            .models
+            .iter_entries()
+            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "No model provider configured. Run `zeroclaw config init` first.",
+                )
+            })?;
+        (entry.0, entry.1.to_string())
+    };
+    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    config.set_prop_persistent(&prop_path, model)?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-models-set-ok",
+            &[
+                ("model", model),
+                ("provider", &format!("{type_key}.{alias}")),
+            ]
+        )
+    );
+    Ok(())
+}
+
+/// Dispatch `ModelCommands` variants to their handlers.
+///
+/// Extracted from `main()` so that the #7087 regression test enters the
+/// same dispatch boundary that `zeroclaw models set <model>` uses.  If
+/// someone changes the `Set` arm back to the read-only doctor path, the
+/// test will fail.
+#[cfg(feature = "agent-runtime")]
+async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
+    match model_command {
+        ModelCommands::List {
+            model_provider,
+            check,
+        } => doctor::run_configured_models(config, model_provider.as_deref(), check).await,
+        ModelCommands::Refresh { model_provider, .. } => {
+            doctor::run_models(config, model_provider.as_deref(), false, false).await
+        }
+        ModelCommands::Set { model } => handle_models_set(config, &model).await,
+        ModelCommands::Status => {
+            match config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            {
+                Some((ty, alias, entry)) => {
+                    let model = entry.model.as_deref().unwrap_or("unknown");
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-models-status-current",
+                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string("cli-models-status-none")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8019,6 +8110,100 @@ mod tests {
         assert!(
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
+        );
+    }
+
+    /// Regression for #7087: `ModelCommands::Set` must write config, not
+    /// route silently to the read-only `doctor::run_models()` path.
+    /// Covers a normal model ID and a slash-bearing (OpenRouter-style) ID.
+    ///
+    /// Calls `dispatch_models_command` — the same function `main()` uses —
+    /// so changing the `Set` arm back to the read-only doctor path will fail
+    /// this test.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-opus-4-7".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // ── Test 1: Normal model ID persists via the dispatch boundary ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "claude-sonnet-4-6".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("normal model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("claude-sonnet-4-6"),
+            "normal model ID must be persisted to config.toml; got:\n{contents}"
+        );
+
+        // ── Test 2: Slash-bearing model ID preserved as-is ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("slash-bearing model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("anthropic/claude-sonnet-4-20250514"),
+            "slash-bearing model ID must be stored as-is; got:\n{contents}"
+        );
+
+        // ── Test 3: No configured provider → error surfaced by dispatch ──
+        let mut empty_config = Config {
+            config_path: tmp.path().join("empty.toml"),
+            data_dir: tmp.path().join("empty_workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        let err = dispatch_models_command(
+            ModelCommands::Set {
+                model: "any-model".to_string(),
+            },
+            &mut empty_config,
+        )
+        .await
+        .expect_err("empty config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No model provider configured"),
+            "error must mention missing provider; got: {msg}"
         );
     }
 }

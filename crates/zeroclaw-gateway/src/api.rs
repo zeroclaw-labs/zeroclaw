@@ -37,7 +37,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-pub(super) fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -4149,5 +4149,84 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    #[cfg(feature = "a2a")]
+    mod a2a_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "a2a-test-token";
+
+        fn paired_state() -> AppState {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.a2a.server.enabled = true;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("maker".to_string(), agent);
+            let mut state = test_state(config);
+            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state
+        }
+
+        async fn status_of(
+            router: axum::Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> StatusCode {
+            router.oneshot(req).await.expect("router response").status()
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unauthenticated_request() {
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#,
+                ))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn catalog_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_with_valid_token() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
     }
 }
