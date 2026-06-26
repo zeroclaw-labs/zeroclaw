@@ -305,17 +305,37 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
-/// GET /api/tools — list registered tool specs
+/// Query parameters for `GET /api/tools`. Pass `?agent=<alias>` to list that
+/// agent's scoped tool set (its built-ins plus the MCP tools granted by its
+/// `mcp_bundles`); omit it for the default listing seeded from the
+/// deterministically smallest enabled agent. An unknown alias falls back to
+/// the default listing rather than erroring, so a stale UI selection still
+/// renders.
+#[derive(Debug, Deserialize)]
+pub struct ToolsQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
 pub async fn handle_api_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ToolsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let tools: Vec<serde_json::Value> = state
-        .tools_registry
+    let registry = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
+        .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
+
+    let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
             serde_json::json!({
@@ -2087,6 +2107,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
@@ -2242,6 +2263,66 @@ mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_scopes_listing_by_agent_query() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let mut state = test_state(config);
+
+        let spec = |name: &str| ToolSpec {
+            name: name.to_string(),
+            description: format!("{name} desc"),
+            parameters: serde_json::json!({}),
+        };
+        state.tools_registry = Arc::new(vec![spec("default_tool")]);
+        let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
+            std::collections::HashMap::new();
+        by_agent.insert("alpha".to_string(), Arc::new(vec![spec("alpha_tool")]));
+        by_agent.insert("beta".to_string(), Arc::new(vec![spec("beta_tool")]));
+        state.tools_registry_by_agent = Arc::new(by_agent);
+
+        async fn tool_names(state: AppState, agent: Option<&str>) -> Vec<String> {
+            let response = handle_api_tools(
+                State(state),
+                HeaderMap::new(),
+                Query(ToolsQuery {
+                    agent: agent.map(str::to_string),
+                }),
+            )
+            .await
+            .into_response();
+            response_json(response).await["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        // A known agent gets its own scoped listing.
+        assert_eq!(
+            tool_names(state.clone(), Some("beta")).await,
+            vec!["beta_tool".to_string()]
+        );
+        // Omitted agent falls back to the default seed listing.
+        assert_eq!(
+            tool_names(state.clone(), None).await,
+            vec!["default_tool".to_string()]
+        );
+        // Unknown and blank aliases fall back to the default rather than error,
+        // so a stale UI selection still renders something.
+        assert_eq!(
+            tool_names(state.clone(), Some("ghost")).await,
+            vec!["default_tool".to_string()]
+        );
+        assert_eq!(
+            tool_names(state.clone(), Some("   ")).await,
+            vec!["default_tool".to_string()]
+        );
     }
 
     #[test]

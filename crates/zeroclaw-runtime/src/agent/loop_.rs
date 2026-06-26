@@ -3133,14 +3133,19 @@ pub async fn process_message(
         // tools (and their target identifiers) that the execution denylist
         // would block — a control boundary violation.
         //
-        // Note: compute_excluded_mcp_tools uses the raw message here (before
-        // thinking directive stripping). This is safe — dynamic tool filter
-        // keyword matching works the same, and risk-profile excluded_tools
-        // are message-independent.
+        // We strip the leading `/think:<level>` directive before filtering
+        // so the prompt-construction and request-execution paths see the
+        // same user-message shape. Otherwise a `tool_filter_groups` dynamic
+        // keyword that happens to appear inside `/think:high` (or the
+        // directive token itself — `"think"`, `"high"`, `"max"`, …) would
+        // make the prompt advertise tools the request then excludes, or
+        // vice versa. Issue #8054 Surface 4.
+        let effective_message_for_filter =
+            crate::agent::thinking::strip_thinking_directive(message);
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
-            message,
+            effective_message_for_filter.as_ref(),
         );
         {
             let active_profile = &risk_profile;

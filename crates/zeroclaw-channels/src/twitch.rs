@@ -123,6 +123,15 @@ impl Channel for TwitchChannel {
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing concept in the Twitch IRC or EventSub APIs.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Normalize a raw OAuth token into the `PASS` value Twitch expects. Twitch

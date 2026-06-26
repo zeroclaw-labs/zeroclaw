@@ -108,6 +108,7 @@
   - [Worked Example](./sop/example.md)
 - [Extending & Plugins](./developing/index.md)
   - [First-party extensions](./developing/first-party-extensions.md)
+  - [How plugins work](./developing/how-plugins-work.md)
   - [Built-in tool inventory](./developing/tool-inventory.md)
   - [Plugin protocol](./developing/plugin-protocol.md)
   - [Extension examples](./developing/extension-examples.md)

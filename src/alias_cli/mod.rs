@@ -456,6 +456,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
+                Some(&config.providers.models),
             )
             .context("open memory backend for the owned-state cascade")?,
         )
