@@ -69,6 +69,7 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
+zeroize = { version = "1.8", features = ["alloc"] }
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 zeroclaw-macros.workspace = true
 
@@ -109,6 +110,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 encoding_rs = "0.8"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
+zeroclaw-tls = { workspace = true, features = ["testing"] }
 zerorelay = { workspace = true }
 futures-util = "0.3"
 tempfile = "3.26"

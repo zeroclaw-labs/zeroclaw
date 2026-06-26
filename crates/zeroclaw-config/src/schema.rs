@@ -306,6 +306,12 @@ pub struct Config {
     #[group = "Network"]
     pub relay: RelayConfig,
 
+    /// Certificate enrollment endpoint for certless clients (`[enroll]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub enroll: EnrollConfig,
+
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     #[nested]
@@ -6612,6 +6618,48 @@ fn default_wss_bind() -> String {
 
 fn default_wss_port() -> u16 {
     9781
+}
+
+fn default_enroll_bind() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_enroll_port() -> u16 {
+    9782
+}
+
+/// Certificate enrollment endpoint (`[enroll]`).
+///
+/// The dedicated, narrowly scoped bootstrap surface a *certless* client reaches
+/// for its FIRST certificate. It is server-authenticated TLS (the daemon proves
+/// itself; the client confirms the CA via the pairing short-auth-string) plus a
+/// pairing-code gate. It accepts exactly one operation: submit a CSR, receive a
+/// signed cert + the CA chain + the relay profile. This is NOT a fallback on the
+/// always-mTLS RPC plane (that plane stays mutually authenticated with no
+/// weakenable path); it is a separate minimal endpoint with its own auth model.
+/// The daemon owns the CA, so this endpoint works with no gateway.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "enroll"]
+pub struct EnrollConfig {
+    /// Enable the enrollment endpoint (default: false). Requires `[wss]` enabled
+    /// (it hands out certs for that mutually authenticated plane) and a daemon CA
+    /// private key (auto-generated, or BYO with key); when the CA key is absent
+    /// the endpoint fails closed and certs must be provisioned out of band.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address the enrollment endpoint binds on.
+    #[serde(default = "default_enroll_bind")]
+    pub bind: String,
+    /// Port the enrollment endpoint listens on.
+    #[serde(default = "default_enroll_port")]
+    pub port: u16,
+    /// Time-boxed migration window: an RFC3339 deadline before which a client may
+    /// enroll WITHOUT a pairing code (so existing plaintext clients are not
+    /// stranded on upgrade). Empty/absent disables the window (the normal,
+    /// pairing-code-gated path). Enrollment-only; never relaxes the RPC plane.
+    #[serde(default)]
+    pub allow_unpaired_enrollment: String,
 }
 
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
@@ -15713,6 +15761,7 @@ impl Default for Config {
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -21407,6 +21456,7 @@ auto_save = true
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -22072,6 +22122,7 @@ default_temperature = 0.7
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),

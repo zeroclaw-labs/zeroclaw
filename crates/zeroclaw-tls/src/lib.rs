@@ -189,6 +189,29 @@ pub fn cert_sha256_fingerprint(cert_der: &[u8]) -> String {
     hex::encode(hash)
 }
 
+/// The enrollment short-auth-string binding a one-time pairing code to the daemon
+/// CA fingerprint (no blind TOFU at bootstrap; threats A1/A7).
+///
+/// The daemon prints this beside the pairing code. A certless client recomputes
+/// it from the code the operator typed plus the CA fingerprint it received over
+/// the (server-authenticated, possibly MITM'd) enrollment channel, and the
+/// operator compares the two out of band. A MITM that substitutes its own CA
+/// yields a different fingerprint and therefore a mismatching SAS, so it cannot
+/// impersonate the daemon CA during the very first exchange. Same inputs on both
+/// ends must produce the same string, so this lives in the shared crate.
+///
+/// Returned as two groups of hex for easy visual comparison, e.g. `A1B2-C3D4`.
+pub fn enrollment_sas(pairing_code: &str, ca_fingerprint_hex: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zeroclaw-enroll-sas-v1\0");
+    hasher.update(pairing_code.trim().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(ca_fingerprint_hex.trim().to_lowercase().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let s = digest[..8].to_uppercase();
+    format!("{}-{}", &s[..4], &s[4..8])
+}
+
 /// A client certificate verifier that delegates to a base verifier and then
 /// checks that the presented certificate matches one of the pinned SHA-256
 /// fingerprints.
@@ -296,6 +319,21 @@ mod tests {
     /// Ensure the rustls `CryptoProvider` is installed (idempotent).
     fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn enrollment_sas_is_deterministic_and_ca_sensitive() {
+        let a = enrollment_sas("270391", "aa11bb22");
+        // Same inputs -> same SAS (daemon and client must agree).
+        assert_eq!(a, enrollment_sas("270391", "AA11BB22"));
+        // A different CA fingerprint (a MITM CA) -> a different SAS.
+        assert_ne!(a, enrollment_sas("270391", "cc33dd44"));
+        // A different code -> a different SAS.
+        assert_ne!(a, enrollment_sas("999999", "aa11bb22"));
+        // Shape: GROUP-GROUP, 4 uppercase hex each.
+        assert_eq!(a.len(), 9);
+        assert_eq!(&a[4..5], "-");
+        assert!(a.chars().filter(|c| *c != '-').all(|c| c.is_ascii_hexdigit()));
     }
 
     /// Generate a self-signed CA cert + key pair.

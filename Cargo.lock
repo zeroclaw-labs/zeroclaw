@@ -14688,6 +14688,7 @@ dependencies = [
  "zeroclaw-tls",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+ "zeroize",
  "zerorelay",
  "zip",
 ]

@@ -327,8 +327,10 @@ pub async fn run(
     // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let need_rpc_ctx =
-        registry.has_socket_start() || registry.has_wss_start() || registry.has_relay_start();
+    let need_rpc_ctx = registry.has_socket_start()
+        || registry.has_wss_start()
+        || registry.has_relay_start()
+        || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
@@ -515,6 +517,30 @@ pub async fn run(
                 let ctx = rpc_ctx.clone();
                 let start = relay_start.clone();
                 let cancel = relay_cancel.clone();
+                let count = count.clone();
+                async move { start(ctx, cancel, count).await }
+            },
+        ));
+    }
+
+    // Certificate enrollment endpoint: the bootstrap surface a certless client
+    // reaches for its first cert. Supervised like the WSS listener; the starter
+    // parks when `[enroll]` is disabled.
+    if let Some(enroll_start) = registry.take_enroll_start() {
+        let rpc_ctx = rpc_ctx
+            .clone()
+            .expect("rpc_ctx built when enroll_start is Some");
+        let enroll_start = std::sync::Arc::new(enroll_start);
+        let enroll_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
+        handles.push(spawn_component_supervisor(
+            "enroll",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let ctx = rpc_ctx.clone();
+                let start = enroll_start.clone();
+                let cancel = enroll_cancel.clone();
                 let count = count.clone();
                 async move { start(ctx, cancel, count).await }
             },

@@ -191,6 +191,14 @@ pub fn ensure_server_materials_protected(
     server_sans: &[String],
     protection: &CaKeyProtection,
 ) -> Result<ServerMaterials> {
+    // Serialize generation across concurrent in-process callers (the daemon runs
+    // the WSS listener and the enrollment endpoint as separate tasks that both
+    // call this on first boot). Without it, two tasks could interleave the CA
+    // cert/key writes and produce a mismatched pair. The lock is held only for the
+    // brief, idempotent materialization; steady-state callers short-circuit below.
+    static GEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gen_guard = GEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let materials = ServerMaterials {
         ca_cert_path: dir.join("ca.crt"),
         ca_key_path: dir.join("ca.key"),
@@ -342,6 +350,21 @@ pub enum CaKeyProtection {
     None,
     /// scrypt + XChaCha20-Poly1305 encryption under an operator passphrase.
     Passphrase(Zeroizing<String>),
+}
+
+impl CaKeyProtection {
+    /// Build a passphrase protection without the caller naming `zeroize`. An
+    /// empty passphrase yields [`CaKeyProtection::None`] (the 0600 floor), so a
+    /// daemon can source the passphrase from an env var / file and pass it
+    /// through unconditionally.
+    pub fn passphrase(passphrase: impl Into<String>) -> Self {
+        let p = passphrase.into();
+        if p.is_empty() {
+            CaKeyProtection::None
+        } else {
+            CaKeyProtection::Passphrase(Zeroizing::new(p))
+        }
+    }
 }
 
 /// Magic header identifying the encrypted CA-key envelope:

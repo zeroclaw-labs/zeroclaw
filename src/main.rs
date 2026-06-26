@@ -2728,6 +2728,28 @@ enum SecurityCommands {
 }
 
 /// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
+/// CA private-key at-rest protection sourced from the environment (decision:
+/// opt-in passphrase, 0600 floor; threat A4). `ZEROCLAW_CA_PASSPHRASE` (or a file
+/// referenced by `ZEROCLAW_CA_PASSPHRASE_FILE`) enables scrypt + XChaCha20-Poly1305
+/// encryption of the CA key at rest; unset keeps the plaintext-0600 default so
+/// zero-config and headless bring-up are unaffected. The daemon sources it
+/// identically at CA generation (the WSS path) and at every CA read (enrollment
+/// + this CLI), so the on-disk form always matches.
+fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
+    if let Ok(p) = std::env::var("ZEROCLAW_CA_PASSPHRASE")
+        && !p.trim().is_empty()
+    {
+        return zeroclaw_tls::CaKeyProtection::passphrase(p.trim());
+    }
+    if let Ok(path) = std::env::var("ZEROCLAW_CA_PASSPHRASE_FILE")
+        && let Ok(p) = std::fs::read_to_string(&path)
+        && !p.trim().is_empty()
+    {
+        return zeroclaw_tls::CaKeyProtection::passphrase(p.trim());
+    }
+    zeroclaw_tls::CaKeyProtection::None
+}
+
 fn issue_wss_client_cert(
     config: &Config,
     name: &str,
@@ -2768,7 +2790,9 @@ fn issue_wss_client_cert(
     }
 
     let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
-    let ca_key_pem = std::fs::read_to_string(&ca_key)?;
+    // Read the CA key honoring any at-rest passphrase, so an encrypted CA still
+    // signs from the CLI (the key never leaves this process).
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(&ca_key, &ca_key_protection_from_env())?;
     let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
 
     // Directory 0700, private key written 0600 atomically (no world-readable window).
@@ -2782,6 +2806,34 @@ fn issue_wss_client_cert(
     }
     std::fs::write(&cert_path, issued.cert_pem.as_bytes())?;
     zeroclaw_tls::certgen::write_private_pem(&key_path, &issued.key_pem)?;
+
+    // Record the issuance in the daemon-owned ledger so this cert is revocable and
+    // appears in the canonical "who holds which cert" record (actor = operator).
+    {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry,
+        };
+        let der = zeroclaw_tls::load_certs(&cert_path.to_string_lossy())?;
+        let fingerprint = zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ledger = CertLedger::open(&config.data_dir, None)?;
+        ledger.record_issued(
+            &LedgerEntry {
+                device_id: name.to_string(),
+                fingerprint,
+                not_before: now - 300,
+                not_after: now + 30 * 86_400,
+                status: CertStatus::Active,
+                token_hash: String::new(),
+                actor: IssuanceActor::Operator.label(),
+                issued_at: now,
+            },
+            false,
+        )?;
+    }
 
     // When issuing into a separate out-dir, also lay it out as a drop-in client
     // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
@@ -4204,9 +4256,14 @@ async fn main() -> Result<()> {
                                 (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
                             }
                             None => {
-                                let mats = zeroclaw_tls::ensure_server_materials(
+                                // Generate (or reuse) the per-daemon CA + server
+                                // cert. The CA key is encrypted at rest when a
+                                // passphrase is configured (same source the
+                                // enrollment + CLI read paths use), else 0600.
+                                let mats = zeroclaw_tls::ensure_server_materials_protected(
                                     &data_dir.join("tls"),
                                     &[],
+                                    &ca_key_protection_from_env(),
                                 )?;
                                 (
                                     mats.server_cert_path.to_string_lossy().into_owned(),
@@ -4304,6 +4361,168 @@ async fn main() -> Result<()> {
                             max_conns: 256,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
+                    })
+                }));
+
+                // Certificate enrollment endpoint: the bootstrap surface a
+                // certless client reaches for its FIRST cert (server-auth TLS +
+                // one-time pairing code, CSR-only). The daemon owns the CA, so
+                // this works with no gateway. It is NOT the mTLS RPC plane.
+                registry.register_enroll(Box::new(|ctx, cancel, _client_count| {
+                    Box::pin(async move {
+                        let (enroll_cfg, wss_cfg, relay_cfg, audit_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.enroll.clone(),
+                                cfg.wss.clone(),
+                                cfg.relay.clone(),
+                                cfg.security.audit.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !enroll_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[enroll] is enabled but [wss] is not. Enrollment issues client \
+                                 certificates for the mutually authenticated WSS plane; enable [wss].",
+                            ));
+                        }
+                        // Issuance needs the daemon CA private key. The only
+                        // bring-your-own form the config expresses is a CA cert
+                        // with no key, which cannot sign - fail closed: do not
+                        // open the endpoint (BYO-CA-without-key mode; provision
+                        // client certs out of band).
+                        let byo_ca = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .filter(|c| c.enabled)
+                            .map(|c| !c.ca_cert_path.is_empty())
+                            .unwrap_or(false);
+                        if byo_ca {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                ),
+                                "enrollment endpoint disabled: a bring-your-own CA has no signing \
+                                 key; provision client certs out of band"
+                            );
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        // Auto-generated per-daemon CA + server cert (secure by
+                        // default). Same passphrase source as the WSS gen + CLI
+                        // read paths, so the on-disk CA-key form always matches.
+                        let protection = ca_key_protection_from_env();
+                        let mats = zeroclaw_tls::ensure_server_materials_protected(
+                            &data_dir.join("tls"),
+                            &[],
+                            &protection,
+                        )?;
+                        let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path)?;
+                        let ca_key_pem =
+                            zeroclaw_tls::load_ca_key_pem(&mats.ca_key_path, &protection)?;
+                        let ca_fingerprint = {
+                            let ders =
+                                zeroclaw_tls::load_certs(&mats.ca_cert_path.to_string_lossy())?;
+                            zeroclaw_tls::cert_sha256_fingerprint(ders[0].as_ref())
+                        };
+
+                        // Server-authentication-only TLS (no client cert; this is
+                        // the bootstrap surface, explicitly not the mTLS plane).
+                        let acceptor =
+                            zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+                                cert_path: mats.server_cert_path.to_string_lossy().into_owned(),
+                                key_path: mats.server_key_path.to_string_lossy().into_owned(),
+                                client_auth: None,
+                            })?;
+
+                        // Relay coordinates handed to the enrolled client. The pin
+                        // (relay LEAF sha256) is sourced from the relay bridge's
+                        // pin store when present; empty otherwise (client TOFUs).
+                        let relay_profile = if relay_cfg.enabled && !relay_cfg.url.is_empty() {
+                            let node_id = zeroclaw_runtime::relay::ensure_node_id(
+                                &data_dir,
+                                &relay_cfg.node_id,
+                            )
+                            .unwrap_or_else(|_| relay_cfg.node_id.clone());
+                            let relay_cert_pin =
+                                std::fs::read_to_string(data_dir.join("relay").join("relay_pin"))
+                                    .ok()
+                                    .map(|s| s.trim().to_string())
+                                    .unwrap_or_default();
+                            zeroclaw_runtime::enroll::RelayProfile {
+                                relay_url: relay_cfg.url.clone(),
+                                node_id,
+                                relay_cert_pin,
+                            }
+                        } else {
+                            zeroclaw_runtime::enroll::RelayProfile::default()
+                        };
+
+                        // One-time pairing code gates enrollment. Print it AND the
+                        // CA-bound short-auth-string so the operator reads both to
+                        // the client out of band (no blind trust-on-first-use).
+                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                            true,
+                            &[],
+                        ));
+                        if let Some(code) = pairing.pairing_code() {
+                            let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
+                            println!();
+                            println!(
+                                "Enrollment endpoint ready on {}:{}. To enroll a client, give it",
+                                enroll_cfg.bind, enroll_cfg.port
+                            );
+                            println!(
+                                "this one-time pairing code and confirm the short-auth-string (SAS)"
+                            );
+                            println!("matches on both ends before trusting the daemon:");
+                            println!("    pairing code : {code}");
+                            println!("    SAS          : {sas}");
+                            println!();
+                        }
+
+                        let allow_unpaired_until = {
+                            let s = enroll_cfg.allow_unpaired_enrollment.trim();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                chrono::DateTime::parse_from_rfc3339(s)
+                                    .ok()
+                                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                            }
+                        };
+
+                        let audit = zeroclaw_runtime::security::audit::AuditLogger::new(
+                            audit_cfg,
+                            data_dir.clone(),
+                        )
+                        .ok()
+                        .map(std::sync::Arc::new);
+                        let ledger = std::sync::Arc::new(
+                            zeroclaw_runtime::security::cert_ledger::CertLedger::open(
+                                &data_dir, audit,
+                            )?,
+                        );
+
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", enroll_cfg.bind, enroll_cfg.port).parse()?;
+                        let server = std::sync::Arc::new(zeroclaw_runtime::enroll::EnrollServer {
+                            bind_addr,
+                            acceptor,
+                            ca_cert_pem,
+                            ca_key_pem,
+                            ledger,
+                            pairing,
+                            allow_unpaired_until,
+                            relay_profile,
+                        });
+                        zeroclaw_runtime::enroll::serve(server, cancel).await
                     })
                 }));
 
