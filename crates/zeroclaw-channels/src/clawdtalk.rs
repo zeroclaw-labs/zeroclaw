@@ -269,6 +269,16 @@ impl ::zeroclaw_api::attribution::Attributable for ClawdTalkChannel {
 
 #[async_trait]
 impl Channel for ClawdTalkChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "ClawdTalk"
     }
