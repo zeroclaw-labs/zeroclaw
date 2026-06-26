@@ -488,32 +488,6 @@ impl AcpServer {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
-        let mut sessions = self.sessions.lock().await;
-
-        let loading_count = self.loading_sessions.lock().await.len();
-        if sessions.len() + loading_count >= self.acp_config.max_sessions {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "active": sessions.len(),
-                        "loading": loading_count,
-                        "max": self.acp_config.max_sessions,
-                    })),
-                "ACP session/new rejected: session limit reached"
-            );
-            return Err(RpcError {
-                code: SESSION_LIMIT_REACHED,
-                message: format!(
-                    "Maximum session limit reached ({})",
-                    self.acp_config.max_sessions
-                ),
-                data: None,
-            });
-        }
-
         let requested_cwd = self.requested_session_cwd(params);
 
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
@@ -568,6 +542,39 @@ impl AcpServer {
 
         let session_id = Uuid::new_v4().to_string();
 
+        // Atomically check the session limit and reserve a loading slot, then
+        // release the locks before building the agent. Agent construction can
+        // perform opt-in MCP startup (`[agents.<alias>].acp_enable_mcp`), which
+        // may block on external server timeouts; holding `self.sessions` across
+        // it would stall unrelated session ops. Mirrors `session/load`.
+        {
+            let sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "active": sessions.len(),
+                            "loading": loading.len(),
+                            "max": self.acp_config.max_sessions,
+                        })),
+                    "ACP session/new rejected: session limit reached"
+                );
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            loading.insert(session_id.clone());
+        }
+
         // Build agent from global config, with the session's cwd pinned as
         // the file/shell sandbox boundary. The agent's data directory
         // (identity, scheduled tasks) still lives under `config.data_dir`.
@@ -575,12 +582,12 @@ impl AcpServer {
         // persisted session history, not the agent's long-term memory store.
         // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
         // by default to keep `session/new` prompt; on to load this agent's
-        // `mcp_bundles` tools.
+        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
         let enable_mcp = self
             .config
             .agent(&agent_alias)
             .is_some_and(|a| a.acp_enable_mcp);
-        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+        let agent = match Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
@@ -591,11 +598,17 @@ impl AcpServer {
             self.canvas_store.clone(),
         )
         .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        })?;
+        {
+            Ok(agent) => agent,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to create agent: {e}"),
+                    data: None,
+                });
+            }
+        };
 
         // Wire an ACP back-channel so tools like `ask_user`,
         // `escalate_to_human`, and `reaction` can talk to the IDE/CLI client
@@ -609,27 +622,10 @@ impl AcpServer {
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
-        let now = Instant::now();
-        sessions.insert(
-            session_id.clone(),
-            Arc::new(Mutex::new(Session {
-                agent,
-                created_at: now,
-                last_active: now,
-                agent_alias: agent_alias.clone(),
-                model_provider: self
-                    .config
-                    .agent(&agent_alias)
-                    .map(|a| a.model_provider.to_string())
-                    .unwrap_or_default(),
-                model: self
-                    .config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|mp| mp.model.clone())
-                    .unwrap_or_default(),
-            })),
-        );
-
+        // Persist before publishing the session, so a failed write never
+        // leaves a live-but-unpersisted session; release the reservation on
+        // failure. The slot stays accounted for (still in `loading`) until the
+        // insert below.
         if let Some(store) = &self.store {
             let store = store.clone();
             let sid = session_id.clone();
@@ -643,14 +639,40 @@ impl AcpServer {
                 Err(join) => Some(join.to_string()),
             };
             if let Some(detail) = error {
-                // Roll back: remove the session we just inserted and surface the error.
-                sessions.remove(&session_id);
+                self.loading_sessions.lock().await.remove(&session_id);
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to persist session: {detail}"),
                     data: None,
                 });
             }
+        }
+
+        let now = Instant::now();
+        // Atomically insert and release the reservation.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
+            sessions.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(Session {
+                    agent,
+                    created_at: now,
+                    last_active: now,
+                    agent_alias: agent_alias.clone(),
+                    model_provider: self
+                        .config
+                        .agent(&agent_alias)
+                        .map(|a| a.model_provider.to_string())
+                        .unwrap_or_default(),
+                    model: self
+                        .config
+                        .model_provider_for_agent(&agent_alias)
+                        .and_then(|mp| mp.model.clone())
+                        .unwrap_or_default(),
+                })),
+            );
         }
 
         let mp = self
@@ -3813,6 +3835,42 @@ mod tests {
             .expect_err("unknown session must fail");
 
         assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    /// `session/new` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached. Guards the reservation/limit check that moved out from
+    /// under the long-held sessions lock so MCP startup no longer blocks it.
+    #[tokio::test]
+    async fn session_new_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+        ));
+
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("first session/new must succeed under the limit");
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect_err("second session/new must fail at max_sessions");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {err:?}"
+        );
     }
 
     /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is
