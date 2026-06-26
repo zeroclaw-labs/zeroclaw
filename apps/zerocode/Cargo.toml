@@ -52,6 +52,11 @@ directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
 
+[dev-dependencies]
+# Enable the in-crate PKI test helpers (gen_ca / gen_client_csr) so the WSS TLS
+# config tests can build real cert+key material.
+zeroclaw-tls = { workspace = true, features = ["testing"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

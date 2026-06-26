@@ -91,6 +91,18 @@ pub(crate) struct WssSection {
     /// Node-id of the target daemon to request from the relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_node: Option<String>,
+    /// How many times to try the direct address before falling back to the relay
+    /// (default 2). Only relevant when both a direct address and a relay exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_attempts: Option<u32>,
+    /// Per-attempt timeout, in seconds, for a direct connect before falling back
+    /// to the relay (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_timeout_secs: Option<u64>,
+    /// While connected through the relay, how often (seconds) to re-probe the
+    /// direct address and migrate back when it returns (default 30; 0 disables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_secs: Option<u64>,
 }
 
 impl WssSection {
@@ -99,6 +111,9 @@ impl WssSection {
             && self.tls.is_empty()
             && self.relay_url.is_none()
             && self.relay_node.is_none()
+            && self.direct_attempts.is_none()
+            && self.direct_timeout_secs.is_none()
+            && self.reprobe_secs.is_none()
     }
 }
 

@@ -143,10 +143,134 @@ fn opt_path(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// Which transport leg a live connection is actually using. Tracked so the
+/// re-probe timer knows whether to attempt a migration back to the direct path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveLeg {
+    Local,
+    WssDirect,
+    WssRelay,
+}
+
+/// A WSS route that may have BOTH a directly-reachable daemon address and a
+/// relay. Connecting prefers the direct path and falls back to the relay tunnel;
+/// once on the relay, a background timer re-probes the direct path and migrates
+/// back when it returns.
+pub(crate) struct WssRoute {
+    /// The directly-reachable daemon address (`--connect` / `[wss].uri`). `None`
+    /// in relay-only mode, where the daemon is reached solely through the relay.
+    pub(crate) direct_url: Option<String>,
+    /// Inner WSS URL used over a relay tunnel: the daemon's loopback SAN (the
+    /// inner mTLS terminates at the daemon, the relay only forwards ciphertext).
+    pub(crate) relay_inner_url: String,
+    /// Relay coordinates, when a relay route is available.
+    pub(crate) relay: Option<client::RelayDial>,
+    /// TLS verification + mutual-TLS client identity, shared by both legs.
+    pub(crate) tls: client::ClientTls,
+    /// How many direct attempts before falling back to the relay (min 1).
+    pub(crate) direct_attempts: u32,
+    /// Per-attempt direct-connect timeout, in seconds (min 1).
+    pub(crate) direct_timeout_secs: u64,
+    /// Re-probe cadence while on the relay leg, in seconds (0 disables).
+    pub(crate) reprobe_secs: u64,
+}
+
+impl WssRoute {
+    /// The key under which an insecure (`skip_verify`) route is remembered: the
+    /// direct address when present, else the inner relay URL.
+    fn ack_key(&self) -> String {
+        self.direct_url
+            .clone()
+            .unwrap_or_else(|| self.relay_inner_url.clone())
+    }
+
+    /// Connect preferring the direct path: try the direct address for a bounded
+    /// number of attempts, then fall back to the relay tunnel. A relay-only route
+    /// (no direct address) dials the relay immediately.
+    async fn connect_preferred(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<(client::RpcClient, ActiveLeg)> {
+        if let Some(url) = &self.direct_url {
+            let mut last_err: Option<anyhow::Error> = None;
+            for _ in 0..self.direct_attempts.max(1) {
+                let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+                match tokio::time::timeout(
+                    Duration::from_secs(self.direct_timeout_secs.max(1)),
+                    fut,
+                )
+                .await
+                {
+                    Ok(Ok(client)) => return Ok((client, ActiveLeg::WssDirect)),
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(_) => {
+                        last_err = Some(anyhow::Error::msg(format!(
+                            "direct connect to {url} timed out after {}s",
+                            self.direct_timeout_secs.max(1)
+                        )))
+                    }
+                }
+            }
+            // Direct exhausted: fall back to the relay when one is available.
+            if let Some(relay) = &self.relay {
+                let client = client::RpcClient::connect_wss_via_relay(
+                    &self.relay_inner_url,
+                    prev_id,
+                    prev_sig,
+                    &self.tls,
+                    relay,
+                )
+                .await?;
+                return Ok((client, ActiveLeg::WssRelay));
+            }
+            return Err(last_err
+                .unwrap_or_else(|| anyhow::Error::msg(format!("direct connect to {url} failed"))));
+        }
+
+        // Relay-only route.
+        let relay = self.relay.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("WSS route has neither a direct address nor a relay")
+        })?;
+        let client = client::RpcClient::connect_wss_via_relay(
+            &self.relay_inner_url,
+            prev_id,
+            prev_sig,
+            &self.tls,
+            relay,
+        )
+        .await?;
+        Ok((client, ActiveLeg::WssRelay))
+    }
+
+    /// A single direct-only connect attempt (no relay fallback), used by the
+    /// re-probe timer to migrate back to the direct path. Errors when the route
+    /// has no direct address.
+    pub(crate) async fn connect_direct(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<client::RpcClient> {
+        let url = self
+            .direct_url
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::msg("no direct address to re-probe"))?;
+        let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+        match tokio::time::timeout(Duration::from_secs(self.direct_timeout_secs.max(1)), fut).await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::Error::msg(format!(
+                "direct re-probe to {url} timed out"
+            ))),
+        }
+    }
+}
+
 /// Where zerocode should connect.
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
-    Wss { url: String, tls: client::ClientTls },
+    // Boxed: `WssRoute` is much larger than the local-socket variant.
+    Wss(Box<WssRoute>),
 }
 
 impl ConnectTarget {
@@ -154,42 +278,36 @@ impl ConnectTarget {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::LocalSocket(p) => format!("local:{}", p.display()),
-            Self::Wss { url, .. } => url.clone(),
+            Self::Wss(route) => match (&route.direct_url, &route.relay) {
+                (Some(url), Some(r)) => format!("{url} (relay {} fallback)", r.relay_addr),
+                (Some(url), None) => url.clone(),
+                (None, Some(r)) => format!("relay {} -> {}", r.relay_addr, r.node_id),
+                (None, None) => "wss".to_string(),
+            },
         }
     }
 
     pub(crate) fn insecure_tls(&self) -> bool {
-        matches!(self, Self::Wss { tls, .. } if tls.skip_verify)
+        matches!(self, Self::Wss(route) if route.tls.skip_verify)
     }
 
     /// Connect to this target, reclaiming a prior TUI identity when
     /// `prev_id`/`prev_sig` are supplied. Single source of truth for the
     /// per-transport connect call — used by initial startup and in-loop
-    /// reconnection alike.
+    /// reconnection alike. Returns the leg the connection actually landed on.
     pub(crate) async fn connect(
         &self,
         prev_id: Option<&str>,
         prev_sig: Option<&str>,
-    ) -> anyhow::Result<client::RpcClient> {
+    ) -> anyhow::Result<(client::RpcClient, ActiveLeg)> {
         match self {
             Self::LocalSocket(socket) => {
-                client::RpcClient::connect(socket, prev_id, prev_sig).await
+                let client = client::RpcClient::connect(socket, prev_id, prev_sig).await?;
+                Ok((client, ActiveLeg::Local))
             }
-            Self::Wss { url, tls } => {
-                client::RpcClient::connect_wss(url, prev_id, prev_sig, tls).await
-            }
+            Self::Wss(route) => route.connect_preferred(prev_id, prev_sig).await,
         }
     }
-}
-
-fn resolve_wss_target(
-    cli_connect: Option<String>,
-    cli_skip_verify: bool,
-    cfg_wss: &config::WssSection,
-) -> Option<(String, bool)> {
-    let uri = cli_connect.or_else(|| cfg_wss.uri.clone())?;
-    let skip_verify = cli_skip_verify || cfg_wss.tls.skip_verify;
-    Some((uri, skip_verify))
 }
 
 /// In relay mode the inner WSS terminates at the daemon's own loopback listener
@@ -197,6 +315,24 @@ fn resolve_wss_target(
 /// self-SAN `127.0.0.1` and the port is cosmetic. When `--connect` is omitted on
 /// a relay route we default to this so the common case is just `--relay`.
 const DEFAULT_RELAY_INNER_URL: &str = "wss://127.0.0.1:9781";
+
+/// Direct-first fallback defaults (overridable via `[connection.wss]`): try the
+/// direct address this many times, with this per-attempt timeout, before falling
+/// back to the relay; while on the relay, re-probe the direct path this often.
+const DEFAULT_DIRECT_ATTEMPTS: u32 = 2;
+const DEFAULT_DIRECT_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_REPROBE_SECS: u64 = 30;
+
+/// The directly-reachable daemon address: CLI `--connect` overrides `[wss].uri`.
+/// `None` means no direct address is configured (relay-only or local socket).
+fn resolve_direct_url(cli_connect: Option<String>, cfg_wss: &config::WssSection) -> Option<String> {
+    cli_connect.or_else(|| cfg_wss.uri.clone())
+}
+
+/// Server verification is skipped when either the flag or the config asks.
+fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> bool {
+    cli_skip_verify || cfg_wss.tls.skip_verify
+}
 
 /// A default client-TLS file under `<config_dir>/tls/<name>`, if it exists, so a
 /// client provisioned the conventional way needs no explicit `--tls-*` flags.
@@ -380,48 +516,64 @@ async fn run() -> anyhow::Result<()> {
     let target = {
         let cfg_wss = &loaded_config.connection.wss;
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        // The cached enrollment profile supplies the relay coordinates so a bare
+        // `zerocode` after enrollment still reaches the daemon through its relay.
+        let cached = enroll::cached_profile(&config_dir);
+        let cached_relay = cached.as_ref().map(|p| &p.relay);
 
-        // Relay route (CLI overrides config).
-        let relay_addr = cli.relay.clone().or_else(|| cfg_wss.relay_url.clone());
+        // Direct daemon address (CLI overrides config). `None` => relay-only.
+        let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
+        let skip_verify = resolve_skip_verify(cli.tls_skip_verify, cfg_wss);
+
+        // Relay coordinates: CLI -> config -> cached enrollment profile.
+        let relay_addr = cli
+            .relay
+            .clone()
+            .or_else(|| cfg_wss.relay_url.clone())
+            .or_else(|| {
+                cached_relay
+                    .map(|r| r.relay_url.clone())
+                    .filter(|s| !s.is_empty())
+            });
         let relay_node = cli
             .relay_node
             .clone()
-            .or_else(|| cfg_wss.relay_node.clone());
-        let relay_configured = relay_addr.is_some() || relay_node.is_some();
-
-        // A WSS route is chosen when --connect / [wss].uri is set, OR a relay is
-        // configured (then the inner URL defaults to the daemon's loopback SAN).
-        let wss_target = resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
+            .or_else(|| cfg_wss.relay_node.clone())
             .or_else(|| {
-                relay_configured.then(|| (DEFAULT_RELAY_INNER_URL.to_string(), cli.tls_skip_verify))
+                cached_relay
+                    .map(|r| r.node_id.clone())
+                    .filter(|s| !s.is_empty())
             });
 
-        if let Some((uri, skip_verify)) = wss_target {
-            let relay = match (relay_addr, relay_node) {
-                (Some(relay_addr), Some(node_id)) => {
-                    // Default the relay's expected cert name to its host:port host.
-                    let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
-                        relay_addr
-                            .rsplit_once(':')
-                            .map(|(h, _)| h.to_string())
-                            .unwrap_or_else(|| relay_addr.clone())
-                    });
-                    Some(client::RelayDial {
-                        relay_addr,
-                        relay_host,
-                        node_id,
-                        relay_ca_path: cli.relay_ca.clone(),
-                        relay_insecure: cli.relay_insecure,
-                    })
-                }
-                (None, None) => None,
-                _ => {
-                    return Err(anyhow::Error::msg(
-                        "relay routing needs both a relay address and a node-id \
-                         (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
-                    ));
-                }
-            };
+        let relay = match (relay_addr, relay_node) {
+            (Some(relay_addr), Some(node_id)) => {
+                // Default the relay's expected cert name to its host:port host.
+                let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
+                    relay_addr
+                        .rsplit_once(':')
+                        .map(|(h, _)| h.to_string())
+                        .unwrap_or_else(|| relay_addr.clone())
+                });
+                Some(client::RelayDial {
+                    relay_addr,
+                    relay_host,
+                    node_id,
+                    relay_ca_path: cli.relay_ca.clone(),
+                    relay_insecure: cli.relay_insecure,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(anyhow::Error::msg(
+                    "relay routing needs both a relay address and a node-id \
+                     (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
+                ));
+            }
+        };
+
+        // A WSS route is chosen when a direct address OR a relay is available;
+        // otherwise the local IPC socket.
+        if direct_url.is_some() || relay.is_some() {
             // Mutual-TLS material: CLI flag -> config -> conventional default path
             // under <config_dir>/tls, so a provisioned client needs no --tls-* flags.
             let tls = client::ClientTls {
@@ -441,9 +593,18 @@ async fn run() -> anyhow::Result<()> {
                     .clone()
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
                     .or_else(|| default_tls_path(&config_dir, "client.key")),
-                relay,
             };
-            ConnectTarget::Wss { url: uri, tls }
+            ConnectTarget::Wss(Box::new(WssRoute {
+                direct_url,
+                relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),
+                relay,
+                tls,
+                direct_attempts: cfg_wss.direct_attempts.unwrap_or(DEFAULT_DIRECT_ATTEMPTS),
+                direct_timeout_secs: cfg_wss
+                    .direct_timeout_secs
+                    .unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
+                reprobe_secs: cfg_wss.reprobe_secs.unwrap_or(DEFAULT_REPROBE_SECS),
+            }))
         } else {
             let socket = client::resolve_socket_path(&config_dir)?;
             ConnectTarget::LocalSocket(socket)
@@ -455,39 +616,42 @@ async fn run() -> anyhow::Result<()> {
     // (initial connect failed → we started one). Only an owned ephemeral
     // daemon may be respawned on disconnect, and then exactly once.
     let mut owns_ephemeral = false;
-    let rpc = match &target {
+    let (rpc, initial_leg) = match &target {
         ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
-                Ok(c) => c,
+                Ok(c) => (c, ActiveLeg::Local),
                 Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     spawn_ephemeral_daemon(&config_dir)?;
                     owns_ephemeral = true;
-                    await_daemon_ready(socket).await?
+                    (await_daemon_ready(socket).await?, ActiveLeg::Local)
                 }
             }
         }
-        ConnectTarget::Wss { url, tls } => {
-            if tls.skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
-                match confirm_insecure_tls(url)? {
-                    InsecureTlsChoice::Once => {}
-                    InsecureTlsChoice::Always => {
-                        config::persist_wss_route_ack(&local_config_dir, url)?;
-                    }
-                    InsecureTlsChoice::Abort => {
-                        anyhow::bail!("aborted: insecure TLS connection not confirmed");
+        ConnectTarget::Wss(route) => {
+            if route.tls.skip_verify {
+                let ack_key = route.ack_key();
+                if !loaded_config.connection.wss.tls.route_acked(&ack_key) {
+                    match confirm_insecure_tls(&ack_key)? {
+                        InsecureTlsChoice::Once => {}
+                        InsecureTlsChoice::Always => {
+                            config::persist_wss_route_ack(&local_config_dir, &ack_key)?;
+                        }
+                        InsecureTlsChoice::Abort => {
+                            anyhow::bail!("aborted: insecure TLS connection not confirmed");
+                        }
                     }
                 }
             }
-            client::RpcClient::connect_wss(url, None, None, tls).await?
+            route.connect_preferred(None, None).await?
         }
     };
 
     // On the mTLS plane, renew the cached client cert if it is past ~50% of its
     // TTL (before the terminal is taken over, so any output is visible). No-op
     // when the client never enrolled here.
-    if matches!(target, ConnectTarget::Wss { .. }) {
+    if matches!(target, ConnectTarget::Wss(_)) {
         enroll::maybe_renew(&rpc, &local_config_dir).await;
     }
 
@@ -500,6 +664,7 @@ async fn run() -> anyhow::Result<()> {
         &target,
         &local_config_dir,
         owns_ephemeral,
+        initial_leg,
     )
     .await;
 
@@ -518,6 +683,7 @@ async fn run_until_exit(
     target: &ConnectTarget,
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
+    initial_leg: ActiveLeg,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
@@ -533,7 +699,7 @@ async fn run_until_exit(
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral, initial_leg) => r.map(|_| ()),
             _ = sigterm.recv() => Ok(()),
         }
     }
@@ -548,6 +714,7 @@ async fn run_until_exit(
             config_dir,
             target,
             owns_ephemeral,
+            initial_leg,
         )
         .await
         .map(|_| ())
@@ -622,8 +789,8 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(Some("wss://flag:2".to_string()), false, &cfg);
-        assert_eq!(got, Some(("wss://flag:2".to_string(), false)));
+        let got = resolve_direct_url(Some("wss://flag:2".to_string()), &cfg);
+        assert_eq!(got.as_deref(), Some("wss://flag:2"));
     }
 
     #[test]
@@ -632,35 +799,38 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(None, false, &cfg);
-        assert_eq!(got, Some(("wss://config:1".to_string(), false)));
+        let got = resolve_direct_url(None, &cfg);
+        assert_eq!(got.as_deref(), Some("wss://config:1"));
     }
 
     #[test]
-    fn no_uri_anywhere_is_local_socket() {
+    fn no_uri_anywhere_has_no_direct_address() {
+        // With no direct address and no relay, the target resolves to the local
+        // socket; here we assert the direct-address half of that decision.
         let cfg = WssSection::default();
-        assert_eq!(resolve_wss_target(None, false, &cfg), None);
+        assert_eq!(resolve_direct_url(None, &cfg), None);
     }
 
     #[test]
     fn skip_verify_is_flag_or_config() {
-        let mut cfg = WssSection {
-            uri: Some("wss://h:1".to_string()),
+        let mut cfg = WssSection::default();
+        cfg.tls.skip_verify = true;
+        assert!(resolve_skip_verify(false, &cfg));
+        cfg.tls.skip_verify = false;
+        assert!(resolve_skip_verify(true, &cfg)); // flag wins
+        assert!(!resolve_skip_verify(false, &cfg)); // neither
+    }
+
+    #[test]
+    fn relay_only_route_still_chooses_wss() {
+        // A relay configured with no direct address must NOT collapse to the
+        // local socket: the route is WSS-over-relay (direct_url stays None).
+        let cfg = WssSection {
+            relay_url: Some("relay.example:9783".to_string()),
+            relay_node: Some("node-abc".to_string()),
             ..Default::default()
         };
-        cfg.tls.skip_verify = true;
-        assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), true))
-        );
-        cfg.tls.skip_verify = false;
-        assert_eq!(
-            resolve_wss_target(None, true, &cfg),
-            Some(("wss://h:1".to_string(), true))
-        );
-        assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), false))
-        );
+        assert_eq!(resolve_direct_url(None, &cfg), None);
+        assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
     }
 }

@@ -443,9 +443,6 @@ pub struct ClientTls {
     pub client_cert_path: Option<String>,
     /// PEM private key for `client_cert_path`.
     pub client_key_path: Option<String>,
-    /// When set, reach the daemon through this relay (the inner mTLS still runs
-    /// end-to-end; the relay only forwards ciphertext).
-    pub relay: Option<RelayDial>,
 }
 
 impl ClientTls {
@@ -791,31 +788,14 @@ impl RpcClient {
     /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
     /// certificate to present). `skip_verify` disables server verification
     /// (self-signed dev only).
-    pub async fn connect_wss(
+    pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
     ) -> Result<Self> {
-        if let Some(relay) = &tls.relay {
-            // Through a nominated relay: establish the OUTER TLS + WS to the relay,
-            // request the node-id, then run the SAME inner WSS + mTLS over the
-            // tunnelled byte stream. The relay only forwards ciphertext DATA frames.
-            let client_io = dial_through_relay(relay).await?;
-            let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
-            let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
-                url,
-                client_io,
-                None,
-                Some(connector),
-            )
-            .await
-            .with_context(|| format!("WSS-over-relay to {url} via {}", relay.relay_addr))?;
-            return Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await;
-        }
-
-        // Direct: the built-in (webpki-roots) connector only for the plain default
-        // (no client cert, no custom CA, no skip-verify); any custom TLS material
+        // The built-in (webpki-roots) connector only for the plain default (no
+        // client cert, no custom CA, no skip-verify); any custom TLS material
         // requires our own rustls ClientConfig.
         let connector = if tls.is_default() {
             None
@@ -828,6 +808,32 @@ impl RpcClient {
             tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
                 .await
                 .with_context(|| format!("WSS connect to {url}"))?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+    }
+
+    /// Connect to the daemon through a nominated relay.
+    ///
+    /// Establishes the OUTER TLS + WS to the relay, requests the target node-id,
+    /// then runs the SAME inner WSS + mTLS (against `inner_url`) over the tunnelled
+    /// byte stream. The relay only ever forwards ciphertext DATA frames and never
+    /// sees plaintext. `inner_url`'s server name is the daemon's loopback SAN.
+    pub async fn connect_wss_via_relay(
+        inner_url: &str,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+        tls: &ClientTls,
+        relay: &RelayDial,
+    ) -> Result<Self> {
+        let client_io = dial_through_relay(relay).await?;
+        let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
+        let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
+            inner_url,
+            client_io,
+            None,
+            Some(connector),
+        )
+        .await
+        .with_context(|| format!("WSS-over-relay to {inner_url} via {}", relay.relay_addr))?;
         Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
     }
 
@@ -2613,5 +2619,37 @@ mod tls_tests {
             ..Default::default()
         };
         assert!(RpcClient::wss_tls_config(&tls).is_err());
+    }
+
+    #[test]
+    fn skip_verify_does_not_drop_the_client_cert() {
+        // Critic gap #8: `skip_verify` relaxes SERVER verification only. It must
+        // never silently drop the presented client certificate, or a relay/MITM
+        // could downgrade an mTLS client to an anonymous one. Build a config with
+        // skip_verify AND a real client cert+key and assert the resolver still
+        // carries certs. (`has_certs` is a trait-object method on the resolver, so
+        // no trait import is needed here.)
+        let (ca_crt, ca_key) = zeroclaw_tls::testing::gen_ca();
+        let (csr_pem, key_pem) = zeroclaw_tls::testing::gen_client_csr("dev_skipverify");
+        let leaf = zeroclaw_tls::sign_csr(&ca_crt, &ca_key, "dev_skipverify", &csr_pem)
+            .expect("signing the test CSR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
+        std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+        let tls = ClientTls {
+            skip_verify: true,
+            client_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            client_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify + client cert builds");
+        assert!(
+            cfg.client_auth_cert_resolver.has_certs(),
+            "skip_verify must not drop the presented client certificate"
+        );
     }
 }
