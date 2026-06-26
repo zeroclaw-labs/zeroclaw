@@ -1262,6 +1262,7 @@ async fn delete_config_cascade(
         path: path.to_string(),
         key: key.to_string(),
         created: false,
+        warnings: None,
     })
     .into_response()
 }
