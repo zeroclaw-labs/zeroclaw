@@ -219,6 +219,18 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
     let configured = channels.iter().filter(|e| e.configured).count();
+    let uncompiled = zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+    if !uncompiled.is_empty() {
+        let names = uncompiled
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return CheckResult::fail(
+            "channels",
+            channel_config_uncompiled_detail(channels.len(), configured, &names),
+        );
+    }
     CheckResult::pass(
         "channels",
         format!(
@@ -226,6 +238,23 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
             channels.len(),
             configured
         ),
+    )
+}
+
+fn channel_config_uncompiled_detail(
+    compiled: usize,
+    compiled_configured: usize,
+    names: &str,
+) -> String {
+    let compiled = compiled.to_string();
+    let configured = compiled_configured.to_string();
+    get_required_cli_string_with_args(
+        "cli-selftest-channel-config-uncompiled",
+        &[
+            ("compiled", compiled.as_str()),
+            ("configured", configured.as_str()),
+            ("names", names),
+        ],
     )
 }
 
@@ -421,12 +450,52 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
 
 #[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header;
+
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
-    let probe_url = format!("ws://{probe_host}:{port}/ws/chat");
+    let alias = config.agents.keys().next().map(String::as_str);
+    let token = resolve_gateway_bearer_token(config);
     let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
-    match tokio_tungstenite::connect_async(&probe_url).await {
+    if config.gateway.require_pairing && token.is_none() {
+        return CheckResult::fail(
+            "websocket",
+            format!(
+                "pairing required but no bearer token available for self-test \
+                 (set ZEROCLAW_GATEWAY_TOKEN or keep a plaintext zc_* entry in \
+                 gateway.paired_tokens): {display_url}"
+            ),
+        );
+    }
+
+    let probe_url = build_websocket_probe_url(
+        probe_host,
+        port,
+        alias,
+        config.gateway.require_pairing,
+        token.as_deref(),
+    );
+
+    let request = match probe_url.as_str().into_client_request() {
+        Ok(mut req) => {
+            if let Some(token) = token {
+                if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                    req.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+            }
+            req
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                "websocket",
+                format!("failed to build websocket request for {display_url}: {e}"),
+            );
+        }
+    };
+
+    match tokio_tungstenite::connect_async(request).await {
         Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {display_url}")),
         Err(e) => CheckResult::fail(
             "websocket",
@@ -435,9 +504,67 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
     }
 }
 
+/// Build the websocket probe URL for the self-test handshake.
+///
+/// When `require_pairing` is true, the resolved plaintext token (if any) is
+/// appended as a query parameter so the browser-compatible query-token path
+/// is exercised alongside the `Authorization: Bearer` header. The separator
+/// is `?` when the URL has no query string yet (no-agent fallback) and `&`
+/// when `?agent=` is already present, so the appended segment is always a
+/// valid query pair on the `/ws/chat` route.
+#[cfg(feature = "gateway")]
+fn build_websocket_probe_url(
+    probe_host: &str,
+    port: u16,
+    alias: Option<&str>,
+    require_pairing: bool,
+    token: Option<&str>,
+) -> String {
+    let mut url = match alias {
+        Some(alias) => format!("ws://{probe_host}:{port}/ws/chat?agent={alias}"),
+        None => format!("ws://{probe_host}:{port}/ws/chat"),
+    };
+    if require_pairing {
+        if let Some(token) = token {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            url.push(sep);
+            url.push_str("token=");
+            url.push_str(token);
+        }
+    }
+    url
+}
+
+/// Resolve a plaintext gateway bearer token for local diagnostics.
+///
+/// Precedence: `ZEROCLAW_GATEWAY_TOKEN`, then `ZEROCLAW_ACP_BRIDGE_TOKEN`,
+/// then the first plaintext (`zc_*`) entry in `gateway.paired_tokens`.
+#[cfg(feature = "gateway")]
+fn resolve_gateway_bearer_token(config: &crate::config::Config) -> Option<String> {
+    for key in ["ZEROCLAW_GATEWAY_TOKEN", "ZEROCLAW_ACP_BRIDGE_TOKEN"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    config
+        .gateway
+        .paired_tokens
+        .iter()
+        .map(|t| t.trim())
+        .find(|t| t.starts_with("zc_"))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gateway")]
+    use super::{build_websocket_probe_url, resolve_gateway_bearer_token};
     use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    #[cfg(feature = "gateway")]
+    use zeroclaw_config::schema::Config;
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
@@ -584,5 +711,60 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_reads_plaintext_paired_token() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["zc_test".into()];
+        assert_eq!(
+            resolve_gateway_bearer_token(&config).as_deref(),
+            Some("zc_test")
+        );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_ignores_hashed_paired_tokens() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["a".repeat(64)];
+        assert!(resolve_gateway_bearer_token(&config).is_none());
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_uses_amp_when_agent_alias_present() {
+        // Agent-alias branch: URL already has `?agent=`, so the token appends
+        // with `&` to keep the query string valid.
+        let url = build_websocket_probe_url("127.0.0.1", 42617, Some("dev"), true, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?agent=dev&token=zc_test");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_uses_question_mark_when_no_alias() {
+        // Regression for PR #7732: previously the no-alias fallback appended
+        // `&token=` to a URL with no `?`, producing
+        // `ws://.../ws/chat&token=...` which is not a valid query string and
+        // would fail the handshake for the wrong reason on instances that
+        // have no configured agents but do require pairing.
+        let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?token=zc_test");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_omits_token_when_pairing_not_required() {
+        let url =
+            build_websocket_probe_url("127.0.0.1", 42617, Some("dev"), false, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?agent=dev");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_omits_token_when_none_resolved() {
+        let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, None);
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat");
     }
 }

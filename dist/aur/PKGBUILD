@@ -2,7 +2,7 @@
 pkgname=zeroclawlabs
 _reponame=zeroclaw
 # >>> generated:pkgbuild-version by `cargo generate installers` - do not edit <<<
-pkgver=0.8.0
+pkgver=0.8.2
 # >>> end generated:pkgbuild-version <<<
 pkgrel=1
 pkgdesc="Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
