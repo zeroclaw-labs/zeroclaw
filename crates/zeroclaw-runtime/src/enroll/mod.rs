@@ -53,6 +53,30 @@ pub struct RelayProfile {
     pub relay_cert_pin: String,
 }
 
+/// Assemble the relay coordinates handed to an enrolling or renewing client.
+/// Default (empty) when no relay is configured. The pin is the relay's OUTER leaf
+/// fingerprint, sourced from the relay bridge's pin store when it exists.
+pub fn relay_profile(
+    data_dir: &std::path::Path,
+    relay: &zeroclaw_config::schema::RelayConfig,
+) -> RelayProfile {
+    if relay.enabled && !relay.url.is_empty() {
+        let node_id = crate::relay::ensure_node_id(data_dir, &relay.node_id)
+            .unwrap_or_else(|_| relay.node_id.clone());
+        let relay_cert_pin = std::fs::read_to_string(data_dir.join("relay").join("relay_pin"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        RelayProfile {
+            relay_url: relay.url.clone(),
+            node_id,
+            relay_cert_pin,
+        }
+    } else {
+        RelayProfile::default()
+    }
+}
+
 /// The enrollment request body (`POST /enroll`).
 #[derive(Debug, Deserialize)]
 struct EnrollRequest {

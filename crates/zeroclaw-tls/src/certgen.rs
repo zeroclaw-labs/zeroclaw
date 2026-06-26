@@ -365,6 +365,26 @@ impl CaKeyProtection {
             CaKeyProtection::Passphrase(Zeroizing::new(p))
         }
     }
+
+    /// Source CA-key protection from the environment (the daemon's opt-in
+    /// passphrase; threat A4). `ZEROCLAW_CA_PASSPHRASE` takes precedence; otherwise
+    /// `ZEROCLAW_CA_PASSPHRASE_FILE` is read. Unset yields [`CaKeyProtection::None`]
+    /// (the 0600 floor). Every CA generation + read path uses this so the on-disk
+    /// form always matches.
+    pub fn from_env() -> Self {
+        if let Ok(p) = std::env::var("ZEROCLAW_CA_PASSPHRASE")
+            && !p.trim().is_empty()
+        {
+            return Self::passphrase(p.trim());
+        }
+        if let Ok(path) = std::env::var("ZEROCLAW_CA_PASSPHRASE_FILE")
+            && let Ok(p) = std::fs::read_to_string(&path)
+            && !p.trim().is_empty()
+        {
+            return Self::passphrase(p.trim());
+        }
+        CaKeyProtection::None
+    }
 }
 
 /// Magic header identifying the encrypted CA-key envelope:

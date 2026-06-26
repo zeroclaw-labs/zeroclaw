@@ -2736,18 +2736,7 @@ enum SecurityCommands {
 /// identically at CA generation (the WSS path) and at every CA read (enrollment
 /// + this CLI), so the on-disk form always matches.
 fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
-    if let Ok(p) = std::env::var("ZEROCLAW_CA_PASSPHRASE")
-        && !p.trim().is_empty()
-    {
-        return zeroclaw_tls::CaKeyProtection::passphrase(p.trim());
-    }
-    if let Ok(path) = std::env::var("ZEROCLAW_CA_PASSPHRASE_FILE")
-        && let Ok(p) = std::fs::read_to_string(&path)
-        && !p.trim().is_empty()
-    {
-        return zeroclaw_tls::CaKeyProtection::passphrase(p.trim());
-    }
-    zeroclaw_tls::CaKeyProtection::None
+    zeroclaw_tls::CaKeyProtection::from_env()
 }
 
 fn issue_wss_client_cert(
@@ -4441,28 +4430,11 @@ async fn main() -> Result<()> {
                                 client_auth: None,
                             })?;
 
-                        // Relay coordinates handed to the enrolled client. The pin
-                        // (relay LEAF sha256) is sourced from the relay bridge's
-                        // pin store when present; empty otherwise (client TOFUs).
-                        let relay_profile = if relay_cfg.enabled && !relay_cfg.url.is_empty() {
-                            let node_id = zeroclaw_runtime::relay::ensure_node_id(
-                                &data_dir,
-                                &relay_cfg.node_id,
-                            )
-                            .unwrap_or_else(|_| relay_cfg.node_id.clone());
-                            let relay_cert_pin =
-                                std::fs::read_to_string(data_dir.join("relay").join("relay_pin"))
-                                    .ok()
-                                    .map(|s| s.trim().to_string())
-                                    .unwrap_or_default();
-                            zeroclaw_runtime::enroll::RelayProfile {
-                                relay_url: relay_cfg.url.clone(),
-                                node_id,
-                                relay_cert_pin,
-                            }
-                        } else {
-                            zeroclaw_runtime::enroll::RelayProfile::default()
-                        };
+                        // Relay coordinates handed to the enrolled client (shared
+                        // with the renew path). The pin (relay LEAF sha256) is
+                        // sourced from the relay bridge's pin store when present.
+                        let relay_profile =
+                            zeroclaw_runtime::enroll::relay_profile(&data_dir, &relay_cfg);
 
                         // One-time pairing code gates enrollment. Print it AND the
                         // CA-bound short-auth-string so the operator reads both to
