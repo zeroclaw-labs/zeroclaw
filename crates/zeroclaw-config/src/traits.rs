@@ -216,6 +216,10 @@ impl HasPropKind for Vec<crate::schema::ClassificationRule> {
 }
 impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::EmbeddingRouteConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -229,6 +233,10 @@ impl HasPropKind for Vec<crate::schema::McpServerConfig> {
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::ModelRouteConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;

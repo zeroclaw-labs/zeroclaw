@@ -92,11 +92,6 @@ zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
 
-zc-input-help-send = Send
-zc-input-help-newline = Insert newline
-zc-input-help-file-browser = File browser
-zc-input-help-paste = Paste
-zc-input-help-attach-cmd = Attach file by path
 
 zc-input-attached = Attached: { $label }
 zc-input-attach-error = Attach error: { $error }
@@ -144,23 +139,6 @@ zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
 
-zc-logs-help-apply-search = Apply search
-zc-logs-help-cancel-search = Cancel search
-zc-logs-help-close-detail = Close detail
-zc-logs-help-move-cursor = Move list cursor
-zc-logs-help-scroll-detail = Scroll detail pane
-zc-logs-help-resize-detail = Resize detail pane
-zc-logs-help-toggle-follow = Toggle follow mode
-zc-logs-help-search = Search
-zc-logs-help-severity-filter = Raise / lower severity filter
-zc-logs-help-clear-search = Clear search filter
-zc-logs-help-yank-detail = Yank detail to clipboard
-zc-logs-help-this-help = This help
-zc-logs-help-move-cursor-list = Move cursor
-zc-logs-help-jump-bottom = Jump to bottom (follow)
-zc-logs-help-jump-top = Jump to top
-zc-logs-help-page = Page down / up
-zc-logs-help-open-detail = Open detail pane
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
 
@@ -178,11 +156,6 @@ zc-doctor-list-title = Diagnostics ({ $filter })
 zc-doctor-detail-title = Detail
 zc-doctor-no-selection = No diagnostic selected
 zc-doctor-label-message = Message
-zc-doctor-help-rerun = Run diagnostics again
-zc-doctor-help-move = Move cursor
-zc-doctor-help-filter = Change filter
-zc-doctor-help-scroll-detail = Scroll detail pane
-zc-doctor-help-this-help = This help
 zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
 
 zc-dashboard-tab-overview = Overview
@@ -237,7 +210,7 @@ zc-dashboard-detail-schedule = Schedule
 zc-dashboard-detail-next-run = Next Run
 zc-dashboard-detail-last-run = Last Run
 zc-dashboard-detail-last-status = Last Status
-zc-dashboard-detail-live-sessions = Live Sessions
+zc-dashboard-detail-sessions = Sessions
 zc-dashboard-detail-persisted-sessions = Persisted Sessions
 zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
 
@@ -257,26 +230,6 @@ zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
 
-zc-dashboard-help-next-tab = Next tab
-zc-dashboard-help-prev-tab = Previous tab
-zc-dashboard-help-jump-tab = Jump to tab
-zc-dashboard-help-refresh = Refresh now
-zc-dashboard-help-this-help = This help
-zc-dashboard-help-apply-search = Apply search
-zc-dashboard-help-cancel-search = Cancel search
-zc-dashboard-help-close-detail = Close detail
-zc-dashboard-help-move-cursor = Move list cursor
-zc-dashboard-help-scroll-detail = Scroll detail
-zc-dashboard-help-resize-detail = Resize detail pane
-zc-dashboard-help-refresh-short = Refresh
-zc-dashboard-help-search = Search
-zc-dashboard-help-clear-search = Clear search
-zc-dashboard-help-move-cursor-list = Move cursor
-zc-dashboard-help-jump-bottom = Jump to bottom
-zc-dashboard-help-jump-top = Jump to top
-zc-dashboard-help-open-detail = Open detail pane
-zc-dashboard-help-search-filter = Search / filter
-zc-dashboard-help-kill-session = Kill session
 
 zc-dashboard-yes = yes
 zc-dashboard-no = no
@@ -314,10 +267,6 @@ zc-quickstart-provider-cloud = Cloud. Provide an API key when prompted.
 
 zc-quickstart-submit-create = Create the agent
 
-zc-quickstart-help-move = Move between selectors
-zc-quickstart-help-open = Open the highlighted selector
-zc-quickstart-help-create = Create the agent (or hit { $enter } on Submit)
-zc-quickstart-help-leave = Leave (no config written)
 
 zc-quickstart-modal-action-move = move
 zc-quickstart-modal-action-pick = pick
@@ -426,6 +375,7 @@ zc-chat-approval-action-edit = Edit
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
+zc-chat-copied-clipboard = Copied to clipboard
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -494,6 +444,8 @@ zc-config-status-skill-deleting = Deleting { $name }...
 zc-config-status-skill-archived = Archived { $name }
 zc-config-status-fetching-models = Fetching models for { $family }...
 zc-config-status-field-set = Set { $prop }
+zc-config-status-invalid-float = Invalid value for { $prop }: expected a number
+zc-config-status-invalid-integer = Invalid value for { $prop }: expected an integer
 zc-config-status-set-failed = Set failed: { $err }
 zc-config-status-loading-personality = Loading personality files...
 zc-config-status-loading-skills = Loading skills...
@@ -508,7 +460,14 @@ zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel
 zc-config-footer-action-save = save
+zc-config-footer-action-edit = edit
+zc-config-footer-action-reset = reset
+zc-config-footer-action-clear-filter = clear filter
 zc-config-footer-action-back-to-files = back to files
 zc-config-footer-action-back-to-skills = back to skills
 zc-config-footer-action-help = help
 zc-config-footer-action-new-line = new line
+
+## Inline hint shown on the selected config field row. The { $keys } placeholder
+## is resolved from the current keybinding for ConfigTabAction::Enter.
+zc-config-field-edit-hint = { $keys } → press to edit

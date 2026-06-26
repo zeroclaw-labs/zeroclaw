@@ -8,6 +8,25 @@ exactly what to type and exactly what comes back.
 Every response on this page is real output from a running daemon. Nothing here
 is illustrative.
 
+## Authentication
+
+The two discovery GETs are unauthenticated: the catalog card and the per-alias
+agent card are readable without a token so a peer can discover your published
+surface before pairing. The `message/send` POST is different. It runs a full
+tool-enabled agent turn, so it is behind the gateway's pairing auth like every
+other write surface. When `[gateway] require_pairing` is on (the default), pass
+a pairing-derived bearer token on the task POST:
+
+```
+curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{...}}'
+```
+
+An unauthenticated task POST gets `401`, never an agent turn. The discovery GETs
+below need no header. See the gateway pairing docs for how to obtain a token.
+
 ## The whole thing in two requests
 
 You only ever need two GET requests to discover an agent.
@@ -57,7 +76,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.2",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -128,7 +147,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.2",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -189,7 +208,7 @@ curl http://localhost:42617/a2a/agent_beta/.well-known/agent-card.json
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.2",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -223,6 +242,7 @@ Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
 
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
@@ -273,9 +293,12 @@ JSON-RPC returns HTTP `400`.
 
 ## Exposure and the one sharp edge
 
-The task endpoint shares the exact posture of the cards: it answers only when
-`[a2a.server] enabled` is set and the alias is enabled and published. A task POST
-to an unpublished or unknown alias returns `404`, the same as its card.
+The task endpoint shares the cards' enabled and published gates: it answers only
+when `[a2a.server] enabled` is set and the alias is enabled and published. A task
+POST to an unpublished or unknown alias returns `404`, the same as its card. It
+does not share the cards' auth posture, though: discovery cards stay public,
+while task invocation requires the gateway bearer token and returns `401` without
+it.
 
 One sharp edge to know about: the interface URL answers a bare GET with the web
 dashboard, not an agent, because the gateway falls back to serving the dashboard
@@ -325,6 +348,14 @@ actually carries: it must live in one of the agent's skill bundles and its
 skill in a bundle the agent does not declare, is dropped silently rather than
 advertised.
 
+The most common cause of an empty `skills: []` array is setting
+`a2a.exposed_skills` on an agent that declares no `skill_bundles`.
+`exposed_skills` only narrows the agent's resolved skill set; it does not load
+skills on its own. With no bundle declared there is nothing for the filter to
+keep, so every name drops and the card advertises nothing. Add the owning
+bundle(s) to `agents.<alias>.skill_bundles`. Config validation surfaces this
+case as a startup warning (`a2a_exposed_skills_without_bundles`).
+
 ### What publishing actually exposes
 
 Read this before you publish. Once the server is enabled and an alias is
@@ -332,26 +363,31 @@ published, `POST /a2a/{alias}` runs a full agent turn for that alias: it invokes
 the agent through the same path the chat surfaces use, with the agent's entire
 configured toolset (shell, file, browser, and whatever else that alias carries).
 
-That endpoint is not behind the gateway's bearer/pairing auth. Authentication in
-this gateway is enforced per handler, and the A2A task handler does not gate on a
-token, by design: cross-deployment interop only works if a peer can reach the
-endpoint without sharing your login. The practical consequence is direct:
-**anyone who can reach the gateway listener can invoke a published agent, tools
-and all, with no credential**, while neighboring endpoints like `/api/config`
-require a bearer token.
+That task endpoint is behind the gateway's bearer/pairing auth, like every other
+write surface. A caller needs a pairing-derived bearer token to invoke a
+published agent; an unauthenticated request gets `401`, never an agent turn.
 
-This is a deliberate trade for frictionless agent-to-agent calls, not an
-oversight, but it means publishing is a real exposure decision. Before you flip
-the switches:
+The discovery cards are not behind that auth. The catalog and per-alias cards are
+readable without a token, so a published surface advertises its agent names and
+exposed skills to any caller who can reach the listener. That is the point of
+discovery: a peer reads the card before it ever pairs. It also means publishing
+exposes that metadata to anyone who can reach the gateway, even though invoking
+the agent still requires a token.
+
+Publishing is an exposure decision on both axes: the card metadata is public, and
+any holder of a valid token can invoke a published alias with its full toolset.
+Before you flip the switches:
 
 - Scope the bind posture. Bind the gateway to a private interface, or sit it
-  behind a reverse proxy that enforces auth, rather than exposing the listener
-  directly to an untrusted network.
+  behind a reverse proxy, rather than exposing the listener directly to an
+  untrusted network. This also bounds who can read the unauthenticated cards.
 - Publish only aliases whose full toolset you are willing to have invoked by any
-  reachable caller, and narrow `exposed_skills` to the minimum that interop
-  needs.
+  token holder, and whose names and skills you are willing to advertise
+  unauthenticated. Narrow `exposed_skills` to the minimum that interop needs.
 - Treat a published alias as a remotely-invokable execution surface when you
   decide which tools and skill bundles that alias carries.
+- Cross-deployment interop shares a token with the peer that calls you; scope and
+  rotate that credential like any other.
 
 ## How several deployments connect
 
