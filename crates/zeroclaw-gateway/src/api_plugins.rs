@@ -31,11 +31,23 @@ pub mod plugin_routes {
         let plugins_enabled = config.plugins.enabled;
         let plugins_dir = config.plugins.plugins_dir.clone();
         let plugin_path = config.plugins.resolved_plugins_dir();
+        let signature_mode_raw = config.plugins.security.signature_mode.clone();
+        let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
         drop(config);
 
         let plugins: Vec<serde_json::Value> = if plugins_enabled {
             if plugin_path.exists() {
-                match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+                // Resolve the configured policy so the listing matches the
+                // runtime tool path exactly: a plugin the agent refuses to load
+                // in strict mode must not appear here as `loaded: true`. An
+                // unrecognized value fails safe to strict, same as the runtime.
+                let signature_mode =
+                    zeroclaw_plugins::host::PluginHost::resolve_signature_mode(&signature_mode_raw);
+                match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                    &plugin_path,
+                    signature_mode,
+                    trusted_publisher_keys,
+                ) {
                     Ok(host) => host
                         .list_plugins()
                         .into_iter()
