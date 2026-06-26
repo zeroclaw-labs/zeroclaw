@@ -770,23 +770,3 @@ cli-bundle-warn-archive = avertissement : échec de l'archivage du répertoire d
 cli-bundle-deleted = skill_bundles.{$alias} supprimé (retiré de {$count} agent(s))
 cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de bundle : {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
-cli-onboard-about = Initialiser votre espace de travail et votre configuration
-cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
-cli-memory-remove-about = Supprimer une entrée de mémoire par clé
-cli-note-show-about = Afficher un contenu de note par nom
-cli-note-update-about = Remplacer le contenu d'une note par son nom
-cli-prompt-list-about = Lister les invites disponibles
-cli-prompt-show-about = Montrer le contenu d'une invite par son nom
-cli-secret-get-about = Voir un secret
-cli-secret-list-about = Lister les secrets
-cli-secret-long-about =
-    Gérer les secrets chiffrés avec AES-256.
-
-    Lister, ajouter, mettre à jour, effacer et chiffrer les secrets stockés de manière sécurisée pour l'authentification et la configuration.
-
-    Exemples :
-    zeroclaw secret list
-    zeroclaw secret add OPENAI_API_KEY
-    zeroclaw secret update OPENAI_API_KEY
-    zeroclaw secret delete OPENAI_API_KEY
-    zeroclaw secret encrypt "chiffrer ce message"
