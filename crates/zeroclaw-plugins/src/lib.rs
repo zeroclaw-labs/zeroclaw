@@ -3,12 +3,19 @@
 //! Plugins are WebAssembly components loaded via wasmtime that can extend
 //! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
+#[cfg(feature = "plugins-wasmtime")]
+pub mod component;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_logging;
 pub mod error;
 pub mod host;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod wasm_memory;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_tool;
 

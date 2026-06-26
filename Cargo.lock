@@ -13192,6 +13192,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-infra",
  "zeroclaw-log",
+ "zeroclaw-spawn",
 ]
 
 [[package]]
