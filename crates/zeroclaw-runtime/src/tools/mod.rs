@@ -40,6 +40,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod spawn_subagent;
+pub(crate) mod subprocess_limits;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
