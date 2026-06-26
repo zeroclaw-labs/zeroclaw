@@ -58,6 +58,9 @@ pub fn update_session_id(sid: &str) {
 
 // ── HerdrClient ──────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
+
 /// Low-level client that sends JSON-RPC requests to the herdr daemon over a
 /// Unix domain socket. Connects, writes, reads response (fire-and-forget),
 /// and disconnects per message.
@@ -65,7 +68,7 @@ pub(crate) struct HerdrClient {
     socket_path: String,
     pane_id: String,
     #[cfg(test)]
-    spy: Option<Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>>,
+    spy: Option<SpyFn>,
 }
 
 impl HerdrClient {
