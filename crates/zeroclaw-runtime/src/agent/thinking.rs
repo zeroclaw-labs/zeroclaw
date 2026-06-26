@@ -55,6 +55,28 @@ pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)
     Some((level, remaining))
 }
 
+/// Strip a leading `/think:<level>` directive from the message, returning
+/// the remainder without allocating when no directive is present.
+///
+/// Used by per-turn tool-filter callers that need the directive-free message
+/// but do not yet care about the resolved thinking level. Pair this with
+/// `parse_thinking_directive` (which is cheaper than a full
+/// `resolve_thinking_from_message` because it skips logging and resolution)
+/// only when the level is also needed.
+///
+/// This helper exists so the prompt-construction path and the
+/// request-execution path of `process_message` see the same `user_message`
+/// shape when matching `tool_filter_groups` keywords — otherwise a dynamic
+/// filter keyword that happens to appear inside `/think:high` would make
+/// the prompt advertise tools that the execution path then excludes (or
+/// vice versa). See issue #8054 Surface 4.
+pub fn strip_thinking_directive(message: &str) -> std::borrow::Cow<'_, str> {
+    match parse_thinking_directive(message) {
+        Some((_, remaining)) => std::borrow::Cow::Owned(remaining),
+        None => std::borrow::Cow::Borrowed(message),
+    }
+}
+
 /// Convert a `ThinkingLevel` into concrete parameters for the LLM request.
 pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
     match level {
@@ -332,6 +354,82 @@ mod tests {
     #[test]
     fn parse_directive_not_triggered_mid_message() {
         assert!(parse_thinking_directive("Hello /think:high world").is_none());
+    }
+
+    // ── strip_thinking_directive ──────────────────────────────────
+
+    #[test]
+    fn strip_directive_returns_remainder_when_directive_present() {
+        assert_eq!(
+            strip_thinking_directive("/think:high What is Rust?"),
+            "What is Rust?"
+        );
+        assert_eq!(strip_thinking_directive("/think:off"), "");
+        assert_eq!(strip_thinking_directive("  /think:low  body"), "body");
+    }
+
+    #[test]
+    fn strip_directive_is_noop_when_directive_absent() {
+        // Borrows the input slice (Cow::Borrowed) to avoid cloning when no
+        // directive is present — callers in the per-turn tool-filter path
+        // care about this because they forward the result straight to
+        // `compute_excluded_mcp_tools` which only reads it.
+        let input = "Hello /think:high world";
+        let out = strip_thinking_directive(input);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), "Hello /think:high world");
+    }
+
+    #[test]
+    fn strip_directive_preserves_invalid_level_input_unchanged() {
+        // An invalid level token is *not* a directive (parse_thinking_directive
+        // returns None), so strip must treat the entire message as user content
+        // and return it untouched. This keeps dynamic filter keyword matching
+        // deterministic — `/think:turbo search` should still expose the
+        // "search" keyword even though the level is invalid.
+        assert_eq!(
+            strip_thinking_directive("/think:turbo search"),
+            "/think:turbo search"
+        );
+    }
+
+    /// Regression test for #8054 Surface 4: prompt-construction and
+    /// request-execution tool-filter callsites must see the same message
+    /// shape. The bug case is a dynamic `tool_filter_groups` keyword that
+    /// only appears in the directive — e.g. an operator who configures
+    /// `"high"` as a keyword (since `/think:high` is a valid directive
+    /// token), or `"think"` itself. With the bug, raw-message filter
+    /// matches but stripped-message filter does not, so the prompt and
+    /// request disagree about which tools are available this turn.
+    #[test]
+    fn strip_directive_yields_same_tool_filter_signal_as_stripped_caller() {
+        // Operator configured keyword "high" in a dynamic tool_filter_group.
+        let raw = "/think:high please look up data";
+        let stripped = strip_thinking_directive(raw).into_owned();
+
+        let msg_lower_raw = raw.to_ascii_lowercase();
+        let msg_lower_stripped = stripped.to_ascii_lowercase();
+        let raw_matches = msg_lower_raw.contains("high");
+        let stripped_matches = msg_lower_stripped.contains("high");
+        assert!(
+            raw_matches,
+            "raw message contains the keyword (the bug case)"
+        );
+        assert!(
+            !stripped_matches,
+            "stripped message no longer contains the keyword"
+        );
+
+        // The fix: prompt-construction callers must pass the stripped
+        // message so both sides agree on the keyword presence.
+        let prompt_filter_view = strip_thinking_directive(raw);
+        let request_filter_view = stripped.as_str();
+        assert_eq!(
+            prompt_filter_view.as_ref(),
+            request_filter_view,
+            "prompt-side and request-side filter inputs must be identical after the fix",
+        );
+        assert!(!prompt_filter_view.to_ascii_lowercase().contains("high"));
     }
 
     // ── Level application ────────────────────────────────────────

@@ -1,15 +1,20 @@
 //! `GET /api/logs` — paginated query over the persisted JSONL log.
 //!
 //! Thin HTTP adapter over [`zeroclaw_log::load_page`]. Pagination is
-//! cursor-based: responses include `next_cursor: (timestamp, id)` which
-//! callers pass back as `until_ts` / `until_id` to fetch older events.
+//! cursor-based: responses include both a legacy `next_cursor` (for
+//! backwards compatibility) and a preferred `next_cursor_line_offset`
+//! (byte offset past the last event on the page). Callers should pass
+//! `next_cursor_line_offset` back as `?until_line_offset=` to resume
+//! without re-scanning already-read bytes and to keep same-timestamp
+//! pagination deterministic regardless of id ordering.
 //!
-//! Top-level query params: `since_ts`, `until_ts`, `until_id`, `action`,
-//! `category`, `outcome`, `severity_min`, `trace_id`, `q`,
-//! `hide_internal`, `limit`. Every other `?key=value` is treated as a
-//! per-attribution exact-match (`zeroclaw.<key> == value`), driven by
-//! [`zeroclaw_log::is_attribution_field`]. Adding a new attribution
-//! field anywhere in the schema requires no changes here.
+//! Top-level query params: `since_ts`, `until_ts`, `until_id`,
+//! `until_line_offset`, `action`, `category`, `outcome`, `severity_min`,
+//! `trace_id`, `q`, `hide_internal`, `limit`. Every other `?key=value`
+//! is treated as a per-attribution exact-match (`zeroclaw.<key> ==
+//! value`), driven by [`zeroclaw_log::is_attribution_field`]. Adding a
+//! new attribution field anywhere in the schema requires no changes
+//! here.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -31,6 +36,7 @@ const TOP_LEVEL_PARAMS: &[&str] = &[
     "since_ts",
     "until_ts",
     "until_id",
+    "until_line_offset",
     "action",
     "category",
     "outcome",
@@ -44,8 +50,24 @@ const TOP_LEVEL_PARAMS: &[&str] = &[
 #[derive(Debug, Serialize)]
 pub struct LogsResponse {
     pub events: Vec<serde_json::Value>,
-    /// `Some((timestamp, id))` when more older events may exist.
+    /// Legacy cursor: `Some((timestamp, id))` when more older events may
+    /// exist. Prefer [`Self::next_cursor_line_offset`] — it is
+    /// independent of id ordering and avoids the lexicographic
+    /// `until_id` tie-break that can drop earlier-written events.
+    ///
+    /// Deprecated since 0.8.0; tracked for removal in
+    /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+    #[deprecated(
+        since = "0.8.0",
+        note = "tie-breaks by lexicographic id and can silently drop events; \
+                use `next_cursor_line_offset` / `until_line_offset` instead. \
+                Removal tracked in zeroclaw-labs/zeroclaw#8012."
+    )]
     pub next_cursor: Option<(String, String)>,
+    /// Byte offset past the last event on this page. Pass back as
+    /// `?until_line_offset=` on the next request to resume without
+    /// re-scanning already-read bytes.
+    pub next_cursor_line_offset: Option<u64>,
     /// True when the file was fully scanned for this filter.
     pub at_end: bool,
     /// Daemon start time so callers can implement "since daemon start"
@@ -71,6 +93,7 @@ fn attribution_keys_for_response() -> Vec<String> {
     keys
 }
 
+#[allow(deprecated)] // we still forward the legacy cursor for backwards compat
 pub async fn handle_api_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -84,6 +107,7 @@ pub async fn handle_api_logs(
         return Json(LogsResponse {
             events: Vec::new(),
             next_cursor: None,
+            next_cursor_line_offset: None,
             at_end: true,
             daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
             attribution_keys: attribution_keys_for_response(),
@@ -106,6 +130,9 @@ pub async fn handle_api_logs(
         .get("limit")
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(200);
+    let until_line_offset = params
+        .get("until_line_offset")
+        .and_then(|raw| raw.parse::<u64>().ok());
 
     let mut field_eq: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in &params {
@@ -131,6 +158,7 @@ pub async fn handle_api_logs(
         since_ts: take("since_ts"),
         until_ts: take("until_ts"),
         until_id: take("until_id"),
+        until_line_offset,
         action: take("action"),
         category: take("category"),
         outcome: take("outcome"),
@@ -144,6 +172,7 @@ pub async fn handle_api_logs(
     let LogPage {
         events,
         next_cursor,
+        next_cursor_line_offset,
         at_end,
     } = match zeroclaw_log::load_page(&path, &filter, limit) {
         Ok(page) => page,
@@ -166,6 +195,7 @@ pub async fn handle_api_logs(
     Json(LogsResponse {
         events: events_json,
         next_cursor,
+        next_cursor_line_offset,
         at_end,
         daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
         attribution_keys: attribution_keys_for_response(),
