@@ -14578,7 +14578,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-relay-proto"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -14705,19 +14705,23 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tls"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
  "hex",
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "scrypt",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "time",
  "tokio-rustls",
  "zeroclaw-log",
+ "zeroize",
 ]
 
 [[package]]
@@ -14973,7 +14977,7 @@ dependencies = [
 
 [[package]]
 name = "zerorelay"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

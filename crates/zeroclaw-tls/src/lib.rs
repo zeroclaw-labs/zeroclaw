@@ -17,7 +17,17 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 
 pub mod certgen;
-pub use certgen::{Pem, ServerMaterials, ensure_server_materials, issue_client_cert};
+pub use certgen::{
+    CaKeyProtection, IssuedLeaf, Pem, ServerMaterials, ensure_server_materials,
+    ensure_server_materials_protected, issue_client_cert, load_ca_key_pem, sign_csr,
+};
+
+/// Shared certificate / CSR generation helpers for downstream test code. Public
+/// under the `testing` feature so the daemon enrollment and relay integration
+/// tests reuse one set of fixtures rather than duplicating rcgen boilerplate;
+/// also available to this crate's own tests under `cfg(test)`.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 /// Client-certificate verification parameters (transport-neutral).
 ///

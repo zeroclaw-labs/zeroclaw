@@ -19,7 +19,19 @@ serde_json = "1.0"
 # Pinned to the `ring` backend to match the project's rustls provider.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
 time = { version = "0.3", default-features = false, features = ["std"] }
+# CA private-key at-rest encryption (threat A4): scrypt KDF + XChaCha20-Poly1305
+# AEAD over the PKCS#8 PEM, key material zeroized on drop. All already vetted
+# in-tree dependencies (no new supply-chain surface).
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+zeroize = { version = "1.8", features = ["alloc"] }
+getrandom = "0.2"
 zeroclaw-log.workspace = true
+
+[features]
+# Shared certificate/CSR generation helpers for downstream test code (the daemon
+# enrollment + relay integration tests) so test fixtures are not duplicated.
+testing = []
 
 [dev-dependencies]
 tempfile = "3.26"
