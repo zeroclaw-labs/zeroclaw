@@ -9,6 +9,9 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+use crate::tools::subprocess_limits::{
+    apply_post_spawn_memory_limit, apply_pre_spawn_memory_limit, memory_limit_exceeded_error,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -283,8 +286,46 @@ impl Tool for SkillShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
+        let max_memory_mb = self.security.shell_max_memory_mb;
+        if let Err(e) = apply_pre_spawn_memory_limit(&mut cmd, max_memory_mb) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to configure memory limit: {e}")),
+            });
+        }
+
+        cmd.kill_on_drop(true);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+        let _memory_limit_guard = match apply_post_spawn_memory_limit(&child, max_memory_mb) {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to configure memory limit: {e}")),
+                });
+            }
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(self.timeout_secs), async {
+            child.wait_with_output().await
+        })
+        .await;
 
         match result {
             Ok(Ok(output)) => {
@@ -308,14 +349,19 @@ impl Tool for SkillShellTool {
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
+                let memory_error =
+                    memory_limit_exceeded_error(output.status, &stderr, max_memory_mb);
+
                 Ok(ToolResult {
-                    success: output.status.success(),
+                    success: output.status.success() && memory_error.is_none(),
                     output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
+                    error: memory_error.or({
+                        if stderr.is_empty() {
+                            None
+                        } else {
+                            Some(stderr)
+                        }
+                    }),
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
@@ -677,6 +723,30 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_memory_limit_can_be_disabled() {
+        let st = SkillTool {
+            name: "hello".to_string(),
+            description: "Say hello".to_string(),
+            kind: "shell".to_string(),
+            command: "echo memory-limit-disabled".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            shell_max_memory_mb: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("memory-limit-disabled"));
     }
 
     #[test]

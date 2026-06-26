@@ -353,6 +353,16 @@ impl Channel for AmqpChannel {
     fn self_handle(&self) -> Option<String> {
         Some(self.sender_label.clone())
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in AMQP.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in AMQP.
+        Ok(())
+    }
 }
 
 /// Interpolate `{field}` placeholders against a JSON body. Placeholders accept

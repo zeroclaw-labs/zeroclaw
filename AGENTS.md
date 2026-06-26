@@ -174,7 +174,7 @@ When uncertain, classify as higher risk.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
-- Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
+- Use conventional commit titles. Prefer small PRs (`size:XS`, `size:S`, or `size:M`).
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/book/src/contributing/privacy.md`).
 

@@ -206,6 +206,10 @@ pub struct Agent {
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
+    /// Test-only clock seam for deterministic cache-key tests. Production
+    /// always uses the live local clock.
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Drop for Agent {
@@ -324,6 +328,8 @@ pub struct AgentBuilder {
     agent_alias: Option<String>,
     channel_name: Option<String>,
     exclude_memory: bool,
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Default for AgentBuilder {
@@ -367,6 +373,8 @@ impl AgentBuilder {
             agent_alias: None,
             channel_name: None,
             exclude_memory: false,
+            #[cfg(test)]
+            turn_datetime: None,
         }
     }
 
@@ -547,6 +555,15 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn turn_datetime<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
+        self
+    }
+
     /// Exclude persistent memory from this agent. When set, the memory
     /// backend is replaced with `NoneMemory`, auto-save is forced off, and
     /// all `memory_*` tools are stripped from the tool set. Used by ACP
@@ -699,6 +716,8 @@ impl AgentBuilder {
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
+            #[cfg(test)]
+            turn_datetime: self.turn_datetime,
         })
     }
 }
@@ -716,6 +735,15 @@ impl Agent {
         }
 
         crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
+    fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
+        #[cfg(test)]
+        if let Some(provider) = &self.turn_datetime {
+            return provider();
+        }
+
+        chrono::Local::now()
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -867,7 +895,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {user_message}")
         } else {
@@ -1959,7 +1987,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now();
+        let now = self.current_turn_datetime();
         let (year, month, day) = (now.year(), now.month(), now.day());
         let (hour, minute, second) = (now.hour(), now.minute(), now.second());
         let tz = now.format("%Z");
@@ -2758,6 +2786,7 @@ mod safety_net;
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3134,6 +3163,13 @@ mod tests {
     #[derive(Default)]
     struct CapturingObserver {
         events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    fn fixed_response_cache_turn_datetime() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 6, 25, 12, 0, 0)
+            .single()
+            .expect("fixed local test timestamp")
     }
 
     impl Observer for CapturingObserver {
@@ -6997,6 +7033,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -7022,6 +7059,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 

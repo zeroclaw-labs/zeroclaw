@@ -201,4 +201,44 @@ mod tests {
         // Still under the limit.
         assert!(limiter.check_rate_limit(key).is_ok());
     }
+
+    #[test]
+    fn loopback_detection_covers_parsed_addresses() {
+        let limiter = AuthRateLimiter::new();
+        // Not the literal "127.0.0.1", but still loopback (127.0.0.0/8) — exempt.
+        for _ in 0..(MAX_ATTEMPTS + 5) {
+            assert!(limiter.check_rate_limit("127.0.0.5").is_ok());
+            limiter.record_attempt("127.0.0.5");
+        }
+        assert!(!limiter.is_locked_out("127.0.0.5"));
+
+        // A non-loopback address is rate-limited as usual.
+        let key = "203.0.113.7";
+        for _ in 0..MAX_ATTEMPTS {
+            let _ = limiter.check_rate_limit(key);
+            limiter.record_attempt(key);
+        }
+        assert!(limiter.check_rate_limit(key).is_err());
+    }
+
+    #[test]
+    fn unknown_key_is_not_locked_out() {
+        let limiter = AuthRateLimiter::new();
+        assert!(!limiter.is_locked_out("198.51.100.1"));
+        // A fresh key passes the check without any recorded attempts.
+        assert!(limiter.check_rate_limit("198.51.100.1").is_ok());
+    }
+
+    #[test]
+    fn lockout_retry_after_is_the_full_lockout_window() {
+        let limiter = AuthRateLimiter::new();
+        let key = "192.0.2.50";
+        for _ in 0..MAX_ATTEMPTS {
+            let _ = limiter.check_rate_limit(key);
+            limiter.record_attempt(key);
+        }
+        let err = limiter.check_rate_limit(key).unwrap_err();
+        // The triggering check sets retry_after to the full lockout window.
+        assert_eq!(err.retry_after_secs, LOCKOUT_SECS);
+    }
 }
