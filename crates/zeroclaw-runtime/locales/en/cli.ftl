@@ -795,6 +795,10 @@ cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
 
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
+
 # ── Agent turn-engine user-visible markers (#7415) ────────────────────
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
