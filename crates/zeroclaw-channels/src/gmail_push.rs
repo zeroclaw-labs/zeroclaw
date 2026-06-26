@@ -573,6 +573,16 @@ impl ::zeroclaw_api::attribution::Attributable for GmailPushChannel {
 
 #[async_trait]
 impl Channel for GmailPushChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Gmail push delivery has no typing-indicator concept.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Gmail push delivery has no typing-indicator concept.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "gmail_push"
     }

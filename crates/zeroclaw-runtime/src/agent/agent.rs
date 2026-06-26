@@ -93,6 +93,7 @@ struct TurnGuard {
     turn_id: Option<String>,
     turn_started_at: Instant,
     agent_alias: Option<String>,
+    channel_name: String,
     total_input_tokens: u64,
     total_output_tokens: u64,
     saw_usage: bool,
@@ -116,7 +117,7 @@ impl TurnGuard {
                 },
             ),
             cost_usd: None,
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
         });
@@ -202,6 +203,13 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Channel name stamped onto observer events to identify the calling surface
+    /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
+    channel_name: String,
+    /// Test-only clock seam for deterministic cache-key tests. Production
+    /// always uses the live local clock.
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Drop for Agent {
@@ -318,7 +326,10 @@ pub struct AgentBuilder {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
+    channel_name: Option<String>,
     exclude_memory: bool,
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Default for AgentBuilder {
@@ -360,7 +371,10 @@ impl AgentBuilder {
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
+            channel_name: None,
             exclude_memory: false,
+            #[cfg(test)]
+            turn_datetime: None,
         }
     }
 
@@ -536,6 +550,20 @@ impl AgentBuilder {
         self
     }
 
+    pub fn channel_name(mut self, name: String) -> Self {
+        self.channel_name = Some(name);
+        self
+    }
+
+    #[cfg(test)]
+    fn turn_datetime<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
+        self
+    }
+
     /// Exclude persistent memory from this agent. When set, the memory
     /// backend is replaced with `NoneMemory`, auto-save is forced off, and
     /// all `memory_*` tools are stripped from the tool set. Used by ACP
@@ -687,6 +715,9 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
+            #[cfg(test)]
+            turn_datetime: self.turn_datetime,
         })
     }
 }
@@ -704,6 +735,19 @@ impl Agent {
         }
 
         crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
+    fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
+        #[cfg(test)]
+        if let Some(provider) = &self.turn_datetime {
+            return provider();
+        }
+
+        chrono::Local::now()
+    }
+
+    pub fn set_channel_name(&mut self, name: String) {
+        self.channel_name = name;
     }
 
     fn new_turn_id() -> String {
@@ -851,7 +895,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {user_message}")
         } else {
@@ -1943,7 +1987,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now();
+        let now = self.current_turn_datetime();
         let (year, month, day) = (now.year(), now.month(), now.day());
         let (hour, minute, second) = (now.hour(), now.minute(), now.second());
         let tz = now.format("%Z");
@@ -1967,7 +2011,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -1979,6 +2023,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2035,6 +2080,7 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let agent_alias_for_loop = self.observer_agent_alias();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2077,7 +2123,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
-                        channel_name: "cli",
+                        channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
@@ -2093,6 +2139,8 @@ impl Agent {
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        turn_id: &turn_id,
                     }),
                 ),
             )
@@ -2332,7 +2380,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -2344,6 +2392,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2403,6 +2452,7 @@ impl Agent {
         };
 
         let cost_context = self.tool_loop_cost_tracking_context();
+        let agent_alias_for_loop = self.observer_agent_alias();
 
         // Built once per turn so the HMAC key is stable across steering rounds
         // and the same collector accumulates every round's receipts. `None`
@@ -2494,7 +2544,7 @@ impl Agent {
                                 },
                             ),
                             history: &mut loop_history,
-                            channel_name: "cli",
+                            channel_name: &self.channel_name,
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
@@ -2510,6 +2560,8 @@ impl Agent {
                             // Phase 1: stamp Internal/Trusted. Real per-transport
                             // stamping is PR C (RFC #6971 §4).
                             ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            turn_id: &turn_id,
                         }),
                     ),
                 )
@@ -2688,8 +2740,6 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
-
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -2716,48 +2766,6 @@ pub async fn run(
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
-    let (provider_name, model_name) =
-        match effective_config.resolved_model_provider_for_agent(agent_alias) {
-            Some((ty, _alias, entry)) => {
-                let model = entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| effective_config.resolve_default_model())
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                (ty.to_string(), model)
-            }
-            None => (
-                provider_override.unwrap_or_else(|| "unknown".to_string()),
-                effective_config
-                    .resolve_default_model()
-                    .unwrap_or_else(|| "<unresolved>".to_string()),
-            ),
-        };
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
-    });
-
-    let _run_guard = TurnGuard {
-        observer: Arc::clone(&agent.observer),
-        model_provider: provider_name,
-        model: model_name,
-        turn_id: None,
-        turn_started_at: start,
-        agent_alias: None,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        saw_usage: false,
-        done: false,
-    };
-
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
         println!("{response}");
@@ -2778,6 +2786,7 @@ mod safety_net;
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3154,6 +3163,13 @@ mod tests {
     #[derive(Default)]
     struct CapturingObserver {
         events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    fn fixed_response_cache_turn_datetime() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 6, 25, 12, 0, 0)
+            .single()
+            .expect("fixed local test timestamp")
     }
 
     impl Observer for CapturingObserver {
@@ -6820,8 +6836,124 @@ mod tests {
             | ObserverEvent::LlmRequest { turn_id, .. }
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
-            | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
             _ => None,
+        }
+    }
+
+    fn assert_all_events_share_turn_id(
+        events: &[ObserverEvent],
+        expected_alias: Option<&str>,
+        expected_channel: Option<&str>,
+    ) {
+        // Regression guard for PR #7771: every lifecycle observer event that
+        // carries the `(channel, agent_alias, turn_id)` correlation triple
+        // MUST populate all three. These six variants back OTel parent-child
+        // span linkage and per-agent attribution; a `None` in any field
+        // silently breaks trace correlation. The original `run()` entry point
+        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
+        // `turn_id: None` because it recorded events outside the turn engine.
+        //
+        // This checks each event individually (no skipping
+        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
+        // than only checking consistency among the non-`None` subset — a
+        // single `None` field is a failure, not something to be filtered out.
+        let mut turn_ids: Vec<String> = Vec::new();
+        for event in events {
+            let (variant, channel, agent_alias, turn_id) = match event {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentStart", channel, agent_alias, turn_id),
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentEnd", channel, agent_alias, turn_id),
+                ObserverEvent::LlmRequest {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmRequest", channel, agent_alias, turn_id),
+                ObserverEvent::LlmResponse {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmResponse", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCallStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCallStart", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCall", channel, agent_alias, turn_id),
+                _ => continue,
+            };
+            assert!(
+                channel.is_some(),
+                "{variant} observer event must carry channel, got None: {event:?}"
+            );
+            assert!(
+                agent_alias.is_some(),
+                "{variant} observer event must carry agent_alias, got None: {event:?}"
+            );
+            assert!(
+                turn_id.is_some(),
+                "{variant} observer event must carry turn_id, got None: {event:?}"
+            );
+            turn_ids.push(turn_id.clone().expect("checked Some above"));
+        }
+
+        assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
+        let first = &turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|id| id == first),
+            "all turn_ids should be consistent"
+        );
+
+        if let Some(alias) = expected_alias {
+            for e in events {
+                let agent_alias = match e {
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                    | ObserverEvent::AgentEnd { agent_alias, .. }
+                    | ObserverEvent::LlmRequest { agent_alias, .. }
+                    | ObserverEvent::LlmResponse { agent_alias, .. }
+                    | ObserverEvent::ToolCallStart { agent_alias, .. }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    _ => continue,
+                };
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some(alias),
+                    "agent_alias should be consistent"
+                );
+            }
+        }
+
+        if let Some(channel) = expected_channel {
+            for e in events {
+                let ch = match e {
+                    ObserverEvent::AgentStart { channel: ch, .. }
+                    | ObserverEvent::LlmRequest { channel: ch, .. }
+                    | ObserverEvent::LlmResponse { channel: ch, .. }
+                    | ObserverEvent::ToolCallStart { channel: ch, .. }
+                    | ObserverEvent::ToolCall { channel: ch, .. }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    _ => continue,
+                };
+                assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
+            }
         }
     }
 
@@ -6901,6 +7033,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -6926,6 +7059,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -7290,18 +7424,13 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
-        let turn_ids: Vec<&str> = events.iter().filter_map(observer_event_turn_id).collect();
-        assert!(!turn_ids.is_empty(), "turn events should carry turn_id");
-        let first = turn_ids[0];
-        assert!(
-            turn_ids.iter().all(|turn_id| *turn_id == first),
-            "all turn_ids should be consistent"
-        );
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 }

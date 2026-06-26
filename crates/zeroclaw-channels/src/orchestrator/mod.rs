@@ -1043,59 +1043,48 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
-fn channel_history_content_for_user_turn(content: &str) -> String {
-    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
-    if image_refs.is_empty() {
-        return content.to_string();
-    }
-
-    let mut cleaned = cleaned.trim().to_string();
-    while cleaned.contains("\n\n\n") {
-        cleaned = cleaned.replace("\n\n\n", "\n\n");
-    }
-
-    if cleaned.is_empty() {
-        "[Image attachment processed by vision model]".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn restore_current_user_turn_media_payload(
-    turns: &mut [ChatMessage],
-    history_content: &str,
-    full_content: &str,
-) {
-    if history_content == full_content {
-        return;
-    }
-
-    if let Some(turn) = turns
-        .iter_mut()
-        .rev()
-        .find(|turn| turn.role == "user" && turn.content == history_content)
-    {
-        turn.content = full_content.to_string();
-    }
-}
-
-fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+/// Collapse only heavy inline `data:` image payloads in historical turns while
+/// preserving re-loadable `[IMAGE:<path>]` file references, so a later turn can
+/// re-inflate from disk (#8151) without re-sending megabytes of base64 every
+/// request (#3460). File-path and placeholder markers pass through untouched.
+fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
     if turns.len() <= 1 {
         return;
     }
-
     let last_idx = turns.len() - 1;
     for turn in &mut turns[..last_idx] {
-        if turn.content.contains("[IMAGE:") {
-            turn.content = channel_history_content_for_user_turn(&turn.content);
+        if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
+            continue;
+        }
+        let (_, refs) = zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
+        if refs.iter().any(|r| r.starts_with("data:")) {
+            turn.content = strip_inline_data_image_markers(&turn.content);
         }
     }
+}
 
-    let current = turns.pop();
-    turns.retain(|turn| !turn.content.trim().is_empty());
-    if let Some(current) = current {
-        turns.push(current);
+fn strip_inline_data_image_markers(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = content[cursor..].find("[IMAGE:data:") {
+        let start = cursor + rel;
+        out.push_str(&content[cursor..start]);
+        match content[start..].find(']') {
+            Some(rel_end) => {
+                out.push_str("[Image attachment omitted from history]");
+                cursor = start + rel_end + 1;
+            }
+            None => {
+                out.push_str(&content[start..]);
+                cursor = content.len();
+                break;
+            }
+        }
     }
+    if cursor < content.len() {
+        out.push_str(&content[cursor..]);
+    }
+    out.trim().to_string()
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -1863,9 +1852,10 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
 
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
-        &zeroclaw_runtime::skills::load_skills_with_config(
+        &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
             ctx.prompt_config.as_ref(),
+            ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.skills.prompt_injection_mode,
@@ -4034,6 +4024,42 @@ fn resolve_channel_ack_reactions(
     }
 }
 
+/// Reconcile the early processing ack (👀) on an early-return path that bails
+/// before the normal 👀 → ✅/⚠️ swap. The early ack is posted unconditionally
+/// right after the self-loop guard, so every path that returns before the swap
+/// would otherwise strand a permanent 👀 that signals "processing" forever. Pass
+/// the emoji that should replace it (✅ for a handled outcome, ⚠️ for a failure),
+/// or `None` to simply clear the ack with no replacement (the caller surfaces its
+/// own signal, e.g. a no_reply kind emoji). No-op when ack reactions are
+/// disabled or no target channel is present, so it mirrors the ack post exactly.
+async fn reconcile_early_ack(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    early_ack_task: Option<tokio::task::JoinHandle<()>>,
+    done_emoji: Option<&str>,
+) {
+    if !resolve_channel_ack_reactions(ctx, msg) {
+        return;
+    }
+    let Some(channel) = target_channel else {
+        return;
+    };
+    // Wait for the spawned 👀 add to land first; otherwise a fast early-return
+    // path could remove before the add runs and strand the ack.
+    if let Some(task) = early_ack_task {
+        let _ = task.await;
+    }
+    let _ = channel
+        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+        .await;
+    if let Some(emoji) = done_emoji {
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, emoji)
+            .await;
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4072,6 +4098,86 @@ async fn process_channel_message_body(
     } else {
         msg
     };
+
+    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+
+    // Self-loop guard, two-layer.
+    //
+    // Layer 1 — SDK side: channels that expose `Channel::self_handle()`
+    // get caught here.
+    //
+    // Layer 2 — agent-loop fallback: even when the channel returned a
+    // handle and Layer 1 ran, re-check via the shared
+    // `peers::should_drop_self_loop` helper using the same handle. The
+    // fallback exists so a channel impl that gains its
+    // self-identity later in its lifecycle (after Layer 1's check
+    // fired with `None`) still has a guard available; both layers use
+    // identical normalization so they agree on what "self" means.
+    if let Some(channel) = target_channel.as_ref() {
+        if channel.drop_self_messages(&msg) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "dropping self-authored inbound message (self-loop guard, sdk layer)"
+            );
+            return;
+        }
+        if zeroclaw_runtime::peers::should_drop_self_loop(
+            &msg.sender,
+            channel.self_handle().as_deref(),
+        ) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
+            );
+            return;
+        }
+    }
+
+    // The early ack is spawned (fire-and-forget) so it lands before the
+    // enrichment/model pipeline without blocking it. The join handle is kept so
+    // any early-return reconciliation can await the add before removing the 👀,
+    // making the swap deterministic instead of racing the spawned add.
+    let early_ack_task: Option<tokio::task::JoinHandle<()>> =
+        if resolve_channel_ack_reactions(&ctx, &msg)
+            && let Some(channel) = target_channel.clone()
+        {
+            let reply_target = msg.reply_target.clone();
+            let message_id = msg.id.clone();
+            let message_id_label = message_id.clone();
+            let agent_alias = Arc::clone(&ctx.agent_alias);
+            let sender = msg.sender.clone();
+            let channel_label = channel.name().to_string();
+            let span = ::zeroclaw_log::attribution_span!(&*channel);
+            Some(zeroclaw_spawn::spawn!(
+            ::zeroclaw_log::scope!(
+                category: "channel",
+                agent_alias: agent_alias.as_str(),
+                channel: channel_label.as_str(),
+                sender: sender.as_str(),
+                message_id: message_id_label.as_str(),
+                => async move {
+                    if let Err(e) = channel
+                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to add ack reaction"
+                        );
+                    }
+                }
+            )
+            .instrument(span)
+        ))
+        } else {
+            None
+        };
 
     let history_key = conversation_history_key(&msg);
     let thinking_override = ctx
@@ -4133,44 +4239,6 @@ async fn process_channel_message_body(
         }
     }
 
-    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-
-    // Self-loop guard, two-layer.
-    //
-    // Layer 1 — SDK side: channels that expose `Channel::self_handle()`
-    // get caught here.
-    //
-    // Layer 2 — agent-loop fallback: even when the channel returned a
-    // handle and Layer 1 ran, re-check via the shared
-    // `peers::should_drop_self_loop` helper using the same handle. The
-    // fallback exists so a channel impl that gains its
-    // self-identity later in its lifecycle (after Layer 1's check
-    // fired with `None`) still has a guard available; both layers use
-    // identical normalization so they agree on what "self" means.
-    if let Some(channel) = target_channel.as_ref() {
-        if channel.drop_self_messages(&msg) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, sdk layer)"
-            );
-            return;
-        }
-        if zeroclaw_runtime::peers::should_drop_self_loop(
-            &msg.sender,
-            channel.self_handle().as_deref(),
-        ) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
-            );
-            return;
-        }
-    }
-
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -4181,6 +4249,14 @@ async fn process_channel_message_body(
         );
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            Some("\u{2705}"),
+        )
+        .await;
         return;
     }
 
@@ -4260,20 +4336,33 @@ async fn process_channel_message_body(
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
             }
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
             return;
         }
     };
-    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+    let history_user_content = msg.content.clone();
+    // Autosave must not persist heavy/private inline `data:` image bytes into
+    // durable memory. Strip them here (path/markers are preserved) before the
+    // store; the channel-history cache still keeps the re-loadable markers via
+    // collapse_inline_image_payloads downstream.
+    let autosave_content = strip_inline_data_image_markers(&history_user_content);
     if ctx.auto_save_memory
-        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
+        && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &history_user_content,
+                &autosave_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -4305,19 +4394,18 @@ async fn process_channel_message_body(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve the dated user turn before the LLM call so interrupted requests
-    // keep the same temporal context as CLI turns. Keep history compact so
-    // inline image payloads are not reloaded into later requests.
+    // Preserve the dated user turn verbatim before the LLM call so interrupted
+    // requests keep the same temporal context as CLI turns. History stores the
+    // full content for every marker type so a later turn can re-load it.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
-    let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_history_content),
+        ChatMessage::user(&timestamped_content),
     );
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns_raw = if force_fresh_session {
+    let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
         ctx.conversation_histories
@@ -4327,13 +4415,6 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
-    if !force_fresh_session {
-        restore_current_user_turn_media_payload(
-            &mut prior_turns_raw,
-            &timestamped_history_content,
-            &timestamped_content,
-        );
-    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -4353,10 +4434,11 @@ async fn process_channel_message_body(
         }
     }
 
-    // Strip [IMAGE:] markers from older cached turns before context
-    // compression. The current message keeps its full payload so vision still
-    // works for the active turn; historical turns keep compact annotations.
-    strip_historical_image_payloads(&mut prior_turns);
+    // Collapse only heavy inline `data:` image payloads in older cached turns.
+    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
+    // re-inflate from disk (#8151); inline base64 is dropped to keep history
+    // within the context budget (#3460).
+    collapse_inline_image_payloads(&mut prior_turns);
 
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
@@ -4520,16 +4602,22 @@ async fn process_channel_message_body(
             &history_key,
             ChatMessage::assistant(&history_response),
         );
-        // Surface the no-reply decision in chat with an emoji on the user's
-        // message so the chatter isn't left wondering whether the bot saw
-        // the message. Same `ack_reactions` gate as the 👀 → ✅/⚠️ ack/done
-        // pattern so operators with reactions disabled don't suddenly see
-        // them. Best-effort: log on failure, never propagate. Channels that
-        // don't implement add_reaction get the trait's no-op default.
+        // Clear the early processing ack first (awaiting the spawned add so it
+        // is never stranded): the agent deliberately chose silence, so a left
+        // 👀 would falsely read as "still working." The message ends carrying
+        // only the no-reply kind emoji.
         //
         // Resolve per-channel overrides: channels like Lark, Telegram,
         // and Matrix allow `<channel>.ack_reactions` to take precedence
         // over the global `[channels].ack_reactions`.
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            None,
+        )
+        .await;
         if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
         {
@@ -4667,21 +4755,6 @@ async fn process_channel_message_body(
         None
     };
 
-    // React with 👀 to acknowledge the incoming message
-    if resolve_channel_ack_reactions(&ctx, &msg)
-        && let Some(channel) = target_channel.as_ref()
-        && let Err(e) = channel
-            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await
-    {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to add reaction"
-        );
-    }
-
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
     let is_partial_draft = target_channel
@@ -4778,6 +4851,7 @@ async fn process_channel_message_body(
         }
     });
     let loop_knobs = LoopKnobs::default();
+    let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -4845,6 +4919,8 @@ async fn process_channel_message_body(
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
                 ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(ctx.agent_alias.as_str()),
+                turn_id: &turn_id,
             });
             let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(thinking.params.native_thinking, tool_loop);
@@ -4913,9 +4989,9 @@ async fn process_channel_message_body(
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
-                            channel: None,
-                            agent_alias: None,
-                            turn_id: None,
+                            channel: Some(msg.channel.to_string()),
+                            agent_alias: Some(ctx.agent_alias.to_string()),
+                            turn_id: Some(turn_id.clone()),
                         });
 
                         continue;
@@ -5404,11 +5480,7 @@ async fn process_channel_message_body(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        &timestamped_history_content,
-                    );
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -5486,10 +5558,14 @@ async fn process_channel_message_body(
         }
     }
 
-    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
+    // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
+        if let Some(task) = early_ack_task {
+            let _ = task.await;
+        }
         let _ = channel
             .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
             .await;
@@ -12273,6 +12349,33 @@ api_key = "anthropic-key"
         }
     }
 
+    struct NoReplyModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoReplyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("NO_REPLY[INFO]: nothing to add".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NoReplyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NoReplyModelProvider"
+        }
+    }
+
     struct ToolCallingModelProvider;
 
     fn tool_call_payload() -> String {
@@ -15876,6 +15979,292 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(removed[0].2, "\u{1F440}");
     }
 
+    // Pins the no_reply reconciliation: when the agent deliberately chooses
+    // silence, the early 👀 ack must be removed (not left dangling) and the
+    // message must end carrying only the no-reply kind emoji. A regression that
+    // strands the 👀 on this path falsely signals "still processing" forever.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_clears_early_ack() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NoReplyModelProvider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "noreply-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-noreply".to_string(),
+                content: "fyi".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.iter().any(|r| r.2 == "\u{1F44D}"),
+            "the informational no-reply emoji must be added, got {added:?}"
+        );
+        assert!(
+            !added.iter().any(|r| r.2 == "\u{2705}"),
+            "no_reply must not produce a completion checkmark, got {added:?}"
+        );
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert!(
+            removed.iter().any(|r| r.2 == "\u{1F440}"),
+            "the early eyes ack must be reconciled (removed) on the no_reply path, got {removed:?}"
+        );
+    }
+
+    struct AckTimingChannel {
+        start: Instant,
+        ack_elapsed_ms: tokio::sync::Mutex<Option<u128>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for AckTimingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "ack-timing"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for AckTimingChannel {
+        fn name(&self) -> &str {
+            "ack-timing-channel"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn add_reaction(
+            &self,
+            _channel_id: &str,
+            _message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            if emoji == "\u{1F440}" {
+                let mut slot = self.ack_elapsed_ms.lock().await;
+                if slot.is_none() {
+                    *slot = Some(self.start.elapsed().as_millis());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // Pins the early-ack ordering: with a slow model_provider, the 👀 ack must
+    // land well before the model completes. Fails on the old order where the
+    // ack was awaited after enrichment / the model call. A regression back to
+    // the late position would record the ack at >= the model delay.
+    #[tokio::test]
+    async fn process_channel_message_acks_before_slow_model_completes() {
+        let model_delay = Duration::from_millis(400);
+        let channel_impl = Arc::new(AckTimingChannel {
+            start: Instant::now(),
+            ack_elapsed_ms: tokio::sync::Mutex::new(None),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(SlowModelProvider { delay: model_delay }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "ack-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-ack".to_string(),
+                content: "hello".to_string(),
+                channel: "ack-timing-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let ack_elapsed = channel_impl
+            .ack_elapsed_ms
+            .lock()
+            .await
+            .expect("eyes ack must have been attempted");
+        assert!(
+            ack_elapsed < model_delay.as_millis(),
+            "ack fired at {ack_elapsed}ms, must precede the {}ms model delay (early-ack ordering)",
+            model_delay.as_millis()
+        );
+    }
+
     #[test]
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
@@ -17951,7 +18340,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+    async fn process_channel_message_persists_image_payload_verbatim() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18086,8 +18475,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.starts_with('['));
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("[IMAGE:data:"));
+        assert!(turns[0].content.contains("AQIDBA"));
     }
 
     #[tokio::test]
@@ -19490,53 +19879,92 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
-        let content =
-            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
-
-        let history_content = channel_history_content_for_user_turn(content);
-
-        assert_eq!(
-            history_content,
-            "[Image: sticker.webp attached]\n\nwhat is this?"
-        );
-        assert!(!history_content.contains("[IMAGE:data:"));
-        assert!(!history_content.contains("abcd"));
-    }
-
-    #[test]
-    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
-        let history_content =
-            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
-
-        assert_eq!(
-            history_content,
-            "[Image attachment processed by vision model]"
-        );
-    }
-
-    #[test]
-    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+    fn channel_history_preserves_image_marker_verbatim_across_followup() {
+        let img = "[IMAGE:/tmp/media/screenshot.png] wait look at this";
         let mut turns = vec![
-            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
-            ChatMessage::assistant("I saw the old image."),
-            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+            ChatMessage::user(img),
+            ChatMessage::assistant("\u{1f44d}"),
+            ChatMessage::user("can you see the screenshot?"),
         ];
 
-        strip_historical_image_payloads(&mut turns);
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
 
-        assert_eq!(turns.len(), 3);
-        assert!(turns[0].content.contains("[Image: old.png attached]"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("base64,old"));
+        assert_eq!(kept[0].content, img);
+        assert!(kept[0].content.contains("/tmp/media/screenshot.png"));
+        assert!(!kept[0].content.contains("processed by vision model"));
+    }
+
+    #[test]
+    fn channel_history_preserves_document_voice_and_text_verbatim() {
+        let doc = "[Document: report.pdf] /tmp/media/report.pdf summarize this";
+        let voice = "[Voice] what did i just send";
+        let text = "plain text with no markers";
+        let mut turns = vec![
+            ChatMessage::user(doc),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(voice),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(text),
+        ];
+
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
+
+        assert_eq!(kept[0].content, doc);
+        assert_eq!(kept[2].content, voice);
+        assert_eq!(kept[4].content, text);
+    }
+
+    #[test]
+    fn collapse_inline_image_payloads_drops_data_uri_keeps_path() {
+        let path_turn = "[IMAGE:/tmp/media/screenshot.png] can you see this?";
+        let data_turn = format!(
+            "[IMAGE:data:image/png;base64,{}] old screenshot",
+            "AQIDBAUGBwg".repeat(64)
+        );
+        let mut turns = vec![
+            ChatMessage::user(path_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(&data_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("[IMAGE:/tmp/media/current.png] and this?"),
+        ];
+
+        collapse_inline_image_payloads(&mut turns);
+
+        assert_eq!(turns[0].content, path_turn, "file-path marker must survive");
         assert!(
-            turns[2]
-                .content
-                .contains("[IMAGE:data:image/png;base64,current]")
+            !turns[2].content.contains("base64"),
+            "inline data payload must be collapsed"
+        );
+        assert!(turns[2].content.contains("old screenshot"));
+        assert_eq!(
+            turns[4].content, "[IMAGE:/tmp/media/current.png] and this?",
+            "current turn is never collapsed"
         );
     }
 
-    // ── E2E: photo [IMAGE:] marker rejected by non-vision model_provider ───
+    #[test]
+    fn strip_inline_data_image_markers_drops_bytes_keeps_path_marker_for_autosave() {
+        // The autosave path calls strip_inline_data_image_markers before
+        // storing to durable memory, so inline data: bytes never persist while
+        // re-loadable path markers and surrounding text survive.
+        let img_open = format!("[{}", "IMAGE:/tmp/shot.png]");
+        let payload = "AQIDBAUGBwg".repeat(64);
+        let data_marker = format!("[{}{payload}]", "IMAGE:data:image/png;base64,");
+        let content = format!("look at {img_open} and {data_marker} please");
+
+        let cleaned = strip_inline_data_image_markers(&content);
+
+        assert!(
+            !cleaned.contains("base64"),
+            "inline data bytes must be stripped before autosave: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("/tmp/shot.png"),
+            "re-loadable path marker must survive: {cleaned}"
+        );
+        assert!(cleaned.contains("look at") && cleaned.contains("please"));
+    }
 
     /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
     /// marker) sent through `process_channel_message` with a non-vision

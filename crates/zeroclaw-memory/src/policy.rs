@@ -195,4 +195,21 @@ mod tests {
             30
         );
     }
+
+    #[test]
+    fn namespace_quota_error_reports_current_and_max_counts() {
+        let policy = MemoryPolicyConfig {
+            max_entries_per_namespace: 3,
+            ..empty_policy()
+        };
+        let enforcer = PolicyEnforcer::new(&policy);
+
+        match enforcer.check_namespace_limit(3) {
+            Err(PolicyViolation::NamespaceQuotaExceeded { max, current }) => {
+                assert_eq!(max, 3);
+                assert_eq!(current, 3);
+            }
+            other => panic!("expected namespace quota exceeded, got {other:?}"),
+        }
+    }
 }

@@ -109,8 +109,8 @@ cli-cron-remove-about = Supprimer une tâche planifiée
 cli-cron-update-about = Mettre à jour un ou plusieurs champs d'une tâche planifiée existante
 cli-cron-pause-about = Mettre en pause une tâche planifiée
 cli-cron-resume-about = Reprendre une tâche en pause
-cli-auth-login-about = Se connecter avec OAuth (OpenAI Codex ou Gemini)
-cli-auth-refresh-about = Actualiser le jeton d'accès OpenAI Codex en utilisant le jeton d'actualisation
+cli-auth-login-about = Se connecter avec OAuth (OpenAI Codex, Gemini ou xAI)
+cli-auth-refresh-about = Actualiser le jeton d'accès OAuth avec le jeton d'actualisation
 cli-auth-logout-about = Supprimer le profil d'authentification
 cli-auth-use-about = Définir le profil actif pour un fournisseur
 cli-auth-list-about = Lister les profils d'authentification
@@ -351,6 +351,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = Vous n'êtes pas autorisé à utiliser cette commande ici.
 channel-discord-interaction-malformed = Commande inconnue ou mal formée.
 channel-discord-interaction-unavailable = Cette commande n'est plus disponible ou son entrée était vide.
+channel-discord-component-expired = Ce bouton ou ce menu a expiré ou a déjà été utilisé.
+channel-discord-approval-recorded = Votre décision a été enregistrée.
 channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
 channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
 channel-whatsapp-web-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} pièce jointe multimédia WhatsApp.)
@@ -623,7 +625,6 @@ cli-status-otp = {"  "}OTP activé :       {$v}
 cli-status-estop = {"  "}Arrêt d'urgence activé :    {$v}
 cli-status-peripherals-enabled = {"  "}Activé :   {$v}
 cli-status-boards = {"  "}Cartes :    {$v}
-cli-status-channel-not-compiled = 🚫 configuré, non compilé
 cli-status-word-enabled = activé
 cli-status-word-disabled = désactivé
 cli-status-word-yes = oui
@@ -633,6 +634,7 @@ cli-status-word-off = désactivé
 cli-status-word-none = (aucun)
 cli-status-word-configured = configuré
 cli-status-word-not-configured = non configuré
+cli-status-channel-not-compiled = 🚫 configuré, non compilé
 cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
 cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
 cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
@@ -641,7 +643,13 @@ cli-config-schema-current = La configuration est déjà à la version actuelle d
 cli-config-applied-ops = {$count} opération(s) appliquée(s) :
 cli-plugins-none = Aucun plugin installé.
 cli-plugins-installed = Plugins installés :
+cli-plugin-search-none = Aucun plugin ne correspond à '{$query}'.
+cli-plugin-search-results = Plugins correspondant à '{$query}' ({$count}) :
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (aucune description)
+cli-plugin-install-resolving = Résolution de '{$source}' depuis le registre de plugins...
 cli-plugin-installed-from = Plugin installé depuis {$source}
+cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.
 cli-plugin-legacy-detected = Remarque : les plugins situés à un emplacement hérité ({$path}) ne sont pas chargés par l'agent. Exécutez `zeroclaw plugin migrate` pour les déplacer vers {$target}.
@@ -679,6 +687,16 @@ cli-auth-active-for = Profil actif pour { $provider } : { $profile }
 cli-auth-refresh-ok = ✓ Actualisation du jeton OK (profil { $profile })
 cli-auth-removed = Profil d'authentification supprimé { $provider }:{ $profile }
 cli-auth-not-found = Profil d'authentification introuvable : { $provider }:{ $profile }
+cli-auth-xai-imported = Profil d'authentification xAI importé depuis { $path }
+cli-auth-xai-device-code-started = Connexion xAI par code d'appareil démarrée.
+cli-auth-oauth-visit = Visitez : { $uri }
+cli-auth-oauth-code = Code :  { $code }
+cli-auth-oauth-fast-link = Lien rapide : { $uri }
+cli-auth-xai-open-oauth-url = Ouvrez cette URL OAuth xAI dans votre navigateur et autorisez l'accès :
+cli-auth-callback-capture-failed = Échec de la capture du callback : { $error }
+cli-auth-run-paste-redirect = Exécutez `zeroclaw auth paste-redirect --model-provider { $provider } --profile { $profile }`
+cli-auth-xai-no-pending-login = Aucune connexion xAI en attente trouvée. Exécutez d'abord `zeroclaw auth login --model-provider xai`.
+cli-auth-paste-redirect-requires-input = paste-redirect requiert l'URL de redirection ou le code OAuth
 cli-locales-fetched = {"  "}récupéré {$name} -> {$path}
 cli-locales-skipped = {"  "}ignoré {$name} : absent en amont ({$path} ; essayé {$refs})
 cli-locales-installed = {$count} catalogue(s) installé(s) pour « {$locale} » dans {$dir}
@@ -707,11 +725,15 @@ cli-channels-build-hint = {"  "}Compilez depuis les sources avec `./install.sh -
 cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
 cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
 cli-channels-configure-hint = Pour configurer :      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = Modèle par défaut défini sur « { $model } » sur { $provider }.
+cli-models-status-current = Modèle par défaut : { $model } (fournisseur : { $provider })
+cli-models-status-none = Aucun modèle par défaut configuré.
 turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
 cli-alias-list-empty = (aucune entrée sous {$section})
@@ -733,6 +755,7 @@ cli-alias-delete-refused-hint = suppression refusée — résolvez d'abord les r
 cli-alias-not-configured = {$path} n'est pas configuré
 cli-alias-delete-failed = échec de la suppression : {$error}
 cli-alias-delete-reserved-default = l'agent `default` est réservé et ne peut pas être supprimé
+cli-alias-create-reserved-default = l'agent `default` est réservé et ne peut pas être créé
 cli-alias-renamed = {$section}.{$from} → {$section}.{$to} renommé ({$count} chemin(s) de référence réécrit(s))
 cli-alias-rename-invalid = nouvel alias invalide : {$message}
 cli-alias-rename-reserved = l'alias `{$alias}` est réservé et ne peut pas être renommé
@@ -753,23 +776,3 @@ cli-bundle-warn-archive = avertissement : échec de l'archivage du répertoire d
 cli-bundle-deleted = skill_bundles.{$alias} supprimé (retiré de {$count} agent(s))
 cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de bundle : {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
-cli-onboard-about = Initialiser votre espace de travail et votre configuration
-cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
-cli-memory-remove-about = Supprimer une entrée de mémoire par clé
-cli-note-show-about = Afficher un contenu de note par nom
-cli-note-update-about = Remplacer le contenu d'une note par son nom
-cli-prompt-list-about = Lister les invites disponibles
-cli-prompt-show-about = Montrer le contenu d'une invite par son nom
-cli-secret-get-about = Voir un secret
-cli-secret-list-about = Lister les secrets
-cli-secret-long-about =
-    Gérer les secrets chiffrés avec AES-256.
-
-    Lister, ajouter, mettre à jour, effacer et chiffrer les secrets stockés de manière sécurisée pour l'authentification et la configuration.
-
-    Exemples :
-    zeroclaw secret list
-    zeroclaw secret add OPENAI_API_KEY
-    zeroclaw secret update OPENAI_API_KEY
-    zeroclaw secret delete OPENAI_API_KEY
-    zeroclaw secret encrypt "chiffrer ce message"

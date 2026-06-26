@@ -1782,6 +1782,12 @@ pub struct LogsQueryParams {
     pub until_ts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until_id: Option<String>,
+    /// Byte offset cap passed back from the previous page's
+    /// `next_cursor_line_offset`. When set, the reader stops scanning
+    /// at this offset so the follow-up page only sees lines strictly
+    /// older than the previous one. Independent of id ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_line_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_min: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1804,7 +1810,18 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
+    /// `until_id` for older. Tie-breaks same-timestamp events by
+    /// lexicographic id, which can drop earlier-written events when id
+    /// order diverges from file insertion order. Prefer
+    /// [`Self::next_cursor_line_offset`] when available — it is
+    /// independent of id ordering.
     pub next_cursor: Option<(String, String)>,
+    /// Byte offset past the OLDEST event on the current page. Pass back
+    /// as [`LogsQueryParams::until_line_offset`] on the next request to
+    /// walk older pages deterministically regardless of id ordering.
+    /// `None` when the page is empty.
+    pub next_cursor_line_offset: Option<u64>,
     pub at_end: bool,
 }
 

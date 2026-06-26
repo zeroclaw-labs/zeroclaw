@@ -452,6 +452,7 @@ async fn handle_socket(
                 return;
             }
         };
+    agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
