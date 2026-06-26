@@ -45,6 +45,46 @@ pub enum ProviderCategory {
     Transcription,
 }
 
+/// Parse a map-keyed config section path into the alias kind whose rename or
+/// delete needs config-reference cascade handling.
+///
+/// The section path is the parent map path, not a concrete key path:
+/// `agents`, `providers.models.openai`, or `channels.discord`.
+#[must_use]
+pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
+    if path == "agents" {
+        return Some(AliasKind::Agent);
+    }
+
+    if let Some(rest) = path.strip_prefix("providers.") {
+        let (cat, family) = rest.split_once('.')?;
+        if family.is_empty() || family.contains('.') {
+            return None;
+        }
+        let category = match cat {
+            "models" => ProviderCategory::Models,
+            "tts" => ProviderCategory::Tts,
+            "transcription" => ProviderCategory::Transcription,
+            _ => return None,
+        };
+        return Some(AliasKind::Provider {
+            category,
+            family: family.to_string(),
+        });
+    }
+
+    if let Some(ty) = path.strip_prefix("channels.") {
+        if ty.is_empty() || ty.contains('.') {
+            return None;
+        }
+        return Some(AliasKind::Channel {
+            channel_type: ty.to_string(),
+        });
+    }
+
+    None
+}
+
 /// HARD = mandatory referrer; deleting the target invalidates config, so the
 /// delete must refuse. SOFT = removable; the delete scrubs the referrer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +613,71 @@ fn scrub_channel_refs(cfg: &mut Config, target: &str) {
 /// as a new alias of any kind by `validate_alias_key`'s leading-underscore rule,
 /// which `rename_map_key` enforces — no separate guard needed here.)
 const RESERVED_DEFAULT_AGENT: &str = "default";
+
+/// True iff `alias` is the reserved AGENT alias (the runtime fallback
+/// `default`). Renaming to or from it is refused (see [`rename_with_cascade`]),
+/// so letting the create surface author `agents.default` would leave the
+/// operator with an agent the rename guard then refuses to rename.
+/// [`create_map_key_checked`] uses this to refuse the create symmetrically.
+/// Reserved only for the agent kind (`default` is a free, conventional key for
+/// providers/channels/profiles).
+#[must_use]
+pub fn is_reserved_agent_alias(alias: &str) -> bool {
+    alias.trim() == RESERVED_DEFAULT_AGENT
+}
+
+/// Why a [`create_map_key_checked`] did not create the key.
+#[derive(Debug)]
+pub enum CreateError {
+    /// The key is the reserved alias for its section (the `default` agent).
+    Reserved(String),
+    /// The generated [`Config::create_map_key`] rejected the request: there is
+    /// no map-keyed section at `path`, or the key is invalid. Carries the reason.
+    Invalid(String),
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reserved(a) => write!(f, "alias `{a}` is reserved and cannot be created"),
+            Self::Invalid(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateError {}
+
+/// Create a new map key under `path`, refusing a reserved alias first, then
+/// delegating to the generated [`Config::create_map_key`] for the insert.
+///
+/// The reserved-agent rule (the `default` runtime fallback) is enforced HERE, at
+/// the shared config boundary, so every operator-facing create surface (the
+/// gateway config-write handlers, the RPC dispatch, and the alias CLI) inherits
+/// it from one place instead of each re-deriving it, which is how the guard would
+/// drift per surface. Set-prop auto-vivification (`PUT /api/config/prop`,
+/// `PATCH /api/config`, RPC `config/set`) is guarded in `ensure_map_key_for_path`
+/// with the same `is_reserved_agent_alias` predicate, so that path cannot
+/// materialize `agents.default` either.
+/// The operator quickstart-apply surface routes through this guard too. The only
+/// raw `create_map_key` writers left are non-operator paths that may legitimately
+/// write `agents.default`: env-override materialization (boot-time, from env
+/// vars) and the v1->v2 migration that synthesizes the fallback agent. Symmetric
+/// with
+/// [`rename_with_cascade`]'s reserved guard: rename refuses renaming to or from
+/// `default`, and this refuses creating it, so no surface can author an
+/// `agents.default` that the rename guard then traps. `create_map_key` still
+/// validates the key and reports an unknown section, surfaced here as
+/// [`CreateError::Invalid`].
+pub fn create_map_key_checked(
+    cfg: &mut Config,
+    path: &str,
+    key: &str,
+) -> Result<bool, CreateError> {
+    if path == "agents" && is_reserved_agent_alias(key) {
+        return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
+    }
+    cfg.create_map_key(path, key).map_err(CreateError::Invalid)
+}
 
 /// Outcome of a successful [`rename_with_cascade`].
 #[derive(Debug, Clone)]
@@ -2632,6 +2737,62 @@ mod tests {
         // nothing mutated
         assert!(cfg.agents.contains_key("default"));
         assert!(cfg.agents.contains_key("bot"));
+    }
+
+    #[test]
+    fn is_reserved_agent_alias_flags_only_default() {
+        // The shared create guard uses this to refuse `default` symmetrically
+        // with the rename guard (so no surface can author an undeletable agent).
+        assert!(is_reserved_agent_alias("default"));
+        assert!(is_reserved_agent_alias("  default  ")); // trims before comparing
+        assert!(!is_reserved_agent_alias("default2"));
+        assert!(!is_reserved_agent_alias("cronos"));
+        assert!(!is_reserved_agent_alias(""));
+    }
+
+    #[test]
+    fn create_map_key_checked_refuses_reserved_default_agent() {
+        let mut cfg = empty_config();
+        // The reserved `default` agent cannot be created, and nothing is
+        // inserted -- the create analogue of rename_default_agent_is_reserved.
+        let err = create_map_key_checked(&mut cfg, "agents", "default").unwrap_err();
+        assert!(matches!(err, CreateError::Reserved(_)));
+        assert!(!cfg.agents.contains_key("default"));
+        // A whitespace-padded variant is refused the same way.
+        assert!(matches!(
+            create_map_key_checked(&mut cfg, "agents", "  default  ").unwrap_err(),
+            CreateError::Reserved(_)
+        ));
+        // A non-reserved agent alias is created and persisted in memory.
+        assert!(create_map_key_checked(&mut cfg, "agents", "scout").unwrap());
+        assert!(cfg.agents.contains_key("scout"));
+        // Agent-scoped only: `default` is a free key for non-agent kinds, so the
+        // guard delegates rather than refusing it as reserved.
+        assert!(create_map_key_checked(&mut cfg, "providers.models.anthropic", "default").unwrap());
+        // An unknown section surfaces as Invalid, not Reserved.
+        assert!(matches!(
+            create_map_key_checked(&mut cfg, "not.a.real.section", "x").unwrap_err(),
+            CreateError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn ensure_map_key_for_path_refuses_reserved_default_agent() {
+        let mut cfg = empty_config();
+        // A set-prop on a nonexistent `agents.default` must NOT auto-vivify the
+        // reserved runtime-fallback agent, and signals the refusal (true) so the
+        // set-prop surface returns a reserved error (PUT /prop, PATCH, RPC set).
+        assert!(cfg.ensure_map_key_for_path("agents.default.enabled"));
+        assert!(!cfg.agents.contains_key("default"));
+        // A non-reserved agent IS vivified (not refused), as normal set-prop-on-new.
+        assert!(!cfg.ensure_map_key_for_path("agents.scout.enabled"));
+        assert!(cfg.agents.contains_key("scout"));
+        // An already-present `default` (e.g. migration-synthesized) is left intact
+        // and still configurable: the existence check returns false (not refused).
+        cfg.agents
+            .insert("default".to_string(), AliasedAgentConfig::default());
+        assert!(!cfg.ensure_map_key_for_path("agents.default.model"));
+        assert!(cfg.agents.contains_key("default"));
     }
 
     #[test]
