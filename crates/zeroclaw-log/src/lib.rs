@@ -44,7 +44,7 @@ pub use broadcast::{
     subscribe, subscribe_or_install,
 };
 pub use chain::display_chain;
-pub use config::{LogConfig, ResolvedPolicy, StoragePolicy, ToolIoPolicy};
+pub use config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StoragePolicy, ToolIoPolicy};
 pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
     Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,
@@ -76,10 +76,19 @@ pub use migrate::migrate_legacy_jsonl_in_place;
 pub use observer_bridge::{clear_observer_bridge, set_observer_bridge};
 pub use reader::{LogFilter, LogPage, current_log_path, find_event_by_id, load_page};
 pub use subscriber::{install_global_subscriber, try_install_capture_subscriber};
-pub use tool_io::{ToolIoCapture, capture_tool_input, capture_tool_output};
-pub use writer::{init_from_config, record_event, runtime_trace_path};
+pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
+pub use writer::{init_from_config, llm_request_payload_policy, record_event, runtime_trace_path};
 
 mod r#macro;
+
+/// Returns whether ZeroClaw DEBUG log events are enabled for the current
+/// subscriber. Use this before building expensive structured DEBUG attrs.
+pub fn debug_enabled() -> bool {
+    ::tracing::enabled!(
+        target: "zeroclaw_log_event",
+        ::tracing::Level::DEBUG
+    )
+}
 
 /// Test-only re-export of the writer-test mutex. Returns an opaque RAII
 /// guard so peer crates need not name `parking_lot`. Workspace crates

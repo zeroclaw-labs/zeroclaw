@@ -530,6 +530,42 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE session_metadata SET agent_alias = NULL WHERE agent_alias = ?1",
+                params![agent_alias],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(rows)
+    }
+
+    fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE session_metadata SET agent_alias = ?2 WHERE agent_alias = ?1",
+                params![from, to],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(rows)
+    }
+
+    fn count_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        // Mirror the `WHERE agent_alias = ?1` predicate `rename_agent_attribution`
+        // re-points, so the residue probe matches exactly what a resume moves.
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(count.max(0) as usize)
+    }
+
     /// Cheap existence probe used by the gateway to skip cancelled-append
     /// writes against a session the user just deleted (#7126). Mirrors the
     /// row that `delete_session` wipes — once the metadata row is gone the
@@ -1400,6 +1436,32 @@ mod tests {
         // Standalone getter also works.
         let alias = backend.get_session_agent_alias("s1").unwrap();
         assert_eq!(alias.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn rename_agent_attribution_repoints_only_matching_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hi")).unwrap();
+        backend.set_session_agent_alias("s1", "scout").unwrap();
+        backend.append("s2", &ChatMessage::user("yo")).unwrap();
+        backend.set_session_agent_alias("s2", "other").unwrap();
+
+        // Rename scout → ranger: the conversation history is kept and its
+        // attribution follows the renamed agent (contrast clear, which NULLs it).
+        let n = backend.rename_agent_attribution("scout", "ranger").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            backend.get_session_agent_alias("s1").unwrap().as_deref(),
+            Some("ranger")
+        );
+        // unrelated session untouched
+        assert_eq!(
+            backend.get_session_agent_alias("s2").unwrap().as_deref(),
+            Some("other")
+        );
+        // unknown source → 0
+        assert_eq!(backend.rename_agent_attribution("ghost", "x").unwrap(), 0);
     }
 
     #[test]

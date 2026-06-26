@@ -601,34 +601,13 @@ impl FileExplorerState {
 
 impl crate::widgets::HelpContext for FileExplorerState {
     fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::widgets::{HelpEntry as E, HelpNode};
+        use crate::widgets::HelpNode;
         if self.searching {
-            HelpNode::entries(vec![
-                E::key("Enter", "Confirm search"),
-                E::key("Esc", "Cancel search"),
-            ])
-        } else if self.dir_picker {
-            HelpNode::entries(vec![
-                E::new(vec!["j", "↓"], "Next entry"),
-                E::new(vec!["k", "↑"], "Prev entry"),
-                E::key("Enter", "Open directory"),
-                E::key("c", "Choose this directory"),
-                E::key("Backspace", "Parent dir"),
-                E::key("/", "Search"),
-                E::key(".", "Toggle hidden"),
-                E::new(vec!["q", "Esc"], "Cancel"),
-            ])
+            HelpNode::entries(crate::help::help_entries::<
+                crate::keymap::FileExplorerSearchAction,
+            >())
         } else {
-            HelpNode::entries(vec![
-                E::new(vec!["j", "↓"], "Next entry"),
-                E::new(vec!["k", "↑"], "Prev entry"),
-                E::key("Enter", "Open dir / confirm"),
-                E::key("Space", "Select file"),
-                E::key("Backspace", "Parent dir"),
-                E::key("/", "Search"),
-                E::key(".", "Toggle hidden"),
-                E::new(vec!["q", "Esc"], "Cancel"),
-            ])
+            HelpNode::entries(crate::help::help_entries::<crate::keymap::FileExplorerAction>())
         }
     }
 }

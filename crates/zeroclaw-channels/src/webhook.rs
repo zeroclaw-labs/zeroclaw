@@ -499,6 +499,15 @@ impl Channel for WebhookChannel {
         // In practice, once listen() starts the server is running.
         true
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No back-channel to a generic webhook client for a typing signal.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

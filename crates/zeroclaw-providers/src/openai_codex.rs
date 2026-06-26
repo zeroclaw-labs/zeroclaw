@@ -1275,6 +1275,7 @@ impl OpenAiCodexModelProvider {
         let creds = self.resolve_credentials().await?;
         let normalized_model = normalize_model_id(model);
 
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let has_tools = tools.is_some();
         let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
@@ -1297,6 +1298,23 @@ impl OpenAiCodexModelProvider {
             tool_choice: has_tools.then(|| "auto".to_string()),
             parallel_tool_calls: has_tools.then_some(true),
         };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai_codex",
+                        "alias": &self.alias,
+                        "request_api": WIRE_API,
+                        "model": &request.model,
+                        "stream": true,
+                        "tools_count": tools_count,
+                        "tool_choice": request.tool_choice.as_deref(),
+                        "parallel_tool_calls": request.parallel_tool_calls,
+                    })),
+                "openai codex responses provider request prepared"
+            );
+        }
 
         let request_builder = self.responses_request_builder(
             &creds.bearer_token,
@@ -1503,6 +1521,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             let (instructions, input) = build_responses_input(&prepared.messages);
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools.is_some();
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
@@ -1525,6 +1544,23 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 tool_choice: has_tools.then(|| "auto".to_string()),
                 parallel_tool_calls: has_tools.then_some(true),
             };
+            if ::zeroclaw_log::debug_enabled() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "openai_codex",
+                            "alias": &provider.alias,
+                            "request_api": WIRE_API,
+                            "model": &request.model,
+                            "stream": true,
+                            "tools_count": tools_count,
+                            "tool_choice": request.tool_choice.as_deref(),
+                            "parallel_tool_calls": request.parallel_tool_calls,
+                        })),
+                    "openai codex responses streaming provider request prepared"
+                );
+            }
 
             let request_builder = provider
                 .responses_request_builder(
