@@ -153,3 +153,103 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::case::TraceExpects;
+    use crate::record::RunRecord;
+
+    fn run(resp: &str, tools: &[&str], all_ok: bool) -> RunRecord {
+        RunRecord {
+            final_response: resp.to_string(),
+            history: Vec::new(),
+            tools_called: tools.iter().map(|s| s.to_string()).collect(),
+            all_tools_succeeded: all_ok,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn empty_expectations_produce_no_results() {
+        let out = evaluate_expects(&TraceExpects::default(), &run("hi", &[], true));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn response_contains_passes_and_fails() {
+        let expects = TraceExpects {
+            response_contains: vec!["hello".to_string(), "missing".to_string()],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &run("hello world", &[], true));
+        assert_eq!(out.len(), 2);
+        assert!(out[0].passed);
+        assert_eq!(out[0].check, r#"response_contains("hello")"#);
+        assert!(!out[1].passed);
+    }
+
+    #[test]
+    fn response_not_contains_inverts_the_check() {
+        let expects = TraceExpects {
+            response_not_contains: vec!["secret".to_string(), "world".to_string()],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &run("hello world", &[], true));
+        assert!(out[0].passed); // "secret" absent -> pass
+        assert!(!out[1].passed); // "world" present -> fail
+    }
+
+    #[test]
+    fn tools_used_and_not_used_are_evaluated_in_order() {
+        let expects = TraceExpects {
+            tools_used: vec!["search".to_string(), "absent".to_string()],
+            tools_not_used: vec!["danger".to_string(), "search".to_string()],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &run("", &["search", "read"], true));
+        assert!(out[0].passed); // tools_used("search") -> called
+        assert!(!out[1].passed); // tools_used("absent") -> not called
+        assert!(out[2].passed); // tools_not_used("danger") -> not called
+        assert!(!out[3].passed); // tools_not_used("search") -> called
+    }
+
+    #[test]
+    fn max_tool_calls_is_inclusive() {
+        let expects = TraceExpects {
+            max_tool_calls: Some(2),
+            ..Default::default()
+        };
+        assert!(evaluate_expects(&expects, &run("", &["a", "b"], true))[0].passed);
+        assert!(!evaluate_expects(&expects, &run("", &["a", "b", "c"], true))[0].passed);
+    }
+
+    #[test]
+    fn all_tools_succeeded_matches_expected_value() {
+        let want_true = TraceExpects {
+            all_tools_succeeded: Some(true),
+            ..Default::default()
+        };
+        assert!(evaluate_expects(&want_true, &run("", &[], true))[0].passed);
+        assert!(!evaluate_expects(&want_true, &run("", &[], false))[0].passed);
+
+        let want_false = TraceExpects {
+            all_tools_succeeded: Some(false),
+            ..Default::default()
+        };
+        assert!(evaluate_expects(&want_false, &run("", &[], false))[0].passed);
+    }
+
+    #[test]
+    fn response_matches_regex_and_reports_invalid_pattern() {
+        let expects = TraceExpects {
+            response_matches: vec!["^h.*o$".to_string(), "(unclosed".to_string()],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &run("hello", &[], true));
+        assert!(out[0].passed); // matches ^h.*o$
+        assert!(!out[1].passed); // invalid regex -> fail, not a panic
+        assert!(out[1].detail.contains("invalid regex"));
+    }
+}
