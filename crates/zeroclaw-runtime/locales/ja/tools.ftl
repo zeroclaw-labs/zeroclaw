@@ -2,10 +2,32 @@ tool-backup = ワークスペースバックアップの作成、一覧表示、
 tool-browser = プラグイン可能なバックエンド（agent-browser、rust-native、computer_use）を使用したWeb/ブラウザオートメーション。DOMアクションに加えて、オプションのOSレベルアクション（mouse_move、mouse_click、mouse_drag、key_type、key_press、screen_capture）をコンピュータユースサイドカー経由でサポート。'snapshot'を使用して対話的要素をref（@e1、@e2）にマップします。openアクション向けにbrowser.allowed_domainsを強制します。
 tool-browser-delegate = ブラウザ対応CLIへのブラウザベースのタスクの委譲。Teams、Outlook、Jira、Confluenceなどのウェブアプリケーションと相互作用するため
 tool-browser-open = 承認されたHTTPS URLをシステムブラウザで開く。セキュリティ制約：許可リストのみのドメイン、ローカル/プライベートホストなし、スクレイピングなし。
+tool-channel-room = アクティブなチャンネルを通じてルームを作成し、ユーザーを招待します。'matrix.default' などのチャンネルキー、アクション 'create_room' または 'invite_user'、およびアクション固有のルームフィールドを指定してください。
+tool-channel-room-param-action = 実行するルーム管理アクション。
+tool-channel-room-param-channel = 'matrix.default' などのアクティブなチャンネルキー。
+tool-channel-room-param-name = create_room 用のオプションのルーム名。
+tool-channel-room-param-topic = create_room 用のオプションのルームトピック。
+tool-channel-room-param-invites = ルーム作成時に招待するオプションのユーザーID。
+tool-channel-room-param-visibility = create_room 用のオプションのルームの可視性。
+tool-channel-room-param-encryption = create_room 中にルーム暗号化を要求するかどうか。
+tool-channel-room-param-room-id = invite_user 用の既存のルームID。
+tool-channel-room-param-user-id = invite_user で招待するユーザーID。
+tool-channel-room-error-security = アクションがブロックされました: { $err }
+tool-channel-room-error-invalid-action = 無効なアクション '{ $action }': 'create_room' または 'invite_user' である必要があります。
+tool-channel-room-error-not-initialized = 利用可能なチャンネルがまだありません(チャンネルが初期化されていません)。
+tool-channel-room-error-channel-not-found = チャンネル '{ $channel }' が見つかりません。利用可能なチャンネル: { $available }
+tool-channel-room-error-create-failed = ルームの作成に失敗しました: { $err }
+tool-channel-room-error-invite-failed = ユーザーの招待に失敗しました: { $err }
+tool-channel-room-error-invites-array = 'invites' は文字列の配列である必要があります。
+tool-channel-room-error-invites-item = 'invites' は空でない文字列の配列である必要があります。
+tool-channel-room-error-invalid-visibility = 無効なルームの可視性: { $err }
+tool-channel-room-error-missing-param = '{ $param }' パラメータがありません。
+tool-channel-room-error-string-param = '{ $param }' は文字列である必要があります。
+tool-channel-room-error-bool-param = '{ $param }' はブール値である必要があります。
 tool-cloud-ops = クラウド変換アドバイザリーツール。IaCプランを分析し、マイグレーションパスを評価し、コストをレビューし、Well-Architected Frameworkの柱に対してアーキテクチャをチェックします。読み取り専用：クラウドリソースを作成または変更しません。
 tool-cloud-patterns = クラウドパターンライブラリ。ワークロード説明を指定すると、適用可能なクラウドネイティブアーキテクチャパターン（コンテナ化、サーバーレス、データベース現代化など）を提案します。
 tool-composio = Composio経由で1000以上のアプリ（Gmail、Notion、GitHub、Slack等）でアクションを実行します。action='list'で利用可能なアクション（パラメータ名を含む）を確認します。action='execute'でaction_name/tool_slugとparamsを指定して実行します。正確なparamsが不確実な場合は、'text'に自然言語の説明を記述してください（Composioが正しいパラメータをNLPで解決します）。action='list_accounts'またはaction='connected_accounts'でOAuth接続アカウントを一覧表示します。action='connect'でapp/auth_config_idを指定するとOAuth URLが取得できます。connected_account_idは省略すると自動解決されます。
-tool-content-search = ワークスペース内のregexパターンでファイルコンテンツを検索します。ripgrep（rg）をサポート、フォールバックとしてgrepを使用。出力モード：'content'（マッチ行とコンテキスト）、'files_with_matches'（ファイルパスのみ）、'count'（ファイルごとのマッチ数）。例：pattern='fn main'、include='*.rs'、output_mode='content'。
+tool-content-search = ワークスペース内のregexパターンでファイルコンテンツを検索します。ripgrep（rg）をサポートし、grepまたは内部検索をフォールバックとして使用。出力モード：'content'（マッチ行とコンテキスト）、'files_with_matches'（ファイルパスのみ）、'count'（ファイルごとのマッチ数）。例：pattern='fn main'、include='*.rs'、output_mode='content'。
 tool-cron-add = cron/at/everyスケジュール付きのスケジュール済みcronジョブ（シェルまたはエージェント）を作成します。job_type='agent'でPromptを使用してAIエージェントをスケジュール実行します。出力をチャネル（Discord、Telegram、Slack、Mattermost、Matrix）に配信するには、delivery={"{"}"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"{"}"}を設定します。これは、チャネル経由でユーザーにスケジュール/遅延メッセージを送信するための推奨ツールです。
 tool-cron-list = すべてのスケジュール済みcronジョブを一覧表示
 tool-cron-remove = IDでcronジョブを削除
@@ -50,7 +72,7 @@ tool-hardware-memory-read = USBを経由してNucleoから実際のメモリ/レ
 tool-http-request = 外部APIにHTTPリクエストを送信します。GET、POST、PUT、DELETE、PATCH、HEAD、OPTIONSメソッドをサポート。セキュリティ制約：許可リストのみのドメイン、ローカル/プライベートホストなし、設定可能なタイムアウトとレスポンスサイズ制限。
 tool-image-info = イメージファイルメタデータ（フォーマット、寸法、サイズ）を読み込み、オプションで基数64エンコード済みデータを返す。
 tool-jira = Jiraと相互作用：設定可能な詳細レベルでチケットを取得、JQLで問題を検索、メンション書式付きコメントを追加。
-tool-knowledge = アーキテクチャ決定、ソリューションパターン、経験、専門家の知識グラフを管理します。アクション：capture、search、relate、suggest、expert_find、lessons_extract、graph_stats。
+tool-knowledge = アーキテクチャ決定、ソリューションパターン、経験、専門家、関係リンクの知識グラフを管理します。
 tool-linkedin = LinkedInを管理：投稿作成、投稿一覧、コメント、リアクション、投稿削除、エンゲージメント表示、プロフィール情報取得、設定されたコンテンツ戦略の読み込み。.envファイルにLINKEDIN_*認証情報が必要。
 tool-discord-search = discord.dbに保存されたDiscordメッセージ履歴を検索します。過去のメッセージを検索したり、チャネルアクティビティを要約したり、ユーザーが何を言ったかを調べるために使用します。キーワード検索とオプショナルフィルタをサポート：channel_id、since、until。
 tool-memory-forget = キーでメモリを削除します。古い情報や機密データを削除する場合に使用。メモリが見つかったかどうか、削除されたかどうかを返します。

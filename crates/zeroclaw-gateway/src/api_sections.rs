@@ -410,6 +410,9 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 group: section_group(&key).to_string(),
                 is_quickstart: wizard.is_some(),
                 shape: wizard.map(zeroclaw_config::sections::Section::shape),
+                cost_category: zeroclaw_config::schema::cost_category_for_provider_section(&key)
+                    .unwrap_or_default()
+                    .to_string(),
                 key,
             }
         })
@@ -566,11 +569,7 @@ fn picker_items_for(
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
-        Section::Tunnel => PickerDispatch::Items(schema_walk_picker_with_none(
-            cfg,
-            "tunnel",
-            "tunnel.tunnel-provider",
-        )),
+        Section::Tunnel => PickerDispatch::Items(tunnel_provider_picker(cfg)),
         Section::Agents => PickerDispatch::Items(agents_picker(cfg)),
         // Storage is two-tier (`storage.<kind>.<alias>`) — same shape
         // and walker as channels and the typed-provider families.
@@ -888,15 +887,21 @@ fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> 
     aliases.first().map(|alias| (*alias).clone())
 }
 
-/// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
-/// `none` entry at the top, marked active when the current `tunnel.tunnel_provider`
-/// matches. Mirrors the TUI's tunnel section.
-fn schema_walk_picker_with_none(
-    cfg: &zeroclaw_config::schema::Config,
-    section: &str,
-    active_prop_path: &str,
-) -> Vec<PickerItem> {
-    let active = cfg.get_prop(active_prop_path).unwrap_or_default();
+/// `tunnel`-flavored picker: synthetic `none` entry first, then every
+/// statically-known option-backed provider from `TunnelConfig`'s
+/// `#[nested] Option<T>` fields. The provider set is sourced from the
+/// schema's own metadata via `nested_option_entries()` rather than
+/// `schema_walk_picker` / `map_key_sections()` — those only enumerate
+/// HashMap-typed sub-sections, so on a fresh config (where every
+/// `Option<Tunnel>` is `None`) the picker would only ever show `none`
+/// and hide every real provider. `nested_option_entries()` reports the
+/// full static catalog with the `is_some()` snapshot, so we get the
+/// closed-kind list without depending on configured state.
+fn tunnel_provider_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    // The canonical prop name uses an underscore (`tunnel_provider`); the
+    // hyphenated form is unknown to get_prop and silently yields "" (no active
+    // provider ever badged).
+    let active = cfg.get_prop("tunnel.tunnel_provider").unwrap_or_default();
     let mut items = vec![PickerItem {
         key: "none".to_string(),
         label: "none".to_string(),
@@ -907,14 +912,25 @@ fn schema_walk_picker_with_none(
             None
         },
     }];
-    let mut rest = schema_walk_picker(cfg, section);
-    // Re-mark the active one in the schema-walk results.
-    for item in &mut rest {
-        if item.key == active {
-            item.badge = Some("active".to_string());
-        }
+    for entry in cfg.tunnel.nested_option_entries() {
+        let badge = if entry.field == active {
+            Some("active".to_string())
+        } else if entry.present {
+            Some("configured".to_string())
+        } else {
+            None
+        };
+        items.push(PickerItem {
+            key: entry.field.to_string(),
+            label: entry.display_name.to_string(),
+            description: if entry.description.is_empty() {
+                None
+            } else {
+                Some(entry.description.to_string())
+            },
+            badge,
+        });
     }
-    items.extend(rest);
     items
 }
 
@@ -1051,23 +1067,38 @@ pub async fn handle_section_select(
         | Section::RiskProfiles
         | Section::RuntimeProfiles => {
             // OneTierAliasMap: the URL path key IS the alias. One
-            // `create_map_key("<section>", &key)` call works for every
+            // `create_map_key_checked("<section>", &key)` call works for every
             // operator-named HashMap section; create_map_key is
             // idempotent, so selecting an existing alias just returns
-            // the form prefix without modifying anything.
+            // the form prefix without modifying anything. Routing through the
+            // shared guarded boundary refuses the reserved `default` agent here
+            // too (this is the second operator create surface alongside
+            // `handle_map_key`), and delegates unchanged for every other section.
             let section_key = section_enum.as_str();
-            let created = working.create_map_key(section_key, &key).map_err(|msg| {
-                error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::PathNotFound,
-                        format!("could not select {section_key} alias `{key}`: {msg}"),
-                    )
-                    .with_path(section_key),
-                )
-            });
-            let created = match created {
+            let created = match zeroclaw_config::alias_refs::create_map_key_checked(
+                &mut working,
+                section_key,
+                &key,
+            ) {
                 Ok(c) => c,
-                Err(resp) => return resp,
+                Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            format!("alias `{a}` is reserved and cannot be created"),
+                        )
+                        .with_path(format!("{section_key}.{key}")),
+                    );
+                }
+                Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::PathNotFound,
+                            format!("could not select {section_key} alias `{key}`: {msg}"),
+                        )
+                        .with_path(section_key),
+                    );
+                }
             };
             // Agents need a per-alias workspace dir on disk so the
             // PersonalityEditor and the runtime have somewhere to read
@@ -1136,13 +1167,13 @@ pub async fn handle_section_select(
             ("memory".to_string(), true)
         }
         Section::Tunnel => {
-            if let Err(e) = working.set_prop_persistent("tunnel.tunnel-provider", &key) {
+            if let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key) {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
-                        format!("could not set tunnel.tunnel-provider = `{key}`: {e}"),
+                        format!("could not set tunnel.tunnel_provider = `{key}`: {e}"),
                     )
-                    .with_path("tunnel.tunnel-provider"),
+                    .with_path("tunnel.tunnel_provider"),
                 );
             }
             let prefix = if key == "none" {
@@ -1372,6 +1403,80 @@ mod tests {
         zeroclaw_config::schema::Config::default()
     }
 
+    fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        AppState {
+            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
+            model: "test-model".to_string(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: std::sync::Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    memory,
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                false,
+                &[],
+            )),
+            trust_forwarded_headers: false,
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
+                std::time::Duration::from_secs(300),
+                1000,
+            )),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: std::sync::Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: std::sync::Arc::new(crate::sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
     #[test]
     fn handle_sections_derives_every_top_level_field_from_schema() {
         // Regression: the section list must be schema-driven, not the old
@@ -1583,13 +1688,136 @@ mod tests {
     #[test]
     fn tunnel_picker_includes_synthetic_none() {
         let cfg = empty_cfg();
-        let items = schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.tunnel-provider");
+        let items = tunnel_provider_picker(&cfg);
         assert_eq!(
             items[0].key, "none",
             "`none` must be the first entry in the tunnel picker"
         );
         // `none` is the active default for a fresh config.
         assert_eq!(items[0].badge.as_deref(), Some("active"));
+    }
+
+    /// Regression for zeroclaw-labs/zeroclaw#7876: on a fresh config
+    /// every option-backed tunnel provider must appear alongside the
+    /// synthetic `none` entry — the picker sources providers from
+    /// `TunnelConfig::nested_option_entries()` rather than
+    /// `schema_walk_picker` / `map_key_sections()` (which only see
+    /// HashMap-typed sub-sections and therefore return zero providers
+    /// when every `Option<Tunnel>` is `None`).
+    #[test]
+    fn tunnel_picker_surfaces_all_option_backed_providers_on_fresh_config() {
+        let cfg = empty_cfg();
+        let items = tunnel_provider_picker(&cfg);
+        let keys: std::collections::BTreeSet<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        for required in [
+            "none",
+            "cloudflare",
+            "tailscale",
+            "ngrok",
+            "openvpn",
+            "pinggy",
+            "custom",
+        ] {
+            assert!(
+                keys.contains(required),
+                "tunnel picker on a fresh config must include `{required}`; got: {:?}",
+                keys.into_iter().collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// When a tunnel provider is configured, its picker entry is badged
+    /// `active` and the rest stay unbadged.
+    #[test]
+    fn tunnel_picker_marks_active_provider_from_configured_section() {
+        let mut cfg = empty_cfg();
+        // Persist `tailscale` as the active provider. The Option<T> field
+        // stays None — only `tunnel.tunnel_provider` is what marks
+        // "active" in the picker. The provider is statically known from
+        // the schema regardless of the Option being Some/None.
+        // Set the active-provider field directly; the picker reads it via
+        // get_prop. Avoids writing the developer's real config in the test.
+        cfg.tunnel.tunnel_provider = "tailscale".to_string();
+        let items = tunnel_provider_picker(&cfg);
+        let active: Vec<&str> = items
+            .iter()
+            .filter(|i| i.badge.as_deref() == Some("active"))
+            .map(|i| i.key.as_str())
+            .collect();
+        assert_eq!(
+            active,
+            vec!["tailscale"],
+            "exactly one entry should be active after setting `tunnel.tunnel_provider = tailscale`"
+        );
+        assert_eq!(
+            items[0].key, "none",
+            "`none` is still the first picker entry even when another provider is active"
+        );
+    }
+
+    /// When an `Option<Tunnel>` is `Some(_)`, its picker entry is badged
+    /// `configured` (independent of `tunnel.tunnel_provider`). This is
+    /// the parallel of `schema_walk_picker`'s HashMap "configured" badge
+    /// — same UX cue, sourced from the schema's `is_some()` snapshot.
+    #[test]
+    fn tunnel_picker_badges_present_option_fields_as_configured() {
+        let mut cfg = empty_cfg();
+        cfg.tunnel.tunnel_provider = "cloudflare".to_string();
+        // Materialize the cloudflare nested Option directly so the picker sees
+        // it as present, without writing the developer's real config.
+        cfg.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig::default());
+        let items = tunnel_provider_picker(&cfg);
+        let cloudflare = items
+            .iter()
+            .find(|i| i.key == "cloudflare")
+            .expect("cloudflare should appear in the picker");
+        assert_eq!(
+            cloudflare.badge.as_deref(),
+            Some("active"),
+            "cloudflare is the active provider"
+        );
+        // `tailscale` is statically known but the user hasn't configured
+        // it — its Option is still None, so no badge.
+        let tailscale = items
+            .iter()
+            .find(|i| i.key == "tailscale")
+            .expect("tailscale should appear in the picker");
+        assert!(
+            tailscale.badge.is_none(),
+            "tailscale's Option is None, so no badge; got: {:?}",
+            tailscale.badge
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_select_updates_canonical_provider_and_active_picker_badge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let state = section_test_state(cfg);
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let cfg = state.config.read().clone();
+        assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        let items = tunnel_provider_picker(&cfg);
+        let cloudflare = items
+            .iter()
+            .find(|item| item.key == "cloudflare")
+            .expect("cloudflare should appear in the picker");
+        assert_eq!(cloudflare.badge.as_deref(), Some("active"));
     }
 
     /// Empty OneTierAliasMap section yields zero picker items. No
