@@ -444,6 +444,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     })];
     let mut history = vec![ChatMessage::user("hi")];
     let (dtx, mut drx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         exec: crate::agent::loop_::ResolvedAgentExecution {
             model_access: crate::agent::loop_::ResolvedModelAccess {
@@ -486,6 +487,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
         ingress: IngressContext::internal(),
+        agent_alias: None,
+        turn_id: &turn_id,
     })
     .await
     .expect("loop should succeed");
@@ -838,6 +841,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         seen: Arc::clone(&seen),
     })];
     let mut history = vec![ChatMessage::user("probe")];
+    let turn_id = uuid::Uuid::new_v4().to_string();
     crate::agent::loop_::scope_thread_id(
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
@@ -883,6 +887,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
                 ingress: IngressContext::internal(),
+                agent_alias: None,
+                turn_id: &turn_id,
             })
             .await
         }),

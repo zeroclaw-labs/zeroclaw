@@ -7,7 +7,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 mod registry;
-pub use registry::DaemonRegistry;
+pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -172,12 +172,17 @@ async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::Atom
 }
 
 pub async fn run(
-    config: Config,
+    mut config: Config,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
     ephemeral: bool,
 ) -> Result<DaemonExit> {
+    config.gateway.host = host.clone();
+    if port != 0 {
+        config.gateway.port = port;
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -207,6 +212,7 @@ pub async fn run(
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
@@ -217,7 +223,10 @@ pub async fn run(
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
-        let gateway_reload_tx = reload_tx.clone();
+        let gateway_reload_controls = GatewayReloadControls {
+            shutdown_tx: gateway_shutdown_tx.clone(),
+            reload_tx: reload_tx.clone(),
+        };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
@@ -228,15 +237,59 @@ pub async fn run(
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
-                let reload = gateway_reload_tx.clone();
+                let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload), Some(tui_reg)).await }
+                async move {
+                    start(
+                        host,
+                        port,
+                        cfg,
+                        Some(tx),
+                        Some(reload_controls),
+                        Some(tui_reg),
+                    )
+                    .await
+                }
             },
         ));
     }
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
+
+    // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
+    // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
+    // before channels so a delegating turn finds the plane live. Best-effort and
+    // additive: on failure the plane stays absent and every producer runs as today.
+    //
+    // `daemon::run` is re-entered on every reload. The handle is installed ONCE (an
+    // OnceLock), so producers and the reaper always agree on one `boot_id`. We therefore
+    // only START on first boot; on reload we reuse the installed handle and just respawn
+    // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
+    // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
+    // would then reap the daemon's OWN live tasks as "prior-boot orphans".
+    if crate::control_plane::control_plane().is_none()
+        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+            .await
+            .map(crate::control_plane::init_control_plane)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+            "control-plane failed to start; supervision disabled for this run"
+        );
+    }
+    // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
+    // boot_id matches what producers stamp via `control_plane()`.
+    if let Some(handle) = crate::control_plane::control_plane() {
+        handle.spawn_reaper(
+            crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            channels_cancel.clone(),
+        );
+        crate::health::mark_component_ok("control-plane");
+    }
 
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
@@ -340,6 +393,7 @@ pub async fn run(
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
+                Some(&config.providers.models),
             ) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
@@ -386,6 +440,7 @@ pub async fn run(
             ),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
+            gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
@@ -871,14 +926,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
-        // Create memory once per tick for recall + consolidation.
+        // Create memory once per tick for recall + consolidation. Use the
+        // routes-aware factory with the provider catalog so `[[embedding_routes]]`
+        // (and dotted `model_provider` refs) resolve here exactly as on the
+        // gateway/RPC paths — otherwise heartbeat recall would silently fall
+        // back to keyword-only for hint-routed embeddings.
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
                 &config.data_dir,
                 config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
+                Some(&config.providers.models),
             )
             .ok();
 
@@ -1972,11 +2034,15 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_tx, tui_registry| {
+            move |host, port, config, event_tx, reload_controls, tui_registry| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
-                    let has_reload_tx = reload_tx.is_some();
+                    let has_gateway_shutdown_tx = reload_controls.is_some();
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let has_reload_tx = !reload_tx.is_closed();
                     let has_tui_registry = tui_registry.is_some();
                     seen_tx
                         .send((
@@ -1984,14 +2050,12 @@ mod tests {
                             port,
                             config.data_dir.clone(),
                             has_event_tx,
+                            has_gateway_shutdown_tx,
                             has_reload_tx,
                             has_tui_registry,
                         ))
                         .expect("record gateway starter inputs");
-                    reload_tx
-                        .expect("daemon should pass reload sender to gateway starter")
-                        .send(true)
-                        .expect("send reload signal");
+                    reload_tx.send(true).expect("send reload signal");
                     std::future::pending::<Result<()>>().await
                 })
             },
@@ -2006,13 +2070,22 @@ mod tests {
         .expect("daemon run should succeed");
 
         assert_eq!(exit, DaemonExit::Reload);
-        let (host, port, data_dir, has_event_tx, has_reload_tx, has_tui_registry) = seen_rx
+        let (
+            host,
+            port,
+            data_dir,
+            has_event_tx,
+            has_gateway_shutdown_tx,
+            has_reload_tx,
+            has_tui_registry,
+        ) = seen_rx
             .try_recv()
             .expect("gateway starter should record its daemon inputs");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 4242);
         assert_eq!(data_dir, expected_data_dir);
         assert!(has_event_tx);
+        assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
     }

@@ -9,6 +9,7 @@ use super::events::{StreamDelta, emit_tool_call_pair};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
+use anyhow::Result;
 use std::collections::HashSet;
 use std::time::Duration;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
@@ -26,19 +27,68 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) executable_calls: Vec<ParsedToolCall>,
 }
 
+fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
+    let canonical_args = canonicalize_json_for_tool_signature(tool_args);
+    let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
+    (tool_name.trim().to_ascii_lowercase(), args_json)
+}
+
+async fn record_duplicate_tool_call(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    iteration: usize,
+) -> ToolExecutionOutcome {
+    let duplicate =
+        format!("Skipped duplicate tool call '{tool_name}' with identical arguments in this turn.");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": tool_name,
+                "arguments": scrub_credentials(&tool_args.to_string()),
+                "result": duplicate,
+                "deduplicated": true,
+                "trace_id": ctx.turn_id,
+            })),
+        "tool_call_result"
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(format!(
+                "\u{274c} {}: {}\n",
+                tool_name, duplicate
+            )))
+            .await;
+    }
+    ToolExecutionOutcome {
+        output: duplicate.clone(),
+        success: false,
+        error_reason: Some(duplicate),
+        duration: Duration::ZERO,
+        receipt: None,
+    }
+}
+
 /// Run per-call preparation over this round's parsed tool calls (upstream
 /// loop body, per-call prep loop).
 pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
+    prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
     dedup_enabled: bool,
-) -> PreparedToolCalls {
+) -> Result<PreparedToolCalls> {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
         // ── Hook: before_tool_call (modifying) ──────────
@@ -109,6 +159,51 @@ pub(crate) async fn prepare_tool_calls(
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
 
+        let requires_prompt = ctx
+            .approval
+            .map(|mgr| mgr.needs_approval(&tool_name))
+            .unwrap_or(false);
+        let reentrant_agent_tool =
+            crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
+        if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
+            let prompt_signature = tool_call_signature(&tool_name, &tool_args);
+            if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
+                let duplicate =
+                    record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
+                continue;
+            }
+            if !prompt_approval_tool_signatures.insert(prompt_signature) {
+                let repeated = format!(
+                    "Agent loop aborted: repeated prompt-required tool call '{tool_name}' with identical arguments before approval."
+                );
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model": ctx.model,
+                            "iteration": iteration + 1,
+                            "tool": tool_name.clone(),
+                            "arguments": scrub_credentials(&tool_args.to_string()),
+                            "result": repeated,
+                            "trace_id": ctx.turn_id,
+                        })),
+                    "tool_call_result"
+                );
+                if let Some(tx) = ctx.on_delta {
+                    let _ = tx
+                        .send(StreamDelta::Status(format!(
+                            "\u{274c} {}: {}\n",
+                            tool_name, repeated
+                        )))
+                        .await;
+                }
+                anyhow::bail!("{repeated}");
+            }
+        }
+
         // ── Approval hook ────────────────────────────────
         let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
             ApprovalGateOutcome::Proceed { approved } => approved,
@@ -126,53 +221,13 @@ pub(crate) async fn prepare_tool_calls(
         };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
-        let signature = {
-            let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
-            let args_json =
-                serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
-            (tool_name.trim().to_ascii_lowercase(), args_json)
-        };
-        let dedup_exempt = ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name)
-            || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
+        let signature = tool_call_signature(&tool_name, &tool_args);
+        let dedup_exempt =
+            ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name) || reentrant_agent_tool;
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
-            let duplicate = format!(
-                "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
-            );
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": ctx.model,
-                        "iteration": iteration + 1,
-                        "tool": tool_name.clone(),
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "result": duplicate,
-                        "deduplicated": true,
-                        "trace_id": ctx.turn_id,
-                    })),
-                "tool_call_result"
-            );
-            if let Some(tx) = ctx.on_delta {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{274c} {}: {}\n",
-                        tool_name, duplicate
-                    )))
-                    .await;
-            }
-            ordered_results[idx] = Some((
-                tool_name.clone(),
-                call.tool_call_id.clone(),
-                ToolExecutionOutcome {
-                    output: duplicate.clone(),
-                    success: false,
-                    error_reason: Some(duplicate),
-                    duration: Duration::ZERO,
-                    receipt: None,
-                },
-            ));
+            let duplicate =
+                record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+            ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
             continue;
         }
 
@@ -238,9 +293,9 @@ pub(crate) async fn prepare_tool_calls(
         });
     }
 
-    PreparedToolCalls {
+    Ok(PreparedToolCalls {
         ordered_results,
         executable_indices,
         executable_calls,
-    }
+    })
 }
