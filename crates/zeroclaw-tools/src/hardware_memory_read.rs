@@ -20,6 +20,7 @@ impl HardwareMemoryReadTool {
         Self { boards }
     }
 
+    #[cfg(feature = "probe")]
     fn chip_for_board(board: &str) -> Option<&'static str> {
         match board {
             "nucleo-f401re" => Some("STM32F401RETx"),
@@ -71,25 +72,6 @@ impl Tool for HardwareMemoryReadTool {
             });
         }
 
-        let board = args
-            .get("board")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| self.boards.first().cloned())
-            .unwrap_or_else(|| "nucleo-f401re".into());
-
-        let chip = Self::chip_for_board(&board);
-        if chip.is_none() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
-                    board
-                )),
-            });
-        }
-
         let address_str = args
             .get("address")
             .and_then(|v| v.as_str())
@@ -102,8 +84,31 @@ impl Tool for HardwareMemoryReadTool {
             .clamp(1, 256);
 
         #[cfg(feature = "probe")]
+        let board = args
+            .get("board")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| self.boards.first().cloned())
+            .unwrap_or_else(|| "nucleo-f401re".into());
+
+        #[cfg(feature = "probe")]
+        let chip = match Self::chip_for_board(&board) {
+            Some(c) => c,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
+                        board
+                    )),
+                });
+            }
+        };
+
+        #[cfg(feature = "probe")]
         {
-            match probe_read_memory(chip.unwrap(), _address, _length) {
+            match probe_read_memory(chip, _address, _length) {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,
