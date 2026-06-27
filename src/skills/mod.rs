@@ -66,6 +66,7 @@ pub async fn handle_command(
             // Build the ordered (label, skills) groups to display.
             let mut rendered: Vec<(String, Vec<Skill>)> = Vec::new();
             if let Some(ref b) = bundle {
+                // A single bundle's on-disk skills.
                 let dir =
                     zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, b)
                         .map_err(anyhow::Error::msg)?;
@@ -73,21 +74,27 @@ pub async fn handle_command(
                     format!("bundle: {b}"),
                     load_skills_from_directory(&dir, allow_scripts),
                 ));
+            } else if let Some(ref a) = agent {
+                // Exactly what this agent loads at runtime — the same loader the
+                // agent boot/loop uses (workspace + open-skills + plugins +
+                // assigned bundles), so `list --agent` mirrors runtime behavior.
+                if config.agent(a).is_none() {
+                    anyhow::bail!("agent '{a}' is not configured");
+                }
+                rendered.push((
+                    format!("loaded by agent '{a}'"),
+                    load_skills_for_agent_from_config(config, a),
+                ));
             } else {
-                let aliases: Vec<String> = match agent {
-                    Some(ref a) => config
-                        .agent(a)
-                        .map(|c| c.skill_bundles.clone())
-                        .ok_or_else(|| {
-                            anyhow::Error::msg(format!("agent '{a}' is not configured"))
-                        })?,
-                    None => config.skill_bundles.keys().cloned().collect(),
-                };
-                for alias in aliases {
+                // Full inventory: every bundle, then the agent-agnostic sources
+                // (global dir + open-skills + plugins). `load_skills_with_config`
+                // is the same loader the old `list` used, so those rows are
+                // preserved (#8334 review).
+                for alias in config.skill_bundles.keys() {
                     if let Ok(dir) = zeroclaw_config::skill_bundles::resolve_directory(
                         config,
                         &install_root,
-                        &alias,
+                        alias,
                     ) {
                         rendered.push((
                             format!("bundle: {alias}"),
@@ -95,16 +102,10 @@ pub async fn handle_command(
                         ));
                     }
                 }
-                // The non-bundle sources (global dir + open-skills + plugin
-                // skills) are agent-agnostic; show them only when unfiltered.
-                // `load_skills_with_config` is the same loader the old `list`
-                // used, so these rows are preserved (#8334 review).
-                if agent.is_none() {
-                    rendered.push((
-                        "global / open-skills / plugins (not from a bundle)".to_string(),
-                        load_skills_with_config(&config.data_dir, config),
-                    ));
-                }
+                rendered.push((
+                    "global / open-skills / plugins (not from a bundle)".to_string(),
+                    load_skills_with_config(&config.data_dir, config),
+                ));
             }
 
             let total: usize = rendered.iter().map(|(_, s)| s.len()).sum();
@@ -1225,5 +1226,65 @@ mod install_location_tests {
             .insert("worker".to_string(), agent_with_bundles(&[]));
         let loc = resolve_install_location(&c, Some("worker"), None).unwrap();
         assert!(matches!(loc, SkillLocation::Global { .. }));
+    }
+
+    fn write_skill(dir: &Path, name: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{name}\"\ndescription = \"boundary test skill\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Boundary test for #8334: a skill placed at the install destination that
+    /// `resolve_install_location` picks for the default agent is actually loaded
+    /// by the runtime loader, while a skill left in the old `data/skills/` dir
+    /// is NOT — proving install now lands somewhere agents read.
+    #[test]
+    fn default_install_destination_is_loaded_by_the_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Where `skills install` (no flags) would write for the default agent.
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        let dest = match loc {
+            SkillLocation::Bundle { ref alias, ref dir } => {
+                assert_eq!(alias, "official");
+                dir.clone()
+            }
+            SkillLocation::Global { .. } => panic!("expected the agent's bundle, got global"),
+        };
+        write_skill(&dest, "loadable-skill");
+
+        // A skill left in the legacy global dir must NOT be loaded (the bug).
+        write_skill(&skills_dir(&c.data_dir), "orphaned-skill");
+
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "loadable-skill"),
+            "install destination must be loaded by the runtime; got {loaded:?}"
+        );
+        assert!(
+            !loaded.iter().any(|n| n == "orphaned-skill"),
+            "data/skills must NOT be loaded by the runtime (this was #8334); got {loaded:?}"
+        );
     }
 }

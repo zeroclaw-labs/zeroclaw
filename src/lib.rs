@@ -423,7 +423,9 @@ pub enum ChannelsCommands {
 pub enum SkillCommands {
     /// List all installed skills
     List {
-        /// Restrict to skills loaded by this agent (its assigned bundles).
+        /// Show exactly what this agent loads at runtime (its workspace +
+        /// open-skills + plugins + assigned bundles). --bundle takes precedence
+        /// when both are passed.
         #[arg(long)]
         agent: Option<String>,
         /// Restrict to a single bundle. Omit to list across all bundles.
