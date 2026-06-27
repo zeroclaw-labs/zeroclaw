@@ -1689,8 +1689,8 @@ mod tests {
 
         assert_eq!(std::fs::read(&binary).unwrap(), asset);
         // Bare (non-archive) download path — no siblings should appear.
-        assert_eq!(staging.join("zerocode").exists(), false);
-        assert_eq!(staging.join("web").exists(), false);
+        assert!(!staging.join("zerocode").exists());
+        assert!(!staging.join("web").exists());
     }
 
     #[tokio::test]
