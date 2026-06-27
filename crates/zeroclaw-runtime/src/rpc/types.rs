@@ -68,6 +68,26 @@ rpc_type! {
         /// daemon on their behalf. Omitted by older clients; defaults to empty.
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         pub env: std::collections::HashMap<String, String>,
+        /// Optional client-side capabilities the TUI advertises during the
+        /// handshake. Today the only inspected sub-key is `elicitation`,
+        /// parsed by `zeroclaw_api::elicitation::ElicitationCapabilities`
+        /// so the per-session `RpcApprovalChannel` can speak the ACP
+        /// `elicitation/create` RFD when the TUI signals support. The field
+        /// is a JSON pass-through so future capabilities can be added
+        /// without bumping the wire schema.
+        ///
+        /// Sourcing is camelCase to match the ACP convention used by the
+        /// elicitation RFD (`clientCapabilities.elicitation`); the runtime
+        /// dispatcher is the canonical owner of the parsed value for the
+        /// lifetime of the connection. Source of truth: the `initialize`
+        /// payload itself — the dispatcher caches the *parsed* form but
+        /// never copies the raw JSON.
+        #[serde(
+            default,
+            rename = "clientCapabilities",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub client_capabilities: Option<serde_json::Value>,
     }
 }
 

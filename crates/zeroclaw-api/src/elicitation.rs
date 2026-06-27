@@ -88,6 +88,142 @@ pub enum ElicitationResponse {
     Cancel,
 }
 
+// ── Schema helpers ──────────────────────────────────────────────
+//
+// These helpers build the JSON Schema payload for the `requested_schema`
+// field of an `elicitation/create` request. They live here (not in any
+// single channel impl) so every channel that speaks elicitation/create
+// — the ACP channel and Zerocode's RPC channel both qualify — gets the
+// exact same on-the-wire shape from one source. Adding a third channel
+// (gateway WS, future plugin) must call these helpers, not roll its own.
+
+/// Property names we refuse to put into a form-mode elicitation schema.
+///
+/// Per the ACP RFD and MCP's parent spec, form-mode elicitation MUST NOT
+/// be used for sensitive data (credentials, API keys, etc.). All Phase 1
+/// in-tree callers ship a fixed `"choice"` / `"choices"` property name,
+/// so a match against this list is a contract violation by an in-tree
+/// caller, not user-controlled input. We `debug_assert!` rather than
+/// `bail!` so production builds aren't degraded by a string scan.
+pub const SENSITIVE_PROPERTY_NAMES: &[&str] = &[
+    "password",
+    "token",
+    "secret",
+    "api_key",
+    "apiKey",
+    "credential",
+    "credentials",
+    "auth",
+    "authorization",
+    "private_key",
+    "privateKey",
+];
+
+/// Build the restricted JSON Schema for a single-select enum elicitation.
+///
+/// `choices` is the user-visible list. The wire-format `const` values
+/// are index-based (`choice-0`, `choice-1`, …) so the response → text
+/// round-trip survives non-unique or empty display strings.
+pub fn single_select_schema(choices: &[String]) -> Value {
+    single_select_schema_with_property_name("choice", choices)
+}
+
+/// Internal — exposed for the sensitive-name trip-wire test.
+pub fn single_select_schema_with_property_name(property: &str, choices: &[String]) -> Value {
+    debug_assert!(
+        !SENSITIVE_PROPERTY_NAMES.contains(&property),
+        "sensitive property name '{property}' in form-mode elicitation schema"
+    );
+    let one_of: Vec<Value> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| serde_json::json!({ "const": format!("choice-{i}"), "title": text }))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            property: {
+                "type": "string",
+                "title": "Choice",
+                "oneOf": one_of,
+            }
+        },
+        "required": [property],
+    })
+}
+
+/// Build the restricted JSON Schema for a multi-select enum elicitation.
+///
+/// Index-based `const` values mirror `single_select_schema` so the
+/// response → text round-trip survives duplicates.
+pub fn multi_select_schema(choices: &[String], min_items: usize, max_items: usize) -> Value {
+    let any_of: Vec<Value> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| serde_json::json!({ "const": format!("choice-{i}"), "title": text }))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "choices": {
+                "type": "array",
+                "title": "Choices",
+                "minItems": min_items,
+                "maxItems": max_items,
+                "items": { "anyOf": any_of },
+            }
+        },
+        "required": ["choices"],
+    })
+}
+
+/// Decode the accepted `content` payload of an `elicitation/create`
+/// single-select response back into the original display text.
+///
+/// Expects `content.choice` to be a `"choice-<idx>"` string whose
+/// index is in bounds against `choices`. Returns the original text.
+/// Returns `Err` if the field is missing, malformed, or out of range —
+/// the same defense-in-depth posture the RFD recommends.
+pub fn decode_single_select_accept(content: &Value, choices: &[String]) -> anyhow::Result<String> {
+    let const_value = content
+        .get("choice")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::Error::msg("elicitation accept missing content.choice string"))?;
+    let idx = const_value
+        .strip_prefix("choice-")
+        .and_then(|s| s.parse::<usize>().ok());
+    match idx.and_then(|i| choices.get(i)) {
+        Some(text) => Ok(text.clone()),
+        None => anyhow::bail!("elicitation returned unknown choice const: {const_value}"),
+    }
+}
+
+/// Decode the accepted `content` payload of an `elicitation/create`
+/// multi-select response back into the original display texts.
+pub fn decode_multi_select_accept(
+    content: &Value,
+    choices: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let arr = content
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::Error::msg("elicitation accept missing content.choices array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let s = v
+            .as_str()
+            .ok_or_else(|| anyhow::Error::msg("non-string entry in content.choices"))?;
+        let idx = s
+            .strip_prefix("choice-")
+            .and_then(|n| n.parse::<usize>().ok());
+        match idx.and_then(|i| choices.get(i)) {
+            Some(text) => out.push(text.clone()),
+            None => anyhow::bail!("elicitation returned unknown choice const: {s}"),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +333,98 @@ mod tests {
         let raw = json!({ "action": "frobnicate" });
         let res: Result<ElicitationResponse, _> = serde_json::from_value(raw);
         assert!(res.is_err());
+    }
+
+    // ── Schema helper tests ────────────────────────────────────
+
+    #[test]
+    fn single_select_schema_has_object_shape() {
+        let schema = single_select_schema(&[
+            "Conservative".to_string(),
+            "Balanced".to_string(),
+            "Aggressive".to_string(),
+        ]);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["choice"]));
+        let choice = &schema["properties"]["choice"];
+        assert_eq!(choice["type"], "string");
+        let one_of = choice["oneOf"].as_array().expect("oneOf array");
+        assert_eq!(one_of.len(), 3);
+        assert_eq!(one_of[0]["const"], "choice-0");
+        assert_eq!(one_of[0]["title"], "Conservative");
+        assert_eq!(one_of[2]["const"], "choice-2");
+        assert_eq!(one_of[2]["title"], "Aggressive");
+    }
+
+    #[test]
+    fn single_select_schema_preserves_choice_text_via_index() {
+        // Empty / duplicate display strings must not collide because the
+        // wire-format `const` is index-based.
+        let schema = single_select_schema(&["".to_string(), "".to_string()]);
+        let one_of = schema["properties"]["choice"]["oneOf"].as_array().unwrap();
+        assert_eq!(one_of[0]["const"], "choice-0");
+        assert_eq!(one_of[1]["const"], "choice-1");
+    }
+
+    #[test]
+    #[should_panic(expected = "sensitive")]
+    fn single_select_schema_rejects_sensitive_property_names_in_debug() {
+        let _ = single_select_schema_with_property_name("password", &["x".to_string()]);
+    }
+
+    #[test]
+    fn multi_select_schema_has_array_shape() {
+        let schema = multi_select_schema(
+            &["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+            1,
+            2,
+        );
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["choices"]));
+        let choices = &schema["properties"]["choices"];
+        assert_eq!(choices["type"], "array");
+        assert_eq!(choices["minItems"], 1);
+        assert_eq!(choices["maxItems"], 2);
+        let any_of = choices["items"]["anyOf"].as_array().expect("anyOf array");
+        assert_eq!(any_of.len(), 3);
+        assert_eq!(any_of[0]["const"], "choice-0");
+        assert_eq!(any_of[2]["title"], "Blue");
+    }
+
+    #[test]
+    fn decode_single_select_accept_returns_text() {
+        let content = json!({ "choice": "choice-1" });
+        let choices = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let text = decode_single_select_accept(&content, &choices).unwrap();
+        assert_eq!(text, "B");
+    }
+
+    #[test]
+    fn decode_single_select_accept_rejects_unknown_const() {
+        let content = json!({ "choice": "choice-99" });
+        let choices = vec!["A".to_string()];
+        assert!(decode_single_select_accept(&content, &choices).is_err());
+    }
+
+    #[test]
+    fn decode_single_select_accept_rejects_missing_field() {
+        let content = json!({});
+        let choices = vec!["A".to_string()];
+        assert!(decode_single_select_accept(&content, &choices).is_err());
+    }
+
+    #[test]
+    fn decode_multi_select_accept_returns_texts() {
+        let content = json!({ "choices": ["choice-0", "choice-2"] });
+        let choices = vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()];
+        let texts = decode_multi_select_accept(&content, &choices).unwrap();
+        assert_eq!(texts, vec!["Red".to_string(), "Blue".to_string()]);
+    }
+
+    #[test]
+    fn decode_multi_select_accept_rejects_unknown_const() {
+        let content = json!({ "choices": ["choice-99"] });
+        let choices = vec!["A".to_string()];
+        assert!(decode_multi_select_accept(&content, &choices).is_err());
     }
 }

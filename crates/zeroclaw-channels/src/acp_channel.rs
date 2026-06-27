@@ -51,6 +51,7 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
+    multi_select_schema, single_select_schema,
 };
 
 use crate::orchestrator::acp_server::RpcOutbound;
@@ -207,22 +208,9 @@ impl AcpChannel {
             .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
         match parsed {
             ElicitationResponse::Accept { content } => {
-                let const_value =
-                    content
-                        .get("choice")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            anyhow::Error::msg("elicitation accept missing content.choice string")
-                        })?;
-                let idx = const_value
-                    .strip_prefix("choice-")
-                    .and_then(|s| s.parse::<usize>().ok());
-                match idx.and_then(|i| choices.get(i)) {
-                    Some(text) => Ok(Some(text.clone())),
-                    None => {
-                        anyhow::bail!("elicitation returned unknown choice const: {const_value}")
-                    }
-                }
+                let text =
+                    zeroclaw_api::elicitation::decode_single_select_accept(&content, choices)?;
+                Ok(Some(text))
             }
             ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
@@ -345,90 +333,13 @@ fn build_approval_content(
 
 /// Property names we refuse to put into a form-mode elicitation schema.
 ///
-/// Per the ACP RFD and MCP's parent spec, form-mode elicitation MUST NOT
-/// be used for sensitive data (credentials, API keys, etc.). All Phase 1
-/// callers ship a fixed `"choice"` / `"choices"` property name, so a
-/// match against this list is a contract violation by an in-tree caller,
-/// not user-controlled input. We `debug_assert!` rather than `bail!` so
-/// production builds aren't degraded by a string scan.
-const SENSITIVE_PROPERTY_NAMES: &[&str] = &[
-    "password",
-    "token",
-    "secret",
-    "api_key",
-    "apiKey",
-    "credential",
-    "credentials",
-    "auth",
-    "authorization",
-    "private_key",
-    "privateKey",
-];
-
-/// Build the restricted JSON Schema for a single-select enum elicitation.
-///
-/// `choices` is the user-visible list. The wire-format `const` values
-/// are index-based (`choice-0`, `choice-1`, …) so the response → text
-/// round-trip survives non-unique or empty display strings.
-fn single_select_schema(choices: &[String]) -> serde_json::Value {
-    single_select_schema_with_property_name("choice", choices)
-}
-
-/// Internal — exposed for the sensitive-name trip-wire test.
-fn single_select_schema_with_property_name(
-    property: &str,
-    choices: &[String],
-) -> serde_json::Value {
-    debug_assert!(
-        !SENSITIVE_PROPERTY_NAMES.contains(&property),
-        "sensitive property name '{property}' in form-mode elicitation schema"
-    );
-    let one_of: Vec<serde_json::Value> = choices
-        .iter()
-        .enumerate()
-        .map(|(i, text)| json!({ "const": format!("choice-{i}"), "title": text }))
-        .collect();
-    json!({
-        "type": "object",
-        "properties": {
-            property: {
-                "type": "string",
-                "title": "Choice",
-                "oneOf": one_of,
-            }
-        },
-        "required": [property],
-    })
-}
-
-/// Build the restricted JSON Schema for a multi-select enum elicitation.
-///
-/// Index-based `const` values mirror `single_select_schema` so the
-/// response → text round-trip survives duplicates.
-fn multi_select_schema(
-    choices: &[String],
-    min_items: usize,
-    max_items: usize,
-) -> serde_json::Value {
-    let any_of: Vec<serde_json::Value> = choices
-        .iter()
-        .enumerate()
-        .map(|(i, text)| json!({ "const": format!("choice-{i}"), "title": text }))
-        .collect();
-    json!({
-        "type": "object",
-        "properties": {
-            "choices": {
-                "type": "array",
-                "title": "Choices",
-                "minItems": min_items,
-                "maxItems": max_items,
-                "items": { "anyOf": any_of },
-            }
-        },
-        "required": ["choices"],
-    })
-}
+/// **Re-exported source of truth:** the canonical list lives at
+/// `zeroclaw_api::elicitation::SENSITIVE_PROPERTY_NAMES`; the schema
+/// helpers in this file (now imported from `zeroclaw_api`) consult it
+/// internally. This module no longer keeps its own copy — that would
+/// be duplicate state per `AGENTS.md`. The list is referenced here in
+/// doc form only so a future reader sees the rationale without
+/// chasing the import.
 
 #[async_trait]
 impl Channel for AcpChannel {
@@ -569,28 +480,9 @@ impl Channel for AcpChannel {
             .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
         match parsed {
             ElicitationResponse::Accept { content } => {
-                let arr = content
-                    .get("choices")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| {
-                        anyhow::Error::msg("elicitation accept missing content.choices array")
-                    })?;
-                let mut out = Vec::with_capacity(arr.len());
-                for v in arr {
-                    let s = v
-                        .as_str()
-                        .ok_or_else(|| anyhow::Error::msg("non-string entry in content.choices"))?;
-                    let idx = s
-                        .strip_prefix("choice-")
-                        .and_then(|n| n.parse::<usize>().ok());
-                    match idx.and_then(|i| choices.get(i)) {
-                        Some(text) => out.push(text.clone()),
-                        None => {
-                            anyhow::bail!("elicitation returned unknown choice const: {s}")
-                        }
-                    }
-                }
-                Ok(Some(out))
+                let texts =
+                    zeroclaw_api::elicitation::decode_multi_select_accept(&content, choices)?;
+                Ok(Some(texts))
             }
             ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
@@ -709,6 +601,7 @@ impl Channel for AcpChannel {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+    use zeroclaw_api::elicitation::single_select_schema_with_property_name;
     use zeroclaw_api::jsonrpc::JSONRPC_VERSION;
 
     fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {

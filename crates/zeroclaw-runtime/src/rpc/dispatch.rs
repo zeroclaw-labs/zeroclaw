@@ -387,6 +387,19 @@ pub struct RpcDispatcher {
     tui_id: Option<String>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
+    /// Client-side elicitation capabilities advertised during `initialize`
+    /// (parsed from `params.clientCapabilities.elicitation`). Connection-
+    /// scoped: ACP `initialize` happens once per connection, before any
+    /// `session/new`. The dispatcher is the canonical owner for the
+    /// lifetime of the TUI connection; the per-session `RpcApprovalChannel`
+    /// receives a `Copy` of this value at session-creation time so it can
+    /// route `request_choice` / `request_multi_choice` over
+    /// `elicitation/create` when supported.
+    ///
+    /// Mirrors the equivalent slot on `AcpServer.client_elicitation_caps`
+    /// — Zerocode's Code tab is a superset of ACP, so both surfaces speak
+    /// the same elicitation RFD.
+    client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
 }
 
 impl RpcDispatcher {
@@ -397,6 +410,7 @@ impl RpcDispatcher {
             authenticated: false,
             tui_id: None,
             peer_label,
+            client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
         }
     }
 
@@ -423,6 +437,7 @@ impl RpcDispatcher {
             authenticated: true,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
+            client_elicitation_caps: self.client_elicitation_caps,
         }
     }
 
@@ -693,6 +708,18 @@ impl RpcDispatcher {
             ));
         }
 
+        // Cache the parsed elicitation capabilities for the lifetime of this
+        // connection. The per-session `RpcApprovalChannel` reads them at
+        // construction time so it can route `request_choice` /
+        // `request_multi_choice` over `elicitation/create` when the client
+        // advertises support. Mirrors the equivalent slot on `AcpServer`.
+        let elicitation = req
+            .client_capabilities
+            .as_ref()
+            .and_then(|c| c.get("elicitation"));
+        self.client_elicitation_caps =
+            zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =
             (req.tui_id.as_deref(), req.tui_sig.as_deref())
@@ -909,6 +936,7 @@ impl RpcDispatcher {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Arc::clone(&self.ctx.approval_pending),
+            self.client_elicitation_caps,
         ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
@@ -1310,6 +1338,7 @@ impl RpcDispatcher {
             sid.to_string(),
             Arc::clone(&self.rpc),
             Arc::clone(&self.ctx.approval_pending),
+            self.client_elicitation_caps,
         ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
@@ -4572,6 +4601,51 @@ mod tests {
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
+    }
+
+    /// Cover the `initialize` parsing path that caches the TUI's
+    /// `clientCapabilities.elicitation` block so the per-session
+    /// `RpcApprovalChannel` can route `request_choice` over
+    /// `elicitation/create`. Source-of-truth check: the dispatcher
+    /// is the canonical owner; the test reads the field directly.
+    #[tokio::test]
+    async fn handle_initialize_caches_elicitation_form_capability() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "clientCapabilities": { "elicitation": { "form": {} } }
+        });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "initialize should succeed; got {result:?}");
+        assert!(dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_without_elicitation_leaves_caps_unset() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+        });
+        let _ = dispatcher.handle_initialize(&params).await.unwrap();
+        assert!(!dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_empty_elicitation_object_is_form_only() {
+        // RFD backward-compat: `"elicitation": {}` advertises form-only.
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "clientCapabilities": { "elicitation": {} }
+        });
+        let _ = dispatcher.handle_initialize(&params).await.unwrap();
+        assert!(dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
     }
 
     // -----------------------------------------------------------------------
