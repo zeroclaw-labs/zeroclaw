@@ -93,18 +93,15 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         }
     }
 
-    // SMS opt-in walkthrough — right after provisioning, while the number's fresh.
+    // Hermes order: realtime → SMS opt-in → iMessage → signing key (last).
+    setup_realtime(&mut fields)?;
     if let Some(number) = phone_number.as_deref() {
         sms_opt_in(&base_url, &api_key, &handle, number)?;
     }
-
-    setup_signing_key(&base_url, &api_key, &mut fields)?;
-    setup_realtime(&mut fields)?;
-
-    // iMessage connect walkthrough.
     setup_imessage(&base_url, &api_key, &handle)?;
+    setup_signing_key(&base_url, &api_key, &mut fields)?;
 
-    let alias = match prompt_alias(&handle)? {
+    let alias = match prompt_alias()? {
         Some(a) => a,
         None => return Ok(None),
     };
@@ -348,6 +345,28 @@ fn setup_signing_key(
     api_key: &str,
     fields: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
+    println!(
+        "\n  {}",
+        crate::t(
+            "cli-quickstart-inkbox-signing-header",
+            "--- Webhook signing key ---"
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-signing-explain1",
+            "Inkbox signs outbound webhooks with an HMAC over the body.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-signing-explain2",
+            "Without the matching key, the gateway cannot verify inbound Inkbox traffic.",
+        )
+    );
+
     if let Some(true) = confirm(
         &crate::t(
             "cli-quickstart-inkbox-have-signing",
@@ -357,20 +376,41 @@ fn setup_signing_key(
     )? {
         if let Some(key) = password(&crate::t(
             "cli-quickstart-inkbox-paste-signing",
-            "Paste your Inkbox signing key (whsec_…)",
+            "Paste your Inkbox signing key",
         ))? {
             let key = key.trim().to_string();
             if !key.is_empty() {
                 fields.insert("signing_key".into(), key);
+                println!(
+                    "  {}",
+                    crate::t(
+                        "cli-quickstart-inkbox-signing-saved",
+                        "✓ Saved signing key. Signature verification enabled.",
+                    )
+                );
             }
         }
         return Ok(());
     }
 
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-signing-rotate1",
+            "Minting a new key here rotates any existing key for your org.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-signing-rotate2",
+            "Any other gateway using the old key will fail verification until updated.",
+        )
+    );
     if let Some(true) = confirm(
         &crate::t(
             "cli-quickstart-inkbox-gen-signing",
-            "Generate a new Inkbox signing key now?",
+            "Generate a new signing key now?",
         ),
         true,
     )? {
@@ -380,8 +420,8 @@ fn setup_signing_key(
                 println!(
                     "  {}",
                     crate::t(
-                        "cli-quickstart-inkbox-signing-saved",
-                        "✓ signing key saved — signature verification on",
+                        "cli-quickstart-inkbox-signing-generated",
+                        "✓ Generated and saved signing key. Signature verification enabled.",
                     )
                 );
             }
@@ -410,12 +450,33 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
         });
 
+    println!(
+        "\n  {}",
+        crate::t(
+            "cli-quickstart-inkbox-rt-header",
+            "--- OpenAI Realtime calls ---"
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-rt-explain1",
+            "Realtime calls send raw phone audio to OpenAI Realtime.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-rt-explain2",
+            "This requires an OpenAI API key with /v1/realtime permission.",
+        )
+    );
     if detected.is_some() {
         println!(
             "  {}",
             crate::t(
                 "cli-quickstart-inkbox-rt-found",
-                "Found an OpenAI API key in your environment.",
+                "Found an existing OpenAI API key in your environment.",
             )
         );
     } else {
@@ -423,7 +484,7 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
             "  {}",
             crate::t(
                 "cli-quickstart-inkbox-rt-none",
-                "Realtime calls need an OpenAI API key with /v1/realtime access.",
+                "No OpenAI API key was detected for Realtime.",
             )
         );
     }
@@ -431,11 +492,18 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
     let Some(true) = confirm(
         &crate::t(
             "cli-quickstart-inkbox-rt-enable",
-            "Use OpenAI Realtime for phone calls?",
+            "Use OpenAI Realtime API for phone calls?",
         ),
         detected.is_some(),
     )?
     else {
+        println!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-rt-disabled",
+                "Realtime disabled. Calls will use Inkbox STT/TTS.",
+            )
+        );
         return Ok(());
     };
 
@@ -443,7 +511,7 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
         Some(k) => k,
         None => match password(&crate::t(
             "cli-quickstart-inkbox-rt-paste",
-            "Paste your OpenAI API key for Realtime",
+            "Paste your OpenAI API key for Realtime calls",
         ))? {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => {
@@ -451,7 +519,7 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
                     "  {}",
                     crate::t(
                         "cli-quickstart-inkbox-rt-skip",
-                        "No key entered; Realtime left off (calls use Inkbox STT/TTS).",
+                        "No OpenAI API key entered. Realtime disabled; calls will use Inkbox STT/TTS.",
                     )
                 );
                 return Ok(());
@@ -464,35 +532,32 @@ fn setup_realtime(fields: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
         "  {}",
         crate::t(
             "cli-quickstart-inkbox-rt-on",
-            "✓ Realtime enabled (validated on the first call).",
+            "✓ Realtime calls are enabled for this agent.",
         )
     );
     Ok(())
 }
 
-/// Prompt for the channel alias, defaulting to the handle, until it is a valid
-/// alias key. Returns `None` if the user backs out.
-fn prompt_alias(handle: &str) -> anyhow::Result<Option<String>> {
+/// Prompt for the channel alias with no pre-filled default (the handle often
+/// isn't a valid alias — hyphens), re-prompting until it's a valid alias key.
+/// Returns `None` if the user backs out.
+fn prompt_alias() -> anyhow::Result<Option<String>> {
     loop {
         let Some(raw) = input(
             &crate::t(
                 "cli-quickstart-inkbox-alias",
                 "Alias for this Inkbox channel",
             ),
-            Some(handle),
+            None,
             false,
         )?
         else {
             return Ok(None);
         };
-        let candidate = {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                handle.to_string()
-            } else {
-                trimmed.to_string()
-            }
-        };
+        let candidate = raw.trim().to_string();
+        if candidate.is_empty() {
+            continue;
+        }
         match zeroclaw_config::helpers::validate_alias_key(&candidate) {
             Ok(()) => return Ok(Some(candidate)),
             Err(err) => eprintln!(
@@ -507,23 +572,55 @@ fn prompt_alias(handle: &str) -> anyhow::Result<Option<String>> {
 /// Seconds to poll for an inbound opt-in / connect message before giving up.
 const POLL_SECS: u64 = 90;
 
-/// SMS opt-in walkthrough: tell the user to text START, then (opt-in) poll for
-/// the inbound START that unlocks outbound SMS.
+/// SMS opt-in walkthrough: tell the user to text START, then poll for the
+/// inbound START that unlocks outbound SMS (Hermes parity; time-bounded poll).
 fn sms_opt_in(base_url: &str, api_key: &str, handle: &str, number: &str) -> anyhow::Result<()> {
     println!(
-        "  {} {}",
+        "\n  {}",
+        crate::t("cli-quickstart-inkbox-sms-header", "--- SMS opt-in ---")
+    );
+    println!(
+        "  {} {} {}",
+        crate::t("cli-quickstart-inkbox-sms-text-start", "Text START to"),
+        number,
         crate::t(
-            "cli-quickstart-inkbox-sms-prompt",
-            "To send SMS from this agent, text START to",
+            "cli-quickstart-inkbox-sms-line1b",
+            "to enable SMS from this agent",
+        ),
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-sms-line2",
+            "to your phone. Do this from every phone you want to message it from.",
+        )
+    );
+    println!(
+        "\n  {}",
+        crate::t(
+            "cli-quickstart-inkbox-sms-waiting-header",
+            "--- Waiting for your START text ---",
+        )
+    );
+    println!(
+        "  {} {}.",
+        crate::t(
+            "cli-quickstart-inkbox-sms-polling",
+            "Polling every 3s for an inbound START to",
         ),
         number,
     );
-    // Hermes parity: with a number provisioned, poll for the START opt-in
-    // directly (no extra prompt). The poll is time-bounded so it can't hang.
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-sms-without",
+            "Without it, the agent cannot send outbound SMS to that phone later.",
+        )
+    );
     let found = poll_with_spinner(
         &crate::t(
             "cli-quickstart-inkbox-sms-listening",
-            "Listening for your START text…",
+            "Listening for START...",
         ),
         || {
             ob::check_sms_start(base_url, api_key, handle)
@@ -536,17 +633,18 @@ fn sms_opt_in(base_url: &str, api_key: &str, handle: &str, number: &str) -> anyh
             "  {} {}",
             crate::t(
                 "cli-quickstart-inkbox-sms-confirmed",
-                "✓ SMS opt-in confirmed from",
+                "✓ Got it. SMS opt-in confirmed from",
             ),
             sender,
         ),
         None => println!(
-            "  {} {}",
-            crate::t(
-                "cli-quickstart-inkbox-sms-later",
-                "No START yet — text it anytime to enable SMS to",
-            ),
+            "  {} {} {}",
+            crate::t("cli-quickstart-inkbox-sms-text-start", "Text START to"),
             number,
+            crate::t(
+                "cli-quickstart-inkbox-sms-later-b",
+                "anytime to enable outbound SMS.",
+            ),
         ),
     }
     Ok(())
@@ -555,10 +653,28 @@ fn sms_opt_in(base_url: &str, api_key: &str, handle: &str, number: &str) -> anyh
 /// iMessage connect walkthrough: enable iMessage, walk the user through texting
 /// the router, then (opt-in) poll for the first inbound message and greet back.
 fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<()> {
+    println!(
+        "\n  {}",
+        crate::t("cli-quickstart-inkbox-imsg-header", "--- iMessage ---")
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-explain1",
+            "Inkbox can make this agent reachable over iMessage from your iPhone.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-explain2",
+            "No number to provision — you connect through the Inkbox iMessage router.",
+        )
+    );
     let Some(true) = confirm(
         &crate::t(
             "cli-quickstart-inkbox-imsg-enable",
-            "Make this agent reachable over iMessage?",
+            "Enable iMessage for this agent?",
         ),
         true,
     )?
@@ -576,6 +692,23 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
         );
         return Ok(());
     }
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-enabled",
+            "✓ iMessage enabled for this agent.",
+        )
+    );
+    let Some(true) = confirm(
+        &crate::t(
+            "cli-quickstart-inkbox-imsg-connect",
+            "Connect your iPhone to this agent now?",
+        ),
+        true,
+    )?
+    else {
+        return Ok(());
+    };
     let (number, connect_command) = match ob::imessage_connect_info(base_url, api_key) {
         Ok(info) => info,
         Err(err) => {
@@ -593,12 +726,12 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
     println!(
         "  {}",
         crate::t(
-            "cli-quickstart-inkbox-imsg-enabled",
-            "✓ iMessage enabled. From your iPhone, in Messages:",
+            "cli-quickstart-inkbox-imsg-steps-intro",
+            "From your iPhone, in the Messages app:",
         )
     );
     println!(
-        "    {} \"{}\" {} {}",
+        "      {} \"{}\" {} {}",
         crate::t("cli-quickstart-inkbox-imsg-step1", "1. Text"),
         connect_command,
         crate::t("cli-quickstart-inkbox-imsg-step1b", "to"),
@@ -608,24 +741,42 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
         "    {}",
         crate::t(
             "cli-quickstart-inkbox-imsg-step2",
-            "2. Then send any message in the new thread it texts back.",
+            "2. Inkbox texts you back from the number now assigned to this agent.",
         )
     );
-    let Some(true) = confirm(
-        &crate::t(
-            "cli-quickstart-inkbox-imsg-wait",
-            "Wait for your first iMessage now?",
-        ),
-        true,
-    )?
-    else {
-        return Ok(());
-    };
+    println!(
+        "    {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-step3",
+            "3. Send any first message (e.g. \"hi\") in that NEW thread.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-only-after",
+            "The agent can only message you after you message it first.",
+        )
+    );
+    println!(
+        "\n  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-waiting-header",
+            "--- Waiting for your first iMessage ---",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-polling",
+            "Polling every 3s for an inbound iMessage to this agent.",
+        )
+    );
     // The poll returns "<conversation_id>|<sender>" so we can greet back.
     let found = poll_with_spinner(
         &crate::t(
             "cli-quickstart-inkbox-imsg-listening",
-            "Listening for your first iMessage…",
+            "Listening for your first iMessage...",
         ),
         || {
             ob::check_first_imessage(base_url, api_key, handle)
@@ -639,31 +790,41 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             "  {}",
             crate::t(
                 "cli-quickstart-inkbox-imsg-later",
-                "No message yet — connect anytime from your iPhone.",
+                "Skipped. The agent replies over iMessage once you connect and message it.",
             )
         );
         return Ok(());
     };
     let (cid_str, sender) = found.split_once('|').unwrap_or((found.as_str(), ""));
     println!(
-        "  {} {}",
-        crate::t("cli-quickstart-inkbox-imsg-connected", "✓ Connected from"),
+        "  {} {}.",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-connected",
+            "✓ Got it. First iMessage received from",
+        ),
         sender,
     );
     if let Ok(cid) = cid_str.parse() {
         let welcome = crate::t(
             "cli-quickstart-inkbox-imsg-welcome",
-            "You're connected to your ZeroClaw agent over iMessage. Send anything here and it replies in this thread.",
+            "You're connected! This is your iMessage channel to your ZeroClaw agent. Anything you send here goes straight to the agent, and its replies show up right in this thread.",
         );
-        if let Err(err) = ob::send_imessage_welcome(base_url, api_key, handle, cid, &welcome) {
-            eprintln!(
+        match ob::send_imessage_welcome(base_url, api_key, handle, cid, &welcome) {
+            Ok(()) => println!(
+                "  {}",
+                crate::t(
+                    "cli-quickstart-inkbox-imsg-welcome-sent",
+                    "✓ Sent a welcome message back on that thread.",
+                )
+            ),
+            Err(err) => eprintln!(
                 "  {} {}",
                 crate::t(
                     "cli-quickstart-inkbox-imsg-welcome-failed",
                     "could not send the welcome message:",
                 ),
                 err,
-            );
+            ),
         }
     }
     Ok(())
