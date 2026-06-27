@@ -697,9 +697,12 @@ async fn run_upgrade(
             // No supervisor: ask `main` to detached-spawn the new binary once
             // the daemon has torn down, then exit. The respawn flag is read at
             // the post-shutdown point, after the listener is released.
+            //
+            // Set the flag *before* sleeping so that an external SIGTERM
+            // arriving during the grace window still finds it set.
+            zeroclaw_runtime::restart::request_respawn();
             set_state(&progress, UpgradeState::Restarting);
             tokio::time::sleep(RESTART_GRACE).await;
-            zeroclaw_runtime::restart::request_respawn();
             trigger_graceful_shutdown();
         }
     }
