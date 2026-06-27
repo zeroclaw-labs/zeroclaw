@@ -243,11 +243,19 @@ pub async fn run_wss_listener(
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // The WSS plane is always mutually authenticated, so a
+                            // client with no certificate (un-migrated) or a revoked
+                            // one fails here. Surface it actionably rather than as a
+                            // bare TLS error so the operator knows to enroll it.
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                                &format!(
+                                    "WSS TLS handshake failed from {remote_addr}: {e}. The WSS plane \
+                                     requires a client certificate; an un-migrated client must enroll \
+                                     first (zerocode --enroll), and a revoked cert is refused."
+                                )
                             );
                             count.fetch_sub(1, Ordering::Relaxed);
                             return;

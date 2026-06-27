@@ -688,7 +688,21 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            route.connect_preferred(None, None).await?
+            match route.connect_preferred(None, None).await {
+                Ok(pair) => pair,
+                // A certless client cannot complete the mutually-authenticated WSS
+                // handshake. Give an actionable enroll hint instead of a bare TLS
+                // error (no silent failure for an un-migrated client).
+                Err(e) if route.tls.client_cert_path.is_none() => {
+                    anyhow::bail!(
+                        "could not connect to the daemon's WSS plane ({e:#}). That plane is \
+                         mutually authenticated and this client has no certificate. Enroll first:\n  \
+                         zerocode --enroll --connect <host>:<port>\n(running interactively against \
+                         --connect enrolls automatically)."
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
 

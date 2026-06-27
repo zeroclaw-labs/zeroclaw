@@ -4522,16 +4522,43 @@ async fn main() -> Result<()> {
                             println!();
                         }
 
+                        // Migration/cutover window: a time-boxed period during which
+                        // clients may enroll WITHOUT a pairing code (to migrate an
+                        // existing fleet). A malformed deadline is surfaced loudly
+                        // (never silently treated as closed), and an OPEN window is
+                        // a security-relevant state the operator must see.
                         let allow_unpaired_until = {
                             let s = enroll_cfg.allow_unpaired_enrollment.trim();
                             if s.is_empty() {
                                 None
                             } else {
-                                chrono::DateTime::parse_from_rfc3339(s)
-                                    .ok()
-                                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                                match chrono::DateTime::parse_from_rfc3339(s) {
+                                    Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                                    Err(e) => {
+                                        anyhow::bail!(
+                                            "[enroll].allow_unpaired_enrollment = {s:?} is not a \
+                                             valid RFC3339 timestamp ({e}). Use e.g. \
+                                             2026-07-01T00:00:00Z, or clear it to require a pairing \
+                                             code."
+                                        );
+                                    }
+                                }
                             }
                         };
+                        if let Some(deadline) = allow_unpaired_until {
+                            if chrono::Utc::now() < deadline {
+                                println!(
+                                    "WARNING: enrollment migration window is OPEN until {deadline}: \
+                                     clients may enroll WITHOUT a pairing code. Clear \
+                                     [enroll].allow_unpaired_enrollment to close it early."
+                                );
+                            } else {
+                                println!(
+                                    "Note: the enrollment migration window closed at {deadline}; a \
+                                     pairing code is now required."
+                                );
+                            }
+                        }
 
                         let audit = zeroclaw_runtime::security::audit::AuditLogger::new(
                             audit_cfg,
