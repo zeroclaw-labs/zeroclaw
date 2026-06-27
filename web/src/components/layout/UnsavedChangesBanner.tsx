@@ -6,20 +6,20 @@
 // banner falls back to a humanized key if the section hasn't been
 // fetched yet.
 
-import { useEffect, useState } from 'react';
-import { Save, X } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { t } from '@/lib/i18n';
-import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
+import { useEffect, useState } from "react";
+import { Save, X } from "lucide-react";
+import { Button } from "@/components/ui";
+import { t } from "@/lib/i18n";
+import { ApiError, getSections, type ValidationWarning } from "@/lib/api";
 import {
   useConfigDirtyCount,
   useConfigDirtySections,
   useConfigDraft,
-} from '@/lib/draftStore';
+} from "@/lib/draftStore";
 
 function humanize(key: string): string {
-  if (!key) return '';
-  const spaced = key.replace(/[-_.]/g, ' ');
+  if (!key) return "";
+  const spaced = key.replace(/[-_.]/g, " ");
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
@@ -45,7 +45,7 @@ export default function UnsavedChangesBanner() {
           // Dotted keys (`providers.models`) — also key the parent so a
           // dirty path under `providers.models.anthropic.x` maps to the
           // dotted label.
-          const first = s.key.split('.')[0];
+          const first = s.key.split(".")[0];
           if (first && !map[first]) map[first] = s.label;
         }
         setLabels(map);
@@ -61,7 +61,7 @@ export default function UnsavedChangesBanner() {
   if (dirtyCount === 0) return null;
 
   const labelFor = (key: string) => labels[key] ?? humanize(key);
-  const sectionList = dirtySections.map(labelFor).join(', ');
+  const sectionList = dirtySections.map(labelFor).join(", ");
 
   const onSave = async () => {
     setSaving(true);
@@ -72,9 +72,15 @@ export default function UnsavedChangesBanner() {
       setWarnings(resp.warnings ?? []);
     } catch (e) {
       if (e instanceof ApiError) {
-        const env = e.envelope as { code?: string; message?: string; path?: string };
-        const label = env.path ? ` (${env.path})` : '';
-        setError(`[${env.code ?? 'error'}] ${env.message ?? 'save failed'}${label}`);
+        const env = e.envelope as {
+          code?: string;
+          message?: string;
+          path?: string;
+        };
+        const label = env.path ? ` (${env.path})` : "";
+        setError(
+          `[${env.code ?? "error"}] ${env.message ?? "save failed"}${label}`,
+        );
       } else {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -88,10 +94,17 @@ export default function UnsavedChangesBanner() {
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="text-sm text-pc-text">
           <span className="font-semibold text-status-warning">
-            {dirtyCount} {dirtyCount === 1 ? t('unsaved_banner.unsaved_change') : t('unsaved_banner.unsaved_changes')}
+            {dirtyCount}{" "}
+            {dirtyCount === 1
+              ? t("unsaved_banner.unsaved_change")
+              : t("unsaved_banner.unsaved_changes")}
           </span>
           {sectionList && (
-            <span className="text-pc-text-secondary"> {t('unsaved_banner.in_sections_prefix')}{sectionList}</span>
+            <span className="text-pc-text-secondary">
+              {" "}
+              {t("unsaved_banner.in_sections_prefix")}
+              {sectionList}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -106,7 +119,7 @@ export default function UnsavedChangesBanner() {
             disabled={saving}
           >
             <X className="h-3.5 w-3.5" />
-            {t('unsaved_banner.discard_all')}
+            {t("unsaved_banner.discard_all")}
           </Button>
           <Button
             size="sm"
@@ -115,15 +128,11 @@ export default function UnsavedChangesBanner() {
             disabled={saving}
           >
             <Save className="h-3.5 w-3.5" />
-            {saving ? t('unsaved_banner.saving') : t('unsaved_banner.save_all')}
+            {saving ? t("unsaved_banner.saving") : t("unsaved_banner.save_all")}
           </Button>
         </div>
       </div>
-      {error && (
-        <p className="text-xs text-status-error">
-          {error}
-        </p>
-      )}
+      {error && <p className="text-xs text-status-error">{error}</p>}
       {warnings.length > 0 && (
         <ul className="text-xs flex flex-col gap-0.5 text-pc-text-secondary">
           {warnings.map((w, i) => (

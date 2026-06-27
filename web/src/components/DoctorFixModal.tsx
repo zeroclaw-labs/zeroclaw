@@ -1,13 +1,10 @@
-import { useEffect, useId, useRef } from 'react';
-import { Link } from 'react-router-dom';
-import { ExternalLink, X } from 'lucide-react';
-import { Button } from '@/components/ui';
-import FieldForm from '@/components/sections/FieldForm';
-import {
-  useFocusTrap,
-  FOCUSABLE_SELECTOR_FORM,
-} from '@/hooks/useFocusTrap';
-import { t } from '@/lib/i18n';
+import { useEffect, useId, useRef } from "react";
+import { Link } from "react-router-dom";
+import { ExternalLink, X } from "lucide-react";
+import { Button } from "@/components/ui";
+import FieldForm from "@/components/sections/FieldForm";
+import { useFocusTrap, FOCUSABLE_SELECTOR_FORM } from "@/hooks/useFocusTrap";
+import { t } from "@/lib/i18n";
 
 export interface DoctorFixModalProps {
   /** Whether the modal is mounted/visible. */
@@ -88,7 +85,7 @@ export default function DoctorFixModal({
         <div className="flex items-center justify-between gap-3 px-6 pt-5 pb-4 border-b border-pc-border">
           <div className="min-w-0">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-pc-text-muted">
-              {t('doctor_fix.title')}
+              {t("doctor_fix.title")}
             </p>
             <h2
               id={titleId}
@@ -101,7 +98,7 @@ export default function DoctorFixModal({
             ref={closeRef}
             type="button"
             onClick={onClose}
-            aria-label={t('common.close')}
+            aria-label={t("common.close")}
             className="inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-pc-border bg-transparent text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X className="h-4 w-4" />
@@ -110,7 +107,12 @@ export default function DoctorFixModal({
 
         {/* Body — the entity's editable fields. FieldForm owns its own Save. */}
         <div className="px-6 py-4 max-h-[60vh] overflow-y-auto">
-          <FieldForm prefix={prefix} drift={[]} onSaved={() => undefined} inlineSaveBar />
+          <FieldForm
+            prefix={prefix}
+            drift={[]}
+            onSaved={() => undefined}
+            inlineSaveBar
+          />
         </div>
 
         {/* Footer — escape hatch to the full config page + close. */}
@@ -119,11 +121,11 @@ export default function DoctorFixModal({
             to={href}
             className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-3.5 text-sm font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
-            {t('doctor_fix.open_full_page')}
+            {t("doctor_fix.open_full_page")}
             <ExternalLink className="h-3.5 w-3.5" />
           </Link>
           <Button variant="ghost" onClick={onClose}>
-            {t('doctor_fix.done')}
+            {t("doctor_fix.done")}
           </Button>
         </div>
       </div>

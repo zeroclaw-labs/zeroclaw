@@ -173,7 +173,9 @@ export function ComboBox({
           className="absolute z-30 mt-1 max-h-60 w-full overflow-y-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-surface p-1 shadow-[var(--pc-shadow-md)]"
         >
           {filtered.length === 0 ? (
-            <li className="px-3 py-2 text-xs text-pc-text-muted">{emptyText}</li>
+            <li className="px-3 py-2 text-xs text-pc-text-muted">
+              {emptyText}
+            </li>
           ) : (
             filtered.map((opt, i) => {
               const sel = opt === value;

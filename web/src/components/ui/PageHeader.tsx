@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { ReactNode } from "react";
 
 export interface PageHeaderProps {
   title: ReactNode;
@@ -12,18 +12,25 @@ export interface PageHeaderProps {
  * Consistent page title row for the Operator Console: a strong title, an
  * optional muted description, and a right-aligned actions slot.
  */
-export function PageHeader({ title, description, actions, className = '' }: PageHeaderProps) {
+export function PageHeader({
+  title,
+  description,
+  actions,
+  className = "",
+}: PageHeaderProps) {
   const classes = [
-    'flex items-start justify-between gap-4 flex-wrap',
+    "flex items-start justify-between gap-4 flex-wrap",
     className,
   ]
     .filter(Boolean)
-    .join(' ');
+    .join(" ");
 
   return (
     <div className={classes}>
       <div className="min-w-0">
-        <h1 className="text-xl font-semibold leading-tight text-pc-text">{title}</h1>
+        <h1 className="text-xl font-semibold leading-tight text-pc-text">
+          {title}
+        </h1>
         {description != null && (
           <p className="mt-1 text-sm text-pc-text-secondary">{description}</p>
         )}

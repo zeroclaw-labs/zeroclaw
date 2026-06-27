@@ -7,16 +7,16 @@
 // `agent` is reserved for #5890 (multi-agent workspaces). Today it is
 // passed through to the API client and ignored by the gateway.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { markdown } from '@codemirror/lang-markdown';
-import { oneDark } from '@codemirror/theme-one-dark';
-import { githubLight } from '@uiw/codemirror-theme-github';
-import CodeMirror from '@uiw/react-codemirror';
-import { useTheme } from '@/hooks/useTheme';
-import ReactMarkdown from 'react-markdown';
-import rehypeHighlight from 'rehype-highlight';
-import remarkGfm from 'remark-gfm';
-import { t } from '@/lib/i18n';
+import { useCallback, useEffect, useRef, useState } from "react";
+import { markdown } from "@codemirror/lang-markdown";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { githubLight } from "@uiw/codemirror-theme-github";
+import CodeMirror from "@uiw/react-codemirror";
+import { useTheme } from "@/hooks/useTheme";
+import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import remarkGfm from "remark-gfm";
+import { t } from "@/lib/i18n";
 import {
   ApiError,
   PersonalityConflictError,
@@ -26,7 +26,7 @@ import {
   putPersonalityFile,
   type PersonalityIndex,
   type PersonalityIndexEntry,
-} from '../../lib/api';
+} from "../../lib/api";
 
 interface BufferState {
   loaded: string;
@@ -45,7 +45,7 @@ export default function PersonalityEditor({ agent }: Props) {
   // editor isn't a dark slab inside a light (operator-light etc.) palette.
   // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
   const { resolvedTheme } = useTheme();
-  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
+  const cmTheme = resolvedTheme === "light" ? githubLight : oneDark;
 
   const [index, setIndex] = useState<PersonalityIndex | null>(null);
   const [active, setActive] = useState<string | null>(null);
@@ -56,7 +56,7 @@ export default function PersonalityEditor({ agent }: Props) {
   // null while the user hasn't picked a starting point yet. Auto-set to
   // 'blank' on load when at least one file already exists — the user
   // clearly isn't starting fresh, so the picker would be noise.
-  const [pick, setPick] = useState<'default' | 'blank' | null>(null);
+  const [pick, setPick] = useState<"default" | "blank" | null>(null);
   const [conflict, setConflict] = useState<{
     filename: string;
     currentContent: string;
@@ -74,7 +74,9 @@ export default function PersonalityEditor({ agent }: Props) {
       // If any file already exists, skip the starter-template picker —
       // the user has already authored at least one and shouldn't have
       // to dismiss a "fresh start" prompt every time they revisit.
-      setPick((prev) => prev ?? (resp.files.some((f) => f.exists) ? 'blank' : null));
+      setPick(
+        (prev) => prev ?? (resp.files.some((f) => f.exists) ? "blank" : null),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -87,7 +89,7 @@ export default function PersonalityEditor({ agent }: Props) {
 
   const fetchTemplates = useCallback(async (): Promise<Map<string, string>> => {
     if (templatesCache.current) return templatesCache.current;
-    const resp = await getPersonalityTemplates({}, 'default', agent);
+    const resp = await getPersonalityTemplates({}, "default", agent);
     const map = new Map(resp.files.map((f) => [f.filename, f.content]));
     templatesCache.current = map;
     return map;
@@ -108,7 +110,7 @@ export default function PersonalityEditor({ agent }: Props) {
         const template = byFilename.get(entry.filename);
         if (template === undefined) continue;
         seeded[entry.filename] = {
-          loaded: '',
+          loaded: "",
           draft: template,
           loadedMtimeMs: null,
           exists: false,
@@ -116,7 +118,7 @@ export default function PersonalityEditor({ agent }: Props) {
         };
       }
       setBuffers((prev) => ({ ...seeded, ...prev }));
-      setPick('default');
+      setPick("default");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -131,7 +133,7 @@ export default function PersonalityEditor({ agent }: Props) {
       const byFilename = await fetchTemplates();
       const template = byFilename.get(active);
       if (template === undefined) {
-        setError(`${t('personality.no_template_prefix')}${active}.`);
+        setError(`${t("personality.no_template_prefix")}${active}.`);
         return;
       }
       setBuffers((prev) => {
@@ -139,7 +141,7 @@ export default function PersonalityEditor({ agent }: Props) {
         return {
           ...prev,
           [active]: {
-            loaded: existing?.loaded ?? '',
+            loaded: existing?.loaded ?? "",
             draft: template,
             loadedMtimeMs: existing?.loadedMtimeMs ?? null,
             exists: existing?.exists ?? false,
@@ -155,7 +157,6 @@ export default function PersonalityEditor({ agent }: Props) {
   useEffect(() => {
     void loadIndex();
   }, [loadIndex]);
-
 
   const loadFile = useCallback(
     async (filename: string) => {
@@ -191,10 +192,10 @@ export default function PersonalityEditor({ agent }: Props) {
     if (!dirty) return;
     const handler = (e: BeforeUnloadEvent) => {
       e.preventDefault();
-      e.returnValue = '';
+      e.returnValue = "";
     };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
   }, [buffers]);
 
   const activeBuf = active ? buffers[active] : undefined;
@@ -275,12 +276,14 @@ export default function PersonalityEditor({ agent }: Props) {
       <div
         className="rounded-xl border p-6 text-sm"
         style={{
-          borderColor: 'var(--pc-border)',
-          background: 'var(--pc-bg-surface)',
-          color: 'var(--pc-text-muted)',
+          borderColor: "var(--pc-border)",
+          background: "var(--pc-bg-surface)",
+          color: "var(--pc-text-muted)",
         }}
       >
-        {error ? `${t('personality.load_failed_prefix')}${error}` : t('common.loading')}
+        {error
+          ? `${t("personality.load_failed_prefix")}${error}`
+          : t("common.loading")}
       </div>
     );
   }
@@ -288,8 +291,8 @@ export default function PersonalityEditor({ agent }: Props) {
   if (pick === null) {
     return (
       <div className="flex flex-col gap-4">
-        <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-          {t('personality.picker_intro')}
+        <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+          {t("personality.picker_intro")}
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <button
@@ -298,31 +301,39 @@ export default function PersonalityEditor({ agent }: Props) {
             onClick={() => void seedDefaultTemplates()}
             className="text-left rounded-xl border p-4 transition-colors hover:border-[var(--pc-accent)]"
             style={{
-              borderColor: 'var(--pc-border)',
-              background: 'var(--pc-bg-surface)',
+              borderColor: "var(--pc-border)",
+              background: "var(--pc-bg-surface)",
             }}
           >
-            <div className="font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
-              {seeding ? t('personality.loading_templates') : t('personality.use_default_templates')}
+            <div
+              className="font-semibold mb-1"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {seeding
+                ? t("personality.loading_templates")
+                : t("personality.use_default_templates")}
             </div>
-            <div className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('personality.use_default_templates_desc')}
+            <div className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+              {t("personality.use_default_templates_desc")}
             </div>
           </button>
           <button
             type="button"
-            onClick={() => setPick('blank')}
+            onClick={() => setPick("blank")}
             className="text-left rounded-xl border p-4 transition-colors hover:border-[var(--pc-accent)]"
             style={{
-              borderColor: 'var(--pc-border)',
-              background: 'var(--pc-bg-surface)',
+              borderColor: "var(--pc-border)",
+              background: "var(--pc-bg-surface)",
             }}
           >
-            <div className="font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
-              {t('personality.start_blank')}
+            <div
+              className="font-semibold mb-1"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("personality.start_blank")}
             </div>
-            <div className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('personality.start_blank_desc')}
+            <div className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+              {t("personality.start_blank_desc")}
             </div>
           </button>
         </div>
@@ -330,9 +341,9 @@ export default function PersonalityEditor({ agent }: Props) {
           <div
             className="rounded-lg border p-3 text-sm"
             style={{
-              background: 'rgba(239, 68, 68, 0.08)',
-              borderColor: 'rgba(239, 68, 68, 0.2)',
-              color: '#f87171',
+              background: "rgba(239, 68, 68, 0.08)",
+              borderColor: "rgba(239, 68, 68, 0.2)",
+              color: "#f87171",
             }}
           >
             {error}
@@ -344,14 +355,14 @@ export default function PersonalityEditor({ agent }: Props) {
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-        {t('personality.editor_intro')}
+      <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+        {t("personality.editor_intro")}
       </p>
 
       {/* Tab strip */}
       <div
         className="flex flex-wrap gap-1 border-b"
-        style={{ borderColor: 'var(--pc-border)' }}
+        style={{ borderColor: "var(--pc-border)" }}
       >
         {index.files.map((f) => (
           <PersonalityTab
@@ -373,31 +384,35 @@ export default function PersonalityEditor({ agent }: Props) {
           {/* Edit ↔ Preview segmented toggle */}
           <div
             className="inline-flex self-end rounded-lg border overflow-hidden"
-            style={{ borderColor: 'var(--pc-border)' }}
+            style={{ borderColor: "var(--pc-border)" }}
           >
             <button
               type="button"
               onClick={() => setPreview(false)}
               className="text-xs px-3 py-1 transition-colors"
               style={{
-                background: !preview ? 'var(--pc-accent-glow)' : 'transparent',
-                color: !preview ? 'var(--pc-accent)' : 'var(--pc-text-secondary)',
+                background: !preview ? "var(--pc-accent-glow)" : "transparent",
+                color: !preview
+                  ? "var(--pc-accent)"
+                  : "var(--pc-text-secondary)",
                 fontWeight: !preview ? 600 : 400,
               }}
             >
-              {t('common.edit')}
+              {t("common.edit")}
             </button>
             <button
               type="button"
               onClick={() => setPreview(true)}
               className="text-xs px-3 py-1 transition-colors"
               style={{
-                background: preview ? 'var(--pc-accent-glow)' : 'transparent',
-                color: preview ? 'var(--pc-accent)' : 'var(--pc-text-secondary)',
+                background: preview ? "var(--pc-accent-glow)" : "transparent",
+                color: preview
+                  ? "var(--pc-accent)"
+                  : "var(--pc-text-secondary)",
                 fontWeight: preview ? 600 : 400,
               }}
             >
-              {t('personality.preview')}
+              {t("personality.preview")}
             </button>
           </div>
 
@@ -405,36 +420,38 @@ export default function PersonalityEditor({ agent }: Props) {
             <div
               className="prose prose-invert max-w-none rounded-md border px-4 py-3 text-sm overflow-y-auto"
               style={{
-                borderColor: 'var(--pc-border)',
-                background: 'var(--pc-bg-base)',
-                minHeight: '20rem',
+                borderColor: "var(--pc-border)",
+                background: "var(--pc-bg-base)",
+                minHeight: "20rem",
               }}
             >
-              {(activeBuf?.draft ?? '').trim().length > 0 ? (
+              {(activeBuf?.draft ?? "").trim().length > 0 ? (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+                  rehypePlugins={[
+                    [rehypeHighlight, { detect: true, ignoreMissing: true }],
+                  ]}
                 >
-                  {activeBuf?.draft ?? ''}
+                  {activeBuf?.draft ?? ""}
                 </ReactMarkdown>
               ) : (
-                <p style={{ color: 'var(--pc-text-muted)' }}>
-                  {t('personality.nothing_to_preview')}
+                <p style={{ color: "var(--pc-text-muted)" }}>
+                  {t("personality.nothing_to_preview")}
                 </p>
               )}
             </div>
           ) : (
             <div
               className="rounded-md border overflow-hidden"
-              style={{ borderColor: 'var(--pc-border)' }}
+              style={{ borderColor: "var(--pc-border)" }}
             >
               <CodeMirror
-                value={activeBuf?.draft ?? ''}
+                value={activeBuf?.draft ?? ""}
                 onChange={(value) =>
                   setBuffers((prev) => ({
                     ...prev,
                     [active]: {
-                      loaded: prev[active]?.loaded ?? '',
+                      loaded: prev[active]?.loaded ?? "",
                       draft: value,
                       loadedMtimeMs: prev[active]?.loadedMtimeMs ?? null,
                       exists: prev[active]?.exists ?? false,
@@ -457,18 +474,21 @@ export default function PersonalityEditor({ agent }: Props) {
           )}
           <div
             className="flex items-center justify-between text-xs"
-            style={{ color: 'var(--pc-text-muted)' }}
+            style={{ color: "var(--pc-text-muted)" }}
           >
             <span>
-              {charCount.toLocaleString()} / {maxChars.toLocaleString()} {t('personality.chars')}
+              {charCount.toLocaleString()} / {maxChars.toLocaleString()}{" "}
+              {t("personality.chars")}
               {overLimit && (
-                <span style={{ color: 'var(--color-status-error)' }}>
-                  {' '}— {t('personality.over_limit')}
+                <span style={{ color: "var(--color-status-error)" }}>
+                  {" "}
+                  — {t("personality.over_limit")}
                 </span>
               )}
               {activeBuf?.truncated && (
-                <span style={{ color: 'var(--color-status-warn)' }}>
-                  {' '}— {t('personality.truncated_warning')}
+                <span style={{ color: "var(--color-status-warn)" }}>
+                  {" "}
+                  — {t("personality.truncated_warning")}
                 </span>
               )}
             </span>
@@ -478,22 +498,22 @@ export default function PersonalityEditor({ agent }: Props) {
                 onClick={() => {
                   // Replacing real content needs explicit confirmation;
                   // empty buffers can take the template silently.
-                  const hasContent = (activeBuf?.draft ?? '').trim().length > 0;
+                  const hasContent = (activeBuf?.draft ?? "").trim().length > 0;
                   if (
                     !hasContent ||
                     window.confirm(
-                      `${t('personality.replace_confirm_prefix')}${active}${t('personality.replace_confirm_suffix')}`,
+                      `${t("personality.replace_confirm_prefix")}${active}${t("personality.replace_confirm_suffix")}`,
                     )
                   ) {
                     void insertTemplateIntoActive();
                   }
                 }}
                 className="btn-secondary text-sm px-3 py-1.5"
-                title={t('personality.insert_template_title')}
+                title={t("personality.insert_template_title")}
               >
-                {(activeBuf?.draft ?? '').trim().length > 0
-                  ? t('personality.replace_with_template')
-                  : t('personality.insert_template')}
+                {(activeBuf?.draft ?? "").trim().length > 0
+                  ? t("personality.replace_with_template")
+                  : t("personality.insert_template")}
               </button>
               <button
                 type="button"
@@ -501,7 +521,7 @@ export default function PersonalityEditor({ agent }: Props) {
                 onClick={() => void onSave()}
                 className="btn-electric text-sm px-4 py-1.5"
               >
-                {saving ? t('personality.saving') : t('common.save')}
+                {saving ? t("personality.saving") : t("common.save")}
               </button>
             </div>
           </div>
@@ -512,9 +532,9 @@ export default function PersonalityEditor({ agent }: Props) {
         <div
           className="rounded-lg border p-3 text-sm"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
           {error}
@@ -525,48 +545,49 @@ export default function PersonalityEditor({ agent }: Props) {
         <div
           className="rounded-lg border p-4 text-sm flex flex-col gap-3"
           style={{
-            background: 'rgba(245, 158, 11, 0.08)',
-            borderColor: 'rgba(245, 158, 11, 0.3)',
+            background: "rgba(245, 158, 11, 0.08)",
+            borderColor: "rgba(245, 158, 11, 0.3)",
           }}
         >
-          <div style={{ color: 'var(--pc-text-primary)' }}>
-            <strong>{conflict.filename}</strong> {t('personality.conflict_message')}
+          <div style={{ color: "var(--pc-text-primary)" }}>
+            <strong>{conflict.filename}</strong>{" "}
+            {t("personality.conflict_message")}
           </div>
           <div className="flex gap-2 flex-wrap">
             <button
               type="button"
               onClick={resolveTakeTheirs}
               className="btn-secondary text-sm px-3 py-1.5"
-              title={t('personality.take_theirs_title')}
+              title={t("personality.take_theirs_title")}
             >
-              {t('personality.take_theirs')}
+              {t("personality.take_theirs")}
             </button>
             <button
               type="button"
               onClick={resolveKeepMine}
               className="btn-secondary text-sm px-3 py-1.5"
-              title={t('personality.keep_mine_title')}
+              title={t("personality.keep_mine_title")}
             >
-              {t('personality.keep_mine')}
+              {t("personality.keep_mine")}
             </button>
           </div>
           <details>
             <summary
               className="cursor-pointer text-xs"
-              style={{ color: 'var(--pc-text-muted)' }}
+              style={{ color: "var(--pc-text-muted)" }}
             >
-              {t('personality.show_on_disk')}
+              {t("personality.show_on_disk")}
             </summary>
             <pre
               className="mt-2 p-2 text-xs rounded font-mono whitespace-pre-wrap break-all"
               style={{
-                background: 'var(--pc-bg-base)',
-                color: 'var(--pc-text-secondary)',
+                background: "var(--pc-bg-base)",
+                color: "var(--pc-text-secondary)",
                 maxHeight: 200,
-                overflow: 'auto',
+                overflow: "auto",
               }}
             >
-              {conflict.currentContent || t('personality.empty')}
+              {conflict.currentContent || t("personality.empty")}
             </pre>
           </details>
         </div>
@@ -589,12 +610,12 @@ function PersonalityTab({ entry, active, dirty, onSelect }: TabProps) {
       onClick={onSelect}
       className="text-sm px-3 py-2 inline-flex items-center gap-2 transition-colors"
       style={{
-        background: active ? 'var(--pc-accent-glow)' : 'transparent',
-        color: active ? 'var(--pc-accent)' : 'var(--pc-text-primary)',
+        background: active ? "var(--pc-accent-glow)" : "transparent",
+        color: active ? "var(--pc-accent)" : "var(--pc-text-primary)",
         fontWeight: active ? 600 : 400,
         borderBottom: active
-          ? '2px solid var(--pc-accent)'
-          : '2px solid transparent',
+          ? "2px solid var(--pc-accent)"
+          : "2px solid transparent",
         marginBottom: -1,
       }}
     >
@@ -602,17 +623,21 @@ function PersonalityTab({ entry, active, dirty, onSelect }: TabProps) {
         className="h-1.5 w-1.5 rounded-full"
         style={{
           background: entry.exists
-            ? 'var(--color-status-success)'
-            : 'var(--pc-border)',
+            ? "var(--color-status-success)"
+            : "var(--pc-border)",
         }}
-        title={entry.exists ? t('personality.tab_saved') : t('personality.tab_not_created')}
+        title={
+          entry.exists
+            ? t("personality.tab_saved")
+            : t("personality.tab_not_created")
+        }
       />
       <span>{entry.filename}</span>
       {dirty && (
         <span
           className="h-1.5 w-1.5 rounded-full"
-          style={{ background: 'var(--color-status-warn)' }}
-          title={t('personality.unsaved_changes')}
+          style={{ background: "var(--color-status-warn)" }}
+          title={t("personality.unsaved_changes")}
         />
       )}
     </button>

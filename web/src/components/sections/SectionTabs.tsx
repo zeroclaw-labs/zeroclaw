@@ -4,9 +4,9 @@
 // `?tab=` URL query so navigation + reloads keep the active tab. The
 // component is presentation-only — tab content is supplied by callers.
 
-import { useMemo } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import type { ReactNode } from 'react';
+import { useMemo } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import type { ReactNode } from "react";
 
 export interface SectionTabSpec {
   /** URL-safe key written into `?tab=...`. */
@@ -30,14 +30,14 @@ export default function SectionTabs({ tabs, defaultKey }: SectionTabsProps) {
 
   const activeKey = useMemo(() => {
     const params = new URLSearchParams(location.search);
-    const fromUrl = params.get('tab');
+    const fromUrl = params.get("tab");
     if (fromUrl && tabs.some((t) => t.key === fromUrl)) return fromUrl;
-    return defaultKey ?? tabs[0]?.key ?? '';
+    return defaultKey ?? tabs[0]?.key ?? "";
   }, [location.search, tabs, defaultKey]);
 
   const setActive = (key: string) => {
     const params = new URLSearchParams(location.search);
-    params.set('tab', key);
+    params.set("tab", key);
     navigate(
       { pathname: location.pathname, search: `?${params.toString()}` },
       { replace: true },
@@ -66,13 +66,13 @@ export default function SectionTabs({ tabs, defaultKey }: SectionTabsProps) {
               aria-selected={isActive}
               onClick={() => setActive(t.key)}
               className={[
-                'px-3 py-2 text-sm border-b-2 -mb-px transition-colors',
-                'focus-visible:outline-none focus-visible:ring-2',
-                'focus-visible:ring-[var(--pc-focus)] focus-visible:rounded-sm',
+                "px-3 py-2 text-sm border-b-2 -mb-px transition-colors",
+                "focus-visible:outline-none focus-visible:ring-2",
+                "focus-visible:ring-[var(--pc-focus)] focus-visible:rounded-sm",
                 isActive
-                  ? 'border-pc-accent text-pc-text font-medium'
-                  : 'border-transparent text-pc-text-muted hover:text-pc-text-secondary',
-              ].join(' ')}
+                  ? "border-pc-accent text-pc-text font-medium"
+                  : "border-transparent text-pc-text-muted hover:text-pc-text-secondary",
+              ].join(" ")}
             >
               {t.label}
             </button>

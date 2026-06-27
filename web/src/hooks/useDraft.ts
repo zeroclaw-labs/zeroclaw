@@ -1,4 +1,4 @@
-import { createContext, useContext, useCallback, useRef } from 'react';
+import { createContext, useContext, useCallback, useRef } from "react";
 
 /**
  * In-memory draft store that survives component unmounts but not page reloads.
@@ -12,7 +12,7 @@ export interface DraftContextType {
 }
 
 export const DraftContext = createContext<DraftContextType>({
-  getDraft: () => '',
+  getDraft: () => "",
   setDraft: () => {},
   clearDraft: () => {},
 });
@@ -21,7 +21,7 @@ export function useDraftStore(): DraftContextType {
   const store = useRef<Map<string, string>>(new Map());
 
   const getDraft = useCallback((key: string): string => {
-    return store.current.get(key) ?? '';
+    return store.current.get(key) ?? "";
   }, []);
 
   const setDraft = useCallback((key: string, value: string): void => {

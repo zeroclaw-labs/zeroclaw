@@ -16,9 +16,9 @@
 // `<type>.<resource>` in headings, error text, and the PATCH path used by
 // FieldForm — never the bare resource.
 
-import { useEffect, useState } from 'react';
-import { ChevronRight, Plus, Trash2 } from 'lucide-react';
-import { t } from '@/lib/i18n';
+import { useEffect, useState } from "react";
+import { ChevronRight, Plus, Trash2 } from "lucide-react";
+import { t } from "@/lib/i18n";
 import {
   ApiError,
   createMapKey,
@@ -27,11 +27,11 @@ import {
   getCatalogModels,
   patchConfig,
   type ModelPricing,
-} from '../../lib/api';
-import { configuredResourceIds } from '../../lib/configuredModels';
-import FieldForm from './FieldForm';
+} from "../../lib/api";
+import { configuredResourceIds } from "../../lib/configuredModels";
+import FieldForm from "./FieldForm";
 
-export type CostRatesCategory = 'models' | 'tts' | 'transcription';
+export type CostRatesCategory = "models" | "tts" | "transcription";
 
 interface CostRatesEditorProps {
   /** Which `[cost.rates.providers.<category>]` subtree to edit. */
@@ -49,7 +49,9 @@ interface CostRatesEditorProps {
 
 export default function CostRatesEditor(props: CostRatesEditorProps) {
   if (props.fixedResource) {
-    return <SingleResourceEditor {...props} fixedResource={props.fixedResource} />;
+    return (
+      <SingleResourceEditor {...props} fixedResource={props.fixedResource} />
+    );
   }
   return <ResourceListEditor {...props} />;
 }
@@ -58,7 +60,11 @@ export default function CostRatesEditor(props: CostRatesEditorProps) {
 // alias rules: a rate row's identity is `<type>.<resource>`, never just
 // `<resource>`. Keeps the rates view consistent with banners, logs, and
 // the [providers.<type>.<alias>] convention next door.
-function composite(category: CostRatesCategory, providerType: string, resource: string) {
+function composite(
+  category: CostRatesCategory,
+  providerType: string,
+  resource: string,
+) {
   return `${category}.${providerType}.${resource}`;
 }
 
@@ -82,22 +88,39 @@ async function applyCatalogPricingToResource(
     try {
       const resp = await getCatalogModels(providerType);
       pricing = resp.pricing?.[resource];
-    } catch { /* silent fail */ }
+    } catch {
+      /* silent fail */
+    }
   }
   if (!pricing) return;
   const fullPath = `${basePath}.${resource}`;
-  const ops: { op: 'replace'; path: string; value: number }[] = [];
+  const ops: { op: "replace"; path: string; value: number }[] = [];
   if (pricing.prompt !== undefined) {
     const v = parseFloat(pricing.prompt);
-    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
+    if (!isNaN(v))
+      ops.push({
+        op: "replace",
+        path: `${fullPath}.input_per_mtok`,
+        value: v * 1_000_000,
+      });
   }
   if (pricing.completion !== undefined) {
     const v = parseFloat(pricing.completion);
-    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
+    if (!isNaN(v))
+      ops.push({
+        op: "replace",
+        path: `${fullPath}.output_per_mtok`,
+        value: v * 1_000_000,
+      });
   }
   if (pricing.input_cache_read !== undefined) {
     const v = parseFloat(pricing.input_cache_read);
-    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
+    if (!isNaN(v))
+      ops.push({
+        op: "replace",
+        path: `${fullPath}.cached_input_per_mtok`,
+        value: v * 1_000_000,
+      });
   }
   if (ops.length > 0) {
     await patchConfig(ops);
@@ -121,7 +144,10 @@ function SingleResourceEditor({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
+  const [catalogPricing, setCatalogPricing] = useState<Record<
+    string,
+    ModelPricing
+  > | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -154,12 +180,19 @@ function SingleResourceEditor({
     try {
       await createMapKey(basePath, fixedResource);
       // Pre-fill rates from catalog pricing.
-      await applyCatalogPricingToResource(basePath, fixedResource, catalogPricing, providerType);
+      await applyCatalogPricingToResource(
+        basePath,
+        fixedResource,
+        catalogPricing,
+        providerType,
+      );
       setExists(true);
       setReloadKey((n) => n + 1);
       onSaved?.();
     } catch (e) {
-      setError(e instanceof ApiError ? e.envelope.message : (e as Error).message);
+      setError(
+        e instanceof ApiError ? e.envelope.message : (e as Error).message,
+      );
     } finally {
       setBusy(false);
     }
@@ -172,10 +205,13 @@ function SingleResourceEditor({
   if (!exists) {
     return (
       <div className="flex flex-col gap-3">
-        <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-          {t('cost_rates.no_entry_yet_for')}{' '}
-          <code className="font-mono">{composite(category, providerType, fixedResource)}</code>.
-          {' '}{t('cost_rates.no_entry_fallback_prefix')} <code>cost.usd_per_1k_input</code>.
+        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
+          {t("cost_rates.no_entry_yet_for")}{" "}
+          <code className="font-mono">
+            {composite(category, providerType, fixedResource)}
+          </code>
+          . {t("cost_rates.no_entry_fallback_prefix")}{" "}
+          <code>cost.usd_per_1k_input</code>.
         </p>
         {error && <ErrorBanner msg={error} />}
         <button
@@ -185,7 +221,7 @@ function SingleResourceEditor({
           className="btn-electric flex items-center gap-2 text-sm px-3 py-2 self-start"
         >
           <Plus className="h-4 w-4" />
-          {busy ? t('cost_rates.adding') : t('cost_rates.add_rates')}
+          {busy ? t("cost_rates.adding") : t("cost_rates.add_rates")}
         </button>
       </div>
     );
@@ -193,10 +229,13 @@ function SingleResourceEditor({
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-        {t('cost_rates.rate_sheet_for')}{' '}
-        <code className="font-mono">{composite(category, providerType, fixedResource)}</code>{' '}
-        {t('cost_rates.path_label')} <code className="font-mono">{fullPath}</code>.
+      <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
+        {t("cost_rates.rate_sheet_for")}{" "}
+        <code className="font-mono">
+          {composite(category, providerType, fixedResource)}
+        </code>{" "}
+        {t("cost_rates.path_label")}{" "}
+        <code className="font-mono">{fullPath}</code>.
       </p>
       {error && <ErrorBanner msg={error} />}
       <FieldForm
@@ -228,10 +267,13 @@ function ResourceListEditor({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
-  const [newResource, setNewResource] = useState('');
+  const [newResource, setNewResource] = useState("");
   const [adding, setAdding] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
+  const [catalogPricing, setCatalogPricing] = useState<Record<
+    string,
+    ModelPricing
+  > | null>(null);
 
   const reload = async () => {
     setLoading(true);
@@ -243,7 +285,9 @@ function ResourceListEditor({
       setResources(keys);
       setSuggestions(sugs);
     } catch (e) {
-      setError(e instanceof ApiError ? e.envelope.message : (e as Error).message);
+      setError(
+        e instanceof ApiError ? e.envelope.message : (e as Error).message,
+      );
     } finally {
       setLoading(false);
     }
@@ -253,14 +297,21 @@ function ResourceListEditor({
     void reload();
     // Fetch catalog pricing for pre-fill — silent fail, nice-to-have.
     getCatalogModels(providerType)
-      .then((r) => { if (r.pricing) setCatalogPricing(r.pricing); })
+      .then((r) => {
+        if (r.pricing) setCatalogPricing(r.pricing);
+      })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [basePath]);
 
   /** Apply catalog pricing to a newly-created resource, if available. */
   const applyPricing = async (resource: string) => {
-    await applyCatalogPricingToResource(basePath, resource, catalogPricing, providerType);
+    await applyCatalogPricingToResource(
+      basePath,
+      resource,
+      catalogPricing,
+      providerType,
+    );
   };
 
   const addResource = async () => {
@@ -272,12 +323,14 @@ function ResourceListEditor({
       await createMapKey(basePath, trimmed);
       // Pre-fill rates from catalog pricing before reload.
       await applyPricing(trimmed);
-      setNewResource('');
+      setNewResource("");
       setOpen(trimmed);
       await reload();
       onSaved?.();
     } catch (e) {
-      setError(e instanceof ApiError ? e.envelope.message : (e as Error).message);
+      setError(
+        e instanceof ApiError ? e.envelope.message : (e as Error).message,
+      );
     } finally {
       setAdding(false);
     }
@@ -291,7 +344,9 @@ function ResourceListEditor({
       await reload();
       onSaved?.();
     } catch (e) {
-      setError(e instanceof ApiError ? e.envelope.message : (e as Error).message);
+      setError(
+        e instanceof ApiError ? e.envelope.message : (e as Error).message,
+      );
     }
   };
 
@@ -303,15 +358,16 @@ function ResourceListEditor({
 
       <div
         className="surface-panel divide-y"
-        style={{ borderColor: 'var(--pc-border)' }}
+        style={{ borderColor: "var(--pc-border)" }}
       >
         {resources.length === 0 ? (
           <div
             className="p-4 text-sm text-center"
-            style={{ color: 'var(--pc-text-muted)' }}
+            style={{ color: "var(--pc-text-muted)" }}
           >
-            {t('cost_rates.no_rates_under')}{' '}
-            <code className="font-mono">{basePath}</code>. {t('cost_rates.add_one_below')}
+            {t("cost_rates.no_rates_under")}{" "}
+            <code className="font-mono">{basePath}</code>.{" "}
+            {t("cost_rates.add_one_below")}
           </div>
         ) : (
           resources.map((resource) => (
@@ -341,9 +397,9 @@ function ResourceListEditor({
               value={newResource}
               onChange={(e) => setNewResource(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void addResource();
+                if (e.key === "Enter") void addResource();
               }}
-              placeholder={suggestions[0] ?? ''}
+              placeholder={suggestions[0] ?? ""}
               className="input-electric flex-1 px-3 py-1.5 text-sm font-mono"
             />
             <datalist id={`cost-rates-suggest-${category}-${providerType}`}>
@@ -360,13 +416,20 @@ function ResourceListEditor({
               className="btn-electric text-sm px-3 py-1.5 flex items-center gap-1"
             >
               <Plus className="h-4 w-4" />
-              {adding ? t('cost_rates.adding') : t('cost_rates.add')}
+              {adding ? t("cost_rates.adding") : t("cost_rates.add")}
             </button>
           </div>
           {suggestions.filter((s) => !resources.includes(s)).length > 0 && (
             <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                {t('cost_rates.from_label')} <code className="font-mono">providers.{category}.{providerType}</code>:
+              <span
+                className="text-xs"
+                style={{ color: "var(--pc-text-muted)" }}
+              >
+                {t("cost_rates.from_label")}{" "}
+                <code className="font-mono">
+                  providers.{category}.{providerType}
+                </code>
+                :
               </span>
               {suggestions
                 .filter((s) => !resources.includes(s))
@@ -377,9 +440,9 @@ function ResourceListEditor({
                     onClick={() => setNewResource(s)}
                     className="text-xs font-mono px-2 py-0.5 rounded-md transition-opacity hover:opacity-80"
                     style={{
-                      background: 'var(--pc-bg-elevated)',
-                      color: 'var(--pc-text-secondary)',
-                      border: '1px solid var(--pc-border)',
+                      background: "var(--pc-bg-elevated)",
+                      color: "var(--pc-text-secondary)",
+                      border: "1px solid var(--pc-border)",
                     }}
                   >
                     {s}
@@ -390,11 +453,8 @@ function ResourceListEditor({
         </div>
       </div>
 
-      <p
-        className="text-xs"
-        style={{ color: 'var(--pc-text-faint)' }}
-      >
-        {t('cost_rates.resource_id_help')} {t('cost_rates.rates_emit_at')}{' '}
+      <p className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
+        {t("cost_rates.resource_id_help")} {t("cost_rates.rates_emit_at")}{" "}
         <code className="font-mono">{basePath}.&lt;resource&gt;</code>.
       </p>
     </div>
@@ -441,13 +501,13 @@ function ResourceRow({
           <div className="min-w-0">
             <span
               className="font-mono"
-              style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}
+              style={{ color: "var(--pc-text-primary)", fontWeight: 500 }}
             >
               {composite(category, providerType, resource)}
             </span>
             <code
               className="block text-xs mt-0.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             >
               {fullPath}
             </code>
@@ -455,8 +515,8 @@ function ResourceRow({
           <ChevronRight
             className="h-4 w-4 flex-shrink-0 transition-transform"
             style={{
-              color: 'var(--pc-text-muted)',
-              transform: isOpen ? 'rotate(90deg)' : 'none',
+              color: "var(--pc-text-muted)",
+              transform: isOpen ? "rotate(90deg)" : "none",
             }}
           />
         </button>
@@ -473,21 +533,21 @@ function ResourceRow({
           }}
           title={
             armed
-              ? `${t('cost_rates.click_again_to_delete')} ${composite(category, providerType, resource)}`
-              : `${t('common.delete')} ${composite(category, providerType, resource)}`
+              ? `${t("cost_rates.click_again_to_delete")} ${composite(category, providerType, resource)}`
+              : `${t("common.delete")} ${composite(category, providerType, resource)}`
           }
           className="btn-icon flex-shrink-0"
           style={
             armed
               ? {
-                  color: 'var(--color-status-error, #f87171)',
-                  borderColor: 'var(--color-status-error, #f87171)',
+                  color: "var(--color-status-error, #f87171)",
+                  borderColor: "var(--color-status-error, #f87171)",
                 }
               : undefined
           }
         >
           {armed ? (
-            <span className="text-xs px-1">{t('common.confirm')}</span>
+            <span className="text-xs px-1">{t("common.confirm")}</span>
           ) : (
             <Trash2 className="h-4 w-4" />
           )}
@@ -496,7 +556,7 @@ function ResourceRow({
       {isOpen && (
         <div
           className="px-4 pb-3"
-          style={{ borderTop: '1px solid var(--pc-border)' }}
+          style={{ borderTop: "1px solid var(--pc-border)" }}
         >
           <FieldForm
             key={`${reloadKey}-${fullPath}`}
@@ -515,7 +575,10 @@ function InlineSpinner() {
     <div className="flex items-center justify-center py-8">
       <div
         className="h-6 w-6 border-2 rounded-full animate-spin"
-        style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+        style={{
+          borderColor: "var(--pc-border)",
+          borderTopColor: "var(--pc-accent)",
+        }}
       />
     </div>
   );
@@ -526,9 +589,9 @@ function ErrorBanner({ msg }: { msg: string }) {
     <div
       className="rounded-xl border p-3 text-sm"
       style={{
-        background: 'var(--color-status-error-alpha-08, rgba(239,68,68,0.08))',
-        borderColor: 'var(--color-status-error-alpha-20, rgba(239,68,68,0.2))',
-        color: 'var(--color-status-error, #f87171)',
+        background: "var(--color-status-error-alpha-08, rgba(239,68,68,0.08))",
+        borderColor: "var(--color-status-error-alpha-20, rgba(239,68,68,0.2))",
+        color: "var(--color-status-error, #f87171)",
       }}
     >
       {msg}

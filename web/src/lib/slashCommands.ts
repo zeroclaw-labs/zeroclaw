@@ -1,4 +1,4 @@
-import { t } from '@/lib/i18n';
+import { t } from "@/lib/i18n";
 
 /**
  * Web chat slash commands (#7137).
@@ -13,7 +13,7 @@ import { t } from '@/lib/i18n';
  */
 
 /** Canonical command name (without the leading slash). */
-export type CommandName = 'help' | 'clear' | 'new' | 'model';
+export type CommandName = "help" | "clear" | "new" | "model";
 
 export interface CommandSpec {
   /** Command name without the leading slash, e.g. `help`. */
@@ -29,10 +29,14 @@ export interface CommandSpec {
  * autocomplete popover and `/help` output.
  */
 export const COMMANDS: readonly CommandSpec[] = [
-  { name: 'help', usage: '/help', descriptionKey: 'agent.cmd_help_help' },
-  { name: 'clear', usage: '/clear', descriptionKey: 'agent.cmd_help_clear' },
-  { name: 'new', usage: '/new', descriptionKey: 'agent.cmd_help_new' },
-  { name: 'model', usage: '/model [name]', descriptionKey: 'agent.cmd_help_model' },
+  { name: "help", usage: "/help", descriptionKey: "agent.cmd_help_help" },
+  { name: "clear", usage: "/clear", descriptionKey: "agent.cmd_help_clear" },
+  { name: "new", usage: "/new", descriptionKey: "agent.cmd_help_new" },
+  {
+    name: "model",
+    usage: "/model [name]",
+    descriptionKey: "agent.cmd_help_model",
+  },
 ] as const;
 
 export interface ParsedCommand {
@@ -49,7 +53,9 @@ export interface ParsedCommand {
  */
 export function isSlashCommand(input: string): boolean {
   const trimmed = input.trimStart();
-  return trimmed.startsWith('/') && !trimmed.startsWith('//') && trimmed.length > 1;
+  return (
+    trimmed.startsWith("/") && !trimmed.startsWith("//") && trimmed.length > 1
+  );
 }
 
 /**
@@ -60,7 +66,7 @@ export function parseCommand(input: string): ParsedCommand {
   const trimmed = input.trim().slice(1); // drop leading '/'
   const firstSpace = trimmed.search(/\s/);
   if (firstSpace === -1) {
-    return { command: trimmed.toLowerCase(), args: '' };
+    return { command: trimmed.toLowerCase(), args: "" };
   }
   return {
     command: trimmed.slice(0, firstSpace).toLowerCase(),
@@ -79,6 +85,8 @@ export function matchCommands(prefix: string): CommandSpec[] {
 
 /** Markdown body for `/help`, derived from {@link COMMANDS}. */
 export function helpText(): string {
-  const lines = COMMANDS.map((c) => `- \`${c.usage}\` — ${t(c.descriptionKey)}`);
-  return `**${t('agent.cmd_help_header')}**\n${lines.join('\n')}\n\n${t('agent.cmd_help_escape')}`;
+  const lines = COMMANDS.map(
+    (c) => `- \`${c.usage}\` — ${t(c.descriptionKey)}`,
+  );
+  return `**${t("agent.cmd_help_header")}**\n${lines.join("\n")}\n\n${t("agent.cmd_help_escape")}`;
 }

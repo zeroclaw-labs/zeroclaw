@@ -162,7 +162,9 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new Error(
+      `API ${result.status}: ${result.text || result.statusText}`,
+    );
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with
@@ -277,8 +279,8 @@ export async function getAdminPairCode(): Promise<{
 /** Thrown when the localhost-only mint endpoint rejects a non-loopback caller. */
 export class PairCodeForbiddenError extends Error {
   constructor() {
-    super('forbidden');
-    this.name = 'PairCodeForbiddenError';
+    super("forbidden");
+    this.name = "PairCodeForbiddenError";
   }
 }
 
@@ -299,7 +301,9 @@ export async function generatePairCode(): Promise<{
   pairing_required: boolean;
   message?: string;
 }> {
-  const response = await fetch(`${basePath}/admin/paircode/new`, { method: 'POST' });
+  const response = await fetch(`${basePath}/admin/paircode/new`, {
+    method: "POST",
+  });
   if (response.status === 403) {
     throw new PairCodeForbiddenError();
   }
@@ -309,7 +313,9 @@ export async function generatePairCode(): Promise<{
     message?: string;
   } | null;
   if (!response.ok || !data) {
-    throw new Error(data?.message || `Failed to generate pairing code (${response.status})`);
+    throw new Error(
+      data?.message || `Failed to generate pairing code (${response.status})`,
+    );
   }
   return data;
 }
@@ -724,7 +730,8 @@ export interface SkillDocument {
 }
 
 /** Where a skill in an agent's effective set was loaded from. */
-export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+export type AgentSkillOrigin =
+  "workspace" | "open-skills" | "plugin" | "bundle";
 
 /**
  * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
@@ -1221,9 +1228,12 @@ export interface ModelsResponse {
   live: boolean;
 }
 
-export function getCatalogModels(provider: string, alias?: string): Promise<ModelsResponse> {
+export function getCatalogModels(
+  provider: string,
+  alias?: string,
+): Promise<ModelsResponse> {
   const params = new URLSearchParams({ provider });
-  if (alias) params.set('alias', alias);
+  if (alias) params.set("alias", alias);
   return apiFetch<ModelsResponse>(
     `/api/config/catalog/models?${params.toString()}`,
   );
@@ -1449,10 +1459,11 @@ export interface QuickstartError {
 }
 
 export type QuickstartValidateResult =
-  | { kind: "ok" }
-  | { kind: "errors"; errors: QuickstartError[] };
+  { kind: "ok" } | { kind: "errors"; errors: QuickstartError[] };
 
-export function quickstartValidate(submission: unknown): Promise<QuickstartValidateResult> {
+export function quickstartValidate(
+  submission: unknown,
+): Promise<QuickstartValidateResult> {
   return apiFetch<QuickstartValidateResult>("/api/quickstart/validate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1473,7 +1484,9 @@ export type QuickstartApplyResult =
   | { kind: "applied"; agent: AppliedAgent; daemon_restarted: boolean }
   | { kind: "errors"; errors: QuickstartError[] };
 
-export function quickstartApply(submission: unknown): Promise<QuickstartApplyResult> {
+export function quickstartApply(
+  submission: unknown,
+): Promise<QuickstartApplyResult> {
   return apiFetch<QuickstartApplyResult>("/api/quickstart/apply", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1555,7 +1568,6 @@ export function quickstartDismiss(req: QuickstartDismissRequest): void {
   } as RequestInit).catch(() => {});
 }
 
-
 // ── Map-keyed alias CRUD ─────────────────────────────────────────────
 
 export interface MapKeysResponse {
@@ -1599,11 +1611,14 @@ export async function renameMapKey(
   from: string,
   to: string,
 ): Promise<MapKeyMutResponse> {
-  const result = await apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, from, to }),
-  });
+  const result = await apiFetch<MapKeyMutResponse>(
+    "/api/config/rename-map-key",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, from, to }),
+    },
+  );
   // The alias changed: invalidate caches (⌘K search index, etc.).
   window.dispatchEvent(new Event("zeroclaw-config-mutated"));
   return result;

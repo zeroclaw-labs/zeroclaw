@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
-import { X } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { useFocusTrap } from '@/hooks/useFocusTrap';
-import { t } from '@/lib/i18n';
+import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
+import { Button } from "@/components/ui";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { t } from "@/lib/i18n";
 
 interface Props {
   label: string;
@@ -11,7 +11,12 @@ interface Props {
   onCancel: () => void;
 }
 
-export default function AliasPromptDialog({ label, suggestion, onConfirm, onCancel }: Props) {
+export default function AliasPromptDialog({
+  label,
+  suggestion,
+  onConfirm,
+  onCancel,
+}: Props) {
   const [value, setValue] = useState(suggestion);
   const inputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -39,7 +44,7 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={`${t('alias_prompt.name_this_prefix')}${label}${t('alias_prompt.name_this_suffix')}`}
+      aria-label={`${t("alias_prompt.name_this_prefix")}${label}${t("alias_prompt.name_this_suffix")}`}
       className="fixed inset-0 z-50 flex items-center justify-center"
       onClick={onCancel}
     >
@@ -52,12 +57,14 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-pc-border">
           <h2 className="text-sm font-semibold text-pc-text">
-            {t('alias_prompt.name_this_prefix')}{label}{t('alias_prompt.name_this_suffix')}
+            {t("alias_prompt.name_this_prefix")}
+            {label}
+            {t("alias_prompt.name_this_suffix")}
           </h2>
           <button
             type="button"
             onClick={onCancel}
-            aria-label={t('common.close')}
+            aria-label={t("common.close")}
             className="h-8 w-8 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X size={16} />
@@ -67,12 +74,19 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
         {/* Body */}
         <div className="px-6 py-5 flex flex-col gap-3">
           <p className="text-xs text-pc-text-muted">
-            {t('alias_prompt.description_prefix')}{' '}
-            <span className="text-pc-text-secondary">{t('alias_prompt.example_work')}</span>,{' '}
-            <span className="text-pc-text-secondary">{t('alias_prompt.example_personal')}</span>,{' '}
-            {t('alias_prompt.or')}{' '}
-            <span className="text-pc-text-secondary">{t('alias_prompt.example_default')}</span>
-            {t('alias_prompt.description_suffix')}
+            {t("alias_prompt.description_prefix")}{" "}
+            <span className="text-pc-text-secondary">
+              {t("alias_prompt.example_work")}
+            </span>
+            ,{" "}
+            <span className="text-pc-text-secondary">
+              {t("alias_prompt.example_personal")}
+            </span>
+            , {t("alias_prompt.or")}{" "}
+            <span className="text-pc-text-secondary">
+              {t("alias_prompt.example_default")}
+            </span>
+            {t("alias_prompt.description_suffix")}
           </p>
           <input
             ref={inputRef}
@@ -80,7 +94,7 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') confirm();
+              if (e.key === "Enter") confirm();
             }}
             placeholder={suggestion}
             className="input-electric w-full px-3 py-2 text-sm"
@@ -90,10 +104,10 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
         {/* Footer */}
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
           <Button variant="ghost" onClick={onCancel}>
-            {t('common.cancel')}
+            {t("common.cancel")}
           </Button>
           <Button variant="primary" onClick={confirm}>
-            {t('common.confirm')}
+            {t("common.confirm")}
           </Button>
         </div>
       </div>

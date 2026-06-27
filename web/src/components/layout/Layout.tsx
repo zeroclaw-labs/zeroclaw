@@ -1,29 +1,29 @@
-import { useState, useEffect } from 'react';
-import { Outlet, useLocation } from 'react-router-dom';
-import Sidebar from '@/components/layout/Sidebar';
-import Header from '@/components/layout/Header';
-import ReloadBanner from '@/components/layout/ReloadBanner';
-import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
-import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
-import { ErrorBoundary } from '@/App';
-import { t } from '@/lib/i18n';
+import { useState, useEffect } from "react";
+import { Outlet, useLocation } from "react-router-dom";
+import Sidebar from "@/components/layout/Sidebar";
+import Header from "@/components/layout/Header";
+import ReloadBanner from "@/components/layout/ReloadBanner";
+import UnsavedChangesBanner from "@/components/layout/UnsavedChangesBanner";
+import CommandPalette, { useCommandPalette } from "@/components/CommandPalette";
+import { ErrorBoundary } from "@/App";
+import { t } from "@/lib/i18n";
 
 // First-path-segment → i18n title key, so the browser tab/history/bookmark
 // reflects the current page instead of a constant "ZeroClaw".
 const TITLE_KEYS: Record<string, string> = {
-  agents: 'nav.agents',
-  config: 'nav.config',
-  setup: 'nav.config',
-  tools: 'nav.tools',
-  integrations: 'nav.integrations',
-  cron: 'nav.cron',
-  logs: 'nav.logs',
-  doctor: 'nav.doctor',
-  pairing: 'nav.pairing',
-  canvas: 'nav.canvas',
-  'acp-console': 'nav.acp',
-  quickstart: 'nav.quickstart',
-  memory: 'nav.memory',
+  agents: "nav.agents",
+  config: "nav.config",
+  setup: "nav.config",
+  tools: "nav.tools",
+  integrations: "nav.integrations",
+  cron: "nav.cron",
+  logs: "nav.logs",
+  doctor: "nav.doctor",
+  pairing: "nav.pairing",
+  canvas: "nav.canvas",
+  "acp-console": "nav.acp",
+  quickstart: "nav.quickstart",
+  memory: "nav.memory",
 };
 
 export default function Layout() {
@@ -38,18 +38,18 @@ export default function Layout() {
 
   // Per-route browser tab title.
   useEffect(() => {
-    const seg = pathname.split('/').filter(Boolean);
+    const seg = pathname.split("/").filter(Boolean);
     const first = seg[0];
     let name: string | null;
     if (!first) {
-      name = t('nav.dashboard');
-    } else if (first === 'agent' && seg[1]) {
-      name = `${decodeURIComponent(seg[1])} · ${t('nav.group.chat')}`;
+      name = t("nav.dashboard");
+    } else if (first === "agent" && seg[1]) {
+      name = `${decodeURIComponent(seg[1])} · ${t("nav.group.chat")}`;
     } else {
       const key = TITLE_KEYS[first];
       name = key ? t(key) : null;
     }
-    document.title = name ? `${name} — ZeroClaw` : 'ZeroClaw';
+    document.title = name ? `${name} — ZeroClaw` : "ZeroClaw";
   }, [pathname]);
 
   return (
@@ -74,7 +74,7 @@ export default function Layout() {
             Keying on the full pathname remounted the entire route tree
             on every section click and reset scroll/state. */}
         <main className="flex-1 overflow-y-auto min-h-0">
-          <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
+          <ErrorBoundary key={pathname.split("/")[1] ?? ""}>
             <Outlet />
           </ErrorBoundary>
         </main>

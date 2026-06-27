@@ -1,4 +1,4 @@
-import type { ElementType, ReactNode, ComponentPropsWithoutRef } from 'react';
+import type { ElementType, ReactNode, ComponentPropsWithoutRef } from "react";
 
 export interface CardProps {
   /** Element/tag to render as. Defaults to `div`. */
@@ -18,20 +18,20 @@ export interface CardProps {
 export function Card({
   as,
   padded = true,
-  className = '',
+  className = "",
   children,
   ...rest
-}: CardProps & Omit<ComponentPropsWithoutRef<'div'>, keyof CardProps>) {
-  const Tag = (as ?? 'div') as ElementType;
+}: CardProps & Omit<ComponentPropsWithoutRef<"div">, keyof CardProps>) {
+  const Tag = (as ?? "div") as ElementType;
   const classes = [
-    'bg-pc-surface',
-    'border border-pc-border',
-    'rounded-[var(--radius-lg)]',
-    padded ? 'p-4' : '',
+    "bg-pc-surface",
+    "border border-pc-border",
+    "rounded-[var(--radius-lg)]",
+    padded ? "p-4" : "",
     className,
   ]
     .filter(Boolean)
-    .join(' ');
+    .join(" ");
 
   return (
     <Tag className={classes} {...rest}>

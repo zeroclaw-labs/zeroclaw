@@ -110,7 +110,9 @@ function healthFixTarget(
     };
   }
   // providers.models.<type>.<alias>
-  const prov = err.match(/^\s*providers\.models\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
+  const prov = err.match(
+    /^\s*providers\.models\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i,
+  );
   if (prov?.[1] && prov[2]) {
     return {
       prefix: `providers.models.${prov[1]}.${prov[2]}`,
@@ -167,12 +169,7 @@ import { t } from "@/lib/i18n";
 import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
 type TabId =
-  | "overview"
-  | "sessions"
-  | "channels"
-  | "memories"
-  | "health"
-  | "cost";
+  "overview" | "sessions" | "channels" | "memories" | "health" | "cost";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -358,36 +355,35 @@ function healthBg(status: string): string {
 
 function readinessColor(state: ChannelReadinessState): string {
   switch (state) {
-    case 'ready':
-      return 'var(--color-status-success)';
-    case 'missing':
-      return 'var(--color-status-error)';
-    case 'unknown':
-      return 'var(--pc-text-muted)';
+    case "ready":
+      return "var(--color-status-success)";
+    case "missing":
+      return "var(--color-status-error)";
+    case "unknown":
+      return "var(--pc-text-muted)";
   }
 }
 
 function readinessLabel(state: ChannelReadinessState): string {
   switch (state) {
-    case 'ready':
-      return t('dashboard.readiness.ready');
-    case 'missing':
-      return t('dashboard.readiness.missing');
-    case 'unknown':
-      return t('dashboard.readiness.not_checked');
+    case "ready":
+      return t("dashboard.readiness.ready");
+    case "missing":
+      return t("dashboard.readiness.missing");
+    case "unknown":
+      return t("dashboard.readiness.not_checked");
   }
 }
 
 // Label keys resolved at render; the second tuple element is the readiness
 // field the row reads.
-const CHANNEL_READINESS_ROWS: Array<[
-  string,
-  'enabled' | 'bound_to_agent' | 'authenticated' | 'listening',
-]> = [
-  ['dashboard.readiness.enabled', 'enabled'],
-  ['dashboard.readiness.agent', 'bound_to_agent'],
-  ['dashboard.readiness.authenticated', 'authenticated'],
-  ['dashboard.readiness.listening', 'listening'],
+const CHANNEL_READINESS_ROWS: Array<
+  [string, "enabled" | "bound_to_agent" | "authenticated" | "listening"]
+> = [
+  ["dashboard.readiness.enabled", "enabled"],
+  ["dashboard.readiness.agent", "bound_to_agent"],
+  ["dashboard.readiness.authenticated", "authenticated"],
+  ["dashboard.readiness.listening", "listening"],
 ];
 
 // Genuinely process-global tiles only. Provider/Model and Memory Backend
@@ -780,43 +776,45 @@ function OverviewTab({
                           {comp.status}
                         </span>
                       </div>
-                      {lastErr ? (
-                        (() => {
-                          const fix = healthFixTarget(lastErr, (p) =>
-                            fieldTabs.get(p),
-                          );
-                          return (
-                            <div className="mt-1 flex items-start gap-2">
-                              <p
-                                className="flex-1 text-[11px] font-mono break-words"
-                                style={{ color: "var(--color-status-error)" }}
-                                title={lastErr}
-                              >
-                                ⚠{" "}
-                                {lastErr.length > 120
-                                  ? lastErr.slice(0, 117) + "…"
-                                  : lastErr}
-                              </p>
-                              {fix && (
-                                <button
-                                  type="button"
-                                  onClick={() => setHealthFix(fix)}
-                                  className="inline-flex h-6 flex-shrink-0 items-center gap-1 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-2 text-[11px] font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base cursor-pointer"
+                      {lastErr
+                        ? (() => {
+                            const fix = healthFixTarget(lastErr, (p) =>
+                              fieldTabs.get(p),
+                            );
+                            return (
+                              <div className="mt-1 flex items-start gap-2">
+                                <p
+                                  className="flex-1 text-[11px] font-mono break-words"
+                                  style={{ color: "var(--color-status-error)" }}
+                                  title={lastErr}
                                 >
-                                  {t("dashboard.fix")}
-                                  <ArrowRight className="h-3 w-3" />
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })()
-                      ) : null}
+                                  ⚠{" "}
+                                  {lastErr.length > 120
+                                    ? lastErr.slice(0, 117) + "…"
+                                    : lastErr}
+                                </p>
+                                {fix && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setHealthFix(fix)}
+                                    className="inline-flex h-6 flex-shrink-0 items-center gap-1 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-2 text-[11px] font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base cursor-pointer"
+                                  >
+                                    {t("dashboard.fix")}
+                                    <ArrowRight className="h-3 w-3" />
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })()
+                        : null}
                       <div
                         className="flex items-center gap-3 text-[11px] mt-0.5"
                         style={{ color: "var(--pc-text-muted)" }}
                       >
                         {lastOk && (
-                          <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                          <span
+                            title={`${t("dashboard.last_ok_title")} ${lastOk}`}
+                          >
                             {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                           </span>
                         )}
@@ -1664,8 +1662,13 @@ function ChannelsTab() {
                 {CHANNEL_READINESS_ROWS.map(([labelKey, key]) => {
                   const value = channel.readiness?.[key];
                   return value ? (
-                    <div key={key} className="flex justify-between gap-3 text-xs">
-                      <span style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
+                    <div
+                      key={key}
+                      className="flex justify-between gap-3 text-xs"
+                    >
+                      <span style={{ color: "var(--pc-text-muted)" }}>
+                        {t(labelKey)}
+                      </span>
                       <span style={{ color: readinessColor(value) }}>
                         {readinessLabel(value)}
                       </span>
@@ -2100,17 +2103,22 @@ function CostTab({
                       className="flex items-center gap-3 text-xs flex-wrap"
                       style={{ color: "var(--pc-text-muted)" }}
                     >
-                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
                       <span>
-                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
+                        {row.request_count} {t("dashboard.cost.exchanges")}
+                      </span>
+                      <span>
+                        {row.input_tokens.toLocaleString()}{" "}
+                        {t("dashboard.cost.input_tokens")}
                       </span>
                       {row.cached_input_tokens > 0 && (
                         <span>
-                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
+                          {row.cached_input_tokens.toLocaleString()}{" "}
+                          {t("dashboard.cost.cached")}
                         </span>
                       )}
                       <span>
-                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
+                        {row.output_tokens.toLocaleString()}{" "}
+                        {t("dashboard.cost.output_tokens")}
                       </span>
                     </div>
                   </li>
@@ -2171,17 +2179,22 @@ function CostTab({
                       className="flex items-center gap-3 text-xs flex-wrap"
                       style={{ color: "var(--pc-text-muted)" }}
                     >
-                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
                       <span>
-                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
+                        {row.request_count} {t("dashboard.cost.exchanges")}
+                      </span>
+                      <span>
+                        {row.input_tokens.toLocaleString()}{" "}
+                        {t("dashboard.cost.input_tokens")}
                       </span>
                       {row.cached_input_tokens > 0 && (
                         <span>
-                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
+                          {row.cached_input_tokens.toLocaleString()}{" "}
+                          {t("dashboard.cost.cached")}
                         </span>
                       )}
                       <span>
-                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
+                        {row.output_tokens.toLocaleString()}{" "}
+                        {t("dashboard.cost.output_tokens")}
                       </span>
                     </div>
                   </li>
@@ -2722,7 +2735,9 @@ function MemoriesTab() {
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium disabled:opacity-50"
               >
-                {submitting ? t("dashboard.mem.saving") : t("dashboard.mem.save")}
+                {submitting
+                  ? t("dashboard.mem.saving")
+                  : t("dashboard.mem.save")}
               </button>
             </div>
           </div>

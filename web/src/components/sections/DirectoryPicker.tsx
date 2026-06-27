@@ -6,17 +6,24 @@
 // rules live in `zeroclaw_runtime::browse::list_directory`; this
 // component is presentation-only.
 
-import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, FolderOpen, ChevronRight, RefreshCw, FolderPlus, Trash2 } from 'lucide-react';
-import { Button, ConfirmDialog } from '@/components/ui';
-import { t } from '@/lib/i18n';
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowUp,
+  FolderOpen,
+  ChevronRight,
+  RefreshCw,
+  FolderPlus,
+  Trash2,
+} from "lucide-react";
+import { Button, ConfirmDialog } from "@/components/ui";
+import { t } from "@/lib/i18n";
 import {
   ApiError,
   browseShared,
   mkdirShared,
   rmdirShared,
   type BrowseEntry,
-} from '../../lib/api';
+} from "../../lib/api";
 
 interface DirectoryPickerProps {
   /** Current relative path (empty = `shared/`). */
@@ -27,14 +34,18 @@ interface DirectoryPickerProps {
   onClose: () => void;
 }
 
-export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryPickerProps) {
+export default function DirectoryPicker({
+  value,
+  onSelect,
+  onClose,
+}: DirectoryPickerProps) {
   const [cwd, setCwd] = useState<string>(initialCwd(value));
   const [entries, setEntries] = useState<BrowseEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
   const [creating, setCreating] = useState(false);
-  const [newDirName, setNewDirName] = useState('');
+  const [newDirName, setNewDirName] = useState("");
   const [busyDir, setBusyDir] = useState<string | null>(null);
   // The directory name queued for deletion; non-null opens the confirm dialog.
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -62,7 +73,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
   // when neither is active.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !creating && pendingDelete === null) {
+      if (e.key === "Escape" && !creating && pendingDelete === null) {
         e.stopPropagation();
         onClose();
       }
@@ -71,17 +82,17 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       // Ignore clicks on the trigger that opened us — it owns its own toggle,
       // and closing here would race its onClick and reopen the picker.
       const target = e.target as Element | null;
-      if (target?.closest?.('[data-dirpicker-trigger]')) return;
+      if (target?.closest?.("[data-dirpicker-trigger]")) return;
       if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
         restoreFocusRef.current = false;
         onClose();
       }
     };
-    document.addEventListener('keydown', onKey);
-    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onPointerDown);
     return () => {
-      document.removeEventListener('keydown', onKey);
-      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPointerDown);
     };
   }, [onClose, creating, pendingDelete]);
 
@@ -115,8 +126,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
   const handleCreate = async () => {
     const name = newDirName.trim();
     if (!name) return;
-    if (name.includes('/') || name.includes('\\')) {
-      setError(t('dir_picker.name_no_slashes'));
+    if (name.includes("/") || name.includes("\\")) {
+      setError(t("dir_picker.name_no_slashes"));
       return;
     }
     const target = cwd ? `${cwd}/${name}` : name;
@@ -124,7 +135,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
     try {
       await mkdirShared(target);
       setCreating(false);
-      setNewDirName('');
+      setNewDirName("");
       reload();
     } catch (e) {
       setError(
@@ -160,8 +171,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
 
   const parent = (() => {
     if (!cwd) return null;
-    const idx = cwd.lastIndexOf('/');
-    return idx <= 0 ? '' : cwd.slice(0, idx);
+    const idx = cwd.lastIndexOf("/");
+    return idx <= 0 ? "" : cwd.slice(0, idx);
   })();
 
   const enterDir = (name: string) => {
@@ -174,7 +185,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       tabIndex={-1}
       className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface shadow-[var(--pc-shadow-md)] overflow-hidden focus:outline-none"
       role="dialog"
-      aria-label={t('dir_picker.aria_label')}
+      aria-label={t("dir_picker.aria_label")}
     >
       <div className="flex items-center gap-2 px-3 py-2 border-b border-pc-border text-xs text-pc-text-secondary">
         <FolderOpen className="h-3.5 w-3.5 flex-shrink-0" />
@@ -184,8 +195,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
         <button
           type="button"
           onClick={() => setCreating((v) => !v)}
-          title={t('dir_picker.new_folder_here')}
-          aria-label={t('dir_picker.new_folder_here')}
+          title={t("dir_picker.new_folder_here")}
+          aria-label={t("dir_picker.new_folder_here")}
           className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <FolderPlus className="h-3.5 w-3.5" />
@@ -193,8 +204,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
         <button
           type="button"
           onClick={reload}
-          title={t('common.refresh')}
-          aria-label={t('common.refresh')}
+          title={t("common.refresh")}
+          aria-label={t("common.refresh")}
           className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <RefreshCw className="h-3.5 w-3.5" />
@@ -208,13 +219,13 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
             value={newDirName}
             onChange={(e) => setNewDirName(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleCreate();
-              if (e.key === 'Escape') {
+              if (e.key === "Enter") void handleCreate();
+              if (e.key === "Escape") {
                 setCreating(false);
-                setNewDirName('');
+                setNewDirName("");
               }
             }}
-            placeholder={t('dir_picker.new_folder_placeholder')}
+            placeholder={t("dir_picker.new_folder_placeholder")}
             className="input-electric flex-1 px-2 py-1 text-xs"
             autoFocus
           />
@@ -224,17 +235,17 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
             onClick={() => void handleCreate()}
             disabled={!newDirName.trim()}
           >
-            {t('dir_picker.create')}
+            {t("dir_picker.create")}
           </Button>
           <Button
             size="sm"
             variant="ghost"
             onClick={() => {
               setCreating(false);
-              setNewDirName('');
+              setNewDirName("");
             }}
           >
-            {t('common.cancel')}
+            {t("common.cancel")}
           </Button>
         </div>
       )}
@@ -248,7 +259,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text-secondary transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
             >
               <ArrowUp className="h-3.5 w-3.5 flex-shrink-0" />
-              {t('dir_picker.up_one_level')}
+              {t("dir_picker.up_one_level")}
             </button>
           </li>
         )}
@@ -256,21 +267,22 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
           <li className="px-3 py-6 flex items-center justify-center">
             <div
               className="h-5 w-5 border-2 rounded-full animate-spin"
-              style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+              style={{
+                borderColor: "var(--pc-border)",
+                borderTopColor: "var(--pc-accent)",
+              }}
             />
           </li>
         ) : error ? (
-          <li className="px-3 py-3 text-xs text-status-error">
-            {error}
-          </li>
+          <li className="px-3 py-3 text-xs text-status-error">{error}</li>
         ) : entries.length === 0 ? (
           <li className="px-3 py-3 text-xs italic text-pc-text-faint">
-            {t('dir_picker.empty')}
+            {t("dir_picker.empty")}
           </li>
         ) : (
           entries.map((entry) => (
             <li key={`${entry.kind}-${entry.name}`}>
-              {entry.kind === 'dir' ? (
+              {entry.kind === "dir" ? (
                 <div className="flex items-stretch">
                   <button
                     type="button"
@@ -278,15 +290,17 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                     className="flex-1 flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
                   >
                     <FolderOpen className="h-3.5 w-3.5 flex-shrink-0 text-pc-accent" />
-                    <span className="flex-1 min-w-0 truncate">{entry.name}</span>
+                    <span className="flex-1 min-w-0 truncate">
+                      {entry.name}
+                    </span>
                     <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-pc-text-muted" />
                   </button>
                   <button
                     type="button"
                     onClick={() => setPendingDelete(entry.name)}
                     disabled={busyDir === entry.name}
-                    title={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
-                    aria-label={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
+                    title={`${t("dir_picker.delete_prefix")}shared/${cwd ? `${cwd}/` : ""}${entry.name}`}
+                    aria-label={`${t("dir_picker.delete_prefix")}shared/${cwd ? `${cwd}/` : ""}${entry.name}`}
                     className="px-2 text-status-error opacity-60 transition-colors hover:opacity-100 hover:bg-status-error/10 disabled:opacity-30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -296,7 +310,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                 <div className="flex items-center gap-2 px-3 py-2 text-sm text-pc-text-muted">
                   <span className="h-3.5 w-3.5 flex-shrink-0" />
                   <span className="flex-1 min-w-0 truncate">{entry.name}</span>
-                  {typeof entry.size === 'number' && (
+                  {typeof entry.size === "number" && (
                     <span className="text-xs text-pc-text-faint">
                       {formatBytes(entry.size)}
                     </span>
@@ -310,19 +324,21 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
 
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-t border-pc-border">
         <span className="text-xs text-pc-text-faint">
-          {t('dir_picker.relative_hint_prefix')}<code>shared/</code>{t('dir_picker.relative_hint_suffix')}
+          {t("dir_picker.relative_hint_prefix")}
+          <code>shared/</code>
+          {t("dir_picker.relative_hint_suffix")}
         </span>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="ghost" onClick={onClose}>
-            {t('common.cancel')}
+            {t("common.cancel")}
           </Button>
           <Button
             size="sm"
             variant="primary"
-            onClick={() => onSelect(cwd ? `shared/${cwd}` : 'shared')}
-            title={t('dir_picker.use_this_title')}
+            onClick={() => onSelect(cwd ? `shared/${cwd}` : "shared")}
+            title={t("dir_picker.use_this_title")}
           >
-            {t('dir_picker.use_this')}
+            {t("dir_picker.use_this")}
           </Button>
         </div>
       </div>
@@ -333,11 +349,11 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       <ConfirmDialog
         open={pendingDelete !== null}
         danger
-        title={t('dir_picker.delete_dialog_title')}
-        message={`${t('dir_picker.delete_prefix')}shared/${
+        title={t("dir_picker.delete_dialog_title")}
+        message={`${t("dir_picker.delete_prefix")}shared/${
           cwd ? `${cwd}/${pendingDelete}` : pendingDelete
-        }${t('dir_picker.delete_dialog_suffix')}`}
-        confirmLabel={t('common.delete')}
+        }${t("dir_picker.delete_dialog_suffix")}`}
+        confirmLabel={t("common.delete")}
         onConfirm={() => {
           if (pendingDelete !== null) void confirmDelete(pendingDelete);
           setPendingDelete(null);
@@ -352,10 +368,10 @@ function initialCwd(value: string): string {
   // Field stores `shared/skills/<alias>/` or similar; strip the `shared/`
   // prefix so the API call (which is implicitly relative to `shared/`)
   // doesn't double-traverse.
-  const trimmed = value.trim().replace(/^\.\//, '').replace(/\/+$/, '');
-  if (trimmed.startsWith('shared/')) return trimmed.slice('shared/'.length);
-  if (trimmed === 'shared') return '';
-  return '';
+  const trimmed = value.trim().replace(/^\.\//, "").replace(/\/+$/, "");
+  if (trimmed.startsWith("shared/")) return trimmed.slice("shared/".length);
+  if (trimmed === "shared") return "";
+  return "";
 }
 
 function formatBytes(n: number): string {

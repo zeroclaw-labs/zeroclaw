@@ -15,11 +15,11 @@
 // elsewhere in software — clarify that nothing is destroyed, the PID
 // stays, and connections will briefly drop.
 
-import { useState } from 'react';
-import { Loader2, RotateCw, X } from 'lucide-react';
-import { ApiError, reloadDaemon } from '../../lib/api';
-import { useReloadAvailable } from '../../lib/reloadAvailability';
-import { t } from '@/lib/i18n';
+import { useState } from "react";
+import { Loader2, RotateCw, X } from "lucide-react";
+import { ApiError, reloadDaemon } from "../../lib/api";
+import { useReloadAvailable } from "../../lib/reloadAvailability";
+import { t } from "@/lib/i18n";
 
 interface ReloadDaemonButtonProps {
   /** Called when /health answers post-reload (parent typically reloads its data). */
@@ -29,15 +29,18 @@ interface ReloadDaemonButtonProps {
 }
 
 type State =
-  | { kind: 'idle' }
-  | { kind: 'confirming' }
-  | { kind: 'reloading' }       // POST /admin/reload sent
-  | { kind: 'waiting'; since: number }  // polling /health
-  | { kind: 'back' }            // /health answered after reload
-  | { kind: 'error'; message: string };
+  | { kind: "idle" }
+  | { kind: "confirming" }
+  | { kind: "reloading" } // POST /admin/reload sent
+  | { kind: "waiting"; since: number } // polling /health
+  | { kind: "back" } // /health answered after reload
+  | { kind: "error"; message: string };
 
-export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: ReloadDaemonButtonProps) {
-  const [state, setState] = useState<State>({ kind: 'idle' });
+export default function ReloadDaemonButton({
+  onReloaded,
+  timeoutMs = 30_000,
+}: ReloadDaemonButtonProps) {
+  const [state, setState] = useState<State>({ kind: "idle" });
   const reloadAvailable = useReloadAvailable();
 
   // The gateway rejects /admin/reload from a remote host unless remote admin
@@ -48,7 +51,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
   }
 
   const triggerReload = async () => {
-    setState({ kind: 'reloading' });
+    setState({ kind: "reloading" });
     try {
       await reloadDaemon();
     } catch (e) {
@@ -58,24 +61,27 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
           : e instanceof Error
             ? e.message
             : String(e);
-      setState({ kind: 'error', message: `${t('reload_btn.request_failed_prefix')}${msg}` });
+      setState({
+        kind: "error",
+        message: `${t("reload_btn.request_failed_prefix")}${msg}`,
+      });
       return;
     }
 
     // The daemon is signalled. Wait briefly for it to actually drop the
     // listener, then poll /health until it answers.
-    setState({ kind: 'waiting', since: Date.now() });
+    setState({ kind: "waiting", since: Date.now() });
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500));
       try {
-        const r = await fetch('/health', { cache: 'no-store' });
+        const r = await fetch("/health", { cache: "no-store" });
         if (r.ok) {
-          setState({ kind: 'back' });
+          setState({ kind: "back" });
           // Hold the success state briefly so the user sees the green
           // confirmation, then return to idle and refresh parent data.
           setTimeout(() => {
-            setState({ kind: 'idle' });
+            setState({ kind: "idle" });
             onReloaded?.();
           }, 1500);
           return;
@@ -85,111 +91,113 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
       }
     }
     setState({
-      kind: 'error',
-      message: `${t('reload_btn.timeout_prefix')}${(timeoutMs / 1000).toFixed(0)}${t('reload_btn.timeout_suffix')}`,
+      kind: "error",
+      message: `${t("reload_btn.timeout_prefix")}${(timeoutMs / 1000).toFixed(0)}${t("reload_btn.timeout_suffix")}`,
     });
   };
 
   const isBusy =
-    state.kind === 'reloading' ||
-    state.kind === 'waiting' ||
-    state.kind === 'back';
+    state.kind === "reloading" ||
+    state.kind === "waiting" ||
+    state.kind === "back";
 
   return (
     <>
       <button
         type="button"
-        onClick={() => setState({ kind: 'confirming' })}
+        onClick={() => setState({ kind: "confirming" })}
         disabled={isBusy}
         className="btn-secondary flex items-center gap-2 text-sm px-3 py-2"
-        title={t('reload_btn.button_title')}
+        title={t("reload_btn.button_title")}
       >
-        {state.kind === 'reloading' || state.kind === 'waiting' ? (
+        {state.kind === "reloading" || state.kind === "waiting" ? (
           <Loader2 className="h-4 w-4 animate-spin" />
         ) : (
           <RotateCw className="h-4 w-4" />
         )}
-        {state.kind === 'reloading'
-          ? t('reload_btn.reloading')
-          : state.kind === 'waiting'
-            ? t('reload_btn.waiting')
-            : state.kind === 'back'
-              ? t('reload_btn.back')
-              : t('reload_btn.reload_daemon')}
+        {state.kind === "reloading"
+          ? t("reload_btn.reloading")
+          : state.kind === "waiting"
+            ? t("reload_btn.waiting")
+            : state.kind === "back"
+              ? t("reload_btn.back")
+              : t("reload_btn.reload_daemon")}
       </button>
 
-      {state.kind === 'error' && (
+      {state.kind === "error" && (
         <div
           className="rounded-xl border p-3 text-sm mt-2"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
           {state.message}
           <button
             type="button"
-            onClick={() => setState({ kind: 'idle' })}
+            onClick={() => setState({ kind: "idle" })}
             className="ml-3 underline"
           >
-            {t('reload_btn.dismiss')}
+            {t("reload_btn.dismiss")}
           </button>
         </div>
       )}
 
-      {state.kind === 'confirming' && (
+      {state.kind === "confirming" && (
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
           <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale">
             <div className="flex items-center justify-between mb-4">
               <h3
                 className="text-lg font-semibold flex items-center gap-2"
-                style={{ color: 'var(--pc-text-primary)' }}
+                style={{ color: "var(--pc-text-primary)" }}
               >
-                <RotateCw className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-                {t('reload_btn.modal_title')}
+                <RotateCw
+                  className="h-5 w-5"
+                  style={{ color: "var(--pc-accent)" }}
+                />
+                {t("reload_btn.modal_title")}
               </h3>
               <button
                 type="button"
-                onClick={() => setState({ kind: 'idle' })}
+                onClick={() => setState({ kind: "idle" })}
                 className="btn-icon"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            <div className="space-y-3 text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-              <p>
-                {t('reload_btn.body_intro')}
-              </p>
+            <div
+              className="space-y-3 text-sm"
+              style={{ color: "var(--pc-text-secondary)" }}
+            >
+              <p>{t("reload_btn.body_intro")}</p>
               <ul className="list-disc pl-5 space-y-1">
-                <li>{t('reload_btn.effect_gateway')}</li>
-                <li>{t('reload_btn.effect_channels')}</li>
-                <li>{t('reload_btn.effect_mcp')}</li>
-                <li>{t('reload_btn.effect_providers')}</li>
+                <li>{t("reload_btn.effect_gateway")}</li>
+                <li>{t("reload_btn.effect_channels")}</li>
+                <li>{t("reload_btn.effect_mcp")}</li>
+                <li>{t("reload_btn.effect_providers")}</li>
               </ul>
-              <p style={{ color: 'var(--pc-text-muted)' }}>
-                {t('reload_btn.body_when')}
+              <p style={{ color: "var(--pc-text-muted)" }}>
+                {t("reload_btn.body_when")}
               </p>
-              <p>
-                {t('reload_btn.body_inflight')}
-              </p>
+              <p>{t("reload_btn.body_inflight")}</p>
             </div>
 
             <div className="flex justify-end gap-3 mt-6">
               <button
                 type="button"
-                onClick={() => setState({ kind: 'idle' })}
+                onClick={() => setState({ kind: "idle" })}
                 className="btn-secondary px-4 py-2 text-sm font-medium"
               >
-                {t('common.cancel')}
+                {t("common.cancel")}
               </button>
               <button
                 type="button"
                 onClick={() => void triggerReload()}
                 className="btn-electric px-4 py-2 text-sm font-medium"
               >
-                {t('reload_btn.reload')}
+                {t("reload_btn.reload")}
               </button>
             </div>
           </div>

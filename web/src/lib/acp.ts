@@ -1,6 +1,6 @@
-import { getToken } from './auth';
-import { apiOrigin, basePath } from './basePath';
-import { isTauri } from './tauri';
+import { getToken } from "./auth";
+import { apiOrigin, basePath } from "./basePath";
+import { isTauri } from "./tauri";
 
 export type JsonRpcId = number | string;
 
@@ -11,20 +11,20 @@ export interface JsonRpcError {
 }
 
 export interface AcpRequest {
-  jsonrpc: '2.0';
+  jsonrpc: "2.0";
   method: string;
   params?: unknown;
   id: JsonRpcId;
 }
 
 export interface AcpNotification {
-  jsonrpc: '2.0';
+  jsonrpc: "2.0";
   method: string;
   params?: unknown;
 }
 
 export interface AcpResponse<T = unknown> {
-  jsonrpc: '2.0';
+  jsonrpc: "2.0";
   result?: T;
   error?: JsonRpcError;
   id: JsonRpcId;
@@ -32,7 +32,7 @@ export interface AcpResponse<T = unknown> {
 
 export type AcpFrame = AcpRequest | AcpNotification | AcpResponse;
 
-export type AcpConnectionStatus = 'disconnected' | 'connecting' | 'connected';
+export type AcpConnectionStatus = "disconnected" | "connecting" | "connected";
 
 export interface AcpInitializeResult {
   protocolVersion?: number;
@@ -83,21 +83,21 @@ interface PendingRequest {
   timeout: ReturnType<typeof setTimeout>;
 }
 
-const ACP_PROTOCOL = 'zeroclaw.acp.v1';
+const ACP_PROTOCOL = "zeroclaw.acp.v1";
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 
 function acpWebSocketBaseUrl(): string {
   if (isTauri() && apiOrigin) {
-    return apiOrigin.replace(/^http/, 'ws');
+    return apiOrigin.replace(/^http/, "ws");
   }
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}`;
 }
 
 function parseFrame(data: string): AcpFrame | null {
   try {
     const parsed = JSON.parse(data) as Partial<AcpFrame>;
-    if (parsed && parsed.jsonrpc === '2.0') {
+    if (parsed && parsed.jsonrpc === "2.0") {
       return parsed as AcpFrame;
     }
   } catch {
@@ -116,36 +116,41 @@ export class AcpWebSocketClient {
   constructor(private readonly handlers: AcpClientHandlers = {}) {}
 
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
+    if (
+      this.ws?.readyState === WebSocket.OPEN ||
+      this.ws?.readyState === WebSocket.CONNECTING
+    ) {
       return;
     }
 
     const token = getToken();
     const params = new URLSearchParams();
-    if (token) params.set('token', token);
+    if (token) params.set("token", token);
 
     const query = params.toString();
-    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${query ? `?${query}` : ''}`;
-    const protocols = token ? [ACP_PROTOCOL, `bearer.${token}`] : [ACP_PROTOCOL];
+    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${query ? `?${query}` : ""}`;
+    const protocols = token
+      ? [ACP_PROTOCOL, `bearer.${token}`]
+      : [ACP_PROTOCOL];
 
     this.ws = new WebSocket(url, protocols);
     this.ws.onopen = () => this.handlers.onOpen?.();
     this.ws.onclose = (event) => {
-      this.rejectPending(new Error('ACP WebSocket closed'));
+      this.rejectPending(new Error("ACP WebSocket closed"));
       this.handlers.onClose?.(event);
     };
     this.ws.onerror = (event) => this.handlers.onError?.(event);
     this.ws.onmessage = (event) => {
-      if (typeof event.data !== 'string') return;
+      if (typeof event.data !== "string") return;
       const frame = parseFrame(event.data);
       if (!frame) return;
 
       this.handlers.onFrame?.(frame);
-      if ('id' in frame && ('result' in frame || 'error' in frame)) {
+      if ("id" in frame && ("result" in frame || "error" in frame)) {
         this.resolveResponse(frame as AcpResponse);
-      } else if ('id' in frame && 'method' in frame) {
+      } else if ("id" in frame && "method" in frame) {
         this.handlers.onRequest?.(frame as AcpRequest);
-      } else if ('method' in frame) {
+      } else if ("method" in frame) {
         this.handlers.onNotification?.(frame as AcpNotification);
       }
     };
@@ -157,12 +162,12 @@ export class AcpWebSocketClient {
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<T> {
     if (!this.connected) {
-      return Promise.reject(new Error('ACP WebSocket is not connected'));
+      return Promise.reject(new Error("ACP WebSocket is not connected"));
     }
 
     const id = this.nextId++;
     const frame: AcpRequest = {
-      jsonrpc: '2.0',
+      jsonrpc: "2.0",
       method,
       id,
       ...(params === undefined ? {} : { params }),
@@ -191,10 +196,10 @@ export class AcpWebSocketClient {
 
   notify(method: string, params?: unknown): void {
     if (!this.connected) {
-      throw new Error('ACP WebSocket is not connected');
+      throw new Error("ACP WebSocket is not connected");
     }
     const frame: AcpNotification = {
-      jsonrpc: '2.0',
+      jsonrpc: "2.0",
       method,
       ...(params === undefined ? {} : { params }),
     };
@@ -203,10 +208,10 @@ export class AcpWebSocketClient {
 
   respond(id: JsonRpcId, result: unknown): void {
     if (!this.connected) {
-      throw new Error('ACP WebSocket is not connected');
+      throw new Error("ACP WebSocket is not connected");
     }
     const frame: AcpResponse = {
-      jsonrpc: '2.0',
+      jsonrpc: "2.0",
       id,
       result,
     };
@@ -215,10 +220,10 @@ export class AcpWebSocketClient {
 
   respondError(id: JsonRpcId, error: JsonRpcError): void {
     if (!this.connected) {
-      throw new Error('ACP WebSocket is not connected');
+      throw new Error("ACP WebSocket is not connected");
     }
     const frame: AcpResponse = {
-      jsonrpc: '2.0',
+      jsonrpc: "2.0",
       id,
       error,
     };
@@ -226,7 +231,7 @@ export class AcpWebSocketClient {
   }
 
   disconnect(): void {
-    this.rejectPending(new Error('ACP WebSocket disconnected'));
+    this.rejectPending(new Error("ACP WebSocket disconnected"));
     this.ws?.close();
     this.ws = null;
   }

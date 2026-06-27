@@ -62,7 +62,10 @@ import {
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
 import { fuzzyFilter } from "../../lib/fuzzy";
-import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
+import {
+  isLocalModelProviderName,
+  primeModelProviderCatalog,
+} from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 
 function entryValue(entry: ListResponseEntry): unknown {
@@ -168,7 +171,15 @@ export interface FieldFormHandle {
 
 function rendererFor(
   entry: ListResponseEntry,
-): "bool" | "array" | "object-array" | "secret" | "select" | "alias-ref" | "number" | "text" {
+):
+  | "bool"
+  | "array"
+  | "object-array"
+  | "secret"
+  | "select"
+  | "alias-ref"
+  | "number"
+  | "text" {
   if (entry.is_secret) return "secret";
   switch (entry.kind) {
     case "bool":
@@ -207,10 +218,46 @@ function fieldShortLabel(entry: ListResponseEntry): string {
 // Common acronyms that should render fully upper-cased in a humanized label
 // (so `api_key` → "API Key", `mcp` → "MCP", not "Api Key" / "Mcp").
 const LABEL_ACRONYMS = new Set([
-  "api", "url", "uri", "id", "ip", "ui", "os", "db", "vm", "ai", "llm",
-  "mcp", "tts", "acp", "ttl", "sop", "cpu", "ram", "gpu", "dns", "ssl",
-  "tls", "json", "toml", "yaml", "csv", "sql", "jwt", "sse", "ws", "wss",
-  "http", "https", "rpc", "grpc", "cli", "sdk", "pdf", "cwd", "env",
+  "api",
+  "url",
+  "uri",
+  "id",
+  "ip",
+  "ui",
+  "os",
+  "db",
+  "vm",
+  "ai",
+  "llm",
+  "mcp",
+  "tts",
+  "acp",
+  "ttl",
+  "sop",
+  "cpu",
+  "ram",
+  "gpu",
+  "dns",
+  "ssl",
+  "tls",
+  "json",
+  "toml",
+  "yaml",
+  "csv",
+  "sql",
+  "jwt",
+  "sse",
+  "ws",
+  "wss",
+  "http",
+  "https",
+  "rpc",
+  "grpc",
+  "cli",
+  "sdk",
+  "pdf",
+  "cwd",
+  "env",
 ]);
 
 // Humanize the schema-provided dotted path's LAST segment into a Title-ish
@@ -274,15 +321,23 @@ function setupRequirement(
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
     const localProvider = isLocalModelProviderPath(entry.path);
-    if (leaf === "model") return { label: t("fieldform.badge_required"), tone: "required" };
+    if (leaf === "model")
+      return { label: t("fieldform.badge_required"), tone: "required" };
     if (leaf === "api_key") {
       return localProvider
-        ? { label: t("fieldform.badge_optional_for_remote_auth"), tone: "optional" }
-        : { label: t("fieldform.badge_required_for_api_key_auth"), tone: "required" };
+        ? {
+            label: t("fieldform.badge_optional_for_remote_auth"),
+            tone: "optional",
+          }
+        : {
+            label: t("fieldform.badge_required_for_api_key_auth"),
+            tone: "required",
+          };
     }
     if (leaf === "requires_openai_auth")
       return { label: t("fieldform.badge_auth_option"), tone: "choice" };
-    if (leaf === "uri") return { label: t("fieldform.badge_endpoint_option"), tone: "choice" };
+    if (leaf === "uri")
+      return { label: t("fieldform.badge_endpoint_option"), tone: "choice" };
     return { label: t("fieldform.badge_optional"), tone: "optional" };
   }
   const topLevelAgentField =
@@ -556,10 +611,10 @@ export function clearFieldFormCatalogCaches() {
 // crates/zeroclaw-macros/src/lib.rs:1056 passes through snake_case Rust
 // field name unchanged for the schema path).
 const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
-  "model_provider": "model_providers",
-  "risk_profile": "risk_profiles",
-  "runtime_profile": "runtime_profiles",
-  "memory_namespace": "memory_namespaces",
+  model_provider: "model_providers",
+  risk_profile: "risk_profiles",
+  runtime_profile: "runtime_profiles",
+  memory_namespace: "memory_namespaces",
 };
 
 // Multi-select alias-ref fields on an agent: render as the chip editor with
@@ -568,9 +623,9 @@ const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
 // convention as AGENT_SINGLE_ALIAS_FIELDS above.
 const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   channels: "channels",
-  "skill_bundles": "skill_bundles",
-  "knowledge_bundles": "knowledge_bundles",
-  "mcp_bundles": "mcp_bundles",
+  skill_bundles: "skill_bundles",
+  knowledge_bundles: "knowledge_bundles",
+  mcp_bundles: "mcp_bundles",
   // Delegates is a subset of the configured agents — give it the same themed
   // multi-select (with agent suggestions) as the bundle fields, not free text.
   delegates: "agents",
@@ -686,13 +741,16 @@ function AgentEmptyAliasFallback({
         background: "var(--pc-bg-surface-subtle)",
       }}
     >
-      {t("fieldform.no_alias_configured_prefix")}{label}{t("fieldform.no_alias_configured_suffix")}{" "}
+      {t("fieldform.no_alias_configured_prefix")}
+      {label}
+      {t("fieldform.no_alias_configured_suffix")}{" "}
       <Link
         to={path}
         className="inline-flex items-center gap-1 underline"
         style={{ color: "var(--pc-text-link)" }}
       >
-        {t("fieldform.configure_prefix")}{label} <ExternalLink className="h-3 w-3" />
+        {t("fieldform.configure_prefix")}
+        {label} <ExternalLink className="h-3 w-3" />
       </Link>
     </div>
   );
@@ -768,7 +826,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       void getChannels()
         .then((channels) => {
           if (cancelled) return;
-          const owner = channels.find((c) => c.name === channelName)?.owning_agent;
+          const owner = channels.find(
+            (c) => c.name === channelName,
+          )?.owning_agent;
           setToolAgent(owner ?? undefined);
         })
         .catch(() => {
@@ -908,7 +968,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
       try {
         const resp = await patchConfig(ops);
-        setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
+        setSavedAt(
+          `${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`,
+        );
         if (scopeActionsToIncludedPaths && includePath) {
           configDraft.discardPaths(actionablePaths);
         } else {
@@ -926,7 +988,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               `${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message} (${t("fieldform.field_label")}: ${env.path})`,
             );
           } else {
-            setTopError(`${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message}`);
+            setTopError(
+              `${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message}`,
+            );
           }
         } else {
           setTopError(
@@ -1421,7 +1485,7 @@ function FieldRow({
   useEffect(() => {
     if (!needsProviderModels) return;
     void primeModelProviderCatalog();
-    const [, , provider, alias] = entry.path.split('.');
+    const [, , provider, alias] = entry.path.split(".");
     if (!provider || !alias) return;
     const cacheKey = `${provider}.${alias}`;
     const cached = modelsCache[cacheKey];
@@ -1432,7 +1496,11 @@ function FieldRow({
     }
     void getCatalogModels(provider)
       .then((r) => {
-        modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
+        modelsCache[cacheKey] = {
+          models: r.models,
+          live: r.live,
+          local: r.local,
+        };
         setProviderModels(r.models);
         setModelsFetchFailed(!r.live && r.models.length === 0);
       })
@@ -1553,7 +1621,10 @@ function FieldRow({
             )}
             {entry.is_secret && (
               <span className="ml-2 text-xs font-sans text-pc-text-muted">
-                🔒 {entry.populated ? t("fieldform.secret_set") : t("fieldform.secret_unset")}
+                🔒{" "}
+                {entry.populated
+                  ? t("fieldform.secret_set")
+                  : t("fieldform.secret_unset")}
               </span>
             )}
           </label>
@@ -1948,9 +2019,7 @@ function ArrayFieldEditor({
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
           {rows.length}{" "}
-          {rows.length === 1
-            ? t("fieldform.entry")
-            : t("fieldform.entries")}
+          {rows.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
           {isOptional && rows.length === 0
             ? t("fieldform.saves_as_null")
             : null}

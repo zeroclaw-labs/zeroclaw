@@ -12,7 +12,7 @@
 // from a small per-type table below; adding a new channel family means
 // one row here.
 
-import { getProp } from './api';
+import { getProp } from "./api";
 
 export interface AgentBoundChannel {
   /** Composite `<type>.<alias>` as it appears in `agents.<alias>.channels`. */
@@ -40,20 +40,20 @@ interface IdentityField {
 // `ChannelsConfig` and the picker derives from there; this table only
 // names which field to surface alongside the composite.
 const CHANNEL_IDENTITY: Record<string, IdentityField> = {
-  matrix: { field: 'user_id', label: 'user' },
-  discord: { field: 'guild_ids', label: 'guilds' },
-  slack: { field: 'channel_ids', label: 'channels' },
-  mattermost: { field: 'channel_ids', label: 'channels' },
-  telegram: { field: 'bot_token', label: '' }, // bot identity, no separate id
-  signal: { field: 'user_id', label: 'user' },
-  imessage: { field: 'user_id', label: 'user' },
-  whatsapp: { field: 'user_id', label: 'user' },
-  email: { field: 'address', label: '' },
-  gmail_push: { field: 'address', label: '' },
-  'gmail-push': { field: 'address', label: '' },
-  irc: { field: 'nickname', label: 'nick' },
-  nextcloud_talk: { field: 'user_id', label: 'user' },
-  'nextcloud-talk': { field: 'user_id', label: 'user' },
+  matrix: { field: "user_id", label: "user" },
+  discord: { field: "guild_ids", label: "guilds" },
+  slack: { field: "channel_ids", label: "channels" },
+  mattermost: { field: "channel_ids", label: "channels" },
+  telegram: { field: "bot_token", label: "" }, // bot identity, no separate id
+  signal: { field: "user_id", label: "user" },
+  imessage: { field: "user_id", label: "user" },
+  whatsapp: { field: "user_id", label: "user" },
+  email: { field: "address", label: "" },
+  gmail_push: { field: "address", label: "" },
+  "gmail-push": { field: "address", label: "" },
+  irc: { field: "nickname", label: "nick" },
+  nextcloud_talk: { field: "user_id", label: "user" },
+  "nextcloud-talk": { field: "user_id", label: "user" },
 };
 
 /** Parse a config-encoded value into a short identity string. The
@@ -62,19 +62,19 @@ const CHANNEL_IDENTITY: Record<string, IdentityField> = {
  *  picker shows `matrix:@clamps-bot:matrix.org` instead of
  *  `matrix:"@clamps-bot:matrix.org"`. */
 function shortIdentity(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
+  if (typeof raw !== "string") return "";
   const s = raw.trim();
-  if (!s || s === '<unset>') return '';
+  if (!s || s === "<unset>") return "";
   // Strip TOML-array wrapping.
-  if (s.startsWith('[') && s.endsWith(']')) {
+  if (s.startsWith("[") && s.endsWith("]")) {
     return s
       .slice(1, -1)
-      .split(',')
-      .map((p) => p.trim().replace(/^"|"$/g, ''))
+      .split(",")
+      .map((p) => p.trim().replace(/^"|"$/g, ""))
       .filter(Boolean)
-      .join(', ');
+      .join(", ");
   }
-  return s.replace(/^"|"$/g, '');
+  return s.replace(/^"|"$/g, "");
 }
 
 /** Walk `agents.<alias>.channels` and resolve each composite's identity
@@ -94,14 +94,14 @@ export async function agentBoundChannels(
   let composites: string[];
   if (Array.isArray(raw)) {
     composites = raw.map(String);
-  } else if (typeof raw === 'string' && raw && raw !== '<unset>') {
+  } else if (typeof raw === "string" && raw && raw !== "<unset>") {
     // The `prop` endpoint sometimes returns the TOML-array string form.
     const trimmed = raw.trim();
-    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
       composites = trimmed
         .slice(1, -1)
-        .split(',')
-        .map((p) => p.trim().replace(/^"|"$/g, ''))
+        .split(",")
+        .map((p) => p.trim().replace(/^"|"$/g, ""))
         .filter(Boolean);
     } else {
       composites = [trimmed];
@@ -112,13 +112,13 @@ export async function agentBoundChannels(
 
   const out: AgentBoundChannel[] = [];
   for (const composite of composites) {
-    const dot = composite.indexOf('.');
+    const dot = composite.indexOf(".");
     const [type, alias] =
       dot >= 0
         ? [composite.slice(0, dot), composite.slice(dot + 1)]
-        : [composite, ''];
+        : [composite, ""];
     const spec = CHANNEL_IDENTITY[type];
-    let identity = '';
+    let identity = "";
     if (spec && alias) {
       try {
         const r = await getProp(`channels.${type}.${alias}.${spec.field}`);
@@ -127,7 +127,7 @@ export async function agentBoundChannels(
           identity = `${spec.label}=${identity}`;
         }
       } catch {
-        identity = '';
+        identity = "";
       }
     }
     out.push({ composite, type, alias, identity });

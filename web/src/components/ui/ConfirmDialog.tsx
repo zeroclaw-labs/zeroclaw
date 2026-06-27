@@ -1,6 +1,6 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react';
-import { Button } from '@/components/ui/Button';
-import { t } from '@/lib/i18n';
+import { useEffect, useId, useRef, type ReactNode } from "react";
+import { Button } from "@/components/ui/Button";
+import { t } from "@/lib/i18n";
 
 export interface ConfirmDialogProps {
   /** Whether the dialog is mounted/visible. */
@@ -35,8 +35,8 @@ export function ConfirmDialog({
   open,
   title,
   message,
-  confirmLabel = t('common.confirm'),
-  cancelLabel = t('common.cancel'),
+  confirmLabel = t("common.confirm"),
+  cancelLabel = t("common.cancel"),
   danger = false,
   onConfirm,
   onClose,
@@ -52,7 +52,8 @@ export function ConfirmDialog({
   useEffect(() => {
     if (!open) return;
     const previouslyFocused = document.activeElement as HTMLElement | null;
-    const buttons = panelRef.current?.querySelectorAll<HTMLButtonElement>('button');
+    const buttons =
+      panelRef.current?.querySelectorAll<HTMLButtonElement>("button");
     buttons?.[buttons.length - 1]?.focus();
     return () => previouslyFocused?.focus?.();
   }, [open]);
@@ -61,19 +62,21 @@ export function ConfirmDialog({
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === "Escape") {
         e.preventDefault();
         onClose();
         return;
       }
-      if (e.key !== 'Tab') return;
+      if (e.key !== "Tab") return;
       const panel = panelRef.current;
       if (!panel) return;
       const focusable = Array.from(
         panel.querySelectorAll<HTMLElement>(
           'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
         ),
-      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      ).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
       if (!first || !last) return;
@@ -86,8 +89,8 @@ export function ConfirmDialog({
         first.focus();
       }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, [open, onClose]);
 
   if (!open) return null;
@@ -113,7 +116,10 @@ export function ConfirmDialog({
             {title}
           </h2>
           {message != null && (
-            <div id={descId} className="text-xs leading-relaxed text-pc-text-muted">
+            <div
+              id={descId}
+              className="text-xs leading-relaxed text-pc-text-muted"
+            >
               {message}
             </div>
           )}
@@ -124,10 +130,7 @@ export function ConfirmDialog({
           <Button variant="ghost" onClick={onClose}>
             {cancelLabel}
           </Button>
-          <Button
-            variant={danger ? 'danger' : 'primary'}
-            onClick={onConfirm}
-          >
+          <Button variant={danger ? "danger" : "primary"} onClick={onConfirm}>
             {confirmLabel}
           </Button>
         </div>

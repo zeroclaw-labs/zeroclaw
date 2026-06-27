@@ -1,19 +1,15 @@
-import { SkillCard } from '@/components/SkillCard';
-import { getAgentOptions, listAgentSkills, readSkill } from '@/lib/api';
-import { t } from '@/lib/i18n';
-import type { AgentSkillEntry, SkillDocument } from '@/lib/api';
-import {
-  BookOpen,
-  RefreshCw,
-  Search
-} from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { SkillCard } from "@/components/SkillCard";
+import { getAgentOptions, listAgentSkills, readSkill } from "@/lib/api";
+import { t } from "@/lib/i18n";
+import type { AgentSkillEntry, SkillDocument } from "@/lib/api";
+import { BookOpen, RefreshCw, Search } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 
 export default function Skills() {
   const [agents, setAgents] = useState<string[]>([]);
-  const [selectedAlias, setSelectedAlias] = useState<string>('');
+  const [selectedAlias, setSelectedAlias] = useState<string>("");
   const [skills, setSkills] = useState<AgentSkillEntry[]>([]);
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [reloading, setReloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -27,7 +23,7 @@ export default function Skills() {
       .then(({ agents: as }) => {
         if (cancelled) return;
         setAgents(as);
-        setSelectedAlias((prev) => prev || as[0] || '');
+        setSelectedAlias((prev) => prev || as[0] || "");
         if (as.length === 0) setLoading(false);
       })
       .catch((err: unknown) => {
@@ -53,7 +49,9 @@ export default function Skills() {
     setError(null);
     setExpandedKey(null);
     loadSkills(selectedAlias)
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+      .catch((err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
+      )
       .finally(() => setLoading(false));
   }, [selectedAlias, loadSkills]);
 
@@ -61,7 +59,9 @@ export default function Skills() {
     if (!selectedAlias) return;
     setReloading(true);
     loadSkills(selectedAlias)
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+      .catch((err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
+      )
       .finally(() => setReloading(false));
   };
 
@@ -77,14 +77,16 @@ export default function Skills() {
     if (!detailMap[key]) {
       readSkill(skill.bundle, skill.name)
         .then((doc) => setDetailMap((prev) => ({ ...prev, [key]: doc })))
-        .catch(() => { /* detail is best-effort */ });
+        .catch(() => {
+          /* detail is best-effort */
+        });
     }
   };
 
   const skillKey = (skill: AgentSkillEntry): string =>
     skill.editable && skill.bundle
       ? `${skill.bundle}/${skill.name}`
-      : `${skill.origin}:${skill.plugin ?? ''}/${skill.name}`;
+      : `${skill.origin}:${skill.plugin ?? ""}/${skill.name}`;
 
   const filtered = skills.filter((s) => {
     const q = search.toLowerCase();
@@ -92,8 +94,8 @@ export default function Skills() {
       s.name.toLowerCase().includes(q) ||
       s.description.toLowerCase().includes(q) ||
       s.origin.toLowerCase().includes(q) ||
-      (s.bundle ?? '').toLowerCase().includes(q) ||
-      (s.plugin ?? '').toLowerCase().includes(q)
+      (s.bundle ?? "").toLowerCase().includes(q) ||
+      (s.plugin ?? "").toLowerCase().includes(q)
     );
   });
 
@@ -103,12 +105,12 @@ export default function Skills() {
         <div
           className="rounded-2xl border p-4"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
-          {t('skills.load_error')}: {error}
+          {t("skills.load_error")}: {error}
         </div>
       </div>
     );
@@ -119,7 +121,10 @@ export default function Skills() {
       <div className="flex items-center justify-center h-64">
         <div
           className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
         />
       </div>
     );
@@ -134,8 +139,8 @@ export default function Skills() {
             value={selectedAlias}
             onChange={(e) => setSelectedAlias(e.target.value)}
             className="input-electric px-3 py-2.5 text-sm"
-            aria-label={t('skills.agent')}
-            title={t('skills.agent')}
+            aria-label={t("skills.agent")}
+            title={t("skills.agent")}
           >
             {agents.map((a) => (
               <option key={a} value={a}>
@@ -147,13 +152,13 @@ export default function Skills() {
           <div className="relative max-w-md flex-1">
             <Search
               className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('skills.search')}
+              placeholder={t("skills.search")}
               className="input-electric w-full pl-10 pr-4 py-2.5 text-sm"
             />
           </div>
@@ -164,28 +169,28 @@ export default function Skills() {
           disabled={reloading}
           className="btn-electric flex items-center gap-2 px-4 py-2 text-sm"
           style={{ opacity: reloading ? 0.6 : 1 }}
-          title={t('skills.reload')}
+          title={t("skills.reload")}
         >
-          <RefreshCw className={`h-4 w-4 ${reloading ? 'animate-spin' : ''}`} />
-          {t('skills.reload')}
+          <RefreshCw className={`h-4 w-4 ${reloading ? "animate-spin" : ""}`} />
+          {t("skills.reload")}
         </button>
       </div>
 
       {/* Section header */}
       <div className="flex items-center gap-2">
-        <BookOpen className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+        <BookOpen className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
         <span
           className="text-sm font-semibold uppercase tracking-wider"
-          style={{ color: 'var(--pc-text-primary)' }}
+          style={{ color: "var(--pc-text-primary)" }}
         >
-          {t('skills.title')} ({filtered.length})
+          {t("skills.title")} ({filtered.length})
         </span>
       </div>
 
       {/* Empty state */}
       {filtered.length === 0 && (
-        <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-          {t('skills.empty')}
+        <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+          {t("skills.empty")}
         </p>
       )}
 

@@ -1,6 +1,6 @@
-import { getMapKeys, getProp, getTemplates } from './api';
+import { getMapKeys, getProp, getTemplates } from "./api";
 
-export type ConfiguredModelCategory = 'models' | 'tts' | 'transcription';
+export type ConfiguredModelCategory = "models" | "tts" | "transcription";
 
 export interface ConfiguredModelBinding {
   type: string;
@@ -21,9 +21,9 @@ export async function walkConfiguredModelBindings(
     const { templates } = await getTemplates();
     const prefix = `${root}.`;
     types = templates
-      .filter((t) => t.kind === 'map' && t.path.startsWith(prefix))
+      .filter((t) => t.kind === "map" && t.path.startsWith(prefix))
       .map((t) => t.path.slice(prefix.length))
-      .filter((t) => t && !t.includes('.'));
+      .filter((t) => t && !t.includes("."));
   } catch {
     return out;
   }
@@ -41,8 +41,8 @@ export async function walkConfiguredModelBindings(
     );
     aliases.forEach((alias, i) => {
       const r = results[i];
-      const v = r && typeof r.value === 'string' ? r.value : '';
-      if (v && v !== '<unset>') {
+      const v = r && typeof r.value === "string" ? r.value : "";
+      if (v && v !== "<unset>") {
         out.push({ type, alias, resource: v });
       }
     });

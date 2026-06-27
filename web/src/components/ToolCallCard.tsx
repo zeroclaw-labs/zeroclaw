@@ -1,17 +1,32 @@
-import type { LucideIcon } from 'lucide-react';
+import type { LucideIcon } from "lucide-react";
 import {
-  Terminal, FileText, FilePlus, FileEdit, Search, FolderSearch,
-  Globe, ExternalLink, Download, Wifi, Database, GitBranch,
-  Image, Camera, Calculator, Wrench, CheckCircle2, Loader2,
-} from 'lucide-react';
-import { Card, Badge } from '@/components/ui';
-import { t } from '@/lib/i18n';
+  Terminal,
+  FileText,
+  FilePlus,
+  FileEdit,
+  Search,
+  FolderSearch,
+  Globe,
+  ExternalLink,
+  Download,
+  Wifi,
+  Database,
+  GitBranch,
+  Image,
+  Camera,
+  Calculator,
+  Wrench,
+  CheckCircle2,
+  Loader2,
+} from "lucide-react";
+import { Card, Badge } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 export interface ToolCallInfo {
   name: string;
   args?: unknown;
-  output?: string;       // undefined = executing; string = completed
-  id?: string;           // gateway tool_call_id; correlates result to card
+  output?: string; // undefined = executing; string = completed
+  id?: string; // gateway tool_call_id; correlates result to card
 }
 
 interface ToolCallCardProps {
@@ -48,18 +63,17 @@ function getIcon(name: string): LucideIcon {
 
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
-  return text.slice(0, max) + '...';
+  return text.slice(0, max) + "...";
 }
 
 export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const Icon = getIcon(toolCall.name);
   const resolved = toolCall.output !== undefined;
 
-  const argsStr = toolCall.args != null
-    ? JSON.stringify(toolCall.args, null, 2)
-    : null;
+  const argsStr =
+    toolCall.args != null ? JSON.stringify(toolCall.args, null, 2) : null;
 
-  const output = toolCall.output ?? '';
+  const output = toolCall.output ?? "";
   const isInline = output.length <= INLINE_THRESHOLD;
 
   return (
@@ -71,12 +85,12 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
           {resolved ? (
             <Badge tone="ok">
               <CheckCircle2 className="h-3 w-3" />
-              {t('tool_call.done')}
+              {t("tool_call.done")}
             </Badge>
           ) : (
             <Badge tone="neutral">
               <Loader2 className="h-3 w-3 animate-spin" />
-              {t('tool_call.running')}
+              {t("tool_call.running")}
             </Badge>
           )}
         </span>
@@ -85,7 +99,7 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
       {argsStr && (
         <details className="mt-2 group">
           <summary className="cursor-pointer select-none text-pc-text-muted hover:text-pc-text-secondary">
-            {t('tool_call.args')}
+            {t("tool_call.args")}
           </summary>
           <pre className="mt-1.5 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
             {argsStr}
@@ -93,8 +107,8 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
         </details>
       )}
 
-      {resolved && (
-        isInline ? (
+      {resolved &&
+        (isInline ? (
           output && (
             <div className="mt-2 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
               {output}
@@ -109,8 +123,7 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
               {output}
             </pre>
           </details>
-        )
-      )}
+        ))}
     </Card>
   );
 }

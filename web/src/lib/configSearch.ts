@@ -16,7 +16,12 @@
 // contributes its own section item, and a total fetch failure resolves to an
 // empty list so the palette keeps showing its nav destinations.
 
-import { getMapKeys, getSectionPicker, getSections, type SectionInfo } from "./api";
+import {
+  getMapKeys,
+  getSectionPicker,
+  getSections,
+  type SectionInfo,
+} from "./api";
 
 /** A flat, jump-to-able config search target. */
 export interface ConfigSearchItem {

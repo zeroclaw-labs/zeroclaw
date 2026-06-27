@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AgentProvider } from '@/contexts/AgentContext';
-import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
-import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
-import { basePath } from '@/lib/basePath';
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AgentProvider } from "@/contexts/AgentContext";
+import { AgentChatInner, type AgentChatStatus } from "@/pages/AgentChat";
+import {
+  ChatTabBar,
+  type TabIndicator,
+  type WorkspaceLayout,
+} from "@/components/ChatTabBar";
+import { basePath } from "@/lib/basePath";
 
-const STORAGE_KEY = 'zeroclaw-chat-workspace';
+const STORAGE_KEY = "zeroclaw-chat-workspace";
 
 interface PersistedState {
   openChats: string[];
@@ -29,7 +33,7 @@ function loadPersisted(): Partial<PersistedState> {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Partial<PersistedState>;
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
@@ -63,7 +67,9 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     return dedupe([...fromStorage, initialAlias]);
   });
   const [activeAlias, setActiveAlias] = useState<string>(initialAlias);
-  const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
+  const [layout, setLayout] = useState<WorkspaceLayout>(
+    persisted.current.layout ?? "tabs",
+  );
   const [splitAliases, setSplitAliases] = useState<[string, string | null]>(
     persisted.current.splitAliases ?? [initialAlias, null],
   );
@@ -71,7 +77,9 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Per-alias streaming / unread bookkeeping. Kept in a ref (source of truth,
   // mutated synchronously from onStatus) plus mirrored to state for rendering.
   const statusRef = useRef<Record<string, PaneStatus>>({});
-  const [indicators, setIndicators] = useState<Record<string, TabIndicator>>({});
+  const [indicators, setIndicators] = useState<Record<string, TabIndicator>>(
+    {},
+  );
 
   // Effective layout. Split works on mobile too — the panes stack vertically
   // there (top/bottom) instead of side-by-side; see the split container below.
@@ -80,7 +88,9 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // The two aliases shown in split. Default the second to the next open chat
   // after the active one (or the active itself if it's the only chat).
   const resolvedSplit = useMemo<[string, string | null]>(() => {
-    const left = openChats.includes(splitAliases[0]) ? splitAliases[0] : activeAlias;
+    const left = openChats.includes(splitAliases[0])
+      ? splitAliases[0]
+      : activeAlias;
     let right = splitAliases[1];
     if (!right || !openChats.includes(right) || right === left) {
       right = openChats.find((a) => a !== left) ?? null;
@@ -90,8 +100,10 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
 
   // Set of aliases currently visible (so background panes can be `hidden`).
   const visibleAliases = useMemo<Set<string>>(() => {
-    if (effectiveLayout === 'split') {
-      return new Set([resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[]);
+    if (effectiveLayout === "split") {
+      return new Set(
+        [resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[],
+      );
     }
     return new Set([activeAlias]);
   }, [effectiveLayout, resolvedSplit, activeAlias]);
@@ -112,19 +124,26 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Stable ref to the latest syncIndicators so the per-alias onStatus closures
   // (cached for identity stability) always run against current visibility.
   const syncIndicatorsRef = useRef(syncIndicators);
-  useEffect(() => { syncIndicatorsRef.current = syncIndicators; }, [syncIndicators]);
+  useEffect(() => {
+    syncIndicatorsRef.current = syncIndicators;
+  }, [syncIndicators]);
 
   // Status callback handed to each pane. Marks a hidden tab unread when its
   // message count grows; tracks streaming from `typing`. Cached per alias so
   // each pane receives a STABLE function identity — otherwise AgentChatInner's
   // onStatus effect would re-run on every workspace render.
-  const onStatusCacheRef = useRef<Record<string, (s: AgentChatStatus) => void>>({});
+  const onStatusCacheRef = useRef<Record<string, (s: AgentChatStatus) => void>>(
+    {},
+  );
   const onStatusFor = useCallback((alias: string) => {
     const cached = onStatusCacheRef.current[alias];
     if (cached) return cached;
     const fn = (s: AgentChatStatus) => {
       const prev = statusRef.current[alias] ?? {
-        lastSeenCount: s.messageCount, liveCount: s.messageCount, streaming: false, unread: false,
+        lastSeenCount: s.messageCount,
+        liveCount: s.messageCount,
+        streaming: false,
+        unread: false,
       };
       const visible = visibleAliasesRef.current.has(alias);
       const grew = s.messageCount > prev.lastSeenCount;
@@ -149,7 +168,10 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // snapshot their seen-count to the latest reported live count.
     for (const alias of visibleAliases) {
       const s = statusRef.current[alias];
-      if (s) { s.unread = false; s.lastSeenCount = s.liveCount; }
+      if (s) {
+        s.unread = false;
+        s.lastSeenCount = s.liveCount;
+      }
     }
     syncIndicators();
   }, [visibleAliases, syncIndicators]);
@@ -157,14 +179,25 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Open + activate the route alias on mount and on every change, without
   // remounting the workspace (the workspace is keyed by nothing volatile).
   useEffect(() => {
-    setOpenChats((prev) => (prev.includes(initialAlias) ? prev : [...prev, initialAlias]));
+    setOpenChats((prev) =>
+      prev.includes(initialAlias) ? prev : [...prev, initialAlias],
+    );
     setActiveAlias(initialAlias);
   }, [initialAlias]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
-    const snapshot: PersistedState = { openChats, activeAlias, layout, splitAliases: resolvedSplit };
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot)); } catch { /* noop */ }
+    const snapshot: PersistedState = {
+      openChats,
+      activeAlias,
+      layout,
+      splitAliases: resolvedSplit,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    } catch {
+      /* noop */
+    }
   }, [openChats, activeAlias, layout, resolvedSplit]);
 
   // Mirror the active alias to the URL via history.replaceState only — never a
@@ -179,7 +212,11 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // concatenation can't produce a double slash.
     const target = `${basePath}/agent/${activeAlias}`;
     if (window.location.pathname !== target) {
-      try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
+      try {
+        window.history.replaceState(window.history.state, "", target);
+      } catch {
+        /* noop */
+      }
     }
   }, [activeAlias]);
 
@@ -193,30 +230,35 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     setActiveAlias(alias);
   }, []);
 
-  const closeChat = useCallback((alias: string) => {
-    setOpenChats((prev) => {
-      if (prev.length <= 1) return prev; // never close the last chat
-      const next = prev.filter((a) => a !== alias);
-      // If we closed the active tab, move activation to a neighbour.
-      setActiveAlias((cur) => {
-        if (cur !== alias) return cur;
-        const idx = prev.indexOf(alias);
-        return next[Math.min(idx, next.length - 1)] ?? next[0] ?? cur;
+  const closeChat = useCallback(
+    (alias: string) => {
+      setOpenChats((prev) => {
+        if (prev.length <= 1) return prev; // never close the last chat
+        const next = prev.filter((a) => a !== alias);
+        // If we closed the active tab, move activation to a neighbour.
+        setActiveAlias((cur) => {
+          if (cur !== alias) return cur;
+          const idx = prev.indexOf(alias);
+          return next[Math.min(idx, next.length - 1)] ?? next[0] ?? cur;
+        });
+        return next;
       });
-      return next;
-    });
-    delete statusRef.current[alias];
-    delete onStatusCacheRef.current[alias];
-    syncIndicators();
-  }, [syncIndicators]);
+      delete statusRef.current[alias];
+      delete onStatusCacheRef.current[alias];
+      syncIndicators();
+    },
+    [syncIndicators],
+  );
 
   const toggleLayout = useCallback(() => {
-    setLayout((l) => (l === 'split' ? 'tabs' : 'split'));
+    setLayout((l) => (l === "split" ? "tabs" : "split"));
     // Seed split with the active alias + next open chat when entering split.
     setSplitAliases((prev) => {
       const left = activeAlias;
       const right = openChats.find((a) => a !== left) ?? null;
-      return prev[0] === left && prev[1] && openChats.includes(prev[1]) ? prev : [left, right];
+      return prev[0] === left && prev[1] && openChats.includes(prev[1])
+        ? prev
+        : [left, right];
     });
   }, [activeAlias, openChats]);
 
@@ -240,15 +282,21 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
-      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0'}>
+      <div
+        className={
+          effectiveLayout === "split"
+            ? "flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border"
+            : "flex-1 min-h-0"
+        }
+      >
         {openChats.map((alias) => {
           const visible = visibleAliases.has(alias);
           // In split, each visible pane takes an equal share of the row.
           const paneClass = visible
-            ? effectiveLayout === 'split'
-              ? 'flex flex-col flex-1 min-w-0 min-h-0'
-              : 'flex flex-col h-full'
-            : 'hidden';
+            ? effectiveLayout === "split"
+              ? "flex flex-col flex-1 min-w-0 min-h-0"
+              : "flex flex-col h-full"
+            : "hidden";
           return (
             <div
               key={alias}
@@ -259,7 +307,10 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
               className={paneClass}
             >
               <AgentProvider key={alias} agentAlias={alias}>
-                <AgentChatInner agentAlias={alias} onStatus={onStatusFor(alias)} />
+                <AgentChatInner
+                  agentAlias={alias}
+                  onStatus={onStatusFor(alias)}
+                />
               </AgentProvider>
             </div>
           );

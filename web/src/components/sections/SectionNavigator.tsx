@@ -22,11 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Plus, Search } from "lucide-react";
-import {
-  getMapKeys,
-  getSectionPicker,
-  type SectionInfo,
-} from "../../lib/api";
+import { getMapKeys, getSectionPicker, type SectionInfo } from "../../lib/api";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import { t } from "@/lib/i18n";
 
@@ -67,9 +63,7 @@ interface SectionNavigatorProps {
 
 // A section's editor shape determines how (and whether) it has children.
 function sectionHasChildren(s: SectionInfo): boolean {
-  return (
-    s.shape === "one_tier_alias_map" || s.shape === "typed_family_map"
-  );
+  return s.shape === "one_tier_alias_map" || s.shape === "typed_family_map";
 }
 
 export default function SectionNavigator({
@@ -223,27 +217,30 @@ export default function SectionNavigator({
   const navRef = useRef<HTMLElement>(null);
   const onTreeKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
     if (
-      e.key !== 'ArrowDown'
-      && e.key !== 'ArrowUp'
-      && e.key !== 'Home'
-      && e.key !== 'End'
+      e.key !== "ArrowDown" &&
+      e.key !== "ArrowUp" &&
+      e.key !== "Home" &&
+      e.key !== "End"
     ) {
       return;
     }
     const container = navRef.current;
     if (!container) return;
     const rows = Array.from(
-      container.querySelectorAll<HTMLElement>('[data-nav-row]'),
+      container.querySelectorAll<HTMLElement>("[data-nav-row]"),
     ).filter((el) => el.offsetParent !== null);
     if (rows.length === 0) return;
     e.preventDefault();
     const current = document.activeElement as HTMLElement | null;
     const idx = current ? rows.indexOf(current) : -1;
     let nextIdx: number;
-    if (e.key === 'Home') nextIdx = 0;
-    else if (e.key === 'End') nextIdx = rows.length - 1;
-    else if (e.key === 'ArrowDown') nextIdx = idx === -1 ? 0 : (idx + 1) % rows.length;
-    else nextIdx = idx === -1 ? rows.length - 1 : (idx - 1 + rows.length) % rows.length;
+    if (e.key === "Home") nextIdx = 0;
+    else if (e.key === "End") nextIdx = rows.length - 1;
+    else if (e.key === "ArrowDown")
+      nextIdx = idx === -1 ? 0 : (idx + 1) % rows.length;
+    else
+      nextIdx =
+        idx === -1 ? rows.length - 1 : (idx - 1 + rows.length) % rows.length;
     rows[nextIdx]!.focus();
   };
 
@@ -331,7 +328,7 @@ export default function SectionNavigator({
     if (ents === "loading" || ents === undefined) {
       return (
         <div className="pl-7 pr-3 py-1.5 text-xs text-pc-text-faint">
-          {t('common.loading')}
+          {t("common.loading")}
         </div>
       );
     }
@@ -345,7 +342,7 @@ export default function SectionNavigator({
     if (ents.length === 0) {
       return (
         <div className="pl-7 pr-3 py-1.5 text-xs text-pc-text-faint italic">
-          {t('section_nav.empty')}
+          {t("section_nav.empty")}
         </div>
       );
     }
@@ -376,7 +373,9 @@ export default function SectionNavigator({
   };
 
   return (
-    <aside className={`w-full md:w-[300px] flex-shrink-0 border-r border-pc-border flex flex-col min-h-0 ${className}`}>
+    <aside
+      className={`w-full md:w-[300px] flex-shrink-0 border-r border-pc-border flex flex-col min-h-0 ${className}`}
+    >
       {/* Search box */}
       <div className="p-3 border-b border-pc-border">
         <div className="relative">
@@ -385,7 +384,7 @@ export default function SectionNavigator({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={t('section_nav.search_placeholder')}
+            placeholder={t("section_nav.search_placeholder")}
             className="w-full pl-8 pr-3 py-2 text-sm rounded-[var(--radius-md)] bg-pc-input border border-pc-border text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:border-pc-border-strong focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
           />
         </div>
@@ -394,7 +393,7 @@ export default function SectionNavigator({
       <nav
         ref={navRef}
         role="tree"
-        aria-label={t('section_nav.tree_label')}
+        aria-label={t("section_nav.tree_label")}
         onKeyDown={onTreeKeyDown}
         className="flex-1 overflow-y-auto py-2"
       >
@@ -458,13 +457,18 @@ export default function SectionNavigator({
             </div>
           ) : (
             <div className="px-3 py-6 text-sm text-center text-pc-text-muted">
-              {t('section_nav.no_matches')}
+              {t("section_nav.no_matches")}
             </div>
           )
         ) : (
           // Grouped collapsible mode.
           grouped.map(({ groupName, items }) => (
-            <div key={groupName} role="group" aria-label={groupName} className="mb-1">
+            <div
+              key={groupName}
+              role="group"
+              aria-label={groupName}
+              className="mb-1"
+            >
               <div className="px-3 pt-3 pb-1 text-[10px] font-medium uppercase tracking-wider text-pc-text-faint">
                 {groupName}
               </div>
@@ -486,16 +490,18 @@ export default function SectionNavigator({
                       className={[
                         "group mx-1.5 flex items-center gap-1 rounded-[var(--radius-sm)]",
                         "transition-colors",
-                        active
-                          ? "bg-pc-accent/10"
-                          : "hover:bg-pc-elevated/60",
+                        active ? "bg-pc-accent/10" : "hover:bg-pc-elevated/60",
                       ].join(" ")}
                     >
                       {hasKids ? (
                         <button
                           type="button"
                           onClick={() => toggle(s.key)}
-                          aria-label={isOpen ? t('section_nav.collapse') : t('section_nav.expand')}
+                          aria-label={
+                            isOpen
+                              ? t("section_nav.collapse")
+                              : t("section_nav.expand")
+                          }
                           aria-expanded={isOpen}
                           className="flex-shrink-0 p-1.5 text-pc-text-muted hover:text-pc-text"
                         >
@@ -539,8 +545,8 @@ export default function SectionNavigator({
                         <button
                           type="button"
                           onClick={() => onAddToSection(s)}
-                          title={`${t('section_nav.add_to_prefix')}${s.label}`}
-                          aria-label={`${t('section_nav.add_to_prefix')}${s.label}`}
+                          title={`${t("section_nav.add_to_prefix")}${s.label}`}
+                          aria-label={`${t("section_nav.add_to_prefix")}${s.label}`}
                           // Always visible on touch (no hover); hover-reveal on
                           // desktop only. Was opacity-0 unconditionally, so the
                           // add affordance never appeared on mobile.

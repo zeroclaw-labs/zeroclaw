@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from "react";
 
 interface Device {
   id: string;
@@ -14,12 +14,12 @@ export function useDevices() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const token = localStorage.getItem('zeroclaw_token') || '';
+  const token = localStorage.getItem("zeroclaw_token") || "";
 
   const fetchDevices = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch('/api/devices', {
+      const res = await fetch("/api/devices", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
@@ -30,7 +30,7 @@ export function useDevices() {
         setError(`HTTP ${res.status}`);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
     }

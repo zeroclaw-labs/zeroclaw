@@ -1,12 +1,12 @@
-import type { SessionMessageRow } from '@/types/api';
-import { generateUUID } from '@/lib/uuid';
+import type { SessionMessageRow } from "@/types/api";
+import { generateUUID } from "@/lib/uuid";
 
 const MAX_MESSAGES = 100;
-const PREFIX = 'zeroclaw_chat_history_v1:';
+const PREFIX = "zeroclaw_chat_history_v1:";
 
 export interface PersistedChatBubble {
   id: string;
-  role: 'user' | 'agent';
+  role: "user" | "agent";
   content: string;
   thinking?: string;
   markdown?: boolean;
@@ -33,35 +33,43 @@ export function loadChatHistory(sessionId: string): PersistedChatBubble[] {
   }
 }
 
-export function saveChatHistory(sessionId: string, messages: PersistedChatBubble[]): void {
+export function saveChatHistory(
+  sessionId: string,
+  messages: PersistedChatBubble[],
+): void {
   try {
     const slice = messages.slice(-MAX_MESSAGES);
-    localStorage.setItem(storageKey(sessionId), JSON.stringify({ messages: slice }));
+    localStorage.setItem(
+      storageKey(sessionId),
+      JSON.stringify({ messages: slice }),
+    );
   } catch {
     // QuotaExceeded or private mode
   }
 }
 
 /** Map server-persisted rows into UI messages (timestamps are synthetic for ordering). */
-export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): PersistedChatBubble[] {
+export function mapServerMessagesToPersisted(
+  rows: SessionMessageRow[],
+): PersistedChatBubble[] {
   const base = Date.now() - rows.length * 1000;
   const out: PersistedChatBubble[] = [];
   let idx = 0;
   for (const row of rows) {
-    if (row.role === 'system') continue;
+    if (row.role === "system") continue;
     const ts = new Date(base + idx * 1000).toISOString();
     idx += 1;
-    if (row.role === 'user') {
+    if (row.role === "user") {
       out.push({
         id: generateUUID(),
-        role: 'user',
+        role: "user",
         content: row.content,
         timestamp: ts,
       });
-    } else if (row.role === 'assistant') {
+    } else if (row.role === "assistant") {
       out.push({
         id: generateUUID(),
-        role: 'agent',
+        role: "agent",
         content: row.content,
         markdown: true,
         timestamp: ts,
@@ -69,7 +77,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
     } else {
       out.push({
         id: generateUUID(),
-        role: 'agent',
+        role: "agent",
         content: row.content,
         markdown: false,
         timestamp: ts,
@@ -79,11 +87,9 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
   return out;
 }
 
-export function persistedToUiMessages(
-  rows: PersistedChatBubble[],
-): Array<{
+export function persistedToUiMessages(rows: PersistedChatBubble[]): Array<{
   id: string;
-  role: 'user' | 'agent';
+  role: "user" | "agent";
   content: string;
   thinking?: string;
   markdown?: boolean;
@@ -106,7 +112,7 @@ export function persistedToUiMessages(
 export function uiMessagesToPersisted(
   messages: Array<{
     id: string;
-    role: 'user' | 'agent';
+    role: "user" | "agent";
     content: string;
     thinking?: string;
     markdown?: boolean;
@@ -116,21 +122,23 @@ export function uiMessagesToPersisted(
     timestamp: Date;
   }>,
 ): PersistedChatBubble[] {
-  return messages
-    // Skip messages flagged `ephemeral: true` (web slash-command output like
-    // /help, /model banners, unknown-command notices). They are throwaway UI
-    // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
-    .filter((m) => !m.ephemeral)
-    .map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      thinking: m.thinking,
-      markdown: m.markdown,
-      // Preserve the verbatim-user-input flag so reloaded bubbles still skip
-      // server-timestamp stripping.
-      local: m.local,
-      toolCall: m.toolCall,
-      timestamp: m.timestamp.toISOString(),
-    }));
+  return (
+    messages
+      // Skip messages flagged `ephemeral: true` (web slash-command output like
+      // /help, /model banners, unknown-command notices). They are throwaway UI
+      // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
+      .filter((m) => !m.ephemeral)
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        thinking: m.thinking,
+        markdown: m.markdown,
+        // Preserve the verbatim-user-input flag so reloaded bubbles still skip
+        // server-timestamp stripping.
+        local: m.local,
+        toolCall: m.toolCall,
+        timestamp: m.timestamp.toISOString(),
+      }))
+  );
 }

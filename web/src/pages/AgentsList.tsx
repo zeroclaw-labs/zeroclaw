@@ -1,11 +1,15 @@
-import { useEffect, useState, useCallback } from 'react';
-import { Link } from 'react-router-dom';
-import { Bot, Plus, AlertCircle } from 'lucide-react';
-import AgentCard from '@/components/AgentCard';
-import AgentDrawer from '@/components/AgentDrawer';
-import { Button, PageHeader } from '@/components/ui';
-import { t } from '@/lib/i18n';
-import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
+import { useEffect, useState, useCallback } from "react";
+import { Link } from "react-router-dom";
+import { Bot, Plus, AlertCircle } from "lucide-react";
+import AgentCard from "@/components/AgentCard";
+import AgentDrawer from "@/components/AgentDrawer";
+import { Button, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
+import {
+  loadAgentSummaries,
+  toggleAgentEnabled,
+  type AgentSummary,
+} from "@/lib/agents";
 
 interface AgentSummariesState {
   loading: boolean;
@@ -31,7 +35,8 @@ export default function AgentsList() {
       .catch((err: unknown) =>
         setState({
           loading: false,
-          error: err instanceof Error ? err.message : t('agents_list.load_failed'),
+          error:
+            err instanceof Error ? err.message : t("agents_list.load_failed"),
           agents: [],
         }),
       );
@@ -54,7 +59,10 @@ export default function AgentsList() {
     } catch (err) {
       setState((s) => ({
         ...s,
-        error: err instanceof Error ? err.message : `${t('agents_list.toggle_failed_prefix')}${agent.alias}`,
+        error:
+          err instanceof Error
+            ? err.message
+            : `${t("agents_list.toggle_failed_prefix")}${agent.alias}`,
       }));
     } finally {
       setToggling((prev) => {
@@ -68,19 +76,19 @@ export default function AgentsList() {
   const selectedAgent =
     selectedAlias === null
       ? null
-      : state.agents.find((a) => a.alias === selectedAlias) ?? null;
+      : (state.agents.find((a) => a.alias === selectedAlias) ?? null);
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <PageHeader
         className="mb-6"
-        title={t('nav.agents')}
-        description={t('agents_list.description')}
+        title={t("nav.agents")}
+        description={t("agents_list.description")}
         actions={
           <Link to="/config/agents">
             <Button variant="primary" size="md">
               <Plus className="h-4 w-4" />
-              {t('agents_list.new_agent')}
+              {t("agents_list.new_agent")}
             </Button>
           </Link>
         }
@@ -95,7 +103,7 @@ export default function AgentsList() {
 
       {state.loading && state.agents.length === 0 ? (
         <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-8 text-center text-sm text-pc-text-muted">
-          {t('common.loading')}
+          {t("common.loading")}
         </div>
       ) : state.agents.length === 0 ? (
         <EmptyState />
@@ -129,15 +137,15 @@ function EmptyState() {
         <Bot className="h-6 w-6 text-pc-accent" />
       </div>
       <p className="text-base font-medium mb-1 text-pc-text">
-        {t('agents_list.empty_title')}
+        {t("agents_list.empty_title")}
       </p>
       <p className="text-sm mb-4 text-pc-text-muted">
-        {t('agents_list.empty_hint')}
+        {t("agents_list.empty_hint")}
       </p>
       <Link to="/quickstart" className="inline-block">
         <Button variant="primary" size="md">
           <Plus className="h-4 w-4" />
-          {t('agents_list.start_quickstart')}
+          {t("agents_list.start_quickstart")}
         </Button>
       </Link>
     </div>

@@ -16,8 +16,8 @@ import {
   useMemo,
   useState,
   type ReactNode,
-} from 'react';
-import { ApiError, patchConfig, type PatchOp, type PatchResponse } from './api';
+} from "react";
+import { ApiError, patchConfig, type PatchOp, type PatchResponse } from "./api";
 
 type DraftEntry = {
   /** Raw input text the user has typed, as it appears in the input box. */
@@ -58,9 +58,12 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [comments, setComments] = useState<Record<string, string>>({});
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
 
-  const setDraft = useCallback((path: string, input: string, value?: unknown) => {
-    setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
-  }, []);
+  const setDraft = useCallback(
+    (path: string, input: string, value?: unknown) => {
+      setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
+    },
+    [],
+  );
 
   const clearDraft = useCallback((path: string) => {
     setDrafts((prev) => {
@@ -201,18 +204,18 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
     const draftedPaths = new Set<string>();
     for (const [path, entry] of Object.entries(drafts)) {
       draftedPaths.add(path);
-      const op: PatchOp = { op: 'replace', path, value: entry.value };
+      const op: PatchOp = { op: "replace", path, value: entry.value };
       const c = comments[path];
       if (c && c.length > 0) op.comment = c;
       ops.push(op);
     }
     for (const [path, comment] of Object.entries(comments)) {
       if (draftedPaths.has(path) || tombstones.has(path)) continue;
-      ops.push({ op: 'comment', path, comment });
+      ops.push({ op: "comment", path, comment });
     }
     for (const path of tombstones) {
       if (draftedPaths.has(path)) continue;
-      ops.push({ op: 'remove', path });
+      ops.push({ op: "remove", path });
     }
     if (ops.length === 0) {
       return { saved: true, results: [], warnings: [] };
@@ -270,7 +273,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
 export function useConfigDraft(): ConfigDraftCtx {
   const ctx = useContext(Context);
   if (!ctx) {
-    throw new Error('useConfigDraft must be used inside <ConfigDraftProvider>');
+    throw new Error("useConfigDraft must be used inside <ConfigDraftProvider>");
   }
   return ctx;
 }
@@ -291,7 +294,7 @@ export function useConfigDirtySections(): string[] {
   const { drafts, comments, tombstones } = useConfigDraft();
   const seen = new Set<string>();
   const collect = (path: string) => {
-    const top = path.split('.', 1)[0];
+    const top = path.split(".", 1)[0];
     if (top) seen.add(top);
   };
   for (const path of Object.keys(drafts)) collect(path);

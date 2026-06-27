@@ -6,7 +6,11 @@
 // No npm dep — the dashboard's filter inputs need this in 4-5 places and the
 // problem is small enough to solve inline.
 
-export function fuzzyFilter<T>(items: T[], query: string, getText: (item: T) => string): T[] {
+export function fuzzyFilter<T>(
+  items: T[],
+  query: string,
+  getText: (item: T) => string,
+): T[] {
   if (!query.trim()) return items;
   const q = query.toLowerCase();
 

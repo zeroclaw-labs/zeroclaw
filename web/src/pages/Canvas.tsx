@@ -1,11 +1,11 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { usePolling } from '@/hooks/usePolling';
-import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
-import { apiFetch } from '@/lib/api';
-import { basePath } from '@/lib/basePath';
-import { getToken } from '@/lib/auth';
-import { Badge, Button, Card, PageHeader } from '@/components/ui';
-import { t } from '@/lib/i18n';
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { usePolling } from "@/hooks/usePolling";
+import { Monitor, Trash2, History, RefreshCw } from "lucide-react";
+import { apiFetch } from "@/lib/api";
+import { basePath } from "@/lib/basePath";
+import { getToken } from "@/lib/auth";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 interface CanvasFrame {
   frame_id: string;
@@ -21,8 +21,8 @@ interface WsCanvasMessage {
 }
 
 export default function Canvas() {
-  const [canvasId, setCanvasId] = useState('default');
-  const [canvasIdInput, setCanvasIdInput] = useState('default');
+  const [canvasId, setCanvasId] = useState("default");
+  const [canvasIdInput, setCanvasIdInput] = useState("default");
   const [currentFrame, setCurrentFrame] = useState<CanvasFrame | null>(null);
   const [history, setHistory] = useState<CanvasFrame[]>([]);
   const [connected, setConnected] = useState(false);
@@ -60,44 +60,49 @@ export default function Canvas() {
 
   // Build WebSocket URL for canvas
   const getWsUrl = useCallback((id: string) => {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const base = basePath || '';
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const base = basePath || "";
     return `${proto}//${location.host}${base}/ws/canvas/${encodeURIComponent(id)}`;
   }, []);
 
   // Connect to canvas WebSocket
-  const connectWs = useCallback((id: string) => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
-
-    const token = getToken();
-    const protocols = token ? ['zeroclaw.v1', `bearer.${token}`] : ['zeroclaw.v1'];
-    const ws = new WebSocket(getWsUrl(id), protocols);
-
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-
-    ws.onmessage = (event) => {
-      try {
-        const msg: WsCanvasMessage = JSON.parse(event.data);
-        if (msg.type === 'frame' && msg.frame) {
-          if (msg.frame.content_type === 'clear') {
-            setCurrentFrame(null);
-            setHistory([]);
-          } else {
-            setCurrentFrame(msg.frame);
-            setHistory((prev) => [...prev.slice(-49), msg.frame!]);
-          }
-        }
-      } catch {
-        // ignore parse errors
+  const connectWs = useCallback(
+    (id: string) => {
+      if (wsRef.current) {
+        wsRef.current.close();
       }
-    };
 
-    wsRef.current = ws;
-  }, [getWsUrl]);
+      const token = getToken();
+      const protocols = token
+        ? ["zeroclaw.v1", `bearer.${token}`]
+        : ["zeroclaw.v1"];
+      const ws = new WebSocket(getWsUrl(id), protocols);
+
+      ws.onopen = () => setConnected(true);
+      ws.onclose = () => setConnected(false);
+      ws.onerror = () => setConnected(false);
+
+      ws.onmessage = (event) => {
+        try {
+          const msg: WsCanvasMessage = JSON.parse(event.data);
+          if (msg.type === "frame" && msg.frame) {
+            if (msg.frame.content_type === "clear") {
+              setCurrentFrame(null);
+              setHistory([]);
+            } else {
+              setCurrentFrame(msg.frame);
+              setHistory((prev) => [...prev.slice(-49), msg.frame!]);
+            }
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      wsRef.current = ws;
+    },
+    [getWsUrl],
+  );
 
   // Connect on mount and when canvasId changes
   useEffect(() => {
@@ -110,7 +115,7 @@ export default function Canvas() {
   // Fetch the canvas list every 5s — paused while the tab is hidden.
   usePolling(async (isStale) => {
     try {
-      const data = await apiFetch<{ canvases: string[] }>('/api/canvas');
+      const data = await apiFetch<{ canvases: string[] }>("/api/canvas");
       if (!isStale()) setCanvasList(data.canvases || []);
     } catch {
       // ignore
@@ -128,11 +133,15 @@ export default function Canvas() {
     if (!currentFrame) return undefined;
 
     const cs = getComputedStyle(document.documentElement);
-    const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
-    const textPrimary = cs.getPropertyValue('--pc-text-primary').trim() || '#d4d4d8';
-    const textSecondary = cs.getPropertyValue('--pc-text-secondary').trim() || '#a1a1aa';
-    const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
-    const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
+    const bgBase = cs.getPropertyValue("--pc-bg-base").trim() || "#1e1e24";
+    const textPrimary =
+      cs.getPropertyValue("--pc-text-primary").trim() || "#d4d4d8";
+    const textSecondary =
+      cs.getPropertyValue("--pc-text-secondary").trim() || "#a1a1aa";
+    const fontMono =
+      cs.getPropertyValue("--pc-font-mono").trim() || "monospace";
+    const fontUi =
+      cs.getPropertyValue("--pc-font-ui").trim() || "system-ui,sans-serif";
 
     // CSP that blocks all scripts — used for non-interactive content types
     // and for the inert placeholder.  object-src 'none' is required
@@ -140,21 +149,20 @@ export default function Canvas() {
     // object-src would otherwise fall back to * and allow <object>,
     // <embed>, and <applet> to load external content from these frames.
     const noScriptCsp =
-      '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'; object-src \'none\'">';
+      "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'; object-src 'none'\">";
 
     // Inert placeholder document.  Used for `eval` (where iframe rendering
     // is intentionally a no-op and execution happens out of band) and as
     // the deny-by-default fallback for any unrecognised content_type.
     // Replacing the previous srcdoc with this guarantees that stale frame
     // content cannot retain capability across a transition.
-    const inertDoc =
-      `<!DOCTYPE html><html><head>${noScriptCsp}</head><body style="margin:0;background:${bgBase};"></body></html>`;
+    const inertDoc = `<!DOCTYPE html><html><head>${noScriptCsp}</head><body style="margin:0;background:${bgBase};"></body></html>`;
 
-    if (currentFrame.content_type === 'eval') {
+    if (currentFrame.content_type === "eval") {
       return inertDoc;
     }
 
-    if (currentFrame.content_type === 'svg') {
+    if (currentFrame.content_type === "svg") {
       // Strip <script> tags and event-handler attributes from SVG to prevent XSS.
       // Run the matched-pair strip first; then strip any remaining <script ...>
       // opener so the void-element / unclosed form (`<script src="..."/>` or
@@ -162,29 +170,29 @@ export default function Canvas() {
       // word boundary keeps the patterns from matching tag names that merely
       // start with "script" (e.g. <scriptlet>, should one ever exist).
       const sanitized = currentFrame.content
-        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
-        .replace(/<script\b[^>]*\/?>/gi, '')
-        .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+        .replace(/<script\b[^>]*\/?>/gi, "")
+        .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, "");
       return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${sanitized}</body></html>`;
     }
 
-    if (currentFrame.content_type === 'markdown') {
+    if (currentFrame.content_type === "markdown") {
       const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
       return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
     }
 
-    if (currentFrame.content_type === 'text') {
+    if (currentFrame.content_type === "text") {
       const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
       return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
     }
 
-    if (currentFrame.content_type === 'html') {
+    if (currentFrame.content_type === "html") {
       // Scripts allowed but still sandboxed (no same-origin).
       return currentFrame.content;
     }
@@ -204,7 +212,9 @@ export default function Canvas() {
       setCurrentFrame(null);
       setHistory([]);
     } catch (err) {
-      showActionError(`${t('canvas.switch_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
+      showActionError(
+        `${t("canvas.switch_failed")}${err instanceof Error ? err.message : t("canvas.unknown_error")}`,
+      );
     }
   };
 
@@ -213,7 +223,9 @@ export default function Canvas() {
     try {
       connectWs(canvasId);
     } catch (err) {
-      showActionError(`${t('canvas.reconnect_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
+      showActionError(
+        `${t("canvas.reconnect_failed")}${err instanceof Error ? err.message : t("canvas.unknown_error")}`,
+      );
     }
   };
 
@@ -235,12 +247,14 @@ export default function Canvas() {
     disarmClear();
     try {
       await apiFetch(`/api/canvas/${encodeURIComponent(canvasId)}`, {
-        method: 'DELETE',
+        method: "DELETE",
       });
       setCurrentFrame(null);
       setHistory([]);
     } catch (err) {
-      showActionError(`${t('canvas.clear_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
+      showActionError(
+        `${t("canvas.clear_failed")}${err instanceof Error ? err.message : t("canvas.unknown_error")}`,
+      );
     }
   };
 
@@ -255,9 +269,9 @@ export default function Canvas() {
         title={
           <span className="inline-flex items-center gap-2.5">
             <Monitor className="h-5 w-5 text-pc-accent" />
-            {t('canvas.title')}
-            <Badge tone={connected ? 'ok' : 'error'}>
-              {connected ? t('canvas.connected') : t('canvas.disconnected')}
+            {t("canvas.title")}
+            <Badge tone={connected ? "ok" : "error"}>
+              {connected ? t("canvas.connected") : t("canvas.disconnected")}
             </Badge>
           </span>
         }
@@ -267,27 +281,39 @@ export default function Canvas() {
               variant="ghost"
               size="sm"
               onClick={() => setShowHistory(!showHistory)}
-              title={t('canvas.toggle_history')}
+              title={t("canvas.toggle_history")}
               aria-pressed={showHistory}
             >
               <History className="h-4 w-4" />
             </Button>
             <Button
-              variant={clearArmed ? 'danger' : 'ghost'}
+              variant={clearArmed ? "danger" : "ghost"}
               size="sm"
               onClick={handleClear}
               onBlur={disarmClear}
-              title={clearArmed ? t('canvas.confirm_clear') : t('canvas.clear_canvas')}
-              aria-label={clearArmed ? t('canvas.confirm_clear_canvas') : t('canvas.clear_canvas')}
+              title={
+                clearArmed
+                  ? t("canvas.confirm_clear")
+                  : t("canvas.clear_canvas")
+              }
+              aria-label={
+                clearArmed
+                  ? t("canvas.confirm_clear_canvas")
+                  : t("canvas.clear_canvas")
+              }
             >
               <Trash2 className="h-4 w-4" />
-              {clearArmed && <span className="text-xs">{t('canvas.confirm_clear_prompt')}</span>}
+              {clearArmed && (
+                <span className="text-xs">
+                  {t("canvas.confirm_clear_prompt")}
+                </span>
+              )}
             </Button>
             <Button
               variant="ghost"
               size="sm"
               onClick={handleReconnect}
-              title={t('canvas.reconnect')}
+              title={t("canvas.reconnect")}
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
@@ -311,16 +337,18 @@ export default function Canvas() {
           type="text"
           value={canvasIdInput}
           onChange={(e) => setCanvasIdInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSwitchCanvas()}
-          placeholder={t('canvas.canvas_id_placeholder')}
+          onKeyDown={(e) => e.key === "Enter" && handleSwitchCanvas()}
+          placeholder={t("canvas.canvas_id_placeholder")}
           className="h-9 px-3 rounded-[var(--radius-md)] text-sm border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
         />
         <Button size="md" onClick={handleSwitchCanvas}>
-          {t('canvas.switch')}
+          {t("canvas.switch")}
         </Button>
         {canvasList.length > 0 && (
           <div className="flex items-center gap-1.5 ml-2 flex-wrap">
-            <span className="text-xs text-pc-text-muted">{t('canvas.active')}</span>
+            <span className="text-xs text-pc-text-muted">
+              {t("canvas.active")}
+            </span>
             {canvasList.map((id) => {
               const active = id === canvasId;
               return (
@@ -333,11 +361,11 @@ export default function Canvas() {
                     setHistory([]);
                   }}
                   className={[
-                    'px-2 py-1 rounded-[var(--radius-sm)] text-xs font-mono border transition-colors',
+                    "px-2 py-1 rounded-[var(--radius-sm)] text-xs font-mono border transition-colors",
                     active
-                      ? 'bg-pc-accent/10 text-pc-accent border-pc-accent/30'
-                      : 'bg-pc-elevated text-pc-text-muted border-pc-border hover:text-pc-text hover:border-pc-border-strong',
-                  ].join(' ')}
+                      ? "bg-pc-accent/10 text-pc-accent border-pc-accent/30"
+                      : "bg-pc-elevated text-pc-text-muted border-pc-border hover:text-pc-text hover:border-pc-border-strong",
+                  ].join(" ")}
                 >
                   {id}
                 </button>
@@ -356,18 +384,21 @@ export default function Canvas() {
               sandbox="allow-scripts"
               srcDoc={srcdoc}
               className="w-full h-full border-0"
-              title={`${t('canvas.iframe_title_prefix')}${canvasId}`}
-              style={{ background: 'var(--pc-bg-base)' }}
+              title={`${t("canvas.iframe_title_prefix")}${canvasId}`}
+              style={{ background: "var(--pc-bg-base)" }}
             />
           ) : (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Monitor className="h-12 w-12 mx-auto mb-3 text-pc-text-faint" />
                 <p className="text-sm text-pc-text-muted">
-                  {t('canvas.waiting_prefix')} <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
+                  {t("canvas.waiting_prefix")}{" "}
+                  <span className="font-mono text-pc-text-secondary">
+                    "{canvasId}"
+                  </span>
                 </p>
                 <p className="text-xs mt-1 text-pc-text-faint">
-                  {t('canvas.waiting_hint')}
+                  {t("canvas.waiting_hint")}
                 </p>
               </div>
             </div>
@@ -378,10 +409,12 @@ export default function Canvas() {
         {showHistory && (
           <Card padded={false} className="w-64 overflow-y-auto">
             <div className="px-3 py-2 border-b border-pc-border text-[11px] font-medium uppercase tracking-wide text-pc-text-faint sticky top-0 bg-pc-surface">
-              {t('canvas.frame_history')} ({history.length})
+              {t("canvas.frame_history")} ({history.length})
             </div>
             {history.length === 0 ? (
-              <p className="p-3 text-xs text-pc-text-muted">{t('canvas.no_frames')}</p>
+              <p className="p-3 text-xs text-pc-text-muted">
+                {t("canvas.no_frames")}
+              </p>
             ) : (
               <div className="space-y-1 p-2">
                 {[...history].reverse().map((frame) => {
@@ -391,11 +424,11 @@ export default function Canvas() {
                       key={frame.frame_id}
                       onClick={() => handleSelectHistoryFrame(frame)}
                       className={[
-                        'w-full text-left px-2 py-1.5 rounded-[var(--radius-sm)] text-xs transition-colors border',
+                        "w-full text-left px-2 py-1.5 rounded-[var(--radius-sm)] text-xs transition-colors border",
                         active
-                          ? 'bg-pc-accent/10 border-pc-accent/30'
-                          : 'border-transparent hover:bg-[var(--pc-hover)]',
-                      ].join(' ')}
+                          ? "bg-pc-accent/10 border-pc-accent/30"
+                          : "border-transparent hover:bg-[var(--pc-hover)]",
+                      ].join(" ")}
                     >
                       <div className="flex items-center justify-between">
                         <span className="font-mono truncate text-pc-accent">
@@ -407,7 +440,7 @@ export default function Canvas() {
                       </div>
                       <div className="truncate mt-0.5 text-[0.65rem] text-pc-text-muted">
                         {frame.content.substring(0, 60)}
-                        {frame.content.length > 60 ? '...' : ''}
+                        {frame.content.length > 60 ? "..." : ""}
                       </div>
                     </button>
                   );
@@ -422,9 +455,15 @@ export default function Canvas() {
       {currentFrame && (
         <div className="flex items-center justify-between px-3 py-2 rounded-[var(--radius-md)] text-xs bg-pc-elevated border border-pc-border text-pc-text-muted">
           <span>
-            {t('canvas.type_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.content_type}</span>
+            {t("canvas.type_label")}{" "}
+            <span className="font-mono text-pc-text-secondary">
+              {currentFrame.content_type}
+            </span>
             <span className="mx-2 text-pc-text-faint">|</span>
-            {t('canvas.frame_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.frame_id.substring(0, 8)}</span>
+            {t("canvas.frame_label")}{" "}
+            <span className="font-mono text-pc-text-secondary">
+              {currentFrame.frame_id.substring(0, 8)}
+            </span>
           </span>
           <span>{new Date(currentFrame.timestamp).toLocaleString()}</span>
         </div>

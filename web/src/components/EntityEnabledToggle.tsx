@@ -1,7 +1,7 @@
-import { useState } from 'react';
-import { Power } from 'lucide-react';
-import { ApiError, ConfigApiCodes, patchConfig } from '@/lib/api';
-import { t } from '@/lib/i18n';
+import { useState } from "react";
+import { Power } from "lucide-react";
+import { ApiError, ConfigApiCodes, patchConfig } from "@/lib/api";
+import { t } from "@/lib/i18n";
 
 export interface EntityEnabledToggleProps {
   /** Dotted prefix of the entity (`agents.clamps`, `channels.discord.clamps`, …).
@@ -40,7 +40,7 @@ export default function EntityEnabledToggle({
     setDriftConflict(false);
     try {
       await patchConfig(
-        [{ op: 'replace', path: `${prefix}.enabled`, value: next }],
+        [{ op: "replace", path: `${prefix}.enabled`, value: next }],
         overrideDrift ? { overrideDrift: true } : undefined,
       );
       onChange(next);
@@ -66,48 +66,50 @@ export default function EntityEnabledToggle({
           onClick={() => void apply(!enabled, false)}
           disabled={busy}
           aria-pressed={enabled}
-          aria-label={enabled ? t('entity_toggle.disable') : t('entity_toggle.enable')}
+          aria-label={
+            enabled ? t("entity_toggle.disable") : t("entity_toggle.enable")
+          }
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
           style={{
             background: enabled
-              ? 'var(--color-status-success-alpha-08)'
-              : 'var(--pc-bg-elevated)',
+              ? "var(--color-status-success-alpha-08)"
+              : "var(--pc-bg-elevated)",
             color: enabled
-              ? 'var(--color-status-success)'
-              : 'var(--pc-text-muted)',
-            border: '1px solid',
+              ? "var(--color-status-success)"
+              : "var(--pc-text-muted)",
+            border: "1px solid",
             borderColor: enabled
-              ? 'var(--color-status-success-alpha-20)'
-              : 'var(--pc-border)',
+              ? "var(--color-status-success-alpha-20)"
+              : "var(--pc-border)",
           }}
         >
           <Power className="h-3.5 w-3.5" />
-          {enabled ? t('entity_toggle.enabled') : t('entity_toggle.disabled')}
+          {enabled ? t("entity_toggle.enabled") : t("entity_toggle.disabled")}
         </button>
         {error && (
           <span
             className="text-[11px]"
-            style={{ color: 'var(--color-status-error)' }}
+            style={{ color: "var(--color-status-error)" }}
             title={error}
           >
-            {t('entity_toggle.save_failed')}
+            {t("entity_toggle.save_failed")}
           </span>
         )}
       </div>
       {driftConflict && (
         <div
           className="inline-flex items-center gap-2 text-[11px]"
-          style={{ color: 'var(--color-status-warning)' }}
+          style={{ color: "var(--color-status-warning)" }}
         >
-          <span>{t('entity_toggle.drift_conflict')}</span>
+          <span>{t("entity_toggle.drift_conflict")}</span>
           <button
             type="button"
             onClick={() => void apply(!enabled, true)}
             disabled={busy}
             className="underline disabled:opacity-50"
-            style={{ color: 'var(--pc-text-link)' }}
+            style={{ color: "var(--pc-text-link)" }}
           >
-            {t('entity_toggle.overwrite')}
+            {t("entity_toggle.overwrite")}
           </button>
         </div>
       )}

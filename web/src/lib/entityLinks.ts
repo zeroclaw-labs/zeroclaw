@@ -9,29 +9,29 @@
 //
 // Adding a new entity kind is one row in `ENTITY_SECTION`.
 
-type Shape = 'alias' | 'typed' | 'picker';
+type Shape = "alias" | "typed" | "picker";
 
 const ENTITY_SECTION = {
-  agent:               { section: 'agents',           shape: 'alias'  },
-  channel:             { section: 'channels',         shape: 'typed'  },
-  'model-provider':    { section: 'providers.models', shape: 'typed'  },
-  'memory-backend':    { section: 'memory',           shape: 'picker' },
-  'risk-profile':      { section: 'risk_profiles',    shape: 'alias'  },
-  'runtime-profile':   { section: 'runtime_profiles', shape: 'alias'  },
-  'skill-bundle':      { section: 'skill_bundles',    shape: 'alias'  },
-  'knowledge-bundle':  { section: 'knowledge_bundles',shape: 'alias'  },
-  'mcp-bundle':        { section: 'mcp_bundles',      shape: 'alias'  },
-  'peer-group':        { section: 'peer_groups',      shape: 'alias'  },
-  cron:                { section: 'cron',             shape: 'alias'  },
+  agent: { section: "agents", shape: "alias" },
+  channel: { section: "channels", shape: "typed" },
+  "model-provider": { section: "providers.models", shape: "typed" },
+  "memory-backend": { section: "memory", shape: "picker" },
+  "risk-profile": { section: "risk_profiles", shape: "alias" },
+  "runtime-profile": { section: "runtime_profiles", shape: "alias" },
+  "skill-bundle": { section: "skill_bundles", shape: "alias" },
+  "knowledge-bundle": { section: "knowledge_bundles", shape: "alias" },
+  "mcp-bundle": { section: "mcp_bundles", shape: "alias" },
+  "peer-group": { section: "peer_groups", shape: "alias" },
+  cron: { section: "cron", shape: "alias" },
 } as const satisfies Record<string, { section: string; shape: Shape }>;
 
 export type EntityKind = keyof typeof ENTITY_SECTION;
 
 export function entityConfigPath(kind: EntityKind, id: string): string {
   const { section, shape } = ENTITY_SECTION[kind];
-  if (shape === 'picker') return `/config/${section}`;
-  if (shape === 'typed') {
-    const dot = id.indexOf('.');
+  if (shape === "picker") return `/config/${section}`;
+  if (shape === "typed") {
+    const dot = id.indexOf(".");
     if (dot > 0) {
       return `/config/${section}/${encodeURIComponent(id.slice(0, dot))}/${encodeURIComponent(id.slice(dot + 1))}`;
     }

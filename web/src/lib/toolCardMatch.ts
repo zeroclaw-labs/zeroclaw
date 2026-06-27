@@ -17,7 +17,10 @@ export function resolveToolResultIndex<T extends ToolCardLike>(
     messages.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
   if (!resultId) return firstUnresolved();
   const byId = messages.findIndex(
-    (m) => m.toolCall && m.toolCall.output === undefined && m.toolCall.id === resultId,
+    (m) =>
+      m.toolCall &&
+      m.toolCall.output === undefined &&
+      m.toolCall.id === resultId,
   );
   return byId === -1 ? firstUnresolved() : byId;
 }

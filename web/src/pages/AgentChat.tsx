@@ -1,11 +1,26 @@
-import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
-import { useDraft } from '@/hooks/useDraft';
-import { t } from '@/lib/i18n';
+import { memo, useState, useEffect, useRef, useCallback } from "react";
+import { Link, Navigate, useParams } from "react-router-dom";
+import {
+  Send,
+  Square,
+  Bot,
+  User,
+  AlertCircle,
+  Copy,
+  Check,
+  X,
+  Trash2,
+  Minimize2,
+  Maximize2,
+  ChevronDown,
+  Wrench,
+  FolderOpen,
+} from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { useAgent, type ChatMessage } from "@/contexts/AgentContext";
+import { useDraft } from "@/hooks/useDraft";
+import { t } from "@/lib/i18n";
 import {
   COMMANDS,
   helpText,
@@ -13,14 +28,14 @@ import {
   matchCommands,
   parseCommand,
   type CommandSpec,
-} from '@/lib/slashCommands';
-import { Badge, Button } from '@/components/ui';
-import ChatWorkspace from '@/pages/ChatWorkspace';
+} from "@/lib/slashCommands";
+import { Badge, Button } from "@/components/ui";
+import ChatWorkspace from "@/pages/ChatWorkspace";
 
-import ToolCallCard from '@/components/ToolCallCard';
-import ApprovalBanner from '@/components/ApprovalBanner';
+import ToolCallCard from "@/components/ToolCallCard";
+import ApprovalBanner from "@/components/ApprovalBanner";
 
-const DRAFT_KEY_PREFIX = 'agent-chat';
+const DRAFT_KEY_PREFIX = "agent-chat";
 
 /**
  * Route entry point for `/agent/:alias`. Reads the alias from the URL and
@@ -81,7 +96,9 @@ export function AgentChatInner({
     respondToApproval,
   } = useAgent();
 
-  const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
+  const { draft, saveDraft, clearDraft } = useDraft(
+    `${DRAFT_KEY_PREFIX}.${agentAlias}`,
+  );
   const [input, setInput] = useState(draft);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
@@ -89,7 +106,11 @@ export function AgentChatInner({
   const [showCommandHint, setShowCommandHint] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [compact, setCompact] = useState(() => {
-    try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
+    try {
+      return localStorage.getItem("zeroclaw_chat_compact") === "1";
+    } catch {
+      return false;
+    }
   });
   // Tool execution is plumbing, not chat. Default off so tool_call /
   // tool_result frames do not surface inline in the conversation transcript.
@@ -98,7 +119,11 @@ export function AgentChatInner({
   // filters them at render time so toggling on retroactively reveals prior
   // tool activity.
   const [showToolActivity, setShowToolActivity] = useState(() => {
-    try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+    try {
+      return localStorage.getItem("zeroclaw_show_tool_activity") === "1";
+    } catch {
+      return false;
+    }
   });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -123,18 +148,21 @@ export function AgentChatInner({
   // moved to AgentContext (PR #6101). Tool activity is filtered at render
   // time below using `showToolActivity`, not at the message-handler layer.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, typing, streamingContent]);
 
   // Close model dropdown when clicking outside
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
-      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) {
+      if (
+        modelDropdownRef.current &&
+        !modelDropdownRef.current.contains(e.target as Node)
+      ) {
         setShowModelDropdown(false);
       }
     }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
   /**
@@ -143,66 +171,85 @@ export function AgentChatInner({
    * Commands drive existing session primitives — clear/reset and model switch —
    * and surface their feedback as local info messages, never to the gateway.
    */
-  const runCommand = useCallback((trimmed: string): boolean => {
-    if (!isSlashCommand(trimmed)) return false;
+  const runCommand = useCallback(
+    (trimmed: string): boolean => {
+      if (!isSlashCommand(trimmed)) return false;
 
-    const { command, args } = parseCommand(trimmed);
-    switch (command) {
-      case 'help':
-        addLocalMessage(helpText());
-        return true;
-
-      case 'clear':
-      case 'new':
-        clearAllMessages();
-        addLocalMessage(t('agent.cmd_cleared'));
-        return true;
-
-      case 'model': {
-        const name = args.trim();
-        if (!name) {
-          const current = currentModel
-            ? t('agent.cmd_model_current').replace('{model}', currentModel)
-            : t('agent.cmd_model_none');
-          const list = availableModels.length > 0
-            ? `\n${t('agent.cmd_model_available').replace('{models}', availableModels.join(', '))}`
-            : '';
-          addLocalMessage(`${current}${list}`);
+      const { command, args } = parseCommand(trimmed);
+      switch (command) {
+        case "help":
+          addLocalMessage(helpText());
           return true;
-        }
-        if (name === currentModel) {
-          addLocalMessage(t('agent.cmd_model_current').replace('{model}', name));
+
+        case "clear":
+        case "new":
+          clearAllMessages();
+          addLocalMessage(t("agent.cmd_cleared"));
           return true;
-        }
-        if (availableModels.length > 0 && !availableModels.includes(name)) {
+
+        case "model": {
+          const name = args.trim();
+          if (!name) {
+            const current = currentModel
+              ? t("agent.cmd_model_current").replace("{model}", currentModel)
+              : t("agent.cmd_model_none");
+            const list =
+              availableModels.length > 0
+                ? `\n${t("agent.cmd_model_available").replace("{models}", availableModels.join(", "))}`
+                : "";
+            addLocalMessage(`${current}${list}`);
+            return true;
+          }
+          if (name === currentModel) {
+            addLocalMessage(
+              t("agent.cmd_model_current").replace("{model}", name),
+            );
+            return true;
+          }
+          if (availableModels.length > 0 && !availableModels.includes(name)) {
+            addLocalMessage(
+              t("agent.cmd_model_unknown")
+                .replace("{model}", name)
+                .replace("{models}", availableModels.join(", ")),
+            );
+            return true;
+          }
+          // switchModel silently no-ops while another switch is in flight, which
+          // looks like the command was ignored. Surface that state explicitly. #7137
+          if (modelLoading) {
+            addLocalMessage(t("agent.cmd_model_busy"));
+            return true;
+          }
           addLocalMessage(
-            t('agent.cmd_model_unknown')
-              .replace('{model}', name)
-              .replace('{models}', availableModels.join(', ')),
+            t("agent.cmd_model_switching").replace("{model}", name),
+          );
+          // Reuse the existing model-switch path (config write + socket rebuild).
+          void switchModel(name).catch(() => {
+            // switchModel surfaces its own error via context `error` state, but
+            // the user just typed a command and expects inline feedback there too.
+            addLocalMessage(
+              t("agent.cmd_model_failed").replace("{model}", name),
+            );
+          });
+          return true;
+        }
+
+        default:
+          addLocalMessage(
+            t("agent.cmd_unknown").replace("{cmd}", `/${command}`),
           );
           return true;
-        }
-        // switchModel silently no-ops while another switch is in flight, which
-        // looks like the command was ignored. Surface that state explicitly. #7137
-        if (modelLoading) {
-          addLocalMessage(t('agent.cmd_model_busy'));
-          return true;
-        }
-        addLocalMessage(t('agent.cmd_model_switching').replace('{model}', name));
-        // Reuse the existing model-switch path (config write + socket rebuild).
-        void switchModel(name).catch(() => {
-          // switchModel surfaces its own error via context `error` state, but
-          // the user just typed a command and expects inline feedback there too.
-          addLocalMessage(t('agent.cmd_model_failed').replace('{model}', name));
-        });
-        return true;
       }
-
-      default:
-        addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
-        return true;
-    }
-  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel, modelLoading]);
+    },
+    [
+      addLocalMessage,
+      clearAllMessages,
+      currentModel,
+      availableModels,
+      switchModel,
+      modelLoading,
+    ],
+  );
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -218,13 +265,13 @@ export function AgentChatInner({
       if (!connected) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
-      sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
+      sendMessage(trimmed.startsWith("//") ? trimmed.slice(1) : trimmed);
     }
     setShowCommandHint(false);
-    setInput('');
+    setInput("");
     clearDraft();
     if (inputRef.current) {
-      inputRef.current.style.height = 'auto';
+      inputRef.current.style.height = "auto";
       inputRef.current.focus();
     }
   };
@@ -232,11 +279,16 @@ export function AgentChatInner({
   const isComposingRef = useRef(false);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Escape' && showCommandHint) {
+    if (e.key === "Escape" && showCommandHint) {
       setShowCommandHint(false);
       return;
     }
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isComposingRef.current) {
+    if (
+      e.key === "Enter" &&
+      !e.shiftKey &&
+      !e.nativeEvent.isComposing &&
+      !isComposingRef.current
+    ) {
       e.preventDefault();
       handleSend();
     }
@@ -248,9 +300,10 @@ export function AgentChatInner({
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
-    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1)).length > 0;
+    const showHint =
+      /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1)).length > 0;
     setShowCommandHint(showHint);
-    e.target.style.height = 'auto';
+    e.target.style.height = "auto";
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
   };
 
@@ -259,8 +312,8 @@ export function AgentChatInner({
   // immediately when it takes no further input.
   const applyCommandHint = useCallback((spec: CommandSpec) => {
     setShowCommandHint(false);
-    const takesArgs = spec.usage.includes('[');
-    setInput(`/${spec.name}${takesArgs ? ' ' : ''}`);
+    const takesArgs = spec.usage.includes("[");
+    setInput(`/${spec.name}${takesArgs ? " " : ""}`);
     inputRef.current?.focus();
   }, []);
 
@@ -271,21 +324,30 @@ export function AgentChatInner({
   const handleCopy = useCallback((msgId: string, content: string) => {
     const onSuccess = () => {
       setCopiedId(msgId);
-      setTimeout(() => setCopiedId((prev) => (prev === msgId ? null : prev)), 2000);
+      setTimeout(
+        () => setCopiedId((prev) => (prev === msgId ? null : prev)),
+        2000,
+      );
     };
 
     if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(content).then(onSuccess).catch(() => {
-        fallbackCopy(content) && onSuccess();
-      });
+      navigator.clipboard
+        .writeText(content)
+        .then(onSuccess)
+        .catch(() => {
+          fallbackCopy(content) && onSuccess();
+        });
     } else {
       fallbackCopy(content) && onSuccess();
     }
   }, []);
 
-  const handleDeleteMessage = useCallback((msgId: string) => {
-    deleteMessage(msgId);
-  }, [deleteMessage]);
+  const handleDeleteMessage = useCallback(
+    (msgId: string) => {
+      deleteMessage(msgId);
+    },
+    [deleteMessage],
+  );
 
   const handleClearAll = useCallback(() => {
     clearAllMessages();
@@ -307,7 +369,11 @@ export function AgentChatInner({
   const toggleCompact = useCallback(() => {
     setCompact((prev) => {
       const next = !prev;
-      try { localStorage.setItem('zeroclaw_chat_compact', next ? '1' : '0'); } catch { /* noop */ }
+      try {
+        localStorage.setItem("zeroclaw_chat_compact", next ? "1" : "0");
+      } catch {
+        /* noop */
+      }
       return next;
     });
   }, []);
@@ -315,7 +381,11 @@ export function AgentChatInner({
   const toggleToolActivity = useCallback(() => {
     setShowToolActivity((prev) => {
       const next = !prev;
-      try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
+      try {
+        localStorage.setItem("zeroclaw_show_tool_activity", next ? "1" : "0");
+      } catch {
+        /* noop */
+      }
       return next;
     });
   }, []);
@@ -325,14 +395,14 @@ export function AgentChatInner({
    * where navigator.clipboard is unavailable.
    */
   function fallbackCopy(text: string): boolean {
-    const textarea = document.createElement('textarea');
+    const textarea = document.createElement("textarea");
     textarea.value = text;
-    textarea.style.position = 'fixed';
-    textarea.style.opacity = '0';
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
     document.body.appendChild(textarea);
     textarea.select();
     try {
-      document.execCommand('copy');
+      document.execCommand("copy");
       return true;
     } catch {
       return false;
@@ -372,10 +442,10 @@ export function AgentChatInner({
           <Link
             to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
             className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-            title={t('agentchat.open_workspace')}
+            title={t("agentchat.open_workspace")}
           >
             <FolderOpen className="h-3.5 w-3.5" />
-            {t('agentchat.files')}
+            {t("agentchat.files")}
           </Link>
         </div>
 
@@ -383,13 +453,20 @@ export function AgentChatInner({
           <button
             type="button"
             onClick={() => setShowModelDropdown((v) => !v)}
-            disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+            disabled={
+              modelLoading ||
+              typing ||
+              (availableModels.length === 0 && currentModel === null)
+            }
             className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
           >
             <span className="max-w-[180px] truncate">
               {modelLoading
-                ? t('agent.model_switching')
-                : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+                ? t("agent.model_switching")
+                : (currentModel ??
+                  (availableModels.length === 0
+                    ? t("agent.model_loading")
+                    : t("agent.select_model")))}
             </span>
             <ChevronDown className="h-3 w-3" />
           </button>
@@ -405,8 +482,8 @@ export function AgentChatInner({
                     onClick={() => handleModelSwitch(model)}
                     className={`w-full text-left px-3 py-2 text-xs transition-colors ${
                       isActive
-                        ? 'text-pc-accent bg-pc-accent/10'
-                        : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                        ? "text-pc-accent bg-pc-accent/10"
+                        : "text-pc-text hover:bg-[var(--pc-hover)]"
                     }`}
                   >
                     {model}
@@ -433,44 +510,58 @@ export function AgentChatInner({
             variant="ghost"
             size="sm"
             onClick={toggleCompact}
-            aria-label={t('agent.compact_mode')}
+            aria-label={t("agent.compact_mode")}
           >
-            {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
-            {t('agent.compact_mode')}
+            {compact ? (
+              <Maximize2 className="h-3 w-3" />
+            ) : (
+              <Minimize2 className="h-3 w-3" />
+            )}
+            {t("agent.compact_mode")}
           </Button>
           <Button
             variant="ghost"
             size="sm"
             onClick={toggleToolActivity}
-            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            aria-label={
+              showToolActivity
+                ? t("agent.tool_activity_hide")
+                : t("agent.tool_activity_show")
+            }
             aria-pressed={showToolActivity}
           >
             <Wrench className="h-3 w-3" />
-            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            {showToolActivity
+              ? t("agent.tool_activity_hide")
+              : t("agent.tool_activity_show")}
           </Button>
           <Button
             variant="danger"
             size="sm"
             onClick={handleClearAll}
-            aria-label={t('agent.clear_all')}
+            aria-label={t("agent.clear_all")}
           >
             <Trash2 className="h-3 w-3" />
-            {t('agent.clear_all')}
+            {t("agent.clear_all")}
           </Button>
         </div>
       )}
 
       {/* Messages area. */}
       <div
-        className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+        className={`flex-1 overflow-y-auto p-4 ${compact ? "space-y-1.5" : "space-y-4"}`}
       >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in text-pc-text-muted">
             <div className="h-14 w-14 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-accent/10">
               <Bot className="h-7 w-7 text-pc-accent" />
             </div>
-            <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
-            <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+            <p className="text-base font-semibold mb-1 text-pc-text">
+              {t("agentchat.empty_title")}
+            </p>
+            <p className="text-sm text-pc-text-muted">
+              {t("agent.start_conversation")}
+            </p>
           </div>
         )}
 
@@ -497,11 +588,20 @@ export function AgentChatInner({
               <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated text-pc-text max-w-[75%]">
                 {streamingThinking && (
                   <details className="mb-2" open={!streamingContent}>
-                    <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}{!streamingContent && '...'}</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{streamingThinking}</pre>
+                    <summary className="text-xs cursor-pointer select-none text-pc-text-muted">
+                      {t("agentchat.thinking")}
+                      {!streamingContent && "..."}
+                    </summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">
+                      {streamingThinking}
+                    </pre>
                   </details>
                 )}
-                {streamingContent && <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>}
+                {streamingContent && (
+                  <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+                    {streamingContent}
+                  </p>
+                )}
               </div>
             ) : (
               <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated flex items-center gap-1.5">
@@ -518,7 +618,10 @@ export function AgentChatInner({
 
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
-        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        <ApprovalBanner
+          pending={pendingApproval}
+          onRespond={respondToApproval}
+        />
       )}
 
       {/* Input area */}
@@ -528,26 +631,46 @@ export function AgentChatInner({
           <div className="relative max-w-4xl mx-auto">
             <div
               className="absolute bottom-1 left-0 rounded-xl border shadow-lg z-50 py-1 min-w-[260px] overflow-hidden"
-              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+              style={{
+                background: "var(--pc-bg-elevated)",
+                borderColor: "var(--pc-border)",
+              }}
             >
               <div
                 className="px-3 py-1 text-[10px] uppercase tracking-wide"
-                style={{ color: 'var(--pc-text-faint)' }}
+                style={{ color: "var(--pc-text-faint)" }}
               >
-                {t('agent.cmd_hint_title')}
+                {t("agent.cmd_hint_title")}
               </div>
               {matchedCommands.map((spec) => (
                 <button
                   key={spec.name}
                   type="button"
-                  onMouseDown={(e) => { e.preventDefault(); applyCommandHint(spec); }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyCommandHint(spec);
+                  }}
                   className="w-full text-left px-3 py-2 text-xs transition-colors flex items-center gap-2"
-                  style={{ color: 'var(--pc-text-primary)' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-bg-surface)'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                  style={{ color: "var(--pc-text-primary)" }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "var(--pc-bg-surface)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "transparent";
+                  }}
                 >
-                  <span className="font-mono font-medium" style={{ color: 'var(--pc-accent)' }}>{spec.usage}</span>
-                  <span className="truncate" style={{ color: 'var(--pc-text-muted)' }}>{t(spec.descriptionKey)}</span>
+                  <span
+                    className="font-mono font-medium"
+                    style={{ color: "var(--pc-accent)" }}
+                  >
+                    {spec.usage}
+                  </span>
+                  <span
+                    className="truncate"
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
+                    {t(spec.descriptionKey)}
+                  </span>
                 </button>
               ))}
             </div>
@@ -560,16 +683,27 @@ export function AgentChatInner({
             value={input}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
-            onCompositionStart={() => { isComposingRef.current = true; }}
-            onCompositionEnd={() => { isComposingRef.current = false; }}
-            placeholder={!connected
-              ? t('agent.connecting')
-              : typing
-                ? t('agent.running')
-                : t('agent.type_message')}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
+            placeholder={
+              !connected
+                ? t("agent.connecting")
+                : typing
+                  ? t("agent.running")
+                  : t("agent.type_message")
+            }
             disabled={!connected || typing}
             className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
-            style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
+            style={{
+              minHeight: "40px",
+              maxHeight: "200px",
+              paddingTop: "9px",
+              paddingBottom: "9px",
+            }}
           />
           {typing ? (
             <Button
@@ -577,8 +711,8 @@ export function AgentChatInner({
               size="md"
               onClick={handleAbort}
               className="flex-shrink-0 w-10 px-0"
-              aria-label={t('agent.stop')}
-              title={t('agent.stop')}
+              aria-label={t("agent.stop")}
+              title={t("agent.stop")}
             >
               <Square className="h-4 w-4" fill="currentColor" />
             </Button>
@@ -589,19 +723,19 @@ export function AgentChatInner({
               onClick={handleSend}
               disabled={!connected || !input.trim()}
               className="flex-shrink-0 w-10 px-0"
-              aria-label={t('agent.send')}
+              aria-label={t("agent.send")}
             >
               <Send className="h-4 w-4" />
             </Button>
           )}
         </div>
         <div className="flex items-center justify-center mt-2">
-          <Badge tone={typing ? 'warn' : connected ? 'ok' : 'error'}>
+          <Badge tone={typing ? "warn" : connected ? "ok" : "error"}>
             {typing
-              ? t('agent.running')
+              ? t("agent.running")
               : connected
-                ? t('agent.connected_status')
-                : t('agent.disconnected_status')}
+                ? t("agent.connected_status")
+                : t("agent.disconnected_status")}
           </Badge>
         </div>
       </div>
@@ -615,10 +749,11 @@ export function AgentChatInner({
 // don't try — we just strip the prefix for display and copy; the bubble shows
 // its own wall-clock caption separately. Anchored to the start so a bracketed
 // datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
+const SERVER_TIMESTAMP_RE =
+  /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
 
 function stripServerTimestamp(content: string): string {
-  return content.replace(SERVER_TIMESTAMP_RE, '');
+  return content.replace(SERVER_TIMESTAMP_RE, "");
 }
 
 // Each chat message is rendered through this memoized component so that
@@ -647,24 +782,29 @@ const MessageItem = memo(function MessageItem({
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent =
+    msg.local || msg.ephemeral
+      ? msg.content
+      : stripServerTimestamp(msg.content);
 
   return (
     <div
-      className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
-        msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
+      className={`group flex items-start ${compact ? "gap-2" : "gap-3"} ${
+        msg.role === "user"
+          ? "flex-row-reverse animate-slide-in-right"
+          : "animate-slide-in-left"
       }`}
       style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
     >
       {!compact && (
         <div
           className={`flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border ${
-            msg.role === 'user'
-              ? 'bg-pc-accent/15 border-pc-accent/30'
-              : 'bg-pc-elevated border-pc-border'
+            msg.role === "user"
+              ? "bg-pc-accent/15 border-pc-accent/30"
+              : "bg-pc-elevated border-pc-border"
           }`}
         >
-          {msg.role === 'user' ? (
+          {msg.role === "user" ? (
             <User className="h-4 w-4 text-pc-accent" />
           ) : (
             <Bot className="h-4 w-4 text-pc-accent" />
@@ -673,24 +813,38 @@ const MessageItem = memo(function MessageItem({
       )}
       <div className="relative max-w-[75%]">
         <div
-          className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
-            msg.role === 'user'
-              ? 'bg-pc-accent/10 border-pc-accent/20'
-              : 'bg-pc-elevated border-pc-border'
+          className={`${compact ? "rounded-[var(--radius-md)] px-3 py-1.5 border" : "rounded-[var(--radius-lg)] px-4 py-3 border"} text-pc-text ${
+            msg.role === "user"
+              ? "bg-pc-accent/10 border-pc-accent/20"
+              : "bg-pc-elevated border-pc-border"
           }`}
         >
           {msg.thinking && (
             <details className="mb-2">
-              <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}</summary>
-              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{msg.thinking}</pre>
+              <summary className="text-xs cursor-pointer select-none text-pc-text-muted">
+                {t("agentchat.thinking")}
+              </summary>
+              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">
+                {msg.thinking}
+              </pre>
             </details>
           )}
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
+            <div
+              className={`${compact ? "text-xs" : "text-sm"} break-words leading-relaxed chat-markdown`}
+            >
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {cleanContent}
+              </ReactMarkdown>
+            </div>
           ) : (
-            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
+            <p
+              className={`${compact ? "text-xs" : "text-sm"} whitespace-pre-wrap break-words leading-relaxed`}
+            >
+              {cleanContent}
+            </p>
           )}
           {!compact && (
             <p className="text-[10px] mt-1.5 text-pc-text-faint">
@@ -701,7 +855,7 @@ const MessageItem = memo(function MessageItem({
         <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             onClick={() => onCopy(msg.id, cleanContent)}
-            aria-label={t('agent.copy_message')}
+            aria-label={t("agent.copy_message")}
             className="p-1 rounded-[var(--radius-sm)] text-pc-text-muted hover:text-pc-text transition-colors"
           >
             {isCopied ? (
@@ -712,7 +866,7 @@ const MessageItem = memo(function MessageItem({
           </button>
           <button
             onClick={() => onDelete(msg.id)}
-            aria-label={t('agent.delete_message')}
+            aria-label={t("agent.delete_message")}
             className="p-1 rounded-[var(--radius-sm)] text-pc-text-muted hover:text-status-error transition-colors"
           >
             <X className="h-3.5 w-3.5" />

@@ -1,8 +1,8 @@
-import type { ApprovalDecision, WsMessage } from '../types/api';
-import { getToken } from './auth';
-import { apiOrigin, basePath } from './basePath';
-import { isTauri } from './tauri';
-import { generateUUID } from './uuid';
+import type { ApprovalDecision, WsMessage } from "../types/api";
+import { getToken } from "./auth";
+import { apiOrigin, basePath } from "./basePath";
+import { isTauri } from "./tauri";
+import { generateUUID } from "./uuid";
 
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;
@@ -25,7 +25,7 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-const SESSION_ID_KEY_PREFIX = 'zeroclaw_session_id';
+const SESSION_ID_KEY_PREFIX = "zeroclaw_session_id";
 
 /** Return a stable session ID for the given agent alias, persisted in
  * localStorage. Each agent gets its own session so parallel conversations
@@ -62,9 +62,9 @@ export class WebSocketClient {
     let defaultBase: string;
     if (isTauri() && apiOrigin) {
       // In Tauri, derive ws URL from the gateway origin.
-      defaultBase = apiOrigin.replace(/^http/, 'ws');
+      defaultBase = apiOrigin.replace(/^http/, "ws");
     } else {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       defaultBase = `${protocol}//${window.location.host}`;
     }
     this.baseUrl = options.baseUrl ?? defaultBase;
@@ -82,12 +82,12 @@ export class WebSocketClient {
     const token = getToken();
     const sessionId = getOrCreateSessionId(this.agentAlias);
     const params = new URLSearchParams();
-    if (token) params.set('token', token);
-    params.set('session_id', sessionId);
-    params.set('agent', this.agentAlias);
+    if (token) params.set("token", token);
+    params.set("session_id", sessionId);
+    params.set("agent", this.agentAlias);
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
-    const protocols: string[] = ['zeroclaw.v1'];
+    const protocols: string[] = ["zeroclaw.v1"];
     if (token) protocols.push(`bearer.${token}`);
     this.ws = new WebSocket(url, protocols);
 
@@ -118,9 +118,9 @@ export class WebSocketClient {
   /** Send a chat message to the agent. */
   sendMessage(content: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket is not connected');
+      throw new Error("WebSocket is not connected");
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(JSON.stringify({ type: "message", content }));
   }
 
   /**
@@ -132,7 +132,11 @@ export class WebSocketClient {
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(
-      JSON.stringify({ type: 'approval_response', request_id: requestId, decision }),
+      JSON.stringify({
+        type: "approval_response",
+        request_id: requestId,
+        decision,
+      }),
     );
   }
 
@@ -159,7 +163,10 @@ export class WebSocketClient {
     if (this.intentionallyClosed || !this.autoReconnect) return;
 
     this.reconnectTimer = setTimeout(() => {
-      this.currentDelay = Math.min(this.currentDelay * 2, this.maxReconnectDelay);
+      this.currentDelay = Math.min(
+        this.currentDelay * 2,
+        this.maxReconnectDelay,
+      );
       this.connect();
     }, this.currentDelay);
   }

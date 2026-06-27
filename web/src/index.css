@@ -38,13 +38,41 @@
   --color-status-error: #ff4466;
   --color-status-info: #0080ff;
   /* Status color alpha helpers (for backgrounds/borders) */
-  --color-status-error-alpha-08: color-mix(in srgb, var(--color-status-error) 8%, transparent);
-  --color-status-error-alpha-20: color-mix(in srgb, var(--color-status-error) 20%, transparent);
-  --color-status-error-alpha-30: color-mix(in srgb, var(--color-status-error) 30%, transparent);
-  --color-status-success-alpha-08: color-mix(in srgb, var(--color-status-success) 8%, transparent);
-  --color-status-success-alpha-20: color-mix(in srgb, var(--color-status-success) 20%, transparent);
-  --color-status-warning-alpha-05: color-mix(in srgb, var(--color-status-warning) 5%, transparent);
-  --color-status-warning-alpha-20: color-mix(in srgb, var(--color-status-warning) 20%, transparent);
+  --color-status-error-alpha-08: color-mix(
+    in srgb,
+    var(--color-status-error) 8%,
+    transparent
+  );
+  --color-status-error-alpha-20: color-mix(
+    in srgb,
+    var(--color-status-error) 20%,
+    transparent
+  );
+  --color-status-error-alpha-30: color-mix(
+    in srgb,
+    var(--color-status-error) 30%,
+    transparent
+  );
+  --color-status-success-alpha-08: color-mix(
+    in srgb,
+    var(--color-status-success) 8%,
+    transparent
+  );
+  --color-status-success-alpha-20: color-mix(
+    in srgb,
+    var(--color-status-success) 20%,
+    transparent
+  );
+  --color-status-warning-alpha-05: color-mix(
+    in srgb,
+    var(--color-status-warning) 5%,
+    transparent
+  );
+  --color-status-warning-alpha-20: color-mix(
+    in srgb,
+    var(--color-status-warning) 20%,
+    transparent
+  );
   /* Backgrounds */
   --pc-bg-base: #1e1e24;
   --pc-bg-surface: #232329;
@@ -57,8 +85,16 @@
      because they color-mix the per-theme surface/text/accent tokens that the
      theme system overrides at runtime (see ThemeContext.applyVars). Defined
      here so referenced vars are never undefined in dark or light palettes. */
-  --pc-bg-surface-subtle: color-mix(in srgb, var(--pc-bg-surface) 92%, var(--pc-text-primary) 8%);
-  --pc-bg-surface-elevated: color-mix(in srgb, var(--pc-bg-elevated) 85%, var(--pc-text-primary) 15%);
+  --pc-bg-surface-subtle: color-mix(
+    in srgb,
+    var(--pc-bg-surface) 92%,
+    var(--pc-text-primary) 8%
+  );
+  --pc-bg-surface-elevated: color-mix(
+    in srgb,
+    var(--pc-bg-elevated) 85%,
+    var(--pc-text-primary) 15%
+  );
 
   /* Borders */
   --pc-border: rgba(255, 255, 255, 0.08);
@@ -105,8 +141,12 @@
   --pc-scrollbar-thumb-hover: #71717a;
 
   /* Fonts */
-  --pc-font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+  --pc-font-ui:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  --pc-font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco,
+    Consolas, monospace;
   --pc-font-size: 15px;
   --pc-font-size-mono: 14px;
 }
@@ -190,59 +230,119 @@ textarea {
   word-break: break-word;
 }
 
-code, kbd, pre {
+code,
+kbd,
+pre {
   font-family: var(--pc-font-mono);
 }
 
 /* ── Animations ── */
 @keyframes fade-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes fadeInScale {
-  from { opacity: 0; transform: scale(0.95); }
-  to { opacity: 1; transform: scale(1); }
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 @keyframes slideInLeft {
-  from { opacity: 0; transform: translateX(-16px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 @keyframes slideInRight {
-  from { opacity: 0; transform: translateX(16px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 @keyframes slideInUp {
-  from { opacity: 0; transform: translateY(16px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 @keyframes bounce-dot {
-  0%, 80%, 100% { transform: translateY(0); opacity: 0.45; }
-  40% { transform: translateY(-4px); opacity: 1; }
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
 }
 
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 @keyframes float {
-  0%, 100% { transform: translateY(0px); }
-  50% { transform: translateY(-4px); }
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
 }
 
 .animate-fade-in {
@@ -284,21 +384,47 @@ code, kbd, pre {
 .bounce-dot {
   animation: bounce-dot 0.9s infinite ease-in-out;
 }
-.bounce-dot:nth-child(1) { animation-delay: 0s; }
-.bounce-dot:nth-child(2) { animation-delay: 0.12s; }
-.bounce-dot:nth-child(3) { animation-delay: 0.24s; }
+.bounce-dot:nth-child(1) {
+  animation-delay: 0s;
+}
+.bounce-dot:nth-child(2) {
+  animation-delay: 0.12s;
+}
+.bounce-dot:nth-child(3) {
+  animation-delay: 0.24s;
+}
 
 /* Stagger delays */
-.stagger-children > *:nth-child(1) { animation-delay: 0ms; }
-.stagger-children > *:nth-child(2) { animation-delay: 60ms; }
-.stagger-children > *:nth-child(3) { animation-delay: 120ms; }
-.stagger-children > *:nth-child(4) { animation-delay: 180ms; }
-.stagger-children > *:nth-child(5) { animation-delay: 240ms; }
-.stagger-children > *:nth-child(6) { animation-delay: 300ms; }
-.stagger-children > *:nth-child(7) { animation-delay: 360ms; }
-.stagger-children > *:nth-child(8) { animation-delay: 420ms; }
-.stagger-children > *:nth-child(9) { animation-delay: 480ms; }
-.stagger-children > *:nth-child(10) { animation-delay: 540ms; }
+.stagger-children > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.stagger-children > *:nth-child(2) {
+  animation-delay: 60ms;
+}
+.stagger-children > *:nth-child(3) {
+  animation-delay: 120ms;
+}
+.stagger-children > *:nth-child(4) {
+  animation-delay: 180ms;
+}
+.stagger-children > *:nth-child(5) {
+  animation-delay: 240ms;
+}
+.stagger-children > *:nth-child(6) {
+  animation-delay: 300ms;
+}
+.stagger-children > *:nth-child(7) {
+  animation-delay: 360ms;
+}
+.stagger-children > *:nth-child(8) {
+  animation-delay: 420ms;
+}
+.stagger-children > *:nth-child(9) {
+  animation-delay: 480ms;
+}
+.stagger-children > *:nth-child(10) {
+  animation-delay: 540ms;
+}
 
 /* ── Utility classes ── */
 
@@ -560,13 +686,18 @@ code, kbd, pre {
 }
 
 .progress-bar-animated::after {
-  content: '';
+  content: "";
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
   bottom: 0;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.15), transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.15),
+    transparent
+  );
   background-size: 200% 100%;
   animation: shimmer 2s infinite;
 }
@@ -639,48 +770,181 @@ code, kbd, pre {
   font-family: var(--pc-font-mono);
 }
 
-.markdown-body p { margin: 4px 0; }
-.markdown-body ul, .markdown-body ol { margin: 4px 0; padding-left: 20px; }
-.markdown-body ul { list-style-type: disc; }
-.markdown-body ol { list-style-type: decimal; }
-.markdown-body li { margin: 2px 0; }
-.markdown-body li > ul, .markdown-body li > ol { margin: 2px 0; }
-.markdown-body li > ul { list-style-type: circle; }
-.markdown-body li > ul > li > ul { list-style-type: square; }
-.markdown-body blockquote { border-left: 3px solid var(--pc-accent-dim); padding-left: 12px; margin: 8px 0; opacity: 0.8; }
-.markdown-body h1, .markdown-body h2, .markdown-body h3 { margin: 12px 0 4px; }
-.markdown-body a { color: var(--pc-accent-light); text-decoration: underline; }
-.markdown-body table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; max-width: 100%; }
-.markdown-body th, .markdown-body td { border: 1px solid var(--pc-border); padding: 6px 12px; }
-.markdown-body th { background: var(--pc-accent-glow); }
-.markdown-body img { max-width: 100%; border-radius: 8px; }
+.markdown-body p {
+  margin: 4px 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+.markdown-body ul {
+  list-style-type: disc;
+}
+.markdown-body ol {
+  list-style-type: decimal;
+}
+.markdown-body li {
+  margin: 2px 0;
+}
+.markdown-body li > ul,
+.markdown-body li > ol {
+  margin: 2px 0;
+}
+.markdown-body li > ul {
+  list-style-type: circle;
+}
+.markdown-body li > ul > li > ul {
+  list-style-type: square;
+}
+.markdown-body blockquote {
+  border-left: 3px solid var(--pc-accent-dim);
+  padding-left: 12px;
+  margin: 8px 0;
+  opacity: 0.8;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  margin: 12px 0 4px;
+}
+.markdown-body a {
+  color: var(--pc-accent-light);
+  text-decoration: underline;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--pc-border);
+  padding: 6px 12px;
+}
+.markdown-body th {
+  background: var(--pc-accent-glow);
+}
+.markdown-body img {
+  max-width: 100%;
+  border-radius: 8px;
+}
 
 /* ── Chat markdown (agent bubbles) ── */
-.chat-markdown p { margin: 0.5em 0; }
-.chat-markdown p:first-child { margin-top: 0; }
-.chat-markdown p:last-child { margin-bottom: 0; }
-.chat-markdown ul, .chat-markdown ol { margin: 0.5em 0; padding-left: 1.5em; }
-.chat-markdown ul { list-style-type: disc; }
-.chat-markdown ol { list-style-type: decimal; }
-.chat-markdown li { margin: 0.25em 0; }
-.chat-markdown li > ul { list-style-type: circle; }
-.chat-markdown li > ul > li > ul { list-style-type: square; }
-.chat-markdown blockquote { border-left: 3px solid var(--pc-accent-dim); padding-left: 0.75em; margin: 0.5em 0; color: var(--pc-text-muted); }
-.chat-markdown h1, .chat-markdown h2, .chat-markdown h3, .chat-markdown h4 { margin: 0.75em 0 0.25em; font-weight: 600; }
-.chat-markdown h1 { font-size: 1.25em; }
-.chat-markdown h2 { font-size: 1.125em; }
-.chat-markdown h3 { font-size: 1em; }
-.chat-markdown hr { border: none; border-top: 1px solid var(--pc-border); margin: 0.75em 0; }
-.chat-markdown a { color: var(--pc-accent-light); text-decoration: underline; }
-.chat-markdown strong { font-weight: 600; color: var(--pc-text-primary); }
-.chat-markdown em { font-style: italic; }
-.chat-markdown code { background: var(--pc-accent-glow); padding: 0.125em 0.375em; border-radius: 0.375em; font-size: 0.875em; font-family: var(--pc-font-mono); }
-.chat-markdown pre { background: var(--pc-bg-code); border: 1px solid var(--pc-border); border-radius: 0.5em; padding: 0.75em; margin: 0.5em 0; overflow-x: auto; font-family: var(--pc-font-mono); font-size: 0.85em; line-height: 1.5; }
-.chat-markdown pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }
-.chat-markdown table { border-collapse: collapse; margin: 0.5em 0; display: block; overflow-x: auto; max-width: 100%; }
-.chat-markdown th, .chat-markdown td { border: 1px solid var(--pc-border); padding: 0.375em 0.75em; font-size: 0.875em; }
-.chat-markdown th { background: var(--pc-accent-glow); font-weight: 600; }
-.chat-markdown img { max-width: 100%; border-radius: 0.5em; }
+.chat-markdown p {
+  margin: 0.5em 0;
+}
+.chat-markdown p:first-child {
+  margin-top: 0;
+}
+.chat-markdown p:last-child {
+  margin-bottom: 0;
+}
+.chat-markdown ul,
+.chat-markdown ol {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+.chat-markdown ul {
+  list-style-type: disc;
+}
+.chat-markdown ol {
+  list-style-type: decimal;
+}
+.chat-markdown li {
+  margin: 0.25em 0;
+}
+.chat-markdown li > ul {
+  list-style-type: circle;
+}
+.chat-markdown li > ul > li > ul {
+  list-style-type: square;
+}
+.chat-markdown blockquote {
+  border-left: 3px solid var(--pc-accent-dim);
+  padding-left: 0.75em;
+  margin: 0.5em 0;
+  color: var(--pc-text-muted);
+}
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4 {
+  margin: 0.75em 0 0.25em;
+  font-weight: 600;
+}
+.chat-markdown h1 {
+  font-size: 1.25em;
+}
+.chat-markdown h2 {
+  font-size: 1.125em;
+}
+.chat-markdown h3 {
+  font-size: 1em;
+}
+.chat-markdown hr {
+  border: none;
+  border-top: 1px solid var(--pc-border);
+  margin: 0.75em 0;
+}
+.chat-markdown a {
+  color: var(--pc-accent-light);
+  text-decoration: underline;
+}
+.chat-markdown strong {
+  font-weight: 600;
+  color: var(--pc-text-primary);
+}
+.chat-markdown em {
+  font-style: italic;
+}
+.chat-markdown code {
+  background: var(--pc-accent-glow);
+  padding: 0.125em 0.375em;
+  border-radius: 0.375em;
+  font-size: 0.875em;
+  font-family: var(--pc-font-mono);
+}
+.chat-markdown pre {
+  background: var(--pc-bg-code);
+  border: 1px solid var(--pc-border);
+  border-radius: 0.5em;
+  padding: 0.75em;
+  margin: 0.5em 0;
+  overflow-x: auto;
+  font-family: var(--pc-font-mono);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+.chat-markdown pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+.chat-markdown table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.chat-markdown th,
+.chat-markdown td {
+  border: 1px solid var(--pc-border);
+  padding: 0.375em 0.75em;
+  font-size: 0.875em;
+}
+.chat-markdown th {
+  background: var(--pc-accent-glow);
+  font-weight: 600;
+}
+.chat-markdown img {
+  max-width: 100%;
+  border-radius: 0.5em;
+}
 
 /* ── Accessibility: reduced motion ── */
 @media (prefers-reduced-motion: reduce) {

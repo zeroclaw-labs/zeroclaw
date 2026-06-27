@@ -1,7 +1,7 @@
-import type { ReactNode } from 'react';
-import { Card } from './Card';
+import type { ReactNode } from "react";
+import { Card } from "./Card";
 
-export type StatTone = 'neutral' | 'ok' | 'warn' | 'error';
+export type StatTone = "neutral" | "ok" | "warn" | "error";
 
 export interface StatCardProps {
   /** Small uppercase caption above the value. */
@@ -18,17 +18,17 @@ export interface StatCardProps {
 }
 
 const valueTone: Record<StatTone, string> = {
-  neutral: 'text-pc-text',
-  ok: 'text-status-success',
-  warn: 'text-status-warning',
-  error: 'text-status-error',
+  neutral: "text-pc-text",
+  ok: "text-status-success",
+  warn: "text-status-warning",
+  error: "text-status-error",
 };
 
 const iconTone: Record<StatTone, string> = {
-  neutral: 'text-pc-accent',
-  ok: 'text-status-success',
-  warn: 'text-status-warning',
-  error: 'text-status-error',
+  neutral: "text-pc-accent",
+  ok: "text-status-success",
+  warn: "text-status-warning",
+  error: "text-status-error",
 };
 
 /**
@@ -40,8 +40,8 @@ export function StatCard({
   value,
   sublabel,
   icon,
-  tone = 'neutral',
-  className = '',
+  tone = "neutral",
+  className = "",
 }: StatCardProps) {
   return (
     <Card className={className}>
@@ -50,7 +50,9 @@ export function StatCard({
           <div className="text-[11px] font-medium uppercase tracking-wide text-pc-text-faint">
             {label}
           </div>
-          <div className={`mt-1.5 text-2xl font-semibold leading-tight ${valueTone[tone]}`}>
+          <div
+            className={`mt-1.5 text-2xl font-semibold leading-tight ${valueTone[tone]}`}
+          >
             {value}
           </div>
           {sublabel != null && (

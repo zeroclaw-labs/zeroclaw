@@ -189,7 +189,7 @@ export interface Session {
   channel_id: string | null;
 }
 
-export type ChannelReadinessState = 'ready' | 'missing' | 'unknown';
+export type ChannelReadinessState = "ready" | "missing" | "unknown";
 
 export interface ChannelReadiness {
   enabled: ChannelReadinessState;

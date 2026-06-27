@@ -6,13 +6,13 @@
 // Lazy-load pattern mirrors PersonalityEditor — list endpoint hydrates
 // the picker, individual SKILL.md content is fetched on selection.
 
-import { useCallback, useEffect, useState } from 'react';
-import { t } from '@/lib/i18n';
-import { markdown } from '@codemirror/lang-markdown';
-import { oneDark } from '@codemirror/theme-one-dark';
-import { githubLight } from '@uiw/codemirror-theme-github';
-import CodeMirror from '@uiw/react-codemirror';
-import { useTheme } from '@/hooks/useTheme';
+import { useCallback, useEffect, useState } from "react";
+import { t } from "@/lib/i18n";
+import { markdown } from "@codemirror/lang-markdown";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { githubLight } from "@uiw/codemirror-theme-github";
+import CodeMirror from "@uiw/react-codemirror";
+import { useTheme } from "@/hooks/useTheme";
 import {
   createSkill,
   deleteSkill,
@@ -21,7 +21,7 @@ import {
   writeSkill,
   type SkillEntry,
   type SkillFrontmatter,
-} from '../../lib/api';
+} from "../../lib/api";
 
 interface Props {
   bundle: string;
@@ -37,7 +37,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   // theme inside a light palette is the light-mode bug we're fixing.
   // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
   const { resolvedTheme } = useTheme();
-  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
+  const cmTheme = resolvedTheme === "light" ? githubLight : oneDark;
 
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -46,8 +46,8 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   const [busy, setBusy] = useState(false);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newDescription, setNewDescription] = useState('');
+  const [newName, setNewName] = useState("");
+  const [newDescription, setNewDescription] = useState("");
 
   const loadList = useCallback(async () => {
     try {
@@ -81,7 +81,8 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   }, [loadActive]);
 
   const dirty =
-    buffer !== null && JSON.stringify(buffer.draft) !== JSON.stringify(buffer.loaded);
+    buffer !== null &&
+    JSON.stringify(buffer.draft) !== JSON.stringify(buffer.loaded);
 
   const onSave = async () => {
     if (!active || !buffer) return;
@@ -102,11 +103,11 @@ export default function SkillsBundleEditor({ bundle }: Props) {
     const name = newName.trim();
     const description = newDescription.trim();
     if (!name) {
-      setError(t('skills_bundle.name_required'));
+      setError(t("skills_bundle.name_required"));
       return;
     }
     if (!description) {
-      setError(t('skills_bundle.description_required'));
+      setError(t("skills_bundle.description_required"));
       return;
     }
     setBusy(true);
@@ -117,12 +118,12 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         frontmatter: {
           name,
           description,
-          version: '0.1.0',
+          version: "0.1.0",
         },
-        body: '',
+        body: "",
       });
-      setNewName('');
-      setNewDescription('');
+      setNewName("");
+      setNewDescription("");
       setCreating(false);
       await loadList();
       setActive(name);
@@ -150,7 +151,10 @@ export default function SkillsBundleEditor({ bundle }: Props) {
     }
   };
 
-  const setFrontmatterField = (field: keyof SkillFrontmatter, value: string) => {
+  const setFrontmatterField = (
+    field: keyof SkillFrontmatter,
+    value: string,
+  ) => {
     setBuffer((prev) =>
       prev
         ? {
@@ -159,7 +163,9 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               ...prev.draft,
               frontmatter: {
                 ...prev.draft.frontmatter,
-                [field]: value || (field === 'name' || field === 'description' ? '' : null),
+                [field]:
+                  value ||
+                  (field === "name" || field === "description" ? "" : null),
               },
             },
           }
@@ -183,12 +189,12 @@ export default function SkillsBundleEditor({ bundle }: Props) {
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-        {t('skills_bundle.intro_before_skill_md')}
-        <code>SKILL.md</code> {t('skills_bundle.intro_after_skill_md')}{' '}
-        <code> scripts/</code>, <code>references/</code>,{' '}
-        {t('skills_bundle.intro_and')} <code>assets/</code>{' '}
-        {t('skills_bundle.intro_subdirs')}
+      <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+        {t("skills_bundle.intro_before_skill_md")}
+        <code>SKILL.md</code> {t("skills_bundle.intro_after_skill_md")}{" "}
+        <code> scripts/</code>, <code>references/</code>,{" "}
+        {t("skills_bundle.intro_and")} <code>assets/</code>{" "}
+        {t("skills_bundle.intro_subdirs")}
       </p>
 
       {/* Skill picker strip */}
@@ -200,9 +206,13 @@ export default function SkillsBundleEditor({ bundle }: Props) {
             onClick={() => setActive(s.name)}
             className="text-xs px-3 py-1.5 rounded-lg border transition-colors"
             style={{
-              borderColor: 'var(--pc-border)',
-              background: s.name === active ? 'var(--pc-accent-glow)' : 'transparent',
-              color: s.name === active ? 'var(--pc-accent)' : 'var(--pc-text-secondary)',
+              borderColor: "var(--pc-border)",
+              background:
+                s.name === active ? "var(--pc-accent-glow)" : "transparent",
+              color:
+                s.name === active
+                  ? "var(--pc-accent)"
+                  : "var(--pc-text-secondary)",
               fontWeight: s.name === active ? 600 : 400,
             }}
           >
@@ -217,14 +227,17 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               setError(null);
             }}
             className="text-xs px-3 py-1.5 rounded-lg border-dashed border"
-            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+            style={{
+              borderColor: "var(--pc-border)",
+              color: "var(--pc-text-muted)",
+            }}
           >
-            {t('skills_bundle.new_skill')}
+            {t("skills_bundle.new_skill")}
           </button>
         )}
         {skills.length === 0 && !creating && (
-          <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-            {t('skills_bundle.no_skills_installed')}
+          <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+            {t("skills_bundle.no_skills_installed")}
           </span>
         )}
       </div>
@@ -233,9 +246,9 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         <div
           className="rounded-lg border p-3 text-sm"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
           {error}
@@ -246,32 +259,41 @@ export default function SkillsBundleEditor({ bundle }: Props) {
       {creating && (
         <div
           className="rounded-xl border p-4 flex flex-col gap-3"
-          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            background: "var(--pc-bg-surface)",
+          }}
         >
           <div className="flex flex-col gap-1">
-            <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('skills_bundle.name_label_create')}
+            <label
+              className="text-xs"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
+              {t("skills_bundle.name_label_create")}
             </label>
             <input
               type="text"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder={t('skills_bundle.name_placeholder')}
+              placeholder={t("skills_bundle.name_placeholder")}
               className="rounded-md border bg-transparent px-3 py-1.5 text-sm"
-              style={{ borderColor: 'var(--pc-border)' }}
+              style={{ borderColor: "var(--pc-border)" }}
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('skills_bundle.description_label_create')}
+            <label
+              className="text-xs"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
+              {t("skills_bundle.description_label_create")}
             </label>
             <textarea
               value={newDescription}
               onChange={(e) => setNewDescription(e.target.value)}
               rows={3}
-              placeholder={t('skills_bundle.description_placeholder')}
+              placeholder={t("skills_bundle.description_placeholder")}
               className="rounded-md border bg-transparent px-3 py-1.5 text-sm font-mono"
-              style={{ borderColor: 'var(--pc-border)' }}
+              style={{ borderColor: "var(--pc-border)" }}
             />
           </div>
           <div className="flex gap-2">
@@ -281,19 +303,19 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               onClick={() => void onCreate()}
               className="btn-primary text-sm"
             >
-              {t('skills_bundle.create_skill')}
+              {t("skills_bundle.create_skill")}
             </button>
             <button
               type="button"
               onClick={() => {
                 setCreating(false);
-                setNewName('');
-                setNewDescription('');
+                setNewName("");
+                setNewDescription("");
                 setError(null);
               }}
               className="btn-secondary text-sm"
             >
-              {t('common.cancel')}
+              {t("common.cancel")}
             </button>
           </div>
         </div>
@@ -309,7 +331,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
           />
           <div
             className="rounded-xl border overflow-hidden"
-            style={{ borderColor: 'var(--pc-border)' }}
+            style={{ borderColor: "var(--pc-border)" }}
           >
             <CodeMirror
               value={buffer.draft.body}
@@ -330,19 +352,21 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               onClick={() => void onSave()}
               className="btn-primary text-sm"
             >
-              {busy ? t('skills_bundle.saving') : t('common.save')}
+              {busy ? t("skills_bundle.saving") : t("common.save")}
             </button>
             <button
               type="button"
               disabled={!dirty || busy}
               onClick={() =>
                 setBuffer((prev) =>
-                  prev ? { ...prev, draft: structuredClone(prev.loaded) } : prev,
+                  prev
+                    ? { ...prev, draft: structuredClone(prev.loaded) }
+                    : prev,
                 )
               }
               className="btn-secondary text-sm"
             >
-              {t('skills_bundle.discard')}
+              {t("skills_bundle.discard")}
             </button>
             <div className="flex-1" />
             {!confirmDelete ? (
@@ -350,31 +374,35 @@ export default function SkillsBundleEditor({ bundle }: Props) {
                 type="button"
                 onClick={() => setConfirmDelete(true)}
                 className="btn-secondary text-sm"
-                style={{ color: '#f87171' }}
+                style={{ color: "#f87171" }}
               >
-                {t('skills_bundle.archive_skill')}
+                {t("skills_bundle.archive_skill")}
               </button>
             ) : (
               <>
-                <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                  {t('skills_bundle.move_to_prefix')}{' '}
-                  <code>shared/skills/_deleted/</code>{t('skills_bundle.move_to_suffix')}
+                <span
+                  className="text-xs"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
+                  {t("skills_bundle.move_to_prefix")}{" "}
+                  <code>shared/skills/_deleted/</code>
+                  {t("skills_bundle.move_to_suffix")}
                 </span>
                 <button
                   type="button"
                   disabled={busy}
                   onClick={() => void onDelete()}
                   className="btn-primary text-sm"
-                  style={{ background: '#dc2626' }}
+                  style={{ background: "#dc2626" }}
                 >
-                  {t('skills_bundle.confirm_archive')}
+                  {t("skills_bundle.confirm_archive")}
                 </button>
                 <button
                   type="button"
                   onClick={() => setConfirmDelete(false)}
                   className="btn-secondary text-sm"
                 >
-                  {t('common.cancel')}
+                  {t("common.cancel")}
                 </button>
               </>
             )}
@@ -391,50 +419,57 @@ interface FrontmatterFormProps {
   onTagsChange: (tags: string[]) => void;
 }
 
-function FrontmatterForm({ value, onChange, onTagsChange }: FrontmatterFormProps) {
+function FrontmatterForm({
+  value,
+  onChange,
+  onTagsChange,
+}: FrontmatterFormProps) {
   return (
     <div
       className="rounded-xl border p-4 grid gap-3 md:grid-cols-2"
-      style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+      style={{
+        borderColor: "var(--pc-border)",
+        background: "var(--pc-bg-surface)",
+      }}
     >
       <Field
-        label={t('skills_bundle.name_label_required')}
+        label={t("skills_bundle.name_label_required")}
         value={value.name}
-        onChange={(v) => onChange('name', v)}
+        onChange={(v) => onChange("name", v)}
       />
       <Field
-        label={t('skills_bundle.version_label')}
-        value={value.version ?? ''}
-        onChange={(v) => onChange('version', v)}
+        label={t("skills_bundle.version_label")}
+        value={value.version ?? ""}
+        onChange={(v) => onChange("version", v)}
         placeholder="0.1.0"
       />
       <div className="md:col-span-2 flex flex-col gap-1">
-        <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-          {t('skills_bundle.description_label_required')}
+        <label className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+          {t("skills_bundle.description_label_required")}
         </label>
         <textarea
           value={value.description}
-          onChange={(e) => onChange('description', e.target.value)}
+          onChange={(e) => onChange("description", e.target.value)}
           rows={2}
           className="rounded-md border bg-transparent px-3 py-1.5 text-sm font-mono"
-          style={{ borderColor: 'var(--pc-border)' }}
+          style={{ borderColor: "var(--pc-border)" }}
         />
       </div>
       <Field
-        label={t('skills_bundle.license_label')}
-        value={value.license ?? ''}
-        onChange={(v) => onChange('license', v)}
+        label={t("skills_bundle.license_label")}
+        value={value.license ?? ""}
+        onChange={(v) => onChange("license", v)}
         placeholder="MIT"
       />
       <Field
-        label={t('skills_bundle.author_label')}
-        value={value.author ?? ''}
-        onChange={(v) => onChange('author', v)}
+        label={t("skills_bundle.author_label")}
+        value={value.author ?? ""}
+        onChange={(v) => onChange("author", v)}
       />
       <Field
-        label={t('skills_bundle.category_label')}
-        value={value.category ?? ''}
-        onChange={(v) => onChange('category', v)}
+        label={t("skills_bundle.category_label")}
+        value={value.category ?? ""}
+        onChange={(v) => onChange("category", v)}
         placeholder="coding, ops, …"
       />
       <TagsField tags={value.tags ?? []} onTagsChange={onTagsChange} />
@@ -455,25 +490,32 @@ interface TagsFieldProps {
  * `slash`/`open-skills`) is preserved on save.
  */
 function TagsField({ tags, onTagsChange }: TagsFieldProps) {
-  const [tagInput, setTagInput] = useState('');
-  const slashOn = tags.includes('slash');
-  const isOpenSkills = tags.includes('open-skills');
-  const editableTags = tags.filter((t) => t !== 'slash' && t !== 'open-skills');
+  const [tagInput, setTagInput] = useState("");
+  const slashOn = tags.includes("slash");
+  const isOpenSkills = tags.includes("open-skills");
+  const editableTags = tags.filter((t) => t !== "slash" && t !== "open-skills");
 
   const setSlash = (on: boolean) =>
-    onTagsChange(on ? [...tags, 'slash'] : tags.filter((t) => t !== 'slash'));
-  const removeTag = (tag: string) => onTagsChange(tags.filter((t) => t !== tag));
+    onTagsChange(on ? [...tags, "slash"] : tags.filter((t) => t !== "slash"));
+  const removeTag = (tag: string) =>
+    onTagsChange(tags.filter((t) => t !== tag));
   const addTag = () => {
     const next = tagInput.trim().toLowerCase();
-    setTagInput('');
-    if (!next || next === 'slash' || next === 'open-skills' || tags.includes(next)) return;
+    setTagInput("");
+    if (
+      !next ||
+      next === "slash" ||
+      next === "open-skills" ||
+      tags.includes(next)
+    )
+      return;
     onTagsChange([...tags, next]);
   };
 
   return (
     <div
       className="md:col-span-2 flex flex-col gap-2 border-t pt-3"
-      style={{ borderColor: 'var(--pc-border)' }}
+      style={{ borderColor: "var(--pc-border)" }}
     >
       <label className="flex items-center gap-2 cursor-pointer select-none">
         <input
@@ -481,16 +523,16 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
           checked={slashOn}
           onChange={(e) => setSlash(e.target.checked)}
         />
-        <span className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+        <span className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
           Slash command
         </span>
-        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-          — expose this skill as a <code>/command</code> in Discord (adds the{' '}
+        <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
+          — expose this skill as a <code>/command</code> in Discord (adds the{" "}
           <code>slash</code> tag)
         </span>
       </label>
       <div className="flex flex-col gap-1">
-        <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+        <label className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
           Tags
         </label>
         <div className="flex flex-wrap items-center gap-1.5">
@@ -498,7 +540,10 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
             <span
               key={tag}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-md border"
-              style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)' }}
+              style={{
+                borderColor: "var(--pc-border)",
+                color: "var(--pc-text-secondary)",
+              }}
             >
               {tag}
               <button
@@ -506,7 +551,7 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
                 onClick={() => removeTag(tag)}
                 aria-label={`Remove tag ${tag}`}
                 className="leading-none"
-                style={{ color: 'var(--pc-text-muted)' }}
+                style={{ color: "var(--pc-text-muted)" }}
               >
                 ×
               </button>
@@ -516,7 +561,10 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
             <span
               className="inline-flex items-center text-xs px-2 py-0.5 rounded-md border opacity-60"
               title="Loader-managed: community-synced skill (open-skills)"
-              style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
+              style={{
+                borderColor: "var(--pc-border)",
+                color: "var(--pc-text-faint)",
+              }}
             >
               open-skills
             </span>
@@ -526,7 +574,7 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
             value={tagInput}
             onChange={(e) => setTagInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') {
+              if (e.key === "Enter") {
                 e.preventDefault();
                 addTag();
               }
@@ -534,7 +582,7 @@ function TagsField({ tags, onTagsChange }: TagsFieldProps) {
             placeholder="add tag…"
             aria-label="Add tag"
             className="text-xs bg-transparent border rounded-md px-2 py-0.5 w-24"
-            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text)' }}
+            style={{ borderColor: "var(--pc-border)", color: "var(--pc-text)" }}
           />
         </div>
       </div>
@@ -552,7 +600,7 @@ interface FieldProps {
 function Field({ label, value, onChange, placeholder }: FieldProps) {
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+      <label className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
         {label}
       </label>
       <input
@@ -561,7 +609,7 @@ function Field({ label, value, onChange, placeholder }: FieldProps) {
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         className="rounded-md border bg-transparent px-3 py-1.5 text-sm"
-        style={{ borderColor: 'var(--pc-border)' }}
+        style={{ borderColor: "var(--pc-border)" }}
       />
     </div>
   );

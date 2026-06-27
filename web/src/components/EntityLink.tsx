@@ -1,7 +1,7 @@
-import { Link } from 'react-router-dom';
-import type { ReactNode, CSSProperties, MouseEventHandler } from 'react';
-import { entityConfigPath, type EntityKind } from '@/lib/entityLinks';
-import { t } from '@/lib/i18n';
+import { Link } from "react-router-dom";
+import type { ReactNode, CSSProperties, MouseEventHandler } from "react";
+import { entityConfigPath, type EntityKind } from "@/lib/entityLinks";
+import { t } from "@/lib/i18n";
 
 export interface EntityLinkProps {
   kind: EntityKind;
@@ -33,16 +33,19 @@ export default function EntityLink({
     <Link
       to={entityConfigPath(kind, id)}
       className={[
-        'underline-offset-2 hover:underline rounded-[var(--radius-sm)]',
-        'transition-colors duration-150',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-        'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
-        className ?? '',
+        "underline-offset-2 hover:underline rounded-[var(--radius-sm)]",
+        "transition-colors duration-150",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]",
+        "focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base",
+        className ?? "",
       ]
         .filter(Boolean)
-        .join(' ')}
-      style={{ color: 'var(--pc-text-link)', ...style }}
-      title={title ?? `${t('entity_link.open_prefix')}${kind}${t('entity_link.config_sep')}${id}`}
+        .join(" ")}
+      style={{ color: "var(--pc-text-link)", ...style }}
+      title={
+        title ??
+        `${t("entity_link.open_prefix")}${kind}${t("entity_link.config_sep")}${id}`
+      }
       onClick={onClick}
     >
       {children ?? id}

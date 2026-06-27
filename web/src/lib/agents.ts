@@ -1,4 +1,11 @@
-import { getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
+import {
+  getCost,
+  getMapKeys,
+  getMemory,
+  getSessions,
+  listProps,
+  patchConfig,
+} from "./api";
 
 export interface AgentSummary {
   alias: string;
@@ -37,11 +44,13 @@ function entryValue(entry: { populated?: boolean; value?: unknown }): unknown {
 
 // `listProps` returns array values as a JSON-encoded string (the macro's
 // display_value), not a parsed array. Decode here so callers can `Array.isArray`.
-function entryAsStringArray(entry: { populated?: boolean; value?: unknown } | undefined): string[] {
+function entryAsStringArray(
+  entry: { populated?: boolean; value?: unknown } | undefined,
+): string[] {
   if (!entry || !entry.populated) return [];
   const raw = entry.value;
   if (Array.isArray(raw)) return raw.map((v) => String(v));
-  if (typeof raw !== 'string' || raw.length === 0) return [];
+  if (typeof raw !== "string" || raw.length === 0) return [];
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) return parsed.map((v) => String(v));
@@ -49,9 +58,9 @@ function entryAsStringArray(entry: { populated?: boolean; value?: unknown } | un
     // fall through to comma/newline split for hand-typed display formats
   }
   return raw
-    .replace(/^\[|\]$/g, '')
+    .replace(/^\[|\]$/g, "")
     .split(/[,\n]/)
-    .map((s) => s.trim().replace(/^"|"$/g, ''))
+    .map((s) => s.trim().replace(/^"|"$/g, ""))
     .filter((s) => s.length > 0);
 }
 
@@ -61,7 +70,7 @@ function entryAsStringArray(entry: { populated?: boolean; value?: unknown } | un
  * pickers; not suitable for the highest-traffic page in the app.
  */
 export async function loadAgentSummaries(): Promise<AgentSummary[]> {
-  const { keys } = await getMapKeys('agents');
+  const { keys } = await getMapKeys("agents");
   if (keys.length === 0) return [];
 
   // Fetch sessions + cost + memories in parallel with per-agent prop
@@ -73,7 +82,7 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
 
   // Reverse-build agent → peer_groups in parallel with the per-agent walks.
   // listProps('peer_groups.<alias>.agents') is the field that names members.
-  const peerGroupsPromise = getMapKeys('peer_groups')
+  const peerGroupsPromise = getMapKeys("peer_groups")
     .then(async ({ keys: pgKeys }) => {
       const memberships: Record<string, string[]> = {};
       await Promise.all(
@@ -100,20 +109,21 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         entries.find((e) => e.path === `agents.${alias}.${suffixKebab}`);
       const stringField = (suffixKebab: string): string => {
         const raw = entryValue(lookup(suffixKebab) ?? { populated: false });
-        return typeof raw === 'string' ? raw : '';
+        return typeof raw === "string" ? raw : "";
       };
       return {
         alias,
-        enabled: entryValue(lookup('enabled') ?? { populated: false }) === 'true',
-        modelProvider: stringField('model_provider'),
-        channels: entryAsStringArray(lookup('channels')),
-        riskProfile: stringField('risk_profile'),
-        runtimeProfile: stringField('runtime_profile'),
-        memoryBackend: stringField('memory.backend'),
-        skillBundles: entryAsStringArray(lookup('skill_bundles')),
-        knowledgeBundles: entryAsStringArray(lookup('knowledge_bundles')),
-        mcpBundles: entryAsStringArray(lookup('mcp_bundles')),
-        cronJobs: entryAsStringArray(lookup('cron_jobs')),
+        enabled:
+          entryValue(lookup("enabled") ?? { populated: false }) === "true",
+        modelProvider: stringField("model_provider"),
+        channels: entryAsStringArray(lookup("channels")),
+        riskProfile: stringField("risk_profile"),
+        runtimeProfile: stringField("runtime_profile"),
+        memoryBackend: stringField("memory.backend"),
+        skillBundles: entryAsStringArray(lookup("skill_bundles")),
+        knowledgeBundles: entryAsStringArray(lookup("knowledge_bundles")),
+        mcpBundles: entryAsStringArray(lookup("mcp_bundles")),
+        cronJobs: entryAsStringArray(lookup("cron_jobs")),
         peerGroups: [],
         sessionCount: 0,
         lastActivity: null,
@@ -157,27 +167,34 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
  * separate from loadAgentSummaries(), which intentionally gathers dashboard
  * sessions, cost, memory, and peer-group data.
  */
-export async function loadAgentPickerSummaries(): Promise<AgentPickerSummary[]> {
-  const { keys } = await getMapKeys('agents');
+export async function loadAgentPickerSummaries(): Promise<
+  AgentPickerSummary[]
+> {
+  const { keys } = await getMapKeys("agents");
   if (keys.length === 0) return [];
 
   return Promise.all(
     keys.map(async (alias): Promise<AgentPickerSummary> => {
       const { entries } = await listProps(`agents.${alias}`);
-      const enabled = entries.find((entry) => entry.path === `agents.${alias}.enabled`);
+      const enabled = entries.find(
+        (entry) => entry.path === `agents.${alias}.enabled`,
+      );
       return {
         alias,
-        enabled: entryValue(enabled ?? { populated: false }) === 'true',
+        enabled: entryValue(enabled ?? { populated: false }) === "true",
       };
     }),
   );
 }
 
 /** Flip the `enabled` flag for one agent via a JSON-Patch replace. */
-export function toggleAgentEnabled(alias: string, next: boolean): Promise<unknown> {
+export function toggleAgentEnabled(
+  alias: string,
+  next: boolean,
+): Promise<unknown> {
   return patchConfig([
     {
-      op: 'replace',
+      op: "replace",
       path: `/agents/${alias}/enabled`,
       value: next,
     },

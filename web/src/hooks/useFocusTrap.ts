@@ -1,4 +1,4 @@
-import { useEffect, useRef, type RefObject } from 'react';
+import { useEffect, useRef, type RefObject } from "react";
 
 /**
  * The focusable-element selector most of the console's modals share. Components
@@ -82,15 +82,17 @@ export function useFocusTrap(
   useEffect(() => {
     if (!enabled) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === "Escape") {
         if (preventDefaultOnEscape) e.preventDefault();
         onCloseRef.current();
         return;
       }
-      if (e.key !== 'Tab') return;
+      if (e.key !== "Tab") return;
       const panel = ref.current;
       if (!panel) return;
-      let focusable = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
+      let focusable = Array.from(
+        panel.querySelectorAll<HTMLElement>(focusableSelector),
+      );
       if (filterVisible) {
         focusable = focusable.filter(
           (el) => el.offsetParent !== null || el === document.activeElement,
@@ -108,8 +110,8 @@ export function useFocusTrap(
         first.focus();
       }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, [enabled, ref, focusableSelector, filterVisible, preventDefaultOnEscape]);
 }
 

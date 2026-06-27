@@ -1,5 +1,5 @@
-import { useState, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import {
   CheckCircle,
   AlertTriangle,
@@ -8,15 +8,15 @@ import {
   Play,
   Stethoscope,
   ArrowRight,
-} from 'lucide-react';
-import type { DiagResult } from '@/types/api';
-import { runDoctor } from '@/lib/api';
-import { Badge, Button, Card, PageHeader } from '@/components/ui';
-import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
-import DoctorFixModal from '@/components/DoctorFixModal';
-import { t } from '@/lib/i18n';
+} from "lucide-react";
+import type { DiagResult } from "@/types/api";
+import { runDoctor } from "@/lib/api";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import ReloadDaemonButton from "@/components/sections/ReloadDaemonButton";
+import DoctorFixModal from "@/components/DoctorFixModal";
+import { t } from "@/lib/i18n";
 
-type Severity = DiagResult['severity'];
+type Severity = DiagResult["severity"];
 
 /**
  * A remediable config entity parsed out of a diagnostic message, paired with
@@ -48,7 +48,7 @@ interface RemediationTarget {
  *                             href `/config/channels/<type>/<alias>`
  */
 function remediationTarget(result: DiagResult): RemediationTarget | null {
-  if (result.severity === 'ok') return null;
+  if (result.severity === "ok") return null;
   const msg = result.message;
   // Leading "<type>.<alias>" entity reference, if present.
   const m = msg.match(/^\s*([a-z0-9_-]+)\.([a-z0-9_-]+)\b/i);
@@ -65,7 +65,7 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
     return {
       prefix: `channels.${rawType}.${rawAlias}`,
       href: `/config/channels/${type}/${alias}`,
-      label: t('doctor.open_config'),
+      label: t("doctor.open_config"),
     };
   }
   // `provider` is word-bounded so it doesn't match inside unrelated words; the
@@ -75,11 +75,11 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
     // connection issues default to the Connection tab (no ?tab needed). The
     // dotted entity prefix FieldForm edits uses dots throughout; the href uses
     // a slash after the section so Config's router can split type/alias.
-    const tab = /\bmodel\b/i.test(msg) ? '?tab=model' : '';
+    const tab = /\bmodel\b/i.test(msg) ? "?tab=model" : "";
     return {
       prefix: `providers.models.${rawType}.${rawAlias}`,
       href: `/config/providers.models/${type}/${alias}${tab}`,
-      label: t('doctor.open_config'),
+      label: t("doctor.open_config"),
     };
   }
   return null;
@@ -91,11 +91,11 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
  * cli-tools) has no sensible in-app target. Returns `[href, label]` or `null`.
  */
 function fallbackLink(result: DiagResult): [string, string] | null {
-  if (result.severity === 'ok') return null;
+  if (result.severity === "ok") return null;
   switch (result.category) {
-    case 'config':
-    case 'workspace':
-      return ['/config', t('doctor.open_config')];
+    case "config":
+    case "workspace":
+      return ["/config", t("doctor.open_config")];
     default:
       return null;
   }
@@ -127,14 +127,18 @@ function SeverityFilterToggle({
       type="button"
       onClick={onToggle}
       aria-pressed={active}
-      title={active ? `${t('doctor.hide_prefix')}${label}` : `${t('doctor.show_prefix')}${label}`}
-      className={[
-        'inline-flex items-center gap-2 rounded-[var(--radius-md)] border px-2.5 py-1 transition-colors duration-150 cursor-pointer select-none',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+      title={
         active
-          ? 'border-pc-accent bg-pc-accent/10 text-pc-text'
-          : 'border-pc-border bg-transparent text-pc-text-muted opacity-60 hover:opacity-100 hover:border-pc-border-strong',
-      ].join(' ')}
+          ? `${t("doctor.hide_prefix")}${label}`
+          : `${t("doctor.show_prefix")}${label}`
+      }
+      className={[
+        "inline-flex items-center gap-2 rounded-[var(--radius-md)] border px-2.5 py-1 transition-colors duration-150 cursor-pointer select-none",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base",
+        active
+          ? "border-pc-accent bg-pc-accent/10 text-pc-text"
+          : "border-pc-border bg-transparent text-pc-text-muted opacity-60 hover:opacity-100 hover:border-pc-border-strong",
+      ].join(" ")}
     >
       {icon}
       <span className="text-sm font-medium text-pc-text">
@@ -146,11 +150,15 @@ function SeverityFilterToggle({
 
 function severityIcon(severity: Severity) {
   switch (severity) {
-    case 'ok':
-      return <CheckCircle className="h-4 w-4 flex-shrink-0 text-status-success" />;
-    case 'warn':
-      return <AlertTriangle className="h-4 w-4 flex-shrink-0 text-status-warning" />;
-    case 'error':
+    case "ok":
+      return (
+        <CheckCircle className="h-4 w-4 flex-shrink-0 text-status-success" />
+      );
+    case "warn":
+      return (
+        <AlertTriangle className="h-4 w-4 flex-shrink-0 text-status-warning" />
+      );
+    case "error":
       return <XCircle className="h-4 w-4 flex-shrink-0 text-status-error" />;
   }
 }
@@ -174,7 +182,7 @@ export default function Doctor() {
       const data = await runDoctor();
       setResults(data);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('doctor.run_failed'));
+      setError(err instanceof Error ? err.message : t("doctor.run_failed"));
     } finally {
       setLoading(false);
     }
@@ -189,9 +197,9 @@ export default function Doctor() {
     });
   };
 
-  const okCount = results?.filter((r) => r.severity === 'ok').length ?? 0;
-  const warnCount = results?.filter((r) => r.severity === 'warn').length ?? 0;
-  const errorCount = results?.filter((r) => r.severity === 'error').length ?? 0;
+  const okCount = results?.filter((r) => r.severity === "ok").length ?? 0;
+  const warnCount = results?.filter((r) => r.severity === "warn").length ?? 0;
+  const errorCount = results?.filter((r) => r.severity === "error").length ?? 0;
 
   // Apply the severity filter, then group. Grouping the FILTERED list lets a
   // category whose every finding is hidden drop out of the list entirely.
@@ -207,8 +215,8 @@ export default function Doctor() {
   return (
     <div className="p-6 space-y-6">
       <PageHeader
-        title={t('doctor.diagnostics_title')}
-        description={t('doctor.system_diagnostics')}
+        title={t("doctor.diagnostics_title")}
+        description={t("doctor.system_diagnostics")}
         actions={
           <>
             {/* Many config/daemon findings only clear after the daemon
@@ -218,12 +226,12 @@ export default function Doctor() {
               {loading ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  {t('doctor.running_btn')}
+                  {t("doctor.running_btn")}
                 </>
               ) : (
                 <>
                   <Play className="h-4 w-4" />
-                  {t('doctor.run_diagnostics')}
+                  {t("doctor.run_diagnostics")}
                 </>
               )}
             </Button>
@@ -242,8 +250,12 @@ export default function Doctor() {
       {loading && (
         <Card className="flex flex-col items-center justify-center py-16">
           <Loader2 className="h-8 w-8 animate-spin text-pc-accent mb-4" />
-          <p className="text-sm text-pc-text-secondary">{t('doctor.running_desc')}</p>
-          <p className="text-[13px] mt-1 text-pc-text-faint">{t('doctor.running_hint')}</p>
+          <p className="text-sm text-pc-text-secondary">
+            {t("doctor.running_desc")}
+          </p>
+          <p className="text-[13px] mt-1 text-pc-text-faint">
+            {t("doctor.running_hint")}
+          </p>
         </Card>
       )}
 
@@ -255,35 +267,43 @@ export default function Doctor() {
               are independent and default to all-shown. */}
           <Card className="flex items-center gap-2 flex-wrap">
             <SeverityFilterToggle
-              active={!hidden.has('ok')}
+              active={!hidden.has("ok")}
               count={okCount}
-              label={t('doctor.severity_ok')}
+              label={t("doctor.severity_ok")}
               icon={<CheckCircle className="h-5 w-5 text-status-success" />}
-              onToggle={() => toggleSeverity('ok')}
+              onToggle={() => toggleSeverity("ok")}
             />
             <SeverityFilterToggle
-              active={!hidden.has('warn')}
+              active={!hidden.has("warn")}
               count={warnCount}
-              label={warnCount !== 1 ? t('doctor.severity_warnings') : t('doctor.severity_warning')}
+              label={
+                warnCount !== 1
+                  ? t("doctor.severity_warnings")
+                  : t("doctor.severity_warning")
+              }
               icon={<AlertTriangle className="h-5 w-5 text-status-warning" />}
-              onToggle={() => toggleSeverity('warn')}
+              onToggle={() => toggleSeverity("warn")}
             />
             <SeverityFilterToggle
-              active={!hidden.has('error')}
+              active={!hidden.has("error")}
               count={errorCount}
-              label={errorCount !== 1 ? t('doctor.severity_errors') : t('doctor.severity_error')}
+              label={
+                errorCount !== 1
+                  ? t("doctor.severity_errors")
+                  : t("doctor.severity_error")
+              }
               icon={<XCircle className="h-5 w-5 text-status-error" />}
-              onToggle={() => toggleSeverity('error')}
+              onToggle={() => toggleSeverity("error")}
             />
 
             {/* Overall indicator */}
             <div className="ml-auto">
               {errorCount > 0 ? (
-                <Badge tone="error">{t('doctor.issues_found')}</Badge>
+                <Badge tone="error">{t("doctor.issues_found")}</Badge>
               ) : warnCount > 0 ? (
-                <Badge tone="warn">{t('doctor.warnings_summary')}</Badge>
+                <Badge tone="warn">{t("doctor.warnings_summary")}</Badge>
               ) : (
-                <Badge tone="ok">{t('doctor.all_clear')}</Badge>
+                <Badge tone="ok">{t("doctor.all_clear")}</Badge>
               )}
             </div>
           </Card>
@@ -291,7 +311,7 @@ export default function Doctor() {
           {/* All severities toggled off → nothing to show. */}
           {filtered.length === 0 && results.length > 0 && (
             <Card className="text-sm text-center text-pc-text-muted py-8">
-              {t('doctor.no_filter_match')}
+              {t("doctor.no_filter_match")}
             </Card>
           )}
 
@@ -317,7 +337,9 @@ export default function Doctor() {
                       >
                         {severityIcon(result.severity)}
                         <div className="min-w-0 flex-1">
-                          <p className="text-sm text-pc-text">{result.message}</p>
+                          <p className="text-sm text-pc-text">
+                            {result.message}
+                          </p>
                         </div>
                         {target && (
                           <button
@@ -338,9 +360,7 @@ export default function Doctor() {
                             <ArrowRight className="h-3.5 w-3.5" />
                           </Link>
                         )}
-                        <Badge tone={result.severity}>
-                          {result.severity}
-                        </Badge>
+                        <Badge tone={result.severity}>{result.severity}</Badge>
                       </Card>
                     );
                   })}
@@ -355,9 +375,9 @@ export default function Doctor() {
           operator to the Doctor list as-is — no navigation, no re-run. */}
       <DoctorFixModal
         open={fixTarget !== null}
-        prefix={fixTarget?.prefix ?? ''}
-        entity={fixTarget?.prefix.split('.').slice(-2).join('.') ?? ''}
-        href={fixTarget?.href ?? ''}
+        prefix={fixTarget?.prefix ?? ""}
+        entity={fixTarget?.prefix.split(".").slice(-2).join(".") ?? ""}
+        href={fixTarget?.href ?? ""}
         onClose={() => setFixTarget(null)}
       />
 
@@ -368,9 +388,9 @@ export default function Doctor() {
             <Stethoscope className="h-8 w-8 text-pc-accent" />
           </div>
           <p className="text-lg font-semibold mb-1 text-pc-text">
-            {t('doctor.system_diagnostics')}
+            {t("doctor.system_diagnostics")}
           </p>
-          <p className="text-sm text-pc-text-muted">{t('doctor.empty_hint')}</p>
+          <p className="text-sm text-pc-text-muted">{t("doctor.empty_hint")}</p>
         </Card>
       )}
     </div>

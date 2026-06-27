@@ -13,7 +13,12 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 import { loadLocale, saveLocale } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
 import { DraftContext, useDraftStore } from "./hooks/useDraft";
-import { getAdminPairCode, generatePairCode, PairCodeForbiddenError, getQuickstartState } from "./lib/api";
+import {
+  getAdminPairCode,
+  generatePairCode,
+  PairCodeForbiddenError,
+  getQuickstartState,
+} from "./lib/api";
 import { basePath } from "./lib/basePath";
 import { ConfigDraftProvider } from "./lib/draftStore";
 import { setLocale, type Locale } from "./lib/i18n";
@@ -211,7 +216,9 @@ function PairingDialog({
         setShowCliFallback(true);
       } else {
         setError(
-          err instanceof Error ? err.message : "Failed to generate pairing code",
+          err instanceof Error
+            ? err.message
+            : "Failed to generate pairing code",
         );
       }
     } finally {

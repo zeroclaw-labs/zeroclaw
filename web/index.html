@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -23,7 +23,22 @@
   <body>
     <div
       id="unsupported-browser"
-      style="display:none;margin:2rem auto;max-width:720px;padding:1rem 1.25rem;border:1px solid #7f1d1d;border-radius:0.75rem;background:#1f1414;color:#fecaca;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;line-height:1.5;"
+      style="
+        display: none;
+        margin: 2rem auto;
+        max-width: 720px;
+        padding: 1rem 1.25rem;
+        border: 1px solid #7f1d1d;
+        border-radius: 0.75rem;
+        background: #1f1414;
+        color: #fecaca;
+        font-family:
+          system-ui,
+          -apple-system,
+          &quot;Segoe UI&quot;,
+          sans-serif;
+        line-height: 1.5;
+      "
     >
       Your browser is not supported for the ZeroClaw web dashboard. Please use
       Chrome 111+, Edge 111+, Firefox 113+, or Safari 16.2+.
@@ -40,7 +55,10 @@
         var banner = document.getElementById("unsupported-browser");
 
         if (!supportsColorMix || !supportsStructuredClone) {
-          document.documentElement.setAttribute("data-unsupported-browser", "1");
+          document.documentElement.setAttribute(
+            "data-unsupported-browser",
+            "1",
+          );
           if (root) {
             root.style.display = "none";
           }

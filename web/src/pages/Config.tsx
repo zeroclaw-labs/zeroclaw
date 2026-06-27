@@ -15,7 +15,17 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, Check, ChevronRight, MessageSquare, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
+import {
+  ArrowLeft,
+  Check,
+  ChevronRight,
+  MessageSquare,
+  Pencil,
+  Plus,
+  Sparkles,
+  Trash2,
+  X,
+} from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
@@ -337,7 +347,8 @@ export default function Config() {
               className="self-start"
             >
               <ArrowLeft className="h-4 w-4" />
-              {t("config.back_to")}{activeSection.label}
+              {t("config.back_to")}
+              {activeSection.label}
             </Button>
             {isAgent && (
               <Link to={`/agent/${encodeURIComponent(typeParam)}`}>
@@ -385,7 +396,11 @@ export default function Config() {
         return (
           <SectionTabs
             tabs={[
-              { key: "aliases", label: t("config.tab_aliases"), render: () => aliasListPane },
+              {
+                key: "aliases",
+                label: t("config.tab_aliases"),
+                render: () => aliasListPane,
+              },
               {
                 key: "costs",
                 label: t("config.tab_costs"),
@@ -418,7 +433,8 @@ export default function Config() {
             className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
-            {t("config.back_to")}{activeSection.label}
+            {t("config.back_to")}
+            {activeSection.label}
           </Button>
           <FieldForm
             key={`${reloadKey}-${typeParam}`}
@@ -608,78 +624,78 @@ export default function Config() {
           </div>
         ) : (
           activeSection && (
-          <div className="flex flex-col gap-4 max-w-3xl min-h-full">
-            {/* Mobile-only: return to the navigator (single-column nav↔detail). */}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="md:hidden self-start"
-              onClick={() => navigate("/config")}
-            >
-              <ArrowLeft className="h-4 w-4" />
-              {t("config.all_settings")}
-            </Button>
-            {/* Layout note: every wrapper between <main> (the scroll
+            <div className="flex flex-col gap-4 max-w-3xl min-h-full">
+              {/* Mobile-only: return to the navigator (single-column nav↔detail). */}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="md:hidden self-start"
+                onClick={() => navigate("/config")}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                {t("config.all_settings")}
+              </Button>
+              {/* Layout note: every wrapper between <main> (the scroll
                 container) and FieldForm's save bar uses flex-1 + min-h-0
                 so the form stretches to the viewport bottom. Without
                 that chain, the save bar's `sticky bottom-0` anchors
                 to a content-height column and floats mid-viewport
                 instead of pinning to the bottom of the scroll area. */}
-            {/* Config header: section title + breadcrumb trail (as the
+              {/* Config header: section title + breadcrumb trail (as the
                 description slot) + the page-level actions. ReloadDaemonButton
                 keeps its own confirm modal — only the surrounding chrome is
                 restyled. */}
-            <PageHeader
-              title={activeSection.label}
-              description={
-                <span className="flex items-center gap-1.5 flex-wrap text-pc-text-muted">
-                  {crumbs.map((crumb, i) => (
-                    <span key={i} className="flex items-center gap-1.5">
-                      {i > 0 && (
-                        <ChevronRight className="h-3 w-3 text-pc-text-faint" />
-                      )}
-                      {crumb.url && i < crumbs.length - 1 ? (
-                        <button
-                          type="button"
-                          onClick={() => navigate(crumb.url!)}
-                          className="text-pc-text-secondary hover:text-pc-text transition-colors"
-                        >
-                          {crumb.label}
-                        </button>
-                      ) : (
-                        <span className="text-pc-text font-medium">
-                          {crumb.label}
-                        </span>
-                      )}
-                    </span>
-                  ))}
-                </span>
-              }
-              actions={
-                <>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => navigate("/quickstart")}
-                    title={t("cfg.header.quickstart")}
-                  >
-                    <Sparkles className="h-3.5 w-3.5" />
-                    {t("cfg.header.quickstart")}
-                  </Button>
-                  <ReloadDaemonButton
-                    onReloaded={() => {
-                      goToSection(activeSection.key);
-                      fetchDrift();
-                      setReloadKey((n) => n + 1);
-                      setNavRefresh((n) => n + 1);
-                    }}
-                  />
-                </>
-              }
-            />
+              <PageHeader
+                title={activeSection.label}
+                description={
+                  <span className="flex items-center gap-1.5 flex-wrap text-pc-text-muted">
+                    {crumbs.map((crumb, i) => (
+                      <span key={i} className="flex items-center gap-1.5">
+                        {i > 0 && (
+                          <ChevronRight className="h-3 w-3 text-pc-text-faint" />
+                        )}
+                        {crumb.url && i < crumbs.length - 1 ? (
+                          <button
+                            type="button"
+                            onClick={() => navigate(crumb.url!)}
+                            className="text-pc-text-secondary hover:text-pc-text transition-colors"
+                          >
+                            {crumb.label}
+                          </button>
+                        ) : (
+                          <span className="text-pc-text font-medium">
+                            {crumb.label}
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                  </span>
+                }
+                actions={
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => navigate("/quickstart")}
+                      title={t("cfg.header.quickstart")}
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      {t("cfg.header.quickstart")}
+                    </Button>
+                    <ReloadDaemonButton
+                      onReloaded={() => {
+                        goToSection(activeSection.key);
+                        fetchDrift();
+                        setReloadKey((n) => n + 1);
+                        setNavRefresh((n) => n + 1);
+                      }}
+                    />
+                  </>
+                }
+              />
 
-            <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
-          </div>
+              <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
+            </div>
           )
         )}
       </main>
@@ -704,9 +720,9 @@ function ConfigAliasHelpBox() {
         <code>
           {"<type>"}.{"<alias>"}
         </code>
-        {t("config.alias_help_examples_pre")}{" "}
-        <code>work</code> {t("config.alias_help_examples_mid")}{" "}
-        <code>personal</code> {t("config.alias_help_examples_post")}
+        {t("config.alias_help_examples_pre")} <code>work</code>{" "}
+        {t("config.alias_help_examples_mid")} <code>personal</code>{" "}
+        {t("config.alias_help_examples_post")}
       </p>
       <p className="mb-0">
         {t("config.alias_help_rules")}{" "}
@@ -805,12 +821,7 @@ function AliasListView({
 
   return (
     <div className="flex flex-col gap-4">
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={onBack}
-        className="self-start"
-      >
+      <Button variant="ghost" size="sm" onClick={onBack} className="self-start">
         <ArrowLeft className="h-4 w-4" />
         {t("common.back")}
       </Button>
@@ -840,7 +851,10 @@ function AliasListView({
           />
         </div>
       ) : (
-        <Card padded={false} className="divide-y divide-pc-border overflow-hidden">
+        <Card
+          padded={false}
+          className="divide-y divide-pc-border overflow-hidden"
+        >
           {aliases.map((alias) => (
             <AliasRow
               key={alias}
@@ -1284,7 +1298,9 @@ function AliasRow({
 }) {
   // Pencil renames in place (reference-rewrite cascade); trash opens a delete
   // cascade preview — what gets scrubbed / what blocks it — before committing.
-  const [mode, setMode] = useState<"idle" | "renaming" | "confirm-delete">("idle");
+  const [mode, setMode] = useState<"idle" | "renaming" | "confirm-delete">(
+    "idle",
+  );
   const [renameValue, setRenameValue] = useState(alias);
   const [plan, setPlan] = useState<DeletePlan | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1354,10 +1370,22 @@ function AliasRow({
           disabled={busy}
           className="input-electric flex-1 px-3 py-1.5 text-sm"
         />
-        <button type="button" onClick={commitRename} disabled={busy} title={t("common.save")} className="btn-icon flex-shrink-0">
+        <button
+          type="button"
+          onClick={commitRename}
+          disabled={busy}
+          title={t("common.save")}
+          className="btn-icon flex-shrink-0"
+        >
           <Check className="h-4 w-4" />
         </button>
-        <button type="button" onClick={() => setMode("idle")} disabled={busy} title={t("common.cancel")} className="btn-icon flex-shrink-0">
+        <button
+          type="button"
+          onClick={() => setMode("idle")}
+          disabled={busy}
+          title={t("common.cancel")}
+          className="btn-icon flex-shrink-0"
+        >
           <X className="h-4 w-4" />
         </button>
       </div>
@@ -1370,12 +1398,19 @@ function AliasRow({
       <div className="w-full flex flex-col gap-2 px-4 py-3 bg-pc-elevated/40">
         <div className="flex items-center justify-between gap-3">
           <span className="font-medium text-pc-text text-sm">{alias}</span>
-          <button type="button" onClick={() => setMode("idle")} title={t("common.cancel")} className="btn-icon flex-shrink-0">
+          <button
+            type="button"
+            onClick={() => setMode("idle")}
+            title={t("common.cancel")}
+            className="btn-icon flex-shrink-0"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
         {plan == null ? (
-          <span className="text-xs text-pc-text-muted">{t("config.delete_checking")}</span>
+          <span className="text-xs text-pc-text-muted">
+            {t("config.delete_checking")}
+          </span>
         ) : blocked ? (
           <div className="text-xs text-status-error">
             {plan.blockers.length > 0 && (
@@ -1410,9 +1445,13 @@ function AliasRow({
                 </ul>
               </div>
             ) : !plan.cascades_owned_state ? (
-              <div className="text-pc-text-muted">{t("config.delete_no_refs")}</div>
+              <div className="text-pc-text-muted">
+                {t("config.delete_no_refs")}
+              </div>
             ) : null}
-            {plan.cascades_owned_state ? <div>{t("config.delete_owned_state")}</div> : null}
+            {plan.cascades_owned_state ? (
+              <div>{t("config.delete_owned_state")}</div>
+            ) : null}
           </div>
         )}
         {plan != null && !blocked && (
@@ -1425,7 +1464,12 @@ function AliasRow({
             >
               {busy ? t("config.delete_deleting") : t("config.delete_confirm")}
             </button>
-            <button type="button" onClick={() => setMode("idle")} disabled={busy} className="text-xs px-2 py-1 text-pc-text-muted">
+            <button
+              type="button"
+              onClick={() => setMode("idle")}
+              disabled={busy}
+              className="text-xs px-2 py-1 text-pc-text-muted"
+            >
               {t("common.cancel")}
             </button>
           </div>
@@ -1449,10 +1493,20 @@ function AliasRow({
         </div>
         <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-muted" />
       </button>
-      <button type="button" onClick={startRename} title={t("config.rename_alias_title")} className="btn-icon flex-shrink-0">
+      <button
+        type="button"
+        onClick={startRename}
+        title={t("config.rename_alias_title")}
+        className="btn-icon flex-shrink-0"
+      >
         <Pencil className="h-4 w-4" />
       </button>
-      <button type="button" onClick={startDelete} title={t("config.delete_alias_title")} className="btn-icon flex-shrink-0">
+      <button
+        type="button"
+        onClick={startDelete}
+        title={t("config.delete_alias_title")}
+        className="btn-icon flex-shrink-0"
+      >
         <Trash2 className="h-4 w-4" />
       </button>
     </div>
@@ -1516,7 +1570,8 @@ function SectionOverview({
           className="self-start"
         >
           <ArrowLeft className="h-4 w-4" />
-          {t("config.back_to")}{section.label}
+          {t("config.back_to")}
+          {section.label}
         </Button>
         <SectionPicker
           sectionKey={section.key}
@@ -1644,9 +1699,7 @@ function ConfiguredOnlyPicker({
           className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-pc-elevated/50"
         >
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-pc-text">
-              {item.label}
-            </div>
+            <div className="text-sm font-medium text-pc-text">{item.label}</div>
             <code className="block text-xs mt-0.5 text-pc-text-faint">
               {item.key}
             </code>

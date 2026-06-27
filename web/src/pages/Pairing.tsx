@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Smartphone, Trash2, X } from 'lucide-react';
-import { getAdminPairCode } from '@/lib/api';
-import { Button, Card, ConfirmDialog, PageHeader } from '@/components/ui';
-import { t } from '@/lib/i18n';
+import { useState, useEffect, useCallback } from "react";
+import { Smartphone, Trash2, X } from "lucide-react";
+import { getAdminPairCode } from "@/lib/api";
+import { Button, Card, ConfirmDialog, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 interface Device {
   id: string;
@@ -24,11 +24,11 @@ export default function Pairing() {
   // the list can't be read (distinct from an empty registry).
   const [unauthorized, setUnauthorized] = useState(false);
 
-  const token = localStorage.getItem('zeroclaw_token') || '';
+  const token = localStorage.getItem("zeroclaw_token") || "";
 
   const fetchDevices = useCallback(async () => {
     try {
-      const res = await fetch('/api/devices', {
+      const res = await fetch("/api/devices", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
@@ -43,10 +43,10 @@ export default function Pairing() {
         setUnauthorized(true);
         setDevices([]);
       } else {
-        setError(t('pairing.load_error'));
+        setError(t("pairing.load_error"));
       }
     } catch (err) {
-      setError(t('pairing.load_error'));
+      setError(t("pairing.load_error"));
     } finally {
       setLoading(false);
     }
@@ -65,38 +65,40 @@ export default function Pairing() {
       });
   }, []);
 
-  useEffect(() => { fetchDevices(); }, [fetchDevices]);
+  useEffect(() => {
+    fetchDevices();
+  }, [fetchDevices]);
 
   const handleInitiatePairing = async () => {
     try {
-      const res = await fetch('/api/pairing/initiate', {
-        method: 'POST',
+      const res = await fetch("/api/pairing/initiate", {
+        method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
         const data = await res.json();
         setPairingCode(data.pairing_code);
       } else {
-        setError(t('pairing.generate_error'));
+        setError(t("pairing.generate_error"));
       }
     } catch (err) {
-      setError(t('pairing.generate_error'));
+      setError(t("pairing.generate_error"));
     }
   };
 
   const handleRevokeDevice = async (deviceId: string) => {
     try {
       const res = await fetch(`/api/devices/${deviceId}`, {
-        method: 'DELETE',
+        method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
-        setDevices(devices.filter(d => d.id !== deviceId));
+        setDevices(devices.filter((d) => d.id !== deviceId));
       } else {
-        setError(t('pairing.revoke_error'));
+        setError(t("pairing.revoke_error"));
       }
     } catch (err) {
-      setError(t('pairing.revoke_error'));
+      setError(t("pairing.revoke_error"));
     } finally {
       setPendingRevoke(null);
     }
@@ -113,11 +115,11 @@ export default function Pairing() {
   return (
     <div className="p-6 space-y-6">
       <PageHeader
-        title={t('pairing.title')}
+        title={t("pairing.title")}
         actions={
           <Button onClick={handleInitiatePairing}>
             <Smartphone className="h-4 w-4" />
-            {t('pairing.pair_new_device')}
+            {t("pairing.pair_new_device")}
           </Button>
         }
       />
@@ -129,7 +131,7 @@ export default function Pairing() {
             type="button"
             onClick={() => setError(null)}
             className="flex-shrink-0 text-status-error/70 hover:text-status-error transition-colors"
-            aria-label={t('pairing.dismiss')}
+            aria-label={t("pairing.dismiss")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -139,47 +141,49 @@ export default function Pairing() {
       {pairingCode && (
         <Card className="p-6 text-center">
           <p className="text-xs uppercase tracking-wider mb-2 text-pc-text-muted">
-            {t('pairing.pairing_code')}
+            {t("pairing.pairing_code")}
           </p>
           <div className="text-4xl font-mono font-bold tracking-[0.4em] py-4 text-pc-text">
             {pairingCode}
           </div>
-          <p className="text-xs text-pc-text-muted">{t('pairing.code_hint')}</p>
+          <p className="text-xs text-pc-text-muted">{t("pairing.code_hint")}</p>
         </Card>
       )}
 
       <Card padded={false} className="overflow-hidden">
         <div className="px-5 py-4 border-b border-pc-border">
           <h3 className="text-sm font-semibold text-pc-text">
-            {t('pairing.paired_devices')}
-            {unauthorized ? '' : ` (${devices.length})`}
+            {t("pairing.paired_devices")}
+            {unauthorized ? "" : ` (${devices.length})`}
           </h3>
         </div>
         {unauthorized ? (
           <div className="p-8 text-center text-sm text-pc-text-muted">
             <p className="font-medium text-pc-text-secondary">
-              {t('pairing.unpaired_title')}
+              {t("pairing.unpaired_title")}
             </p>
-            <p className="mt-1">
-              {t('pairing.unpaired_hint')}
-            </p>
+            <p className="mt-1">{t("pairing.unpaired_hint")}</p>
           </div>
         ) : devices.length === 0 ? (
           <div className="p-8 text-center text-sm text-pc-text-muted">
-            {t('pairing.no_devices')}
+            {t("pairing.no_devices")}
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-pc-border text-left text-xs uppercase tracking-wider text-pc-text-muted">
-                  <th className="px-5 py-3 font-medium">{t('pairing.name')}</th>
-                  <th className="px-5 py-3 font-medium">{t('pairing.type')}</th>
-                  <th className="px-5 py-3 font-medium">{t('pairing.paired')}</th>
-                  <th className="px-5 py-3 font-medium">{t('pairing.last_seen')}</th>
-                  <th className="px-5 py-3 font-medium">{t('pairing.ip')}</th>
+                  <th className="px-5 py-3 font-medium">{t("pairing.name")}</th>
+                  <th className="px-5 py-3 font-medium">{t("pairing.type")}</th>
+                  <th className="px-5 py-3 font-medium">
+                    {t("pairing.paired")}
+                  </th>
+                  <th className="px-5 py-3 font-medium">
+                    {t("pairing.last_seen")}
+                  </th>
+                  <th className="px-5 py-3 font-medium">{t("pairing.ip")}</th>
                   <th className="px-5 py-3 font-medium text-right">
-                    {t('pairing.actions')}
+                    {t("pairing.actions")}
                   </th>
                 </tr>
               </thead>
@@ -190,10 +194,10 @@ export default function Pairing() {
                     className="transition-colors hover:bg-pc-elevated/50"
                   >
                     <td className="px-5 py-3 text-pc-text">
-                      {device.name || t('pairing.unnamed')}
+                      {device.name || t("pairing.unnamed")}
                     </td>
                     <td className="px-5 py-3 text-pc-text-secondary">
-                      {device.device_type || t('pairing.unknown')}
+                      {device.device_type || t("pairing.unknown")}
                     </td>
                     <td className="px-5 py-3 text-xs text-pc-text-muted">
                       {new Date(device.paired_at).toLocaleDateString()}
@@ -202,14 +206,14 @@ export default function Pairing() {
                       {new Date(device.last_seen).toLocaleString()}
                     </td>
                     <td className="px-5 py-3 font-mono text-xs text-pc-text-secondary">
-                      {device.ip_address || '-'}
+                      {device.ip_address || "-"}
                     </td>
                     <td className="px-5 py-3 text-right">
                       <Button
                         variant="danger"
                         size="sm"
                         onClick={() => setPendingRevoke(device)}
-                        aria-label={t('pairing.actions')}
+                        aria-label={t("pairing.actions")}
                       >
                         <Trash2 className="h-4 w-4" />
                       </Button>
@@ -225,17 +229,17 @@ export default function Pairing() {
       <ConfirmDialog
         open={pendingRevoke !== null}
         danger
-        title={t('pairing.revoke_title')}
+        title={t("pairing.revoke_title")}
         message={
           <>
-            {t('pairing.revoke_message_prefix')}{' '}
+            {t("pairing.revoke_message_prefix")}{" "}
             <span className="text-pc-text-secondary">
-              {pendingRevoke?.name || t('pairing.this_device')}
+              {pendingRevoke?.name || t("pairing.this_device")}
             </span>
-            {t('pairing.revoke_message_suffix')}
+            {t("pairing.revoke_message_suffix")}
           </>
         }
-        confirmLabel={t('pairing.revoke')}
+        confirmLabel={t("pairing.revoke")}
         onConfirm={() => {
           if (pendingRevoke) void handleRevokeDevice(pendingRevoke.id);
         }}

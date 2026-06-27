@@ -17,15 +17,10 @@
 // - While the value is still loading, we treat reload as available so the
 //   button never flash-hides on first paint.
 
-import { useEffect, useState } from 'react';
-import { getPublicHealth } from './api';
+import { useEffect, useState } from "react";
+import { getPublicHealth } from "./api";
 
-const LOOPBACK_HOSTNAMES = new Set([
-  'localhost',
-  '127.0.0.1',
-  '::1',
-  '[::1]',
-]);
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 /**
  * True when the page is served from a loopback origin. The gateway always
@@ -35,7 +30,7 @@ export function isLoopbackHost(): boolean {
   const host = window.location.hostname;
   if (LOOPBACK_HOSTNAMES.has(host)) return true;
   // Covers `<name>.localhost` (a reserved loopback TLD).
-  return host.endsWith('.localhost');
+  return host.endsWith(".localhost");
 }
 
 // Module-level cache so multiple hook consumers share a single /health fetch

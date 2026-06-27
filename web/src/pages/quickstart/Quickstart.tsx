@@ -131,7 +131,10 @@ export default function Quickstart() {
             setForm((f) =>
               f.runtime
                 ? f
-                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+                : {
+                    ...f,
+                    runtime: { preset_name: defaultRuntime.preset_name },
+                  },
             );
           }
         }
@@ -475,7 +478,10 @@ function Stepper({ steps }: { steps: { label: string; done: boolean }[] }) {
   // accent lands on what the operator should fill in next.
   const activeIdx = steps.findIndex((s) => !s.done);
   return (
-    <ol className="flex items-center gap-2" aria-label={t("quickstart.setup_progress")}>
+    <ol
+      className="flex items-center gap-2"
+      aria-label={t("quickstart.setup_progress")}
+    >
       {steps.map((step, i) => {
         const active = i === activeIdx;
         const state = step.done
@@ -484,7 +490,10 @@ function Stepper({ steps }: { steps: { label: string; done: boolean }[] }) {
             ? "bg-pc-elevated border-pc-border-strong text-pc-text"
             : "bg-pc-surface border-pc-border text-pc-text-muted";
         return (
-          <li key={step.label} className="flex items-center gap-2 flex-1 min-w-0">
+          <li
+            key={step.label}
+            className="flex items-center gap-2 flex-1 min-w-0"
+          >
             <div
               className={`flex items-center gap-2 px-3 py-1.5 rounded-[var(--radius-md)] border text-xs font-medium min-w-0 ${state}`}
             >
@@ -632,7 +641,12 @@ function StagedRow({
           </code>
         )}
       </div>
-      <Button variant="ghost" size="sm" onClick={onRemove} title={t("quickstart.clear")}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onRemove}
+        title={t("quickstart.clear")}
+      >
         <Trash2 className="h-4 w-4" />
       </Button>
     </div>
@@ -797,7 +811,11 @@ function ProviderForm({
         </select>
       </label>
 
-      <LabeledInput label={t("quickstart.alias")} value={alias} onChange={setAlias} />
+      <LabeledInput
+        label={t("quickstart.alias")}
+        value={alias}
+        onChange={setAlias}
+      />
 
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
@@ -897,7 +915,9 @@ function ChannelsList({
                   {c.channel_type}.{c.alias}
                 </span>
                 <span className="ml-2 text-xs" style={MUTED}>
-                  {c.mode === "existing" ? t("quickstart.reuse") : t("quickstart.new")}
+                  {c.mode === "existing"
+                    ? t("quickstart.reuse")
+                    : t("quickstart.new")}
                 </span>
               </div>
               <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
@@ -964,7 +984,10 @@ function ChannelAddForm({
     let cancelled = false;
     void (async () => {
       try {
-        const f = await quickstartFields({ section: "channel", type_key: type });
+        const f = await quickstartFields({
+          section: "channel",
+          type_key: type,
+        });
         if (!cancelled) setDescriptors(f.fields);
       } catch {
         if (!cancelled) setDescriptors([]);
@@ -1043,7 +1066,10 @@ function ChannelAddForm({
       ) : (
         <>
           <label className="block">
-            <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
+            <div
+              className="text-xs uppercase tracking-wider mb-1"
+              style={MUTED}
+            >
               {t("quickstart.channel_type")}
             </div>
             <select
@@ -1052,7 +1078,9 @@ function ChannelAddForm({
               onChange={(e) => {
                 const next = e.target.value;
                 setType(next);
-                setAlias((prev) => (prev === "" || prev === type ? next : prev));
+                setAlias((prev) =>
+                  prev === "" || prev === type ? next : prev,
+                );
                 setExtras({});
               }}
             >
@@ -1067,7 +1095,11 @@ function ChannelAddForm({
             </select>
           </label>
 
-          <LabeledInput label={t("quickstart.alias_label")} value={alias} onChange={setAlias} />
+          <LabeledInput
+            label={t("quickstart.alias_label")}
+            value={alias}
+            onChange={setAlias}
+          />
           {conflict && (
             <div className="text-xs" style={ERROR}>
               <code>{freshRef}</code> {t("quickstart.already_exists")}
