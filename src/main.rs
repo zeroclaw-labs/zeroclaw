@@ -6935,6 +6935,10 @@ async fn run_gateway_if_enabled(
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
+    // Capture the launch command before the gateway starts so in-app upgrade
+    // can self-respawn after the listener is released. Must mirror the same
+    // call in the Daemon branch.
+    zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
@@ -6943,6 +6947,10 @@ async fn run_gateway_if_enabled(
         host, port, config, tx, None, None, None, None, None,
     ))
     .await;
+    // Self-respawn after the listener is released, if an in-app upgrade
+    // requested it. No-op when no respawn was requested or on supervised
+    // restart modes.
+    zeroclaw_runtime::restart::respawn_if_requested();
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
             let restart_port = available_gateway_restart_hint_port(host, port);
