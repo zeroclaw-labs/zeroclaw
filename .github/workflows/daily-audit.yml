@@ -84,7 +84,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "ci: Advisory scan failed — $(date -u +%Y-%m-%d)" \
             --label "security" \
-            --label "risk: high" \
+            --label "risk:high" \
             --body-file /tmp/issue-body.md)
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
 
