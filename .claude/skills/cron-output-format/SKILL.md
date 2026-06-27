@@ -20,16 +20,6 @@ The `output_format` is defined in the **config schema** (`CronJobDecl`) as the s
 
 For imperative jobs created via API/CLI (no config entry), the format defaults to `"wrapped"`.
 
-## Key Code Locations
-
-| Location | Purpose |
-|---|---|
-| `crates/zeroclaw-config/src/schema.rs:11333` | `output_format` field on `CronJobDecl` |
-| `crates/zeroclaw-runtime/src/cron/scheduler.rs:1164` | Config resolution and format assembly |
-| `web/src/types/api.ts:90` | TypeScript type definition |
-| `web/src/lib/api.ts:1703,1757` | API body types |
-| `web/src/pages/Cron.tsx:218,732` | UI toggle component |
-
 ## Design Constraints
 
 - **Single Source of Truth**: `output_format` lives on `CronJobDecl` (config), never cached on the runtime `CronJob` struct

@@ -191,8 +191,4 @@ The ZeroClaw runtime agent discovers tool skills through:
 2. The `read_skill(name)` tool
 3. The `## Tool Skills` section in `system_prompt.rs`
 
-## Key System Prompt Code
-
-- `crates/zeroclaw-runtime/src/agent/system_prompt.rs:302` — `## Tool Skills` section
-- `crates/zeroclaw-runtime/src/skills/mod.rs` — skill loading
-- `crates/zeroclaw-runtime/src/tools/mod.rs:504` — `all_tools_with_runtime()` registration
+_Note: Tool skills in `.claude/skills/tools/` are for Claude Code developer reference. They are NOT loadable by the ZeroClaw runtime agent's `read_skill` — runtime tool skills must be placed in the agent workspace `skills/` directory following the `tool:<name>` pattern._

@@ -14,15 +14,6 @@ The channel orchestrator supports a **silent response sentinel** that lets the L
 3. The draft is cancelled, a log event is emitted, and the function returns early
 4. No message is sent, no history is appended, no memory is consolidated
 
-## Key Code Locations
-
-| Location | Purpose |
-|---|---|
-| `crates/zeroclaw-channels/src/orchestrator/mod.rs:3349` | Constant `SILENT_RESPONSE_SENTINEL` definition |
-| `crates/zeroclaw-channels/src/orchestrator/mod.rs:1000` | LLM instruction in `build_channel_system_prompt()` |
-| `crates/zeroclaw-channels/src/orchestrator/mod.rs:5174` | Early-return check (after hooks, before sanitization) |
-| `crates/zeroclaw-runtime/src/agent/system_prompt.rs:403` | General system prompt instruction |
-
 ## Relationship With Existing NoReply Classifier
 
 The sentinel is **complementary** to the existing classifier pre-check:
