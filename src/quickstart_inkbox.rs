@@ -48,8 +48,8 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         return Ok(None);
     };
 
-    // Resolve an (api_key, identity handle) pair, by signup or by pasted key.
-    let Some((api_key, handle)) = (if has_key {
+    // Resolve (api_key, identity handle, existing phone) by signup or pasted key.
+    let Some((api_key, handle, existing_phone)) = (if has_key {
         api_key_flow(&base_url)?
     } else {
         signup_flow(&base_url)?
@@ -64,40 +64,63 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         fields.insert("base_url".into(), base_url.clone());
     }
 
-    // Phone: server-side only (no config field) — unlocks SMS + voice.
-    let mut phone_number: Option<String> = None;
-    if let Some(true) = confirm(
-        &crate::t(
-            "cli-quickstart-inkbox-provision-phone",
-            "Provision a local phone number? (unlocks SMS + voice)",
-        ),
-        true,
-    )? {
-        match ob::provision_phone(&base_url, &api_key, &handle) {
-            Ok(number) => {
-                println!(
-                    "  {} {}",
-                    crate::t("cli-quickstart-inkbox-provisioned", "✓ provisioned"),
-                    number
-                );
-                phone_number = Some(number);
-            }
-            Err(err) => eprintln!(
-                "  {} {}",
-                crate::t(
-                    "cli-quickstart-inkbox-provision-failed",
-                    "could not provision a number:",
-                ),
-                err
+    // Phone: server-side only (no config field) — unlocks SMS + voice. Mirror
+    // Hermes `_offer_phone_for_existing`: only offer to provision when the
+    // identity has no number; if it already has one, say nothing and move on.
+    let mut phone_number = existing_phone;
+    let mut did_provision = false;
+    if phone_number.is_none() {
+        println!(
+            "\n  {}",
+            crate::t(
+                "cli-quickstart-inkbox-no-phone",
+                "This agent has no phone number attached.",
+            )
+        );
+        println!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-phone-unlocks",
+                "A local US number unlocks SMS and voice for this agent.",
+            )
+        );
+        if let Some(true) = confirm(
+            &crate::t(
+                "cli-quickstart-inkbox-provision-now",
+                "Provision a local phone number now?",
             ),
+            true,
+        )? {
+            match ob::provision_phone(&base_url, &api_key, &handle) {
+                Ok(number) => {
+                    println!(
+                        "  {} {}",
+                        crate::t("cli-quickstart-inkbox-provisioned", "✓ Provisioned:"),
+                        number
+                    );
+                    phone_number = Some(number);
+                    did_provision = true;
+                }
+                Err(err) => eprintln!(
+                    "  {} {}",
+                    crate::t(
+                        "cli-quickstart-inkbox-provision-failed",
+                        "could not provision a number:",
+                    ),
+                    err
+                ),
+            }
         }
     }
 
-    // Hermes order: realtime → SMS opt-in → iMessage → signing key (last).
-    setup_realtime(&mut fields)?;
-    if let Some(number) = phone_number.as_deref() {
-        sms_opt_in(&base_url, &api_key, &handle, number)?;
+    // Hermes order: SMS opt-in (only when we just provisioned — a pre-existing
+    // number is assumed already opted in) → realtime → iMessage → signing key.
+    if did_provision {
+        if let Some(number) = phone_number.as_deref() {
+            sms_opt_in(&base_url, &api_key, &handle, number)?;
+        }
     }
+    setup_realtime(&mut fields)?;
     setup_imessage(&base_url, &api_key, &handle)?;
     setup_signing_key(&base_url, &api_key, &mut fields)?;
 
@@ -118,8 +141,9 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
     Ok(Some((alias, fields)))
 }
 
-/// Self-signup branch: create a fresh identity and verify it.
-fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
+/// Self-signup branch: create a fresh identity and verify it. The fresh
+/// identity has no phone yet, so the third tuple element is always `None`.
+fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
     println!(
         "  {}",
         crate::t(
@@ -247,11 +271,11 @@ fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
             ),
         }
     }
-    Ok(Some((signup.api_key, signup.agent_handle)))
+    Ok(Some((signup.api_key, signup.agent_handle, None)))
 }
 
 /// Paste-a-key branch: validate the key and confirm its bound identity.
-fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
+fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
     let Some(api_key) = password(&crate::t(
         "cli-quickstart-inkbox-paste-key",
         "Paste your Inkbox API key (ApiKey_…)",
@@ -418,14 +442,14 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
                 crate::t("cli-quickstart-inkbox-key-bound", "✓ key validated for"),
                 id.handle
             );
-            if let Some(phone) = id.phone_number {
+            if let Some(phone) = &id.phone_number {
                 println!(
                     "  {} {}",
                     crate::t("cli-quickstart-inkbox-phone", "phone:"),
                     phone
                 );
             }
-            Ok(Some((effective_key, id.handle)))
+            Ok(Some((effective_key, id.handle, id.phone_number)))
         }
         Err(err) => {
             eprintln!(
@@ -834,42 +858,87 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             "No number to provision — you connect through the Inkbox iMessage router.",
         )
     );
-    let Some(true) = confirm(
-        &crate::t(
-            "cli-quickstart-inkbox-imsg-enable",
-            "Enable iMessage for this agent?",
-        ),
-        true,
-    )?
-    else {
-        return Ok(());
+    // Hermes parity: skip the enable prompt entirely when iMessage is already
+    // on; surface phones already connected so a rerun doesn't read like a
+    // first-time setup (and defaults the walkthrough off when one exists).
+    let status = match ob::imessage_status(base_url, api_key, handle) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-imsg-status-failed",
+                    "could not check iMessage status:",
+                ),
+                err,
+            );
+            return Ok(());
+        }
     };
-    if let Err(err) = ob::enable_imessage(base_url, api_key, handle) {
-        eprintln!(
+    let mut connected = status.connected;
+    if status.enabled {
+        println!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-imsg-already-enabled",
+                "✓ iMessage is already enabled for this agent.",
+            )
+        );
+    } else {
+        let Some(true) = confirm(
+            &crate::t(
+                "cli-quickstart-inkbox-imsg-enable",
+                "Enable iMessage for this agent?",
+            ),
+            true,
+        )?
+        else {
+            return Ok(());
+        };
+        if let Err(err) = ob::enable_imessage(base_url, api_key, handle) {
+            eprintln!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-imsg-enable-failed",
+                    "could not enable iMessage:",
+                ),
+                err,
+            );
+            return Ok(());
+        }
+        println!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-imsg-enabled",
+                "✓ iMessage enabled for this agent.",
+            )
+        );
+        connected = Vec::new();
+    }
+    if !connected.is_empty() {
+        println!(
             "  {} {}",
             crate::t(
-                "cli-quickstart-inkbox-imsg-enable-failed",
-                "could not enable iMessage:",
+                "cli-quickstart-inkbox-imsg-already-connected",
+                "✓ Already connected:",
             ),
-            err,
+            connected.join(", "),
         );
-        return Ok(());
     }
-    println!(
-        "  {}",
+    // Default the walkthrough off when a phone is already connected (Hermes
+    // `not connected`): reconnecting another iPhone is the rare case.
+    let connect_q = if connected.is_empty() {
         crate::t(
-            "cli-quickstart-inkbox-imsg-enabled",
-            "✓ iMessage enabled for this agent.",
-        )
-    );
-    let Some(true) = confirm(
-        &crate::t(
             "cli-quickstart-inkbox-imsg-connect",
             "Connect your iPhone to this agent now?",
-        ),
-        true,
-    )?
-    else {
+        )
+    } else {
+        crate::t(
+            "cli-quickstart-inkbox-imsg-connect-another",
+            "Connect another iPhone to this agent now?",
+        )
+    };
+    let Some(true) = confirm(&connect_q, connected.is_empty())? else {
         return Ok(());
     };
     let (number, connect_command) = match ob::imessage_connect_info(base_url, api_key) {

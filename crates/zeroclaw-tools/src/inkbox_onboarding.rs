@@ -310,6 +310,52 @@ pub fn check_sms_start(
     })
 }
 
+/// iMessage configuration state for an identity (Hermes parity), so reruns can
+/// skip the enable prompt and not read like a first-time setup.
+#[derive(Debug, Clone, Default)]
+pub struct ImessageStatus {
+    /// Whether shared-iMessage reachability is already enabled.
+    pub enabled: bool,
+    /// Remote numbers already connected through the router (empty if disabled).
+    pub connected: Vec<String>,
+}
+
+/// Read whether iMessage is enabled for the identity and which phones are
+/// already connected. Mirrors the front of Hermes `_configure_imessage`.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+/// * `handle` - the agent handle to inspect.
+///
+/// # Returns
+/// An [`ImessageStatus`] (enabled flag + connected remote numbers).
+pub fn imessage_status(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+) -> anyhow::Result<ImessageStatus> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        let enabled = id.imessage_enabled();
+        // Listing assignments requires iMessage on, so only ask when enabled.
+        let connected = if enabled {
+            id.list_imessage_assignments(5, 0)
+                .map(|v| v.into_iter().map(|a| a.remote_number).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(ImessageStatus { enabled, connected })
+    })
+}
+
 /// Enable shared-iMessage reachability on the identity.
 ///
 /// # Arguments
