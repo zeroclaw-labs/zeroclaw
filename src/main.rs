@@ -284,6 +284,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
+#[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
@@ -2577,10 +2579,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search an installable plugin registry
+    Search {
+        /// Query to match against plugin names and descriptions
+        query: String,
+        /// Registry JSON URL to search
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory/manifest or registry name
     Install {
-        /// Path to plugin directory or manifest
+        /// Path to plugin directory/manifest, or registry name/version
         source: String,
+        /// Registry JSON URL used for install-by-name
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2594,6 +2607,23 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_host_with_configured_security(
+    config: &crate::config::schema::Config,
+) -> Result<zeroclaw::plugins::host::PluginHost> {
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted = config.plugins.security.trusted_publisher_keys.clone();
+    Ok(
+        zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            &config.plugins.resolved_plugins_dir(),
+            mode,
+            trusted,
+        )?,
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -5721,9 +5751,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5752,25 +5780,100 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
-                    )
-                );
+            PluginCommands::Search { query, registry } => {
+                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                let matches = plugin_registry::search_entries(&index, &query);
+                if matches.is_empty() {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-none",
+                            &[("query", &query)],
+                            "No matching plugins."
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-results",
+                            &[("query", &query), ("count", &matches.len().to_string())],
+                            "Plugins matching query:"
+                        )
+                    );
+                    for plugin in &matches {
+                        let missing_description;
+                        let description = if let Some(description) = plugin.description.as_deref() {
+                            description
+                        } else {
+                            missing_description =
+                                t("cli-plugin-no-description", "(no description)");
+                            &missing_description
+                        };
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-search-result",
+                                &[
+                                    ("name", &plugin.name),
+                                    ("version", &plugin.version),
+                                    ("description", description),
+                                ],
+                                "Plugin search result"
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source, registry } => {
+                if plugin_registry::looks_like_url(&source) {
+                    bail!(
+                        "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
+                    );
+                }
+                let mut host = plugin_host_with_configured_security(&config)?;
+                if plugin_registry::is_local_plugin_source(&source) {
+                    host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                } else {
+                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-install-resolving",
+                            &[("source", &source)],
+                            "Resolving plugin from registry..."
+                        )
+                    );
+                    let downloaded =
+                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    host.install(&plugin_dir)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-name-version",
+                            &[
+                                ("name", &downloaded.manifest().name),
+                                ("version", &downloaded.manifest().version),
+                            ],
+                            "Plugin installed"
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let mut host = plugin_host_with_configured_security(&config)?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5779,9 +5882,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(

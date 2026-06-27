@@ -8,6 +8,8 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::io::BufReader;
 use std::io::{self, BufRead, Write};
 use zeroclaw_config::schema::RiskProfileConfig;
 
@@ -87,7 +89,8 @@ pub enum ApprovalRequirement {
 /// - Records an audit trail of all decisions
 ///
 /// Two modes:
-/// - **Interactive** (CLI): tools needing approval trigger a stdin prompt.
+/// - **Interactive** (CLI): tools needing approval trigger a terminal prompt
+///   with stdin fallback.
 /// - **Non-interactive** (channels): tools needing approval are auto-denied
 ///   because there is no interactive operator to approve them. `auto_approve`
 ///   policy is still enforced, and `always_ask` / supervised-default tools are
@@ -266,7 +269,8 @@ impl ApprovalManager {
 
 // ── CLI prompt ───────────────────────────────────────────────────
 
-/// Display the approval prompt and read user input from stdin.
+/// Display the approval prompt and read user input from the controlling
+/// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
     eprintln!();
@@ -275,17 +279,59 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
     let _ = io::stderr().flush();
 
-    let stdin = io::stdin();
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
+    let Ok(line) = read_cli_approval_line() else {
         return ApprovalResponse::No;
-    }
+    };
 
+    parse_cli_approval_response(&line)
+}
+
+fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => ApprovalResponse::Yes,
         "a" | "always" => ApprovalResponse::Always,
         _ => ApprovalResponse::No,
     }
+}
+
+#[cfg(unix)]
+fn read_cli_approval_line() -> io::Result<String> {
+    read_cli_approval_line_with(
+        || std::fs::File::open("/dev/tty").map(BufReader::new),
+        read_stdin_approval_line,
+    )
+}
+
+#[cfg(unix)]
+fn read_cli_approval_line_with<Tty, OpenTty, ReadStdin>(
+    open_tty: OpenTty,
+    read_stdin: ReadStdin,
+) -> io::Result<String>
+where
+    Tty: BufRead,
+    OpenTty: FnOnce() -> io::Result<Tty>,
+    ReadStdin: FnOnce() -> io::Result<String>,
+{
+    match open_tty() {
+        Ok(tty) => read_approval_line_from(tty),
+        Err(_) => read_stdin(),
+    }
+}
+
+#[cfg(not(unix))]
+fn read_cli_approval_line() -> io::Result<String> {
+    read_stdin_approval_line()
+}
+
+fn read_stdin_approval_line() -> io::Result<String> {
+    let stdin = io::stdin();
+    read_approval_line_from(stdin.lock())
+}
+
+fn read_approval_line_from<R: BufRead>(mut reader: R) -> io::Result<String> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(line)
 }
 
 /// Produce a short human-readable summary of tool arguments. Argument keys
@@ -416,6 +462,85 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         }
+    }
+
+    // ── CLI prompt input ────────────────────────────────────
+
+    #[test]
+    fn cli_approval_parser_accepts_yes_and_always() {
+        assert_eq!(parse_cli_approval_response("y\n"), ApprovalResponse::Yes);
+        assert_eq!(parse_cli_approval_response("YES\n"), ApprovalResponse::Yes);
+        assert_eq!(
+            parse_cli_approval_response(" always \n"),
+            ApprovalResponse::Always
+        );
+        assert_eq!(
+            parse_cli_approval_response("A\r\n"),
+            ApprovalResponse::Always
+        );
+    }
+
+    #[test]
+    fn cli_approval_parser_denies_empty_eof_and_unknown_input() {
+        assert_eq!(parse_cli_approval_response(""), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("\n"), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("maybe\n"), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("[Y]\n"), ApprovalResponse::No);
+    }
+
+    #[test]
+    fn approval_line_reader_preserves_existing_stdin_eof_semantics() {
+        let line = read_approval_line_from(std::io::Cursor::new("yes\n")).unwrap();
+        assert_eq!(line, "yes\n");
+
+        let eof = read_approval_line_from(std::io::Cursor::new(Vec::<u8>::new())).unwrap();
+        assert_eq!(eof, "");
+        assert_eq!(parse_cli_approval_response(&eof), ApprovalResponse::No);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_prefers_tty_over_stdin_eof() {
+        let line =
+            read_cli_approval_line_with(|| Ok(std::io::Cursor::new("yes\n")), || Ok(String::new()))
+                .unwrap();
+
+        assert_eq!(line, "yes\n");
+        assert_eq!(parse_cli_approval_response(&line), ApprovalResponse::Yes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_falls_back_to_stdin_when_tty_unavailable() {
+        let line = read_cli_approval_line_with(
+            || -> io::Result<std::io::Cursor<&'static str>> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "no tty"))
+            },
+            || Ok("always\n".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(line, "always\n");
+        assert_eq!(parse_cli_approval_response(&line), ApprovalResponse::Always);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_tty_read_error_fails_without_stdin_fallback() {
+        struct FailingReader;
+
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "tty read"))
+            }
+        }
+
+        let result = read_cli_approval_line_with(
+            || Ok(std::io::BufReader::new(FailingReader)),
+            || panic!("stdin fallback should not run after tty read errors"),
+        );
+
+        assert!(result.is_err());
     }
 
     // ── needs_approval ───────────────────────────────────────

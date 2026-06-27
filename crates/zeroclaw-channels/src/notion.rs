@@ -519,6 +519,15 @@ impl Channel for NotionChannel {
             .await
             .is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in the Notion API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Helper functions ──────────────────────────────────────────────
