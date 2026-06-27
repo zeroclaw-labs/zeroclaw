@@ -197,13 +197,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         if !power_tools.is_empty() {
             prompt.push_str(
                 "## Tool Authorization\n\n\
-                 The runtime autonomy policy is set to `full`. The user has explicitly granted the agent permission to act without per-call approval. The following tools are AUTHORIZED and NOT blocked by any security policy: ",
+                 The runtime autonomy policy is set to `full`. The user has granted the agent permission to act without per-call approval, so the following tools are registered and authorized to call (to attempt) under Full autonomy: ",
             );
             prompt.push_str(&power_tools.join(", "));
             prompt.push_str(
                 ".\n\
-                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT respond with simulated refusal text such as \"blocked by security policy\" or \"restricted in this environment\".\n\
-                 If a real runtime error or policy block occurs, it will be reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
+                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
+                 Full autonomy removes the approval prompt, not the runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
             );
         }
     }
@@ -464,8 +464,51 @@ mod tests {
             "expected Tool Authorization section at Full autonomy when shell is registered"
         );
         assert!(prompt.contains("shell"));
-        assert!(prompt.contains("AUTHORIZED"));
-        assert!(prompt.contains("simulated refusal"));
+        assert!(prompt.contains("authorized to call"));
+        assert!(prompt.contains("simulated"));
+    }
+
+    #[test]
+    fn full_autonomy_authorization_is_attempt_scoped_not_unconditional() {
+        // Regression guard: the Full-autonomy block must authorize the model to
+        // *attempt* the registered tools without self-refusing, but must NOT
+        // claim the tools are exempt from security policy. Full autonomy removes
+        // the approval prompt, not forbidden_commands/forbidden_paths/sandbox.
+        let tools = [
+            ("shell", "Run a shell command"),
+            ("file_write", "Write a file"),
+        ];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        let auth = prompt
+            .split("## Tool Authorization")
+            .nth(1)
+            .expect("Tool Authorization section present");
+        let auth = auth.split("\n## ").next().unwrap_or(auth);
+
+        // Must authorize attempting, not exempt from policy.
+        assert!(
+            auth.contains("authorized to call") || auth.contains("authorized to call (to attempt)"),
+            "Full-autonomy block must authorize *attempting* the tool"
+        );
+        assert!(
+            auth.contains("not self-refuse") || auth.contains("do NOT self-refuse"),
+            "block must tell the model not to self-refuse merely for using shell/file tooling"
+        );
+        // Must keep the runtime safeguards explicit.
+        assert!(
+            auth.contains("forbidden_commands") && auth.contains("forbidden_paths"),
+            "block must state forbidden_commands/forbidden_paths still apply"
+        );
+        assert!(
+            auth.contains("sandbox"),
+            "block must state OS sandboxing still applies"
+        );
+        // Must NOT regress to the overbroad claim.
+        assert!(
+            !auth.contains("NOT blocked by any security policy")
+                && !auth.contains("not blocked by any security policy"),
+            "block must not claim the tools are exempt from all security policy"
+        );
     }
 
     #[test]
