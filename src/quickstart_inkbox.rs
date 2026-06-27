@@ -1014,7 +1014,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
         )
     );
     println!(
-        "      {} \"{}\" {} {}",
+        "    {} \"{}\" {} {}",
         crate::t("cli-quickstart-inkbox-imsg-step1", "1. Text"),
         connect_command,
         crate::t("cli-quickstart-inkbox-imsg-step1b", "to"),
