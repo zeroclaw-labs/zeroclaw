@@ -348,22 +348,7 @@ jobs:
           fi
           # Extract git-dep keys from Cargo.lock using the same Python
           # logic as refresh-nix-hashes.sh.
-          python3 -c '
-import json, re, sys
-try:
-    import tomllib as tom
-except ImportError:
-    import tomli as tom
-with open("Cargo.lock", "rb") as f:
-    data = tom.load(f)
-keys = set()
-for pkg in data.get("package", []):
-    src = pkg.get("source", "") or ""
-    if not src.startswith("git+"):
-        continue
-    keys.add(f"{pkg["name"]}-{pkg["version"]}")
-print(json.dumps(sorted(keys)))
-' > /tmp/lock_keys.json
+          python3 scripts/ci/list_git_dep_keys.py > /tmp/lock_keys.json
           LOCK_COUNT=$(jq length /tmp/lock_keys.json)
           echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
           if [[ "$LOCK_COUNT" -eq 0 ]]; then
