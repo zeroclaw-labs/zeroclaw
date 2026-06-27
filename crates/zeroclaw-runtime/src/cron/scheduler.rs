@@ -219,6 +219,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            output_format: "wrapped".to_string(),
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1161,16 +1162,32 @@ async fn run_job_command_with_timeout(
         Err(e) => return (false, format!("shell setup error: {e}")),
     };
 
+    // Resolve output_format from config (SSOT) — imperative jobs without a
+    // config entry default to "wrapped".
+    let output_format: &str = config
+        .cron
+        .get(&job.id)
+        .map(|decl| decl.output_format.as_str())
+        .unwrap_or("wrapped");
+
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!(
-                "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            );
+            let combined = if output_format == "raw" {
+                if output.status.success() {
+                    stdout.trim().to_string()
+                } else {
+                    format!("exit code: {}\n{}", output.status, stderr.trim())
+                }
+            } else {
+                format!(
+                    "status={}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                )
+            };
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),

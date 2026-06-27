@@ -996,8 +996,12 @@ fn build_channel_system_prompt(
              via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user.\n\nCalibration note: agents in this system currently err \
              on the side of silence when a response would be appropriate, which users \
-             find frustrating. Skew toward replying. Memory is supplementary context \
-             that informs how you respond, not a gate on whether you respond."
+              find frustrating. Skew toward replying. Memory is supplementary context \
+              that informs how you respond, not a gate on whether you respond.\n\n\
+              Silent response: If after completing the requested task you determine \
+              that no response is needed (e.g. a conditional check found nothing to \
+              report), output the exact string __ZEROCLAW_NO_REPLY__ as your entire \
+              response. Do not add any other text before or after it."
         );
         prompt.push_str(&context);
     }
@@ -3347,6 +3351,12 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
 const EMPTY_CHANNEL_REPLY_FALLBACK: &str =
     "I couldn't produce a visible reply for that message. Please try again.";
 
+/// Magic string an LLM can emit as its entire response to signal intentional
+/// silence (e.g. a conditional check found nothing to report). The orchestrator
+/// intercepts this before sanitization and returns early without sending a
+/// message, appending history, or consolidating memory.
+const SILENT_RESPONSE_SENTINEL: &str = "__ZEROCLAW_NO_REPLY__";
+
 /// Ensure channel outbound text is never empty so users don't see typing with no message.
 fn ensure_nonempty_channel_reply(
     delivered_response: String,
@@ -5159,6 +5169,29 @@ async fn process_channel_message_body(
                         outbound_response = modified_content;
                     }
                 }
+            }
+
+            // ── Silent response sentinel ──────────────────────────
+            if outbound_response.trim() == SILENT_RESPONSE_SENTINEL {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_duration(
+                            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        )
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": route.model_provider,
+                            "model": route.model,
+                            "sender": msg.sender,
+                        })),
+                    "channel_message_silent_response_sentinel"
+                );
+                if let (Some(channel), Some(draft_id)) =
+                    (target_channel.as_ref(), draft_message_id.as_deref())
+                {
+                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                }
+                return;
             }
 
             let sanitized_response =

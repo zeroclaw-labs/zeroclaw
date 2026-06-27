@@ -2353,6 +2353,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                output_format: "wrapped".to_string(),
             },
         )
     }
@@ -2379,6 +2380,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                output_format: "wrapped".to_string(),
             },
         )
     }
@@ -2566,6 +2568,7 @@ mod tests {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            output_format: "wrapped".to_string(),
         };
 
         let mut decls = std::collections::HashMap::new();

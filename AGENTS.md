@@ -203,6 +203,9 @@ AI coding assistant skills live in `.claude/skills/`. Use the right one for the 
 - `.claude/skills/skill-creator/SKILL.md` — Framework for creating, testing, evaluating, and optimizing new AI skills. Trigger: `create skill`, `improve skill`, `run skill evals`.
 - `.claude/skills/squash-merge/SKILL.md` — Performs conventional squash-merges into master with preserved commit history. Trigger: `squash-merge #123`, `land #789`.
 - `.claude/skills/zeroclaw/SKILL.md` — Operational guide for interacting with a ZeroClaw agent instance via CLI or API. Trigger: `check agent status`, `manage memory`, `zeroclaw config`.
+- `.claude/skills/tools/SKILL.md` — Tool skill discovery index. Maps every ZeroClaw tool (shell, cron, memory, sessions, browser, integrations, SOP, hardware, etc.) to its individual skill file in `.claude/skills/tools/`. Trigger: `tool skill`, `how to use tool`, `tool discovery`.
+- `.claude/skills/sentinel-silent-response/SKILL.md` — Silent response sentinel (`__ZEROCLAW_NO_REPLY__`) for the channel orchestrator. Trigger: `silent response`, `no reply`, `sentinel`, `conditional silence`.
+- `.claude/skills/cron-output-format/SKILL.md` — Cron shell job `output_format` field (raw vs wrapped). Trigger: `cron output`, `output format`, `raw output`, `wrapped output`.
 
 ## Localization
 

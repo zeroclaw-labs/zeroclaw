@@ -297,6 +297,19 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str("\n\n");
     }
 
+    // ── 3b. Tool Skills (optional usage guides) ─────────────────
+    if has_tools {
+        prompt.push_str(
+            "## Tool Skills\n\n\
+             You can create tool skill files in your workspace `skills/` directory to extend \
+             tool documentation with usage patterns, examples, and edge cases beyond what the \
+             tool description provides.\n\
+             - Name tool skill files `tool:<name>` (e.g. `tool:shell`, `tool:cron_add`).\n\
+             - Load them with `read_skill(\"tool:<name>\")`.\n\
+             - If a tool skill is not found, rely on the tool description and parameter schema.\n\n",
+        );
+    }
+
     // ── 4. Workspace ────────────────────────────────────────────
     let _ = writeln!(
         prompt,
@@ -399,7 +412,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         if !show_tool_calls {
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
-        prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
+        prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n");
+        prompt.push_str("- Silent response: If after completing the requested task you determine that no response is needed (e.g. a conditional check found nothing to report), output the exact string __ZEROCLAW_NO_REPLY__ as your entire response. Do not add any other text before or after it.\n\n");
     } // end if !compact_context (Channel Capabilities)
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────

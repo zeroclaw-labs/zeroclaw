@@ -213,6 +213,7 @@ export default function Cron() {
   const [formDeliveryChannel, setFormDeliveryChannel] = useState('');
   const [formDeliveryTo, setFormDeliveryTo] = useState('');
   const [formDeliveryBestEffort, setFormDeliveryBestEffort] = useState(true);
+  const [formOutputFormat, setFormOutputFormat] = useState<'wrapped' | 'raw'>('wrapped');
   const [agentOptions, setAgentOptions] = useState<string[]>([]);
   const [boundChannels, setBoundChannels] = useState<AgentBoundChannel[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
@@ -235,6 +236,7 @@ export default function Cron() {
     setFormDeliveryChannel('');
     setFormDeliveryTo('');
     setFormDeliveryBestEffort(true);
+    setFormOutputFormat('wrapped');
     setFormError(null);
     setModalJob('add');
   };
@@ -274,6 +276,9 @@ export default function Cron() {
       setFormModel('');
       setFormSessionTarget('isolated');
       setFormAllowedTools('');
+      setFormOutputFormat(
+        (job as CronJob & { output_format?: string }).output_format === 'raw' ? 'raw' : 'wrapped',
+      );
     }
     setFormError(null);
     setModalJob(job);
@@ -722,6 +727,35 @@ export default function Cron() {
                     rows={4}
                     className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm resize-y font-mono"
                   />
+                  <div className="mt-3">
+                    <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                      {t('cron.output_format')}
+                    </label>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setFormOutputFormat('wrapped')}
+                        className={`flex-1 px-3 py-2 text-sm rounded-[var(--radius-md)] border transition-colors ${
+                          formOutputFormat === 'wrapped'
+                            ? 'border-[var(--pc-accent)] bg-[var(--pc-accent)]/10 text-[var(--pc-accent)]'
+                            : 'border-pc-border text-pc-text-faint hover:border-pc-border-strong'
+                        }`}
+                      >
+                        Wrapped
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFormOutputFormat('raw')}
+                        className={`flex-1 px-3 py-2 text-sm rounded-[var(--radius-md)] border transition-colors ${
+                          formOutputFormat === 'raw'
+                            ? 'border-[var(--pc-accent)] bg-[var(--pc-accent)]/10 text-[var(--pc-accent)]'
+                            : 'border-pc-border text-pc-text-faint hover:border-pc-border-strong'
+                        }`}
+                      >
+                        Raw
+                      </button>
+                    </div>
+                  </div>
                 </div>
               ) : (
                 <>

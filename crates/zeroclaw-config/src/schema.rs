@@ -11330,6 +11330,15 @@ pub struct CronJobDecl {
     #[serde(default)]
     #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Output format for shell jobs: `"wrapped"` (default) includes
+    /// status/stdout/stderr labels; `"raw"` returns only the command's stdout
+    /// (or stderr on non-zero exit).
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+}
+
+fn default_output_format() -> String {
+    "wrapped".to_string()
 }
 
 impl Default for CronJobDecl {
@@ -11346,6 +11355,7 @@ impl Default for CronJobDecl {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            output_format: default_output_format(),
         }
     }
 }
