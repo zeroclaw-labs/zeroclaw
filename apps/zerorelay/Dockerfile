@@ -17,7 +17,7 @@
 # --registration-mode open|allowlist with --allow/--deny keyed on the daemon pubkey
 # FINGERPRINT (sha256 hex), plus an optional shared-secret gate via --relay-token.
 
-# ── Stage 1: build only the relay binary ───────────────────────
+# --- Stage 1: build only the relay binary ---
 FROM rust:1.94-slim AS builder
 WORKDIR /app
 COPY . .
@@ -27,7 +27,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cargo build --release -p zerorelay \
     && cp target/release/zerorelay /usr/local/bin/zerorelay
 
-# ── Stage 2: minimal distroless runtime (no shell) ─────────────
+# --- Stage 2: minimal distroless runtime (no shell) ---
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /usr/local/bin/zerorelay /usr/local/bin/zerorelay
 # Ship a default config (bind 0.0.0.0:8443, self-provision TLS into /data/tls,
