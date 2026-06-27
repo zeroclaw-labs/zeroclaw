@@ -82,7 +82,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -265,7 +265,7 @@ jobs:
     continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
@@ -376,7 +376,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -431,6 +431,10 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      packages: write   # retained from workflow-level — publish job doesn't
+                        # push packages today, but explicitly listed so
+                        # future changes don't silently break on missing
+                        # permission. Docker/build jobs also have it.
     environment:
       name: github-releases
       url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
@@ -492,7 +496,9 @@ jobs:
           echo "--- Assets ---"
           ls -lh release-assets/
 
-      - name: Attach SLSA provenance attestation
+      - id: attest
+        name: Attach SLSA provenance attestation
+        continue-on-error: true
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: release-assets/*
@@ -501,6 +507,43 @@ jobs:
         env:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Append verification instructions to release notes
+        run: |
+          cat >> release-notes.md <<'VERIFY_EOF'
+
+          ---
+          ### Verify SLSA Provenance
+
+          Release artifacts are signed with SLSA Build L3 provenance.
+
+          **Online (gh CLI)**
+            gh attestation verify <artifact> --repo zeroclaw-labs/zeroclaw
+
+          **Offline (slsa-verifier)**
+            # Download the .attestation bundle from the release assets, then:
+            slsa-verifier verify-artifact <artifact> \
+              --provenance-path <artifact>.attestation \
+              --source-uri github.com/zeroclaw-labs/zeroclaw
+
+          Install gh: https://cli.github.com/
+          Install slsa-verifier: https://github.com/slsa-framework/slsa-verifier
+          VERIFY_EOF
+
+      - name: Download attestation bundles for offline verification
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for artifact in release-assets/*.tar.gz release-assets/*.zip release-assets/*.dmg release-assets/SHA256SUMS; do
+            [ -f "$artifact" ] || continue
+            gh attestation download "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --output-dir release-assets/
+          done
+          echo "--- Attestation bundles ---"
+          ls -lh release-assets/*.attestation 2>/dev/null || echo "(no bundles — step may have been skipped)"
 
       - name: Create tag and release
         env:
