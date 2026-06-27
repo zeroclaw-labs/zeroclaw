@@ -1,8 +1,23 @@
+//! Herdr integration — agent lifecycle reporting to the Herdr sidebar.
+//!
+//! This integration is purely environment-variable driven. There is no `[herdr]`
+//! config section. Enable it by setting these env vars:
+//!
+//! - `HERDR_ENV=1` — must be set to activate the integration
+//! - `HERDR_SOCKET_PATH` — path to the Herdr daemon's Unix socket
+//! - `HERDR_PANE_ID` — the Herdr pane identifier
+//!
+//! A dedicated background I/O thread owns the UDS connection. The observer
+//! never touches a socket — it pushes state transitions to a channel (sub-µs)
+//! and the thread processes them in order with bounded timeouts. Startup and
+//! shutdown messages are guaranteed by flushing the channel synchronously.
+
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -12,6 +27,79 @@ use zeroclaw_api::observability_traits::ObserverMetric;
 use crate::observability::{
     BroadcastHookGuard, Observer, ObserverEvent, set_scoped_broadcast_hook,
 };
+
+// ── I/O timeouts ──────────────────────────────────────────────────────────────
+
+/// Maximum time to wait for a UDS connect before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum time to wait for a UDS write or read before giving up.
+const IO_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Connect to a Unix domain socket with a timeout by delegating to a
+/// background thread. `std::os::unix::net::UnixStream::connect` has no
+/// built-in timeout, so we use a channel + `recv_timeout` to bound it.
+#[cfg(unix)]
+fn connect_with_timeout(path: &str, timeout: Duration) -> Result<UnixStream, std::io::Error> {
+    let path = path.to_owned();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(&path));
+    });
+    rx.recv_timeout(timeout).unwrap_or(Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "herdr connect timed out",
+    )))
+}
+
+// ── Background I/O thread ─────────────────────────────────────────────────────
+
+/// Commands sent from the observer to the dedicated I/O thread.
+#[cfg(unix)]
+enum IoCommand {
+    /// A pre-serialized JSON-RPC notification to write to the herdr daemon.
+    Message(String),
+    /// Flush the channel and acknowledge that all prior messages were sent.
+    Flush(mpsc::Sender<()>),
+    /// Terminate the I/O thread.
+    Shutdown,
+}
+
+/// Dedicated I/O thread: owns the UDS connection, processes messages in FIFO
+/// order, reconnects on error, and never outlives the `HerdrClient`.
+#[cfg(unix)]
+fn io_thread_main(socket_path: &str, rx: mpsc::Receiver<IoCommand>) {
+    let mut stream: Option<UnixStream> = None;
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            IoCommand::Message(payload) => {
+                if stream.is_none() {
+                    stream = connect_with_timeout(socket_path, CONNECT_TIMEOUT).ok();
+                }
+                if let Some(ref mut s) = stream
+                    && send_on_stream(s, &payload).is_err()
+                {
+                    stream = None;
+                }
+            }
+            IoCommand::Flush(ack) => {
+                let _ = ack.send(());
+            }
+            IoCommand::Shutdown => break,
+        }
+    }
+}
+
+/// Write a JSON-RPC notification to a connected UDS stream with bounded
+/// timeouts. Returns `Err` if any operation times out or the peer disconnects.
+#[cfg(unix)]
+fn send_on_stream(s: &mut UnixStream, payload: &str) -> Result<(), std::io::Error> {
+    s.set_write_timeout(Some(IO_TIMEOUT))?;
+    s.write_all(payload.as_bytes())?;
+    s.write_all(b"\n")?;
+    s.flush()?;
+    Ok(())
+}
 
 // ── Socket discovery ─────────────────────────────────────────────────────────
 
@@ -43,6 +131,9 @@ pub fn try_install_hook() -> Option<BroadcastHookGuard> {
     // Report initial idle state so herdr shows the agent immediately, even
     // before any user message triggers a state transition.
     client.report_state("idle", None);
+    // Flush so the I/O thread has sent both messages before the agent loop
+    // starts processing user messages.
+    client.flush();
     let reporter = DebouncedReporter::new(client);
     let observer = Arc::new(HerdrObserver::new(reporter));
     Some(set_scoped_broadcast_hook(observer))
@@ -61,35 +152,70 @@ pub fn update_session_id(sid: &str) {
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
-/// Low-level client that sends JSON-RPC requests to the herdr daemon over a
-/// Unix domain socket. Connects, writes, reads response (fire-and-forget),
-/// and disconnects per message.
+/// Client that sends JSON-RPC notifications to the herdr daemon via a
+/// dedicated background I/O thread. The `send()` method serialises the
+/// message and pushes it to an mpsc channel — it never blocks on I/O.
+/// Call `flush()` to wait until the I/O thread has processed all pending
+/// messages (used at startup and shutdown for guaranteed delivery).
 pub(crate) struct HerdrClient {
-    socket_path: String,
     pane_id: String,
     #[cfg(test)]
     spy: Option<SpyFn>,
+    /// Channel to the background I/O thread. `None` on non-Unix or when the
+    /// thread failed to spawn (best-effort: messages are silently dropped).
+    #[cfg(unix)]
+    io_tx: Option<mpsc::Sender<IoCommand>>,
 }
 
 impl HerdrClient {
     pub(crate) fn new(socket_path: String, pane_id: String) -> Self {
-        Self {
-            socket_path,
-            pane_id,
-            #[cfg(test)]
-            spy: None,
+        #[cfg(unix)]
+        {
+            let (tx, rx) = mpsc::channel::<IoCommand>();
+            let spawned = std::thread::Builder::new()
+                .name("herdr-io".into())
+                .spawn(move || io_thread_main(&socket_path, rx))
+                .is_ok();
+            Self {
+                pane_id,
+                #[cfg(test)]
+                spy: None,
+                io_tx: if spawned { Some(tx) } else { None },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket_path;
+            Self {
+                pane_id,
+                #[cfg(test)]
+                spy: None,
+            }
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_spy<F>(socket_path: String, pane_id: String, spy: F) -> Self
+    pub(crate) fn new_with_spy<F>(_socket_path: String, pane_id: String, spy: F) -> Self
     where
         F: Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync + 'static,
     {
         Self {
-            socket_path,
             pane_id,
             spy: Some(Arc::new(spy)),
+            #[cfg(unix)]
+            io_tx: None,
+        }
+    }
+
+    /// Flush pending messages: block until the I/O thread has sent all
+    /// messages that were enqueued before this call.
+    pub(crate) fn flush(&self) {
+        #[cfg(unix)]
+        if let Some(tx) = &self.io_tx {
+            let (ack_tx, ack_rx) = mpsc::channel::<()>();
+            if tx.send(IoCommand::Flush(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1));
+            }
         }
     }
 
@@ -136,29 +262,16 @@ impl HerdrClient {
         map.insert("params".into(), serde_json::Value::Object(params_map));
 
         let request = serde_json::Value::Object(map);
-        let msg = serde_json::to_string(&request)?;
+        let payload = serde_json::to_string(&request)?;
 
+        // Push to the background I/O thread. This never blocks — the channel
+        // is unbounded, so send is O(1) even if the thread is busy.
         #[cfg(unix)]
-        {
-            let mut stream = UnixStream::connect(&self.socket_path)?;
-            stream.write_all(msg.as_bytes())?;
-            stream.write_all(b"\n")?;
-            stream.flush()?;
-
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-
-            Ok(())
+        if let Some(tx) = &self.io_tx {
+            let _ = tx.send(IoCommand::Message(payload));
         }
 
-        #[cfg(not(unix))]
-        {
-            let _ = msg;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "UDS requires a Unix platform",
-            ))
-        }
+        Ok(())
     }
 
     fn report_state(&self, state: &str, session_id: Option<&str>) {
@@ -175,6 +288,15 @@ impl HerdrClient {
 
     fn report_released(&self) {
         let _ = self.send("pane.release_agent", &serde_json::Map::new());
+    }
+}
+
+impl Drop for HerdrClient {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(tx) = self.io_tx.take() {
+            let _ = tx.send(IoCommand::Shutdown);
+        }
     }
 }
 
@@ -220,6 +342,17 @@ impl DebouncedReporter {
             };
             self.client.report_state(label, session_id);
         }
+    }
+
+    /// Flush the reporter at shutdown: if the agent has not yet reported
+    /// Released, send the release messages now, then drain the I/O channel.
+    fn flush(&mut self) {
+        if self.state != HerdrState::Released {
+            self.state = HerdrState::Released;
+            self.client.report_state("idle", None);
+            self.client.report_released();
+        }
+        self.client.flush();
     }
 }
 
@@ -285,7 +418,10 @@ impl Observer for HerdrObserver {
 
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
+        reporter.flush();
+    }
 
     fn name(&self) -> &str {
         "herdr"
@@ -343,5 +479,23 @@ pub(crate) mod tests {
         );
         let reporter = DebouncedReporter::new(client);
         (reporter, calls)
+    }
+
+    #[test]
+    fn send_fire_and_forget_returns_immediately() {
+        let client = HerdrClient::new(
+            "/tmp/nonexistent-herdr-test-socket.sock".into(),
+            "test-pane".into(),
+        );
+
+        let start = std::time::Instant::now();
+        let _result = client.send("pane.report_agent", &serde_json::Map::new());
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "fire-and-forget send should not block the caller, took {:?}",
+            elapsed,
+        );
     }
 }

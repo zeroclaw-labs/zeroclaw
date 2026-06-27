@@ -403,12 +403,6 @@ pub struct Config {
     #[group = "Integrations"]
     pub google_workspace: GoogleWorkspaceConfig,
 
-    /// Herdr agent status reporting (`[herdr]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub herdr: HerdrConfig,
-
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     #[nested]
@@ -7586,19 +7580,6 @@ impl Default for GoogleWorkspaceConfig {
         }
     }
 }
-
-/// Herdr agent status reporting configuration (`[herdr]`).
-///
-/// When enabled and running inside a Herdr pane (detected via `HERDR_ENV=1`),
-/// the agent reports its lifecycle state (working/idle/released) to the
-/// Herdr daemon so the sidebar shows the current agent status.
-///
-/// Requires running inside a Herdr pane — environment variables
-/// `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID` must be present.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "herdr"]
-pub struct HerdrConfig {}
 
 // ── Knowledge ───────────────────────────────────────────────────
 
@@ -15663,7 +15644,6 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
-            herdr: HerdrConfig::default(),
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -21357,7 +21337,6 @@ auto_save = true
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
-            herdr: HerdrConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
@@ -22022,7 +22001,6 @@ default_temperature = 0.7
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
-            herdr: HerdrConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
