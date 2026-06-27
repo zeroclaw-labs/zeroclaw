@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use inkbox::identities::types::Unset;
+use inkbox::identities::types::{IdentityPhoneNumberCreateOptions, Unset};
 use inkbox::whoami::types::{
     AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_CLAIMED, AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_UNCLAIMED,
     WhoamiResponse,
@@ -409,5 +409,77 @@ pub fn send_imessage_welcome(
         let id = client.get_identity(&h)?;
         id.send_imessage(None, Some(&conversation_id), Some(&body), None, None)
             .map(|_| ())
+    })
+}
+
+/// Create a new agent identity (admin-key path), optionally provisioning a
+/// local phone number. Mirrors Hermes `_create_identity`.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - an admin-scoped key.
+/// * `handle` - desired (globally unique) agent handle.
+/// * `display_name` - optional display name shown to recipients.
+/// * `provision_phone` - provision a local US number when `true`.
+///
+/// # Returns
+/// The created identity's handle.
+pub fn create_identity(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+    display_name: Option<&str>,
+    provision_phone: bool,
+) -> anyhow::Result<String> {
+    let (key, base, h, dn) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+        display_name.map(|s| s.to_string()),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let phone = provision_phone.then(IdentityPhoneNumberCreateOptions::default);
+        let id = client.create_identity_with(
+            &h,
+            dn.as_deref(),
+            Unset::Omit,
+            None,
+            None,
+            Unset::Omit,
+            None,
+            phone.as_ref(),
+            None,
+        )?;
+        Ok(id.agent_handle())
+    })
+}
+
+/// Mint an agent-scoped API key for an identity so the gateway never stores the
+/// admin key (admin-key path). Mirrors Hermes `_mint_agent_scoped_key`.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - an admin-scoped key.
+/// * `handle` - the identity to scope the new key to.
+///
+/// # Returns
+/// The newly minted agent-scoped API key.
+pub fn mint_agent_key(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<String> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        let label = format!("ZeroClaw gateway - {}", id.agent_handle());
+        let created = client.api_keys().create(
+            &label,
+            Some("Auto-minted by zeroclaw quickstart; scoped to one identity."),
+            Some(id.id()),
+        )?;
+        Ok(created.api_key)
     })
 }

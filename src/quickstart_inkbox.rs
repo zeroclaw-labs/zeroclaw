@@ -315,20 +315,22 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
             return Ok(None);
         }
     };
-    if handles.is_empty() {
-        eprintln!(
-            "  {}",
-            crate::t(
-                "cli-quickstart-inkbox-no-identities",
-                "Key valid, but it sees no agent identities.",
-            )
-        );
-        return Ok(None);
-    }
-    let handle = match info.auth {
+    // The key the channel will store: the pasted key for an agent-scoped key,
+    // or a freshly-minted agent-scoped key for the admin path.
+    let (effective_key, handle): (String, String) = match info.auth {
         // Agent-scoped: bound to one identity — use it (warn if the API ever
         // returns more), exactly like Hermes `_pick_agent_scoped`.
         ob::KeyAuth::AgentScoped => {
+            if handles.is_empty() {
+                eprintln!(
+                    "  {}",
+                    crate::t(
+                        "cli-quickstart-inkbox-no-identities",
+                        "Agent-scoped key but no identity returned.",
+                    )
+                );
+                return Ok(None);
+            }
             if handles.len() > 1 {
                 eprintln!(
                     "  {} {} {}",
@@ -351,27 +353,65 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
                 ),
                 handles[0]
             );
-            handles[0].clone()
+            (api_key.clone(), handles[0].clone())
         }
-        // Admin-scoped: pick from the org's identities (Hermes `_pick_admin_scoped`).
+        // Admin-scoped: pick an existing identity OR create a new one, then mint
+        // an agent-scoped key so the gateway never stores the admin key
+        // (Hermes `_pick_admin_scoped` + `_create_identity` + `_mint_agent_scoped_key`).
         _ => {
+            let create_label = crate::t(
+                "cli-quickstart-inkbox-create-new",
+                "+ Create a new identity",
+            );
+            let mut items = handles.clone();
+            items.push(create_label);
             let Some(idx) = dialoguer::FuzzySelect::new()
                 .with_prompt(crate::t(
                     "cli-quickstart-inkbox-pick-identity",
                     "Select the identity this gateway runs as",
                 ))
-                .items(&handles)
+                .items(&items)
                 .default(0)
-                .max_length(handles.len().max(1))
+                .max_length(items.len().max(1))
                 .interact_opt()?
             else {
                 return Ok(None);
             };
-            handles[idx].clone()
+            let chosen = if idx < handles.len() {
+                handles[idx].clone()
+            } else {
+                match create_new_identity(base_url, &api_key)? {
+                    Some(h) => h,
+                    None => return Ok(None),
+                }
+            };
+            let minted = match ob::mint_agent_key(base_url, &api_key, &chosen) {
+                Ok(k) => k,
+                Err(err) => {
+                    eprintln!(
+                        "  {} {}",
+                        crate::t(
+                            "cli-quickstart-inkbox-mint-failed",
+                            "could not mint a scoped key:",
+                        ),
+                        err
+                    );
+                    return Ok(None);
+                }
+            };
+            println!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-minted",
+                    "✓ minted an agent-scoped key for",
+                ),
+                chosen
+            );
+            (minted, chosen)
         }
     };
 
-    match ob::fetch_identity(base_url, &api_key, &handle) {
+    match ob::fetch_identity(base_url, &effective_key, &handle) {
         Ok(id) => {
             println!(
                 "  {} {}",
@@ -385,7 +425,7 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
                     phone
                 );
             }
-            Ok(Some((api_key, id.handle)))
+            Ok(Some((effective_key, id.handle)))
         }
         Err(err) => {
             eprintln!(
@@ -393,6 +433,67 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
                 crate::t(
                     "cli-quickstart-inkbox-handle-failed",
                     "could not load that identity:",
+                ),
+                err
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Admin-key "create a new identity" sub-flow (Hermes `_create_identity`):
+/// prompt handle + optional display name, offer a phone number, then create it.
+fn create_new_identity(base_url: &str, api_key: &str) -> anyhow::Result<Option<String>> {
+    let Some(handle) = input(
+        &crate::t(
+            "cli-quickstart-inkbox-new-handle",
+            "Agent handle for the new identity (globally unique)",
+        ),
+        None,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+    let handle = handle.trim().to_string();
+    if handle.is_empty() {
+        return Ok(None);
+    }
+    let display = input(
+        &crate::t(
+            "cli-quickstart-inkbox-new-display",
+            "Display name (shown to recipients, optional)",
+        ),
+        None,
+        true,
+    )?
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let provision = matches!(
+        confirm(
+            &crate::t(
+                "cli-quickstart-inkbox-new-phone",
+                "Provision a local phone number? (unlocks SMS + voice)",
+            ),
+            true,
+        )?,
+        Some(true)
+    );
+    match ob::create_identity(base_url, api_key, &handle, display.as_deref(), provision) {
+        Ok(h) => {
+            println!(
+                "  {} {}",
+                crate::t("cli-quickstart-inkbox-new-created", "✓ created identity"),
+                h
+            );
+            Ok(Some(h))
+        }
+        Err(err) => {
+            eprintln!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-new-failed",
+                    "could not create identity:",
                 ),
                 err
             );
