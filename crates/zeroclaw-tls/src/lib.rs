@@ -671,6 +671,57 @@ mod tests {
     }
 
     #[test]
+    fn verifier_supports_dual_trust_anchors_ca_rotation_seam() {
+        // CA-rotation seam (the one accepted, design-sanctioned deferral): full CA
+        // rotation orchestration is out of scope for v1, but the verifier's
+        // RootCertStore already holds MULTIPLE trust anchors, so a future rotation
+        // could trust both the OLD and NEW CA during an overlap window and clients
+        // issued by EITHER verify. This proves the seam is representable; nothing
+        // here orchestrates a rotation.
+        ensure_crypto_provider();
+        let (ca_old, _k_old) = testing::gen_ca();
+        let (ca_new, k_new) = testing::gen_ca();
+
+        // A client cert issued by the NEW anchor.
+        let (csr, _key) = testing::gen_client_csr("dev_rotated");
+        let leaf = sign_csr(&ca_new, &k_new, "dev_rotated", &csr).unwrap();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+
+        // One CA file holding BOTH anchors (old + new) - the overlap-window trust.
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), format!("{ca_old}\n{ca_new}")).unwrap();
+        let verifier = build_client_verifier(&ClientAuthParams {
+            ca_cert_path: ca_file.path().to_str().unwrap().to_string(),
+            require_client_cert: true,
+            pinned_certs: vec![],
+            crl_path: String::new(),
+        })
+        .unwrap();
+
+        let now = rustls::pki_types::UnixTime::now();
+        assert!(
+            verifier.verify_client_cert(&leaf_der, &[], now).is_ok(),
+            "a cert from the second (new) trust anchor must verify - the rotation seam"
+        );
+
+        // A cert from a THIRD, untrusted CA is still rejected (not accept-all).
+        let (ca_rogue, k_rogue) = testing::gen_ca();
+        let (csr2, _k2) = testing::gen_client_csr("dev_rogue");
+        let rogue = sign_csr(&ca_rogue, &k_rogue, "dev_rogue", &csr2).unwrap();
+        let rogue_der = rustls_pemfile::certs(&mut rogue.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            verifier.verify_client_cert(&rogue_der, &[], now).is_err(),
+            "a cert from an untrusted CA must still be rejected"
+        );
+    }
+
+    #[test]
     fn relay_pin_verifier_matches_rejects_and_tofu_records() {
         use rustls::client::danger::ServerCertVerifier as _;
         ensure_crypto_provider();
