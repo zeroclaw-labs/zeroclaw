@@ -29,7 +29,7 @@ events; only the JSONL writer is gated.
 
 > **Privacy & cost.** Captured content is sanitized best-effort: inline image data is
 > elided and known credential shapes (key=value, bearer, and `sk-`/`ghp_`/`xoxb-`-style
-> prefixes) are redacted. This does NOT guarantee removal of all secrets or PII — prefer
+> prefixes) are redacted. This does NOT guarantee removal of all secrets or PII. Prefer
 > an access-controlled trace backend if conversations may be sensitive. Capture cost is
 > O(prompt size) **per agent-loop iteration** (the growing history is re-scanned each
 > round), and full text grows per-span payload proportionally. On per-byte backends,
