@@ -4395,9 +4395,29 @@ async fn main() -> Result<()> {
                                 // cert. The CA key is encrypted at rest when a
                                 // passphrase is configured (same source the
                                 // enrollment + CLI read paths use), else 0600.
+                                // [wss].sans adds the hostnames/IPs a remote client
+                                // uses to reach the daemon to the server cert
+                                // (localhost + 127.0.0.1 are always included);
+                                // empty keeps the local-only default.
+                                let server_sans: Vec<String> = if wss_cfg.sans.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    let mut s = vec![
+                                        "localhost".to_string(),
+                                        "127.0.0.1".to_string(),
+                                    ];
+                                    s.extend(
+                                        wss_cfg
+                                            .sans
+                                            .iter()
+                                            .filter(|x| !x.trim().is_empty())
+                                            .cloned(),
+                                    );
+                                    s
+                                };
                                 let mats = zeroclaw_tls::ensure_server_materials_protected(
                                     &data_dir.join("tls"),
-                                    &[],
+                                    &server_sans,
                                     &ca_key_protection_from_env(),
                                 )?;
                                 (

@@ -206,10 +206,35 @@ pub fn ensure_server_materials_protected(
         server_key_path: dir.join("server.key"),
     };
 
+    // Resolve the desired server SANs and detect a change vs. what the current
+    // leaf was generated with (recorded in `server.sans`). The SAN-change regen is
+    // only enforced when the operator explicitly set SANs; the default
+    // localhost/127.0.0.1 path keeps the plain reuse-if-present behaviour so
+    // existing daemons are untouched.
+    let want_sans = if server_sans.is_empty() {
+        default_server_sans()
+    } else {
+        server_sans.to_vec()
+    };
+    let sans_marker_path = dir.join("server.sans");
+    let want_marker = {
+        let mut v: Vec<String> = want_sans
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        v.join("\n")
+    };
+    let sans_changed = !server_sans.is_empty()
+        && std::fs::read_to_string(&sans_marker_path).ok().as_deref() != Some(want_marker.as_str());
+
     if materials.ca_cert_path.exists()
         && materials.ca_key_path.exists()
         && materials.server_cert_path.exists()
         && materials.server_key_path.exists()
+        && !sans_changed
     {
         return Ok(materials);
     }
@@ -231,19 +256,21 @@ pub fn ensure_server_materials_protected(
         (ca_cert, ca_key)
     };
 
-    // (Re)generate the server leaf only if it is missing.
-    if !materials.server_cert_path.exists() || !materials.server_key_path.exists() {
+    // (Re)generate the server leaf if it is missing or its configured SANs changed.
+    // The CA is never touched, so already-issued client certs keep verifying.
+    if !materials.server_cert_path.exists() || !materials.server_key_path.exists() || sans_changed {
         let server_key = rcgen::KeyPair::generate().context("generating server key")?;
-        let sans = if server_sans.is_empty() {
-            default_server_sans()
-        } else {
-            server_sans.to_vec()
-        };
-        let server_cert = server_params(&sans)?
+        let server_cert = server_params(&want_sans)?
             .signed_by(&server_key, &ca_cert, &ca_key)
             .context("signing server certificate")?;
         write_public_pem(&materials.server_cert_path, &server_cert.pem())?;
         write_private_pem(&materials.server_key_path, &server_key.serialize_pem())?;
+        if !server_sans.is_empty() {
+            // Record the SAN set the current leaf carries so a later config change
+            // is detected and triggers a regen.
+            std::fs::write(&sans_marker_path, &want_marker)
+                .with_context(|| format!("writing {}", sans_marker_path.display()))?;
+        }
     }
 
     Ok(materials)
@@ -528,6 +555,89 @@ mod tests {
         let m2 = ensure_server_materials(dir.path(), &[]).unwrap();
         let ca2 = std::fs::read_to_string(&m2.ca_cert_path).unwrap();
         assert_eq!(ca1, ca2, "CA was regenerated on the second call");
+    }
+
+    #[test]
+    fn server_sans_are_applied_and_regenerate_only_on_change() {
+        use x509_parser::prelude::*;
+        let dir = tempfile::tempdir().unwrap();
+        let crt = dir.path().join("server.crt");
+
+        let leaf_fp = |p: &std::path::Path| {
+            let der = crate::load_certs(&p.to_string_lossy()).unwrap();
+            crate::cert_sha256_fingerprint(der[0].as_ref())
+        };
+        let sans_of = |p: &std::path::Path| -> std::collections::BTreeSet<String> {
+            let der = crate::load_certs(&p.to_string_lossy()).unwrap();
+            let (_, cert) = X509Certificate::from_der(der[0].as_ref()).unwrap();
+            let mut out = std::collections::BTreeSet::new();
+            if let Ok(Some(ext)) = cert.subject_alternative_name() {
+                for gn in ext.value.general_names.iter() {
+                    match gn {
+                        GeneralName::DNSName(d) => {
+                            out.insert(format!("dns:{}", d.to_ascii_lowercase()));
+                        }
+                        GeneralName::IPAddress(b) => {
+                            let ip = match b.len() {
+                                4 => {
+                                    let a: [u8; 4] = (*b).try_into().unwrap();
+                                    std::net::IpAddr::from(a).to_string()
+                                }
+                                16 => {
+                                    let a: [u8; 16] = (*b).try_into().unwrap();
+                                    std::net::IpAddr::from(a).to_string()
+                                }
+                                _ => continue,
+                            };
+                            out.insert(format!("ip:{ip}"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            out
+        };
+
+        // localhost / 127.0.0.1 are passed explicitly by the daemon; custom SANs
+        // (a hostname + an IP) ride alongside.
+        let base: Vec<String> = vec![
+            "localhost".into(),
+            "127.0.0.1".into(),
+            "zero.example".into(),
+            "10.1.2.3".into(),
+        ];
+        ensure_server_materials(dir.path(), &base).unwrap();
+        let s1 = sans_of(&crt);
+        assert!(s1.contains("dns:zero.example"), "got {s1:?}");
+        assert!(s1.contains("ip:10.1.2.3"), "got {s1:?}");
+        assert!(s1.contains("dns:localhost"), "got {s1:?}");
+        let fp1 = leaf_fp(&crt);
+
+        // Unchanged SANs: the leaf is reused (no regeneration).
+        ensure_server_materials(dir.path(), &base).unwrap();
+        assert_eq!(
+            fp1,
+            leaf_fp(&crt),
+            "leaf regenerated despite unchanged SANs"
+        );
+
+        // Added SAN: the leaf is regenerated, the new SAN is present, the CA is
+        // never rotated.
+        let ca_before = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+        let mut more = base.clone();
+        more.push("shard".into());
+        ensure_server_materials(dir.path(), &more).unwrap();
+        assert_ne!(
+            fp1,
+            leaf_fp(&crt),
+            "leaf was not regenerated on a SAN change"
+        );
+        assert!(sans_of(&crt).contains("dns:shard"));
+        assert_eq!(
+            ca_before,
+            std::fs::read_to_string(dir.path().join("ca.crt")).unwrap(),
+            "CA must not rotate when only SANs change"
+        );
     }
 
     #[cfg(unix)]

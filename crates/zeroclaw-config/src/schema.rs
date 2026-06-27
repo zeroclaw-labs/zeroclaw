@@ -6566,6 +6566,14 @@ pub struct WssConfig {
     /// Path to the PEM-encoded server private key file.
     #[serde(default)]
     pub key_path: String,
+    /// Extra Subject Alternative Names for the AUTO-GENERATED server certificate
+    /// (hostnames and/or IPs a remote client uses to reach this daemon, e.g.
+    /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
+    /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
+    /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// Ignored when you bring your own server certificate via `cert_path`.
+    #[serde(default)]
+    pub sans: Vec<String>,
     /// Client certificate authentication (mutual TLS) for the remote WSS plane.
     /// When the listener is enabled, the remote plane is always mutually
     /// authenticated; this section supplies the CA and pinning policy.
@@ -6582,6 +6590,7 @@ impl Default for WssConfig {
             port: default_wss_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            sans: Vec::new(),
             client_auth: None,
         }
     }
