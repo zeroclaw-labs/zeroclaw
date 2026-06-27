@@ -49,6 +49,7 @@ import {
   getAgentOptions,
   getCatalogModels,
   listProps,
+  mcpRequiredByTransport,
   objectArrayElementProps,
   patchConfig,
   resolveAliasSource,
@@ -270,6 +271,7 @@ function setupFieldPriority(entry: ListResponseEntry): number {
 function setupRequirement(
   entry: ListResponseEntry,
   mcpTransport?: string | null,
+  requiredByTransport?: Record<string, string> | null,
 ): { label: string; tone: "required" | "choice" | "optional" } | null {
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
@@ -308,7 +310,11 @@ function setupRequirement(
   // MCP server command/url: required-ness tracks the chosen transport, not the
   // Rust type (see mcpFieldRequired). Badge names the transport it's for so the
   // operator knows why `command` is optional under http/sse (and vice versa).
-  const mcpRequired = mcpFieldRequired(entry.path, mcpTransport);
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
   if (mcpRequired !== null) {
     // `leaf` (declared at the top of this fn) is `command` | `url` here.
     if (mcpRequired) {
@@ -477,31 +483,30 @@ function isRequiredField(typeHint: string): boolean {
 // follow the chosen transport instead of the type. Returns null for any field
 // that isn't one of these two transport-gated leaves (transport itself, args,
 // headers, ...), leaving the generic `Option<...>` rule in charge.
-// Which leaf each transport makes mandatory, keyed explicitly per transport so
-// the decision mirrors the server-side `validate_mcp_config` match (Stdio vs
-// Http | Sse) rather than collapsing the enum into a single `=== "stdio"`
-// boolean. A transport the backend adds to the enum but that has no rule here is
-// left UNCLASSIFIED (see below) instead of being silently assumed url-required,
-// which the old `!isStdio` form did to every unknown variant. The fully
-// registry-driven fix is backend-emitted required-leaf-per-transport metadata
-// on the entry; tracked as a follow-up.
-const MCP_REQUIRED_LEAF: Record<string, "command" | "url"> = {
-  stdio: "command",
-  http: "url",
-  sse: "url",
-};
-
+// Which leaf each transport makes mandatory comes from the backend, not from a
+// map kept here: `mcpRequiredByTransport` reads the `x-required-by-transport`
+// metadata the server stamps onto the `McpServerConfig` schema, derived from
+// `McpTransport::required_leaf` (the same relationship `validate_mcp_config`
+// enforces). The form reads what the backend hands it, so a transport variant
+// added backend-side classifies correctly with no change here. When the metadata
+// is absent (a backend predating it) the map is null and required-ness is left
+// UNCLASSIFIED rather than re-encoding the enum, so the generic `Option<...>`
+// rule stays in charge.
 function mcpFieldRequired(
   path: string,
   transport: string | null | undefined,
+  requiredByTransport: Record<string, string> | null | undefined,
 ): boolean | null {
   const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
   if (leaf !== "command" && leaf !== "url") return null;
+  // Backend predates the x-required-by-transport metadata: do not assert
+  // required-ness rather than guessing it from a hand-kept map.
+  if (!requiredByTransport) return null;
   // Empty / unset transport defaults to stdio (the schema default).
   const t = (transport ?? "").trim().toLowerCase() || "stdio";
-  const requiredLeaf = MCP_REQUIRED_LEAF[t];
-  // Unknown transport (a variant added backend-side without a rule here): do not
-  // assert required-ness, so a new variant cannot be silently misclassified.
+  const requiredLeaf = requiredByTransport[t];
+  // Unknown transport (a variant the metadata has no rule for): do not assert
+  // required-ness, so a new variant cannot be silently misclassified.
   if (!requiredLeaf) return null;
   return leaf === requiredLeaf;
 }
@@ -546,6 +551,9 @@ function validationHint(
   // the empty-required check on `command` / `url` tracks the chosen transport
   // rather than the bare Rust type. Null for non-MCP rows.
   mcpTransport?: string | null,
+  // Backend-emitted transport->required-leaf map (see mcpRequiredByTransport);
+  // null when the backend predates the metadata.
+  requiredByTransport?: Record<string, string> | null,
 ): string | null {
   // Secrets: an empty box means "keep the stored value", never "cleared" —
   // so emptiness is never an error here.
@@ -569,7 +577,11 @@ function validationHint(
   // stdio / url-for-http-sse), overriding the generic Option<...> rule - `url` is
   // optional at the type level yet client-required under http/sse, and `command`
   // is type-required yet optional under http/sse.
-  const mcpRequired = mcpFieldRequired(entry.path, mcpTransport);
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
   if (mcpRequired !== null) {
     if (mcpRequired && renderer !== "bool" && trimmed.length === 0) {
       return t("cfg.field.validation.required");
@@ -856,6 +868,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         cancelled = true;
       };
     }, []);
+
+    // Transport->required-leaf map, read once from the cached schema so every
+    // MCP server row classifies command/url required-ness from the registry
+    // (`x-required-by-transport`) instead of a hardcoded map. Null on backends
+    // that predate the metadata; rows then leave required-ness unclassified.
+    const requiredByTransport = useMemo(
+      () => mcpRequiredByTransport(schema),
+      [schema],
+    );
 
     const reload = async () => {
       setLoading(true);
@@ -1219,6 +1240,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 key={f.path}
                 entry={f}
                 mcpTransport={resolveMcpTransport(f.path, entries, draft)}
+                requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
                 onChange={(v) => {
                   setDraft((d) => ({ ...d, [f.path]: v }));
@@ -1353,6 +1375,9 @@ interface FieldRowProps {
    *  (null when this row isn't an MCP server field). Drives the
    *  transport-conditional required badge/hint on `command` and `url`. */
   mcpTransport?: string | null;
+  /** Backend transport->required-leaf map for MCP rows (null on older
+   *  backends); drives the required badge/hint without a hardcoded map. */
+  requiredByTransport?: Record<string, string> | null;
 }
 
 function FieldRow({
@@ -1369,9 +1394,10 @@ function FieldRow({
   tombstoned,
   onUndoTombstone,
   mcpTransport,
+  requiredByTransport,
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
-  const requirement = setupRequirement(entry, mcpTransport);
+  const requirement = setupRequirement(entry, mcpTransport, requiredByTransport);
   // Display-only inline validation derived from this entry's schema metadata.
   // Pure read of `value` — it does not feed the save/PATCH path in any way.
   // If the badge marks the field optional, don't also flag empty as required
@@ -1387,6 +1413,7 @@ function FieldRow({
     (requirement != null && requirement.tone !== "required") ||
       (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
     mcpTransport,
+    requiredByTransport,
   );
   // Suppress the local hint while a server-side error is already bound to this
   // field so the two don't stack; the authoritative server message wins.
