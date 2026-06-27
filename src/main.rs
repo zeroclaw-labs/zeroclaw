@@ -2756,6 +2756,33 @@ enum SecurityCommands {
         force: bool,
     },
 
+    /// Revoke an issued client certificate so the daemon refuses it at the next
+    /// WSS handshake (threat A5). The revoke is written to the issued-cert ledger,
+    /// which materializes `<data_dir>/tls/revoked` for the verifier - no daemon
+    /// restart needed. Identify the cert by `--fingerprint` (its SHA-256 hex) or
+    /// `--device` (revokes every active cert that device holds).
+    RevokeClientCert {
+        /// SHA-256 fingerprint (hex) of the certificate to revoke.
+        #[arg(long, conflicts_with = "device", required_unless_present = "device")]
+        fingerprint: Option<String>,
+
+        /// Device id whose active certificates should ALL be revoked.
+        #[arg(
+            long,
+            conflicts_with = "fingerprint",
+            required_unless_present = "fingerprint"
+        )]
+        device: Option<String>,
+    },
+
+    /// List the still-active client certificates issued by this daemon's CA
+    /// (device id, fingerprint, validity) by reading the issued-cert ledger.
+    ListClientCerts {
+        /// Emit machine-readable JSON instead of a text table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Request an on-demand relay node-id rotation. The running daemon mints a
     /// fresh id, registers it alongside the old one for a grace window, then
     /// retires the old id; the new id reaches clients in-band on their next
@@ -2936,6 +2963,87 @@ fn issue_wss_client_cert(
             ca_cert.display(),
             cert_path.display(),
             key_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Revoke an issued client certificate (or every active cert a device holds) in
+/// the daemon ledger, which materializes `<data_dir>/tls/revoked` so the WSS
+/// verifier refuses it at the next handshake (threat A5). The operator-driven
+/// counterpart to `issue-client-cert`.
+#[cfg(feature = "agent-runtime")]
+fn revoke_wss_client_cert(
+    config: &Config,
+    fingerprint: Option<String>,
+    device: Option<String>,
+) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    // `operator` matches the issuance actor `issue-client-cert` records.
+    const ACTOR: &str = "operator";
+    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let changed = if let Some(fp) = fingerprint {
+        let fp = fp.trim().to_ascii_lowercase();
+        if ledger.mark_revoked(&fp, ACTOR)? {
+            println!("Revoked certificate {fp}.");
+            true
+        } else {
+            println!(
+                "No active certificate with fingerprint {fp} (already revoked or never issued)."
+            );
+            false
+        }
+    } else if let Some(device_id) = device {
+        let n = ledger.revoke_device(&device_id, ACTOR)?;
+        println!("Revoked {n} active certificate(s) for device '{device_id}'.");
+        n > 0
+    } else {
+        // clap requires exactly one of --fingerprint / --device; defensive only.
+        anyhow::bail!("provide --fingerprint <hex> or --device <id>");
+    };
+    if changed {
+        println!(
+            "Updated {}; the daemon refuses the revoked certificate(s) at the next connection.",
+            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&config.data_dir).display()
+        );
+    }
+    Ok(())
+}
+
+/// List the still-active client certificates this daemon's CA has issued, read
+/// from the issued-cert ledger. Read-only operator visibility into who holds a
+/// live certificate.
+#[cfg(feature = "agent-runtime")]
+fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let active = ledger.list_active()?;
+    if json {
+        let rows: Vec<serde_json::Value> = active
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "device_id": e.device_id,
+                    "fingerprint": e.fingerprint,
+                    "not_before": e.not_before,
+                    "not_after": e.not_after,
+                    "issued_at": e.issued_at,
+                    "actor": e.actor,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if active.is_empty() {
+        println!("No active client certificates issued by this daemon's CA.");
+        return Ok(());
+    }
+    println!("Active client certificates ({}):", active.len());
+    for e in &active {
+        println!(
+            "  {}  device={}  not_after={}  actor={}",
+            e.fingerprint, e.device_id, e.not_after, e.actor
         );
     }
     Ok(())
@@ -5116,6 +5224,11 @@ async fn main() -> Result<()> {
                 out_dir,
                 force,
             } => issue_wss_client_cert(&config, &name, out_dir, force),
+            SecurityCommands::RevokeClientCert {
+                fingerprint,
+                device,
+            } => revoke_wss_client_cert(&config, fingerprint, device),
+            SecurityCommands::ListClientCerts { json } => list_wss_client_certs(&config, json),
             SecurityCommands::RelayRotateNodeId => {
                 if !config.relay.node_id.trim().is_empty() {
                     anyhow::bail!(
@@ -8051,6 +8164,113 @@ mod tests {
             }
             other => panic!("expected security status command, got {other:?}"),
         }
+    }
+
+    /// Operator revocation through the `revoke-client-cert` handler writes the
+    /// fingerprint into `<data_dir>/tls/revoked` - the exact file the WSS
+    /// verifier reads - so a revoked cert is refused at the next handshake (A5).
+    /// Guards the production trigger for revocation (the path the ledger revoke
+    /// API exposes but nothing operator-facing reached before this command).
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_client_cert_handler_materializes_the_revoked_file() {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry, revoked_list_path,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let fp = "ab".repeat(32); // 64-hex fingerprint
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev_under_test".to_string(),
+                        fingerprint: fp.clone(),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: IssuanceActor::Operator.label(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .expect("record issued");
+        }
+
+        // The operator command revokes by fingerprint.
+        revoke_wss_client_cert(&config, Some(fp.clone()), None).expect("revoke");
+
+        // The verifier's input file now lists the fingerprint, and the ledger
+        // reflects the revocation.
+        let revoked = std::fs::read_to_string(revoked_list_path(&config.data_dir))
+            .expect("read revoked file");
+        assert!(
+            revoked.lines().any(|l| l == fp),
+            "revoked file must list the revoked fingerprint, got: {revoked:?}"
+        );
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        assert_eq!(
+            ledger.status_of(&fp).expect("status"),
+            Some(CertStatus::Revoked)
+        );
+    }
+
+    /// `revoke-client-cert` requires exactly one of --fingerprint / --device,
+    /// and `list-client-certs` parses.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_and_list_client_cert_cli_parsing() {
+        // Neither selector -> rejected.
+        assert!(Cli::try_parse_from(["zeroclaw", "security", "revoke-client-cert"]).is_err());
+        // Both selectors -> rejected (mutually exclusive).
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "security",
+                "revoke-client-cert",
+                "--fingerprint",
+                "ab",
+                "--device",
+                "d",
+            ])
+            .is_err()
+        );
+        // Exactly one selector -> parses.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "security",
+            "revoke-client-cert",
+            "--fingerprint",
+            "abcd",
+        ])
+        .expect("single selector parses");
+        match cli.command {
+            Commands::Security {
+                security_command:
+                    SecurityCommands::RevokeClientCert {
+                        fingerprint,
+                        device,
+                    },
+            } => {
+                assert_eq!(fingerprint.as_deref(), Some("abcd"));
+                assert!(device.is_none());
+            }
+            other => panic!("expected revoke-client-cert, got {other:?}"),
+        }
+        // list-client-certs parses with --json.
+        let cli = Cli::try_parse_from(["zeroclaw", "security", "list-client-certs", "--json"])
+            .expect("list parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                security_command: SecurityCommands::ListClientCerts { json: true }
+            }
+        ));
     }
 
     /// `--rotate` parses and is mutually exclusive with `--new` and
