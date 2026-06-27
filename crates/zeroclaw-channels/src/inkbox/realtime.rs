@@ -83,6 +83,9 @@ pub struct CallMeta {
     pub purpose: Option<String>,
     /// Outbound opening line to say verbatim, when set.
     pub opening: Option<String>,
+    /// On an outbound call, the number we dialed — used to resolve that party's
+    /// contact card (outbound legs carry no `call_id`).
+    pub remote_number: Option<String>,
     /// Our own agent identity (resolved at call start) so the model speaks as
     /// ZeroClaw with the right contact details.
     pub agent_handle: String,
@@ -136,7 +139,8 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
     CallMeta {
         direction: "outbound".into(),
         purpose: ctx.as_ref().and_then(|c| c.purpose.clone()),
-        opening: ctx.and_then(|c| c.opening_message),
+        opening: ctx.as_ref().and_then(|c| c.opening_message.clone()),
+        remote_number: ctx.and_then(|c| c.remote_number),
         ..Default::default()
     }
 }
@@ -600,6 +604,9 @@ pub(super) async fn run_realtime_bridge(
         let client = client.clone();
         let handle = identity.clone();
         let call_id = call_id.clone();
+        // Outbound calls carry no call_id; resolve the party from the number we
+        // dialed (stashed in the call context by inkbox_place_call) instead.
+        let dialed = meta.remote_number.clone();
         let resolved = tokio::task::spawn_blocking(move || {
             let ident = client.get_identity(&handle).ok();
             let (agent_handle, agent_email, agent_phone, phone_id) = match &ident {
@@ -614,48 +621,40 @@ pub(super) async fn run_realtime_bridge(
             let mut caller_name = None;
             let mut caller_card = None;
             let mut direction = String::new();
-            if !call_id.is_empty() && let Some(pid) = phone_id.as_deref() {
+            // The remote party's number: from the call record on inbound (which
+            // also gives us the direction), or the dialed number on outbound.
+            let remote = if !call_id.is_empty() && let Some(pid) = phone_id.as_deref() {
+                match client.calls().get(pid, &call_id) {
+                    Ok(call) => {
+                        direction = call.direction;
+                        call.remote_phone_number
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            format!("[inkbox] could not load call record {call_id}: {e}"),
+                        );
+                        String::new()
+                    }
+                }
+            } else {
+                dialed.unwrap_or_default()
+            };
+            if !remote.is_empty() {
                 // Surface SDK errors: a failed lookup here is the difference
                 // between "unknown caller" and "we couldn't reach Inkbox".
-                match client.calls().get(pid, &call_id) {
-                        Ok(call) => {
-                            direction = call.direction;
-                            let remote = call.remote_phone_number;
-                            if !remote.is_empty() {
-                                match client
-                                    .contacts()
-                                    .lookup(None, None, None, Some(&remote), None)
-                                {
-                                    Ok(found) => {
-                                        if let Some(c) = found.first() {
-                                            caller_name = contact_display_name(c);
-                                            // Reverse-lookup returns a summary (no emails/phones);
-                                            // fetch the full card by id, summary as fallback.
-                                            match client.contacts().get(&c.id.to_string()) {
-                                                Ok(full) => {
-                                                    caller_card = Some(render_contact_card(&full));
-                                                }
-                                                Err(e) => {
-                                                    ::zeroclaw_log::record!(
-                                                        WARN,
-                                                        ::zeroclaw_log::Event::new(
-                                                            module_path!(),
-                                                            ::zeroclaw_log::Action::Note
-                                                        )
-                                                        .with_outcome(
-                                                            ::zeroclaw_log::EventOutcome::Failure
-                                                        ),
-                                                        format!(
-                                                            "[inkbox] caller contact detail fetch failed for {}: {e}",
-                                                            c.id
-                                                        ),
-                                                    );
-                                                    caller_card = Some(render_contact_card(c));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => ::zeroclaw_log::record!(
+                match client.contacts().lookup(None, None, None, Some(&remote), None) {
+                    Ok(found) => {
+                        if let Some(c) = found.first() {
+                            caller_name = contact_display_name(c);
+                            // Reverse-lookup returns a summary (no emails/phones);
+                            // fetch the full card by id, summary as fallback.
+                            match client.contacts().get(&c.id.to_string()) {
+                                Ok(full) => caller_card = Some(render_contact_card(&full)),
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
                                         WARN,
                                         ::zeroclaw_log::Event::new(
                                             module_path!(),
@@ -663,19 +662,22 @@ pub(super) async fn run_realtime_bridge(
                                         )
                                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                                         format!(
-                                            "[inkbox] caller contact lookup failed for call {call_id}: {e}"
+                                            "[inkbox] caller contact detail fetch failed for {}: {e}",
+                                            c.id
                                         ),
-                                    ),
+                                    );
+                                    caller_card = Some(render_contact_card(c));
                                 }
                             }
                         }
-                        Err(e) => ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                            format!("[inkbox] could not load call record {call_id}: {e}"),
-                        ),
                     }
+                    Err(e) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        format!("[inkbox] caller contact lookup failed for {remote}: {e}"),
+                    ),
+                }
             }
             (agent_handle, agent_email, agent_phone, caller_name, caller_card, direction)
         })

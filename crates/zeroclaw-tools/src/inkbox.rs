@@ -149,6 +149,9 @@ pub struct CallContext {
     pub purpose: Option<String>,
     /// Opening line to say verbatim as the first turn, when set.
     pub opening_message: Option<String>,
+    /// The number we dialed, so the bridge can resolve that party's contact
+    /// card (outbound legs carry no `call_id` to look the call record up by).
+    pub remote_number: Option<String>,
 }
 
 static CALL_CONTEXTS: OnceLock<Mutex<HashMap<String, CallContext>>> = OnceLock::new();
@@ -160,11 +163,16 @@ fn call_contexts() -> &'static Mutex<HashMap<String, CallContext>> {
 /// Stash single-use outbound-call context, returning the token to append to the
 /// call WS URL as `context_token`. The voice bridge reclaims it via
 /// [`take_call_context`] when Inkbox connects the audio leg.
-fn stash_call_context(purpose: Option<&str>, opening: Option<&str>) -> String {
+fn stash_call_context(
+    purpose: Option<&str>,
+    opening: Option<&str>,
+    remote_number: Option<&str>,
+) -> String {
     let token = uuid::Uuid::new_v4().to_string();
     let ctx = CallContext {
         purpose: purpose.map(str::to_string).filter(|s| !s.is_empty()),
         opening_message: opening.map(str::to_string).filter(|s| !s.is_empty()),
+        remote_number: remote_number.map(str::to_string).filter(|s| !s.is_empty()),
     };
     call_contexts().lock().insert(token.clone(), ctx);
     token
@@ -428,10 +436,16 @@ impl Tool for InkboxPlaceCall {
                         .map(|t| t.public_host)
                         .map(|host| format!("wss://{host}/phone/media/ws"))
                 });
-                // Port call context (purpose/opening) to the realtime bridge via
-                // a single-use token file the voice handler reads on connect.
-                if ws.is_some() && (purpose.is_some() || opening.is_some()) {
-                    let token = stash_call_context(purpose.as_deref(), opening.as_deref());
+                // Port call context to the realtime bridge via a single-use
+                // token the voice handler reads on connect. Always stash on
+                // outbound (even with no purpose/opening) so the bridge can
+                // resolve the dialed party's contact card.
+                if ws.is_some() {
+                    let token = stash_call_context(
+                        purpose.as_deref(),
+                        opening.as_deref(),
+                        Some(&to_number),
+                    );
                     ws = ws.map(|u| {
                         let sep = if u.contains('?') { '&' } else { '?' };
                         format!("{u}{sep}context_token={token}")
@@ -1030,16 +1044,18 @@ mod tests {
 
     #[test]
     fn call_context_round_trips_in_memory_and_is_single_use() {
-        let token = stash_call_context(Some("confirm order"), None);
+        let token = stash_call_context(Some("confirm order"), None, Some("+15551234567"));
         let ctx = take_call_context(&token).expect("context present");
         assert_eq!(ctx.purpose.as_deref(), Some("confirm order"));
         assert_eq!(ctx.opening_message, None);
+        assert_eq!(ctx.remote_number.as_deref(), Some("+15551234567"));
         // Single-use: a second take finds nothing.
         assert!(take_call_context(&token).is_none());
         // Empty strings are normalized to None.
-        let t2 = stash_call_context(Some(""), Some("hi"));
+        let t2 = stash_call_context(Some(""), Some("hi"), Some(""));
         let c2 = take_call_context(&t2).unwrap();
         assert_eq!(c2.purpose, None);
         assert_eq!(c2.opening_message.as_deref(), Some("hi"));
+        assert_eq!(c2.remote_number, None);
     }
 }
