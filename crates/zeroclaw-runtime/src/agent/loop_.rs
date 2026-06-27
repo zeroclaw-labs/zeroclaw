@@ -1083,6 +1083,27 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
+        // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
+        // exporter's background interval fires. Hold a FlushGuard for the rest of
+        // this body so every return path — including `?` errors — pushes buffered
+        // telemetry before the runtime is torn down. Daemon/cron/subagent callers
+        // pass `interactive = false` and skip this; they rely on periodic export.
+        let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
+        if interactive
+            && matches!(
+                config.observability.backend,
+                zeroclaw_config::schema::ObservabilityBackend::Prometheus
+            )
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Observability backend is Prometheus (pull/scrape model): a one-shot CLI process \
+                 exits before any scraper can pull, so its telemetry will not be collected. \
+                 Prometheus is intended for long-running (daemon) deployments."
+            );
+        }
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -2655,11 +2676,27 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
+        // Populate aggregate token usage from the cost-tracking context that
+        // scoped every `run_tool_call_loop` call above — mirroring the streamed
+        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
+        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
+        // reads the context's own accumulator, which holds the session-wide
+        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
+        // even though usage was tracked.
+        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+            let usage = ctx.snapshot_turn_usage();
+            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+        });
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used: None,
+            tokens_used,
             cost_usd: None,
             channel: Some(channel_name.to_string()),
             agent_alias: Some(agent_alias.to_string()),

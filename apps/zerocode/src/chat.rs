@@ -2926,32 +2926,13 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.rebuild_lines(inner_width);
     }
 
-    let mut lines: Vec<Line> = state.cached_lines.iter().map(borrow_line).collect();
-    let mut transient = false;
-
-    if !state.streaming_text.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-            theme::agent_label_style(),
-        )]));
-        lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
-        transient = true;
-    }
-
-    if state.show_thoughts && !state.streaming_thought.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("(thinking) ", theme::thought_style()),
-            Span::styled(state.streaming_thought.as_str(), theme::dim_style()),
-        ]));
-        transient = true;
-    }
-
-    if state.pending_approval().is_some() {
-        for _ in 0..APPROVAL_OVERLAY_HEIGHT {
-            lines.push(Line::default());
-        }
-        transient = true;
-    }
+    // Determine transient overlays (live streaming / approval) up front from
+    // cheap state reads. Transient frames append uncached lines and must use
+    // the full-buffer path; idle/scroll frames render only the viewport slice.
+    let has_stream_text = !state.streaming_text.is_empty();
+    let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
+    let has_approval = state.pending_approval().is_some();
+    let transient = has_stream_text || has_stream_thought || has_approval;
 
     // Reserve a pinned top row inside the panel for the session's first user
     // message — a recovery reminder that stays put across scroll and reload.
@@ -2982,10 +2963,38 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         inner.height.saturating_sub(first_row_h),
     );
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Build the full line buffer (history + transient overlays) only on
+    // transient frames; idle/scroll frames never materialize the whole
+    // history and instead slice the viewport below.
+    let transient_lines: Vec<Line<'static>> = if transient {
+        let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
+        if has_stream_text {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                theme::agent_label_style(),
+            )]));
+            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
+        }
+        if has_stream_thought {
+            lines.push(Line::from(vec![
+                Span::styled("(thinking) ", theme::thought_style()),
+                Span::styled(state.streaming_thought.clone(), theme::dim_style()),
+            ]));
+        }
+        if has_approval {
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
+        }
+        lines
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
-        p.line_count(inner_width) as u16
+        Paragraph::new(transient_lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16
     } else {
         state.cached_total_rows
     };
@@ -2996,7 +3005,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.scroll_offset.min(max_scroll)
     };
 
-    let p = p.scroll((scroll, 0));
+    // Non-transient frames (idle, scrolling) render only the viewport slice so
+    // per-frame work stays O(visible) instead of O(history). Transient frames
+    // (live streaming, approval overlay) append uncached lines and keep the
+    // full-buffer path.
+    let (render_lines, render_scroll) = if transient {
+        (transient_lines, scroll)
+    } else {
+        state.visible_line_slice(scroll, inner_height)
+    };
+
+    let p = Paragraph::new(render_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
@@ -4299,6 +4320,63 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
+    /// Collect only the cached lines whose wrapped screen rows intersect the
+    /// viewport `[scroll, scroll + height)`, plus the residual scroll within
+    /// the first partially-visible entry. Lets `render_conversation` build a
+    /// `Paragraph` sized to the viewport instead of cloning the whole history
+    /// every frame, so scroll and keystroke latency stay flat as a session
+    /// grows. Returns `(lines, local_scroll)`; an empty slice yields the full
+    /// `scroll` so the caller's clamping is unchanged.
+    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), scroll);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), scroll);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        let local_scroll = scroll.saturating_sub(self.cached_screen_ranges[first].1);
+        (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
+    }
+
+    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), 0);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), 0);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        (
+            self.cached_lines[line_lo..line_hi].to_vec(),
+            self.cached_screen_ranges[first].1,
+        )
+    }
+
     /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
     /// each entry's `Line`s individually, so screen row positions reflect
     /// markdown wrapping (code blocks, tables, etc.). Called after every
@@ -4324,20 +4402,12 @@ impl ChatState {
         }
     }
 
-    /// Rebuild `copy_hit_regions` from `cached_lines`. Walks every cached line,
-    /// tracking its wrapped screen-row offset, and for each code fence records
-    /// the `[Copy]` label cells on both the header and footer bars plus the
-    /// fence's source text, re-wrapped in its Markdown fence (language tag and
-    /// backticks) from the recovered body lines so a copied fence round-trips.
-    /// `scroll` and `body` map global wrapped rows onto screen cells; labels
-    /// scrolled out of view are dropped.
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
-        let mut screen_cursor = 0u16;
-        // (header_row, header_label_col, header_label_cells, lang, accumulated_body)
+        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
         let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
-        for line in &self.cached_lines {
+        for line in &lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 let lang = header_fence_lang(line);
@@ -5200,6 +5270,66 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[test]
+    fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+
+        let total = s.cached_lines.len();
+        assert!(total > 100, "expected a deep history, got {total} lines");
+
+        let height = 20u16;
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let mid_scroll = max_scroll / 2;
+
+        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, height);
+
+        assert!(
+            slice.len() < total,
+            "viewport slice ({}) must be smaller than full history ({total})",
+            slice.len()
+        );
+        assert!(
+            slice.len() <= (height as usize) + 8,
+            "viewport slice ({}) should be bounded near the viewport height ({height}), not the history",
+            slice.len()
+        );
+        assert!(
+            local_scroll < height,
+            "local scroll ({local_scroll}) must land inside the first visible entry, below viewport height ({height})"
+        );
+    }
+
+    #[test]
+    fn visible_line_slice_handles_top_and_bottom_extents() {
+        let mut s = state();
+        for i in 0..50 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        let height = 12u16;
+
+        let (top, top_local) = s.visible_line_slice(0, height);
+        assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
+        assert!(!top.is_empty());
+
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let (bottom, _) = s.visible_line_slice(max_scroll, height);
+        assert!(!bottom.is_empty(), "bottom extent must still yield lines");
     }
 
     #[test]
@@ -6194,6 +6324,38 @@ mod tests {
         assert_eq!(
             state.copy_hit_regions[0].text, "```\nplain text\n```",
             "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+        );
+    }
+
+    #[test]
+    fn copy_regions_track_scroll_with_history_above_viewport() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        let pad = "filler line\n".repeat(200);
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(pad.as_str())));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```rust\nfn main() {}\n```\n",
+        )));
+        state.dirty = LinesDirty::Full;
+        state.rebuild_lines(60);
+
+        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
+        let body = Rect::new(0, 0, 60, 20);
+
+        state.rebuild_copy_regions(60, fence_entry.1, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```rust\nfn main() {}\n```",
+            "scrolled-to fence registers a copy region through the bounded scan"
+        );
+
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "fence far below the viewport registers nothing"
         );
     }
 

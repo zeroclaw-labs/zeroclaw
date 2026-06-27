@@ -4694,7 +4694,15 @@ async fn main() -> Result<()> {
 
         Commands::Browse { path } => browse::handle_browse(path, &config),
 
-        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+        Commands::Sop { sop_command } => match sop_command {
+            // Out-of-band approval verbs talk to the running daemon over the
+            // gateway (they must see the daemon's runs, not a throwaway local
+            // engine). List/Validate/Show stay local + synchronous.
+            cmd @ (SopCommands::Approve { .. }
+            | SopCommands::Deny { .. }
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            other => sop::handle_command(other, &config),
+        },
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -6313,6 +6321,148 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
                 "Failed to connect to gateway: {e}"
             )))
         }
+    }
+}
+
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
+/// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
+/// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
+/// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    let host = config.gateway.host.clone();
+    let port = config.gateway.port;
+    let prefix = config.gateway.path_prefix.as_deref();
+    let client = reqwest::Client::new();
+    match cmd {
+        SopCommands::Pending => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            let pending = body
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
+            } else {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
+                for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
+                    );
+                }
+            }
+            Ok(())
+        }
+        SopCommands::Approve { run_id } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
+        }
+        SopCommands::Deny { run_id, reason } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            sop_admin_post(
+                &client,
+                &url,
+                serde_json::json!({ "run_id": run_id, "reason": reason }),
+            )
+            .await
+        }
+        // List/Validate/Show are dispatched on the local synchronous path.
+        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+    }
+}
+
+/// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+    let status = resp.status();
+    let out: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        println!(
+            "{}",
+            out.get("outcome").and_then(|v| v.as_str()).unwrap_or("ok")
+        );
+        Ok(())
+    } else {
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("request failed");
+        anyhow::bail!("Gateway responded {status}: {detail}");
     }
 }
 

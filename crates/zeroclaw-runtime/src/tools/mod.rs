@@ -1168,18 +1168,11 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
