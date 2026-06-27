@@ -41,6 +41,7 @@ import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
 import SectionPicker, {
   badgeIsGood,
+  badgeTone,
 } from "../components/sections/SectionPicker";
 import SectionNavigator from "../components/sections/SectionNavigator";
 import AddEntityDialog from "../components/sections/AddEntityDialog";
@@ -1653,7 +1654,7 @@ function ConfiguredOnlyPicker({
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {item.badge && (
-              <Badge tone={item.badge === "active" ? "ok" : "neutral"}>
+              <Badge tone={badgeTone(item.badge)}>
                 {item.badge}
               </Badge>
             )}

@@ -213,7 +213,7 @@ export function badgeIsGood(badge: string | undefined): boolean {
 // Map a schema-driven badge string to a calm Badge tone. The badge text
 // itself is rendered verbatim — only the tint is chosen here, so no
 // section/option names are hardcoded.
-function badgeTone(badge: string): BadgeTone {
+export function badgeTone(badge: string): BadgeTone {
   if (badgeIsGood(badge)) return "ok";
   if (badge === "needs setup") return "warn";
   return "neutral";
