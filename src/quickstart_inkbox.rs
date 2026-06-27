@@ -48,8 +48,10 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         return Ok(None);
     };
 
-    // Resolve (api_key, identity handle, existing phone) by signup or pasted key.
-    let Some((api_key, handle, existing_phone)) = (if has_key {
+    // Resolve the identity by signup or pasted key. Each flow owns the phone
+    // question (mirroring Hermes' per-flow provisioning) and reports back the
+    // resolved number plus whether it was *just* provisioned this run.
+    let Some((api_key, handle, phone_number, did_provision)) = (if has_key {
         api_key_flow(&base_url)?
     } else {
         signup_flow(&base_url)?
@@ -62,55 +64,6 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
     fields.insert("identity".into(), handle.clone());
     if base_url != DEFAULT_BASE_URL {
         fields.insert("base_url".into(), base_url.clone());
-    }
-
-    // Phone: server-side only (no config field) — unlocks SMS + voice. Mirror
-    // Hermes `_offer_phone_for_existing`: only offer to provision when the
-    // identity has no number; if it already has one, say nothing and move on.
-    let mut phone_number = existing_phone;
-    let mut did_provision = false;
-    if phone_number.is_none() {
-        println!(
-            "\n  {}",
-            crate::t(
-                "cli-quickstart-inkbox-no-phone",
-                "This agent has no phone number attached.",
-            )
-        );
-        println!(
-            "  {}",
-            crate::t(
-                "cli-quickstart-inkbox-phone-unlocks",
-                "A local US number unlocks SMS and voice for this agent.",
-            )
-        );
-        if let Some(true) = confirm(
-            &crate::t(
-                "cli-quickstart-inkbox-provision-now",
-                "Provision a local phone number now?",
-            ),
-            true,
-        )? {
-            match ob::provision_phone(&base_url, &api_key, &handle) {
-                Ok(number) => {
-                    println!(
-                        "  {} {}",
-                        crate::t("cli-quickstart-inkbox-provisioned", "✓ Provisioned:"),
-                        number
-                    );
-                    phone_number = Some(number);
-                    did_provision = true;
-                }
-                Err(err) => eprintln!(
-                    "  {} {}",
-                    crate::t(
-                        "cli-quickstart-inkbox-provision-failed",
-                        "could not provision a number:",
-                    ),
-                    err
-                ),
-            }
-        }
     }
 
     // Hermes order: SMS opt-in (only when we just provisioned — a pre-existing
@@ -141,9 +94,81 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
     Ok(Some((alias, fields)))
 }
 
-/// Self-signup branch: create a fresh identity and verify it. The fresh
-/// identity has no phone yet, so the third tuple element is always `None`.
-fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+/// Offer to provision a local number when the identity has none, mirroring
+/// Hermes `_offer_phone_for_existing`: stay silent and provision nothing if it
+/// already has one.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the (agent-scoped) key to act as.
+/// * `handle` - the agent handle to attach a number to.
+/// * `current` - the identity's existing phone number, if any.
+///
+/// # Returns
+/// `(phone, did_provision)` — the number to use (existing or freshly minted)
+/// and whether this call provisioned it (gates the SMS opt-in poll).
+fn offer_phone_for_existing(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+    current: Option<String>,
+) -> anyhow::Result<(Option<String>, bool)> {
+    // Already has one — say nothing and move on (Hermes returns immediately).
+    if current.is_some() {
+        return Ok((current, false));
+    }
+    println!(
+        "\n  {}",
+        crate::t(
+            "cli-quickstart-inkbox-no-phone",
+            "This agent has no phone number attached.",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-phone-unlocks",
+            "A local US number unlocks SMS and voice for this agent.",
+        )
+    );
+    if confirm(
+        &crate::t(
+            "cli-quickstart-inkbox-provision-now",
+            "Provision a local phone number now?",
+        ),
+        true,
+    )? != Some(true)
+    {
+        return Ok((None, false));
+    }
+    match ob::provision_phone(base_url, api_key, handle) {
+        Ok(number) => {
+            println!(
+                "  {} {}",
+                crate::t("cli-quickstart-inkbox-provisioned", "✓ Provisioned:"),
+                number
+            );
+            Ok((Some(number), true))
+        }
+        Err(err) => {
+            eprintln!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-provision-failed",
+                    "could not provision a number:",
+                ),
+                err
+            );
+            Ok((None, false))
+        }
+    }
+}
+
+/// Self-signup branch: create a fresh identity, verify it, then offer a number.
+/// Returns `(api_key, handle, phone, did_provision)`.
+fn signup_flow(
+    base_url: &str,
+) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
     println!(
         "  {}",
         crate::t(
@@ -271,11 +296,23 @@ fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<
             ),
         }
     }
-    Ok(Some((signup.api_key, signup.agent_handle, None)))
+    // Fresh identity has no number yet — offer to provision one (Hermes signup
+    // provisions here too), which also arms the SMS opt-in poll.
+    let (phone, did_provision) =
+        offer_phone_for_existing(base_url, &signup.api_key, &signup.agent_handle, None)?;
+    Ok(Some((
+        signup.api_key,
+        signup.agent_handle,
+        phone,
+        did_provision,
+    )))
 }
 
 /// Paste-a-key branch: validate the key and confirm its bound identity.
-fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+/// Returns `(api_key, handle, phone, did_provision)`.
+fn api_key_flow(
+    base_url: &str,
+) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
     let Some(api_key) = password(&crate::t(
         "cli-quickstart-inkbox-paste-key",
         "Paste your Inkbox API key (ApiKey_…)",
@@ -340,8 +377,10 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option
         }
     };
     // The key the channel will store: the pasted key for an agent-scoped key,
-    // or a freshly-minted agent-scoped key for the admin path.
-    let (effective_key, handle): (String, String) = match info.auth {
+    // or a freshly-minted agent-scoped key for the admin path. `created_new`
+    // marks the admin "create a new identity" path, whose phone question is
+    // handled during creation (so we don't re-offer it afterwards).
+    let (effective_key, handle, created_new): (String, String, bool) = match info.auth {
         // Agent-scoped: bound to one identity — use it (warn if the API ever
         // returns more), exactly like Hermes `_pick_agent_scoped`.
         ob::KeyAuth::AgentScoped => {
@@ -377,7 +416,7 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option
                 ),
                 handles[0]
             );
-            (api_key.clone(), handles[0].clone())
+            (api_key.clone(), handles[0].clone(), false)
         }
         // Admin-scoped: pick an existing identity OR create a new one, then mint
         // an agent-scoped key so the gateway never stores the admin key
@@ -401,11 +440,11 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option
             else {
                 return Ok(None);
             };
-            let chosen = if idx < handles.len() {
-                handles[idx].clone()
+            let (chosen, created_new) = if idx < handles.len() {
+                (handles[idx].clone(), false)
             } else {
                 match create_new_identity(base_url, &api_key)? {
-                    Some(h) => h,
+                    Some(h) => (h, true),
                     None => return Ok(None),
                 }
             };
@@ -431,7 +470,7 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option
                 ),
                 chosen
             );
-            (minted, chosen)
+            (minted, chosen, created_new)
         }
     };
 
@@ -449,7 +488,19 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option
                     phone
                 );
             }
-            Ok(Some((effective_key, id.handle, id.phone_number)))
+            let handle = id.handle;
+            let (phone, did_provision) = if created_new {
+                // The create sub-flow already asked about (and may have minted)
+                // a number — don't re-offer; a number present means we just
+                // minted it, which arms the SMS opt-in poll (Hermes parity).
+                let just_provisioned = id.phone_number.is_some();
+                (id.phone_number, just_provisioned)
+            } else {
+                // Existing identity (agent-scoped or admin-pick): offer a number
+                // only if it has none, mirroring `_offer_phone_for_existing`.
+                offer_phone_for_existing(base_url, &effective_key, &handle, id.phone_number)?
+            };
+            Ok(Some((effective_key, handle, phone, did_provision)))
         }
         Err(err) => {
             eprintln!(
