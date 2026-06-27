@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Check, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { t } from '@/lib/i18n';
@@ -77,24 +77,43 @@ export function UpgradeDialog({
   const [status, setStatus] = useState<UpgradeStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reconciled, setReconciled] = useState(false);
-  /** Wall-clock when the `restarting` view was first entered. Used to drive
-   *  the elapsed-time hint shown to the user while we wait for the new
-   *  process to come back up. */
-  const [restartStartedAt, setRestartStartedAt] = useState<number | null>(null);
+  /** True once the restart poll times out without detecting a new version.
+   *  Stops the spinner and shows a manual-refresh hint in its place. */
+  const [pollTimedOut, setPollTimedOut] = useState(false);
+  /** Wall-clock when the `restarting` view was first entered. Stored in a ref
+   *  rather than state so that the initial stamp doesn't cause the restarting
+   *  effect to teardown+rebuild (which would discard the first tick). */
+  const restartStartedAtRef = useRef<number | null>(null);
   /** Ticks once a second while restarting so the elapsed counter re-renders
-   *  without us having to thread state through every poll callback. */
+   *  without us having to thread state through every poll callback. The value
+   *  itself is not used — only the re-render it triggers matters. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [, setRestartTick] = useState(0);
   const canAutoRestart =
     restartMode === 'supervised' || restartMode === 'self_respawn';
   const [autoRestart, setAutoRestart] = useState(true);
+  /** Version that was running when the upgrade started (or when we re-attached
+   *  to an in-progress restart). Kept as both a ref (stable closure capture in
+   *  the polling effect) and state (drives UI guards that re-render on change). */
+  const baselineVersionRef = useRef<string | null>(null);
+  const [baselineVersion, setBaselineVersion] = useState<string | null>(null);
+  const setBaseline = useCallback((v: string | null) => {
+    baselineVersionRef.current = v;
+    setBaselineVersion(v);
+  }, []);
+
+  // Primitive string so the polling effect dep doesn't react to object identity churn.
+  const targetVersion = status?.target_version ?? info?.latest_version ?? null;
 
   // Reset on open, and re-attach to an upgrade that is still running server-side.
   useEffect(() => {
     if (!open) return;
     setError(null);
     setReconciled(false);
+    setPollTimedOut(false);
     setAutoRestart(canAutoRestart);
-    setRestartStartedAt(null);
+    restartStartedAtRef.current = null;
+    setBaseline(null);
     getUpgradeStatus()
       .then((s) => {
         if (s.state === 'running') {
@@ -102,6 +121,7 @@ export function UpgradeDialog({
           setStatus(s);
           setView('progress');
         } else if (s.state === 'restarting') {
+          setBaseline(s.previous_version ?? null);
           setHandoffId(s.handoff_id ?? null);
           setStatus(s);
           setView('restarting');
@@ -120,13 +140,13 @@ export function UpgradeDialog({
         // Don't let Esc dismiss the dialog while we're waiting for the new
         // process — closing here would stop the /api/status reconciliation
         // poll that triggers the auto-reload.
-        if (view === 'restarting') return;
+        if (view === 'restarting' || (view === 'done' && !!baselineVersion && !reconciled && !pollTimedOut)) return;
         onClose();
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [open, view, onClose]);
+  }, [open, view, reconciled, pollTimedOut, baselineVersion, onClose]);
 
   // Poll the upgrade endpoint while running.
   useEffect(() => {
@@ -141,7 +161,11 @@ export function UpgradeDialog({
         else if (s.state === 'failed') {
           setError(s.error ?? 'upgrade failed');
           setView('failed');
-        } else if (s.state === 'restarting') setView('restarting');
+        } else if (s.state === 'restarting') {
+          // Fall back to server's previous_version if baseline wasn't set yet.
+          if (!baselineVersionRef.current) setBaseline(s.previous_version ?? null);
+          setView('restarting');
+        }
       } catch {
         /* keep polling */
       }
@@ -154,54 +178,75 @@ export function UpgradeDialog({
     };
   }, [open, view, handoffId]);
 
-  // While restarting, the gateway exits and the supervisor relaunches it.
-  // Reconcile by polling /api/status until the new version reports in,
-  // then auto-reload the SPA so the user picks up the freshly-shipped
-  // bundle without having to F5 by hand.
+  // Poll /api/status while restarting or done-but-unreconciled; reload when the
+  // new version reports in. Baseline is fixed at upgrade-start time (not derived
+  // from render-time state) so it survives setStatus(null) without drifting.
   useEffect(() => {
-    if (!open || view !== 'restarting') return;
-    // Stamp the start of the wait the first time we enter this view, and
-    // tick a 1Hz counter so the elapsed-time hint re-renders smoothly.
-    if (restartStartedAt == null) setRestartStartedAt(Date.now());
-    const tickId = window.setInterval(() => setRestartTick((n) => n + 1), 1000);
+    const isWaiting =
+      view === 'restarting' ||
+      (view === 'done' && !reconciled && !pollTimedOut);
+    if (!open || !isWaiting) return;
+
+    const baseline = baselineVersionRef.current;
+    // No baseline → skip polling entirely. This prevents an unrelated gateway
+    // restart from triggering a false reload when we have nothing to compare.
+    if (!baseline) return;
+
+    if (view === 'restarting') {
+      if (restartStartedAtRef.current == null) restartStartedAtRef.current = Date.now();
+    }
+    // 1Hz tick only while restarting so the elapsed counter re-renders.
+    const tickId = view === 'restarting'
+      ? window.setInterval(() => setRestartTick((n) => n + 1), 1000)
+      : null;
 
     let active = true;
+    let inFlight = false;
+    // Cancel the reload only when the dialog is dismissed; a view transition
+    // (restarting → done) must not suppress it.
+    let reloadCancelled = false;
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
-    const target = status?.target_version ?? info?.latest_version ?? null;
-    const previous = status?.previous_version ?? info?.current_version ?? null;
+
     const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const s = await getStatus();
         if (!active) return;
         const v = s.version ?? null;
-        if (v && v !== previous && (!target || v === target)) {
+        if (v && v !== baseline && (!targetVersion || v === targetVersion)) {
+          active = false;
+          window.clearInterval(id);
           setReconciled(true);
-          setView('done');
-          // The gateway is back on the new version — the new web bundle is
-          // now being served. Reload after a short pause so the user sees
-          // the success state register before the page swaps out.
+          if (view === 'restarting') setView('done');
           window.setTimeout(() => {
-            if (active) window.location.reload();
+            if (!reloadCancelled) window.location.reload();
           }, RELOAD_AFTER_RECONCILE_MS);
           return;
         }
       } catch {
         /* gateway is down mid-restart — keep polling */
+      } finally {
+        inFlight = false;
       }
-      if (Date.now() > deadline && active) {
-        // Came back on the old version, or never came back in time.
-        setReconciled(false);
-        setView('done');
+      if (!active) return;
+      if (Date.now() > deadline) {
+        active = false;
+        window.clearInterval(id);
+        setPollTimedOut(true);
+        if (view === 'restarting') setView('done');
       }
     };
+
     void tick();
     const id = window.setInterval(() => void tick(), RESTART_POLL_MS);
     return () => {
       active = false;
       window.clearInterval(id);
-      window.clearInterval(tickId);
+      if (tickId !== null) window.clearInterval(tickId);
+      if (!open) reloadCancelled = true;
     };
-  }, [open, view, status, info, restartStartedAt]);
+  }, [open, view, reconciled, pollTimedOut, targetVersion]);
 
   useEffect(() => {
     if (!open) return;
@@ -224,6 +269,9 @@ export function UpgradeDialog({
         auto_restart: autoRestart && canAutoRestart,
       });
       setHandoffId(res.handoff_id);
+      // Capture baseline before setStatus(null) — info?.current_version is the
+      // only reliable source of the old version string at this point.
+      setBaseline(info?.current_version ?? null);
       setStatus(null);
       setView('progress');
     } catch (e) {
@@ -232,9 +280,9 @@ export function UpgradeDialog({
     }
   };
 
-  // Backdrop dismissal is suppressed while restarting — see the Esc handler
-  // above for the same reason. The browser still has the dialog tree.
-  const handleBackdropClick = view === 'restarting' ? undefined : onClose;
+  // Backdrop dismissal is suppressed while restarting or waiting for a manual
+  // restart — closing either would stop the /api/status poll that auto-reloads.
+  const handleBackdropClick = (view === 'restarting' || (view === 'done' && !!baselineVersion && !reconciled && !pollTimedOut)) ? undefined : onClose;
 
   return (
     <div
@@ -422,9 +470,9 @@ export function UpgradeDialog({
               that the page will reload itself the moment the new version
               reports in via /api/status. */}
           {view === 'restarting' && (() => {
-            const target = status?.target_version ?? info?.latest_version ?? null;
-            const elapsedSec = restartStartedAt != null
-              ? Math.max(0, Math.floor((Date.now() - restartStartedAt) / 1000))
+            const startedAt = restartStartedAtRef.current;
+            const elapsedSec = startedAt != null
+              ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
               : 0;
             const deadlineSec = Math.floor(RESTART_TIMEOUT_MS / 1000);
             return (
@@ -438,10 +486,10 @@ export function UpgradeDialog({
                 </div>
                 <div className="text-xs text-pc-text-muted text-center max-w-[20rem]">
                   {t('upgrade.restart_waiting')}
-                  {target && (
+                  {targetVersion && (
                     <>
                       {' '}
-                      <span className="font-mono text-pc-text">v{target}</span>
+                      <span className="font-mono text-pc-text">v{targetVersion}</span>
                     </>
                   )}
                 </div>
@@ -465,11 +513,11 @@ export function UpgradeDialog({
             <div className="text-xs text-pc-text flex flex-col gap-1">
               <div>
                 ✓ {t('upgrade.done')}
-                {reconciled && info?.latest_version && (
+                {reconciled && targetVersion && (
                   <span>
                     {' '}
                     — {t('upgrade.now_running')}{' '}
-                    <span className="font-mono">v{info.latest_version}</span>
+                    <span className="font-mono">v{targetVersion}</span>
                   </span>
                 )}
               </div>
@@ -480,10 +528,23 @@ export function UpgradeDialog({
                 </div>
               )}
               {!reconciled && (
-                <div className="text-pc-text-muted">
-                  {t('upgrade.restart_to_apply')}
-                  {restartHint && (
-                    <code className="ml-1 font-mono text-pc-text">{restartHint}</code>
+                <div className="text-pc-text-muted flex flex-col gap-1">
+                  <div>
+                    {t('upgrade.restart_to_apply')}
+                    {restartHint && (
+                      <code className="ml-1 font-mono text-pc-text">{restartHint}</code>
+                    )}
+                  </div>
+                  {baselineVersion && !pollTimedOut && (
+                    <div className="flex items-center gap-1.5">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      {t('upgrade.waiting_for_restart')}
+                    </div>
+                  )}
+                  {pollTimedOut && (
+                    <div className="text-pc-text-muted">
+                      {t('upgrade.poll_timed_out')}
+                    </div>
                   )}
                 </div>
               )}
@@ -540,12 +601,11 @@ export function UpgradeDialog({
             </Button>
           )}
 
-          {/* During restart we keep the dialog modal — closing it would stop
-              the /api/status polling that auto-reloads when the new process
-              is live. The user can still dismiss with Esc if they really
-              need to, but no inline button invites it. */}
+          {/* During restart or while waiting for manual restart, keep the dialog
+              modal — closing stops the /api/status poll that triggers auto-reload.
+              Once reconciled (reload armed) or on failure, show Close normally. */}
 
-          {(view === 'done' || view === 'failed') && (
+          {(view === 'failed' || (view === 'done' && (reconciled || !baselineVersion || pollTimedOut))) && (
             <Button variant="primary" onClick={onClose}>
               {t('upgrade.close')}
             </Button>
