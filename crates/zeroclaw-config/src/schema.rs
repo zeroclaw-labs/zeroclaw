@@ -8950,18 +8950,18 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
         }
 
         // The transport -> required-leaf relationship is owned by
-        // `McpTransport::required_leaf`; matching on it here keeps the runtime
-        // enforcement and the `x-required-by-transport` schema metadata reading
-        // from the same source.
-        match server.transport.required_leaf() {
-            "command" => {
+        // `McpTransport::required_leaf`, which feeds the `x-required-by-transport`
+        // schema metadata. The validator matches on the `McpTransport` enum so a
+        // new variant is a compile error here rather than a runtime fall-through.
+        match server.transport {
+            McpTransport::Stdio => {
                 if server.command.trim().is_empty() {
                     anyhow::bail!(
                         "mcp.servers[{i}] with transport=stdio requires non-empty command"
                     );
                 }
             }
-            "url" => {
+            McpTransport::Http | McpTransport::Sse => {
                 let url = server
                     .url
                     .as_deref()
@@ -8991,14 +8991,6 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                 if !matches!(parsed.scheme(), "http" | "https") {
                     anyhow::bail!("mcp.servers[{i}].url must use http/https");
                 }
-            }
-            // `required_leaf` only ever returns "command" or "url" today; a new
-            // leaf must add its enforcement here rather than pass unchecked.
-            other => {
-                anyhow::bail!(
-                    "mcp.servers[{i}] transport={} declares required leaf '{other}' with no validation rule",
-                    server.transport.wire_name()
-                );
             }
         }
     }
