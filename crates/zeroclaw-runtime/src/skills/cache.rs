@@ -188,6 +188,20 @@ pub(super) fn cached_load(
     tag: &'static str,
     load: impl FnOnce() -> LoadOutput,
 ) -> LoadOutput {
+    cached_load_in(cache(), dir, allow_scripts, tag, load)
+}
+
+/// Core of [`cached_load`] parameterized over the backing cache store. Production
+/// always passes the process-global [`cache`]; tests can pass a fresh local store
+/// so a hit/miss assertion is isolated from sibling tests (and their
+/// [`invalidate`] calls) under a parallel run.
+fn cached_load_in(
+    cache: &RwLock<HashMap<CacheKey, CacheEntry>>,
+    dir: &Path,
+    allow_scripts: bool,
+    tag: &'static str,
+    load: impl FnOnce() -> LoadOutput,
+) -> LoadOutput {
     if !cache_enabled() {
         return load();
     }
@@ -201,7 +215,7 @@ pub(super) fn cached_load(
     };
 
     {
-        let guard = cache().read().unwrap_or_else(|e| e.into_inner());
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get(&key)
             && entry.signature == signature
         {
@@ -214,7 +228,7 @@ pub(super) fn cached_load(
     // mutates during `load`, its content digest changes, so the *next* call's
     // signature differs from what we store and the entry self-heals.
     let output = load();
-    let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
     guard.insert(
         key,
         CacheEntry {
@@ -246,7 +260,7 @@ mod tests {
 
     #[test]
     fn second_load_is_a_cache_hit() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -271,8 +285,8 @@ mod tests {
             }
         };
 
-        let a = cached_load(&skills_dir, false, "test", load);
-        let b = cached_load(&skills_dir, false, "test", load);
+        let a = cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        let b = cached_load_in(&local_cache, &skills_dir, false, "test", load);
         assert_eq!(a.skills.len(), 1);
         assert_eq!(b.skills.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "loader should run once");
@@ -280,7 +294,7 @@ mod tests {
 
     #[test]
     fn adding_a_skill_invalidates_via_signature() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -293,9 +307,9 @@ mod tests {
             }
         };
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
         write(&skills_dir, "beta", "# Beta\n");
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -306,7 +320,7 @@ mod tests {
 
     #[test]
     fn editing_content_invalidates_via_signature() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -319,14 +333,14 @@ mod tests {
             }
         };
 
-        cached_load(&skills_dir, false, "test", load);
-        // Different length → signature changes even if mtime resolution is coarse.
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        // Different length -> signature changes even if mtime resolution is coarse.
         write(
             &skills_dir,
             "alpha",
             "# Alpha skill, now with a longer body.\n",
         );
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -342,7 +356,7 @@ mod tests {
     // is now a content digest.
     #[test]
     fn same_length_same_mtime_edit_still_busts_cache() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "AAAA\n");
@@ -359,7 +373,7 @@ mod tests {
             }
         };
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         // Rewrite with same byte length, then forcibly restore the original mtime
         // so length + mtime are byte-for-byte identical to the cached state.
@@ -374,7 +388,7 @@ mod tests {
             "test precondition: length unchanged"
         );
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -391,7 +405,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_regular_entry_bypasses_cache_without_hanging() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -413,8 +427,8 @@ mod tests {
 
         // Must return promptly (no hang) and, because the dir can't be signed,
         // run the loader every time instead of caching.
-        cached_load(&skills_dir, false, "test", load);
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -514,9 +528,18 @@ mod tests {
 
     // #7963: the dropped-skill record must ride the cache, so a cache HIT returns
     // the same drops as the miss without re-running (re-auditing) the loader.
+    //
+    // This drives `cached_load_in` against a FRESH LOCAL cache store rather than the
+    // process-global one. The hit/miss assertions (loader runs exactly once; drops
+    // survive the hit) hinge on no other actor touching the entry between the miss
+    // and the hit. The global `invalidate()` clears the whole shared map, and every
+    // sibling cache test calls it on entry, so against the global cache a concurrent
+    // sibling could wipe this entry between the two loads and turn the expected hit
+    // into a miss under the default parallel run. A private store removes that shared
+    // state entirely, so the test is deterministic in parallel.
     #[test]
     fn dropped_records_survive_cache_hit() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -536,7 +559,7 @@ mod tests {
             }
         };
 
-        let first = cached_load(&skills_dir, false, "test", load);
+        let first = cached_load_in(&local_cache, &skills_dir, false, "test", load);
         // On the hit the loader must NOT run; the closure asserts via call count.
         let hit_load = || {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -545,7 +568,7 @@ mod tests {
                 dropped: vec![],
             }
         };
-        let second = cached_load(&skills_dir, false, "test", hit_load);
+        let second = cached_load_in(&local_cache, &skills_dir, false, "test", hit_load);
 
         assert_eq!(first.dropped.len(), 1);
         assert_eq!(
