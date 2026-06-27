@@ -1,0 +1,21 @@
+name: npm Dependency Review
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - web/package-lock.json
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Check npm advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
+        with:
+          fail-on-severity: high

@@ -415,10 +415,16 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-doctor-systemd-linger-enabled = systemd user lingering enabled
+cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+
+# Service lifecycle warnings.
+cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -704,7 +710,13 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
