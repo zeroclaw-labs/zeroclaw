@@ -4159,11 +4159,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hashify"
@@ -5485,15 +5480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lru"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
-dependencies = [
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6291,7 +6277,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
 dependencies = [
- "lru 0.16.4",
+ "lru",
  "nostr",
  "tokio",
 ]
@@ -6315,7 +6301,7 @@ dependencies = [
  "async-wsocket",
  "atomic-destructor",
  "hex",
- "lru 0.16.4",
+ "lru",
  "negentropy",
  "nostr",
  "nostr-database",
@@ -8055,7 +8041,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "kasuari",
- "lru 0.16.4",
+ "lru",
  "strum 0.27.2",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -13541,7 +13527,7 @@ dependencies = [
  "image",
  "lapin",
  "lettre",
- "lru 0.18.0",
+ "lru",
  "mail-parser",
  "matrix-sdk",
  "md5",
@@ -13944,7 +13930,7 @@ dependencies = [
  "indicatif",
  "landlock",
  "libc",
- "lru 0.18.0",
+ "lru",
  "mime_guess",
  "nanohtml2text",
  "opentelemetry",
@@ -14109,7 +14095,7 @@ dependencies = [
  "indicatif",
  "lettre",
  "libc",
- "lru 0.18.0",
+ "lru",
  "mail-parser",
  "mime_guess",
  "nanohtml2text",
