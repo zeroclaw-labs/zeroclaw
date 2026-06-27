@@ -49,6 +49,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-imessage"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Inkbox"),
+        type_keys: &["inkbox"],
+        compiled: cfg!(feature = "channel-inkbox"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Matrix"),
         type_keys: &["matrix"],
         compiled: cfg!(feature = "channel-matrix"),
