@@ -540,7 +540,11 @@ rpc_type! {
     pub struct CronTriggerResult {
         pub id: String,
         pub success: bool,
+        pub status: String,
         pub output: String,
+        pub duration_ms: i64,
+        pub started_at: String,
+        pub finished_at: String,
     }
 }
 

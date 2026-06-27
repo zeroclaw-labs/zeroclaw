@@ -36,24 +36,6 @@ ignore = [
     # transitive via zeroclaw-desktop (tauri -> webkit2gtk); glib 0.18.5 is the
     # latest compatible version with the GTK3 stack; fix requires gtk-rs series bump
     { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
-    # wasmtime -- multiple advisories via extism 1.21.0 which pins wasmtime 41.x;
-    # all CVEs fixed in wasmtime 42.0.2; extism has not released a version with
-    # wasmtime 42+; plugins are feature-gated behind --features plugins-wasm;
-    # the critical aarch64 sandbox-escape CVEs require the Winch compiler backend
-    # which is not enabled in production (default Cranelift backend is unaffected)
-    # Tracking: TBD — replace TBD with a tracking issue number once created
-    # (extism/wasmtime upgrade tracker)
-    { id = "RUSTSEC-2026-0085", reason = "wasmtime flags component panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0086", reason = "wasmtime 64-bit table data leakage (Winch); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0087", reason = "wasmtime f64x2.splat Cranelift segfault; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0088", reason = "wasmtime pooling allocator data leakage; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0089", reason = "wasmtime Winch table.fill panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0091", reason = "wasmtime OOB write transcoding strings; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0092", reason = "wasmtime UTF-16 transcoding panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0093", reason = "wasmtime heap OOB read UTF-16 transcoding; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0094", reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
-    { id = "RUSTSEC-2026-0095", reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; Winch backend not used in production; tracking TBD" },
-    { id = "RUSTSEC-2026-0096", reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; default Cranelift backend on x86-64 unaffected; tracking TBD" },
 ]
 
 [licenses]
