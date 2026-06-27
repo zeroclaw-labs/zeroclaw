@@ -16,7 +16,10 @@
 # Self-checks (hard failures, exit non-zero):
 #   - direct mTLS handshake SUCCEEDS with the client cert (TLS 1.3, Verify OK)
 #   - direct mTLS handshake is REJECTED without a client cert (mandatory mTLS)
-#   - the same mutual-TLS handshake completes end-to-end THROUGH the blind relay
+#   - the relay's OUTER TLS verifies and the daemon bridge is up
+#   - over-the-wire ENROLLMENT: a certless client fetches its first cert with the
+#     pairing code and that cert then completes the mTLS handshake
+#   - an UN-MIGRATED (certless) client fails with an actionable enroll-first hint
 #
 # Nothing here touches a real deployment: it runs on test ports under a scratch
 # dir, and the mTLS/relay code is inert in normal daemon config (no [wss]).
@@ -57,6 +60,7 @@ done
 TB="${ZC_TESTBED_DIR:-${TMPDIR:-/tmp}/zc-mtls-testbed}"
 WSS_PORT="${ZC_WSS_PORT:-9799}"
 RELAY_PORT="${ZC_RELAY_PORT:-8459}"
+ENROLL_PORT="${ZC_ENROLL_PORT:-9783}"
 NODE_ID="${ZC_NODE_ID:-testbed-daemon}"
 PROFILE="${ZC_PROFILE:-release}"
 RELAY_TOKEN="testbed-token"
@@ -130,6 +134,14 @@ node_id = "$NODE_ID"
 token = "$RELAY_TOKEN"
 relay_host = "127.0.0.1"
 relay_ca_path = "$RELAY_TLS_DIR/ca.crt"
+
+# Enrollment endpoint: the bootstrap surface a certless client reaches for its
+# FIRST certificate (server-auth TLS + one-time pairing code, CSR-only). Lets the
+# testbed exercise the over-the-wire enroll flow, not just CLI issuance.
+[enroll]
+enabled = true
+bind = "127.0.0.1"
+port = $ENROLL_PORT
 TOML
 ok "wrote $TB/config.toml (wss :$WSS_PORT, relay :$RELAY_PORT, node '$NODE_ID')"
 
@@ -216,6 +228,54 @@ echo "$out" | grep -q "Verify return code: 0 (ok)" \
   || { echo "$out" | tail -20 >&2; die "relay outer TLS did not verify against its self-provisioned CA"; }
 kill -0 "$DAEMON_PID" 2>/dev/null || die "daemon exited before the relay bridge could register"
 ok "relay outer TLS verified against its own CA; daemon bridge running (deep e2e: cargo test --test relay_full_path)"
+
+# --- 7b. self-check: OVER-THE-WIRE ENROLLMENT -------------------------------
+# Prove the headline frictionless flow: a CERTLESS client fetches its first
+# certificate from the enrollment endpoint using the daemon's one-time pairing
+# code, caches it, and that cert then completes the mutually-authenticated WSS
+# handshake. Driven non-interactively (the pairing code + SAS confirmation are
+# piped on stdin; the SAS human-compare step is trusted for the local testbed).
+say "self-check D: over-the-wire enrollment (certless client -> pairing code -> cert)"
+for _ in $(seq 1 40); do
+  ss -ltn 2>/dev/null | grep -q ":$ENROLL_PORT" && break
+  sleep 0.25
+done
+ss -ltn 2>/dev/null | grep -q ":$ENROLL_PORT" || die "enroll endpoint never bound :$ENROLL_PORT"
+CODE="$(grep -oE 'pairing code[[:space:]]*:[[:space:]]*[A-Za-z0-9]+' "$TB/daemon.log" | head -1 | awk '{print $NF}')"
+[ -n "$CODE" ] || { tail -30 "$TB/daemon.log" >&2; die "could not read the pairing code from daemon.log"; }
+ENROLL_DIR="$TB/enrolled"
+# --enroll enrolls and then proceeds to the normal connect flow; that post-enroll
+# connect (here, via the cached relay whose self-signed outer cert this fresh
+# client does not yet trust) is irrelevant to validating ENROLLMENT itself, so we
+# ignore the exit code and assert the cert was cached, then verify it below.
+printf '%s\ny\n' "$CODE" | ZEROCLAW_CONFIG_DIR="$ENROLL_DIR" "$ZEROCODE" \
+  --enroll --enroll-host 127.0.0.1 --enroll-port "$ENROLL_PORT" \
+  --config-dir "$ENROLL_DIR" > "$TB/enroll.log" 2>&1 || true
+ENR_CRT="$ENROLL_DIR/tls/client.crt"; ENR_KEY="$ENROLL_DIR/tls/client.key"
+[ -f "$ENR_CRT" ] && [ -f "$ENR_KEY" ] \
+  || { cat "$TB/enroll.log" >&2; die "enrollment did not cache a client cert at $ENROLL_DIR/tls"; }
+out="$(echo Q | openssl s_client -connect "127.0.0.1:$WSS_PORT" -tls1_3 \
+  -CAfile "$CA" -cert "$ENR_CRT" -key "$ENR_KEY" 2>&1 || true)"
+echo "$out" | grep -q "Verify return code: 0 (ok)" \
+  || { echo "$out" | tail -20 >&2; die "the ENROLLED cert did not complete the mTLS handshake"; }
+ok "enrolled over the wire and the enrolled cert verifies (TLS 1.3, Verify OK)"
+
+# --- 7c. self-check: UN-MIGRATED CLIENT gets an actionable error -------------
+# A certless client that connects to the always-mTLS WSS plane (non-interactive,
+# so auto-enroll does not fire) must FAIL with an actionable "enroll first"
+# message, never a silent hang or a bare TLS error.
+say "self-check E: un-migrated (certless) client is told to enroll"
+UNMIG_DIR="$TB/unmigrated"
+mkdir -p "$UNMIG_DIR"
+set +e
+out="$(ZEROCLAW_CONFIG_DIR="$UNMIG_DIR" "$ZEROCODE" \
+  --connect "wss://127.0.0.1:$WSS_PORT" --config-dir "$UNMIG_DIR" </dev/null 2>&1)"
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || die "a certless client unexpectedly connected (mTLS not enforced?)"
+echo "$out" | grep -qiE "enroll|client certificate" \
+  || { echo "$out" | tail -20 >&2; die "certless connect failed without an actionable enroll hint"; }
+ok "certless client fails with an actionable enroll-first message (exit $rc)"
 
 # --- 8. done -----------------------------------------------------------------
 echo
