@@ -12,49 +12,20 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use zeroclaw_runtime::rpc::types::{
+    AgentSkillEntry, AgentSkillsResult, SkillBundleEntry, SkillListEntry, SkillsBundlesResult,
+    SkillsListResult, SkillsReadResult,
+};
 use zeroclaw_runtime::skills::{
-    RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillsService,
+    EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillOrigin,
+    SkillsService,
 };
 
 use super::AppState;
 use super::api::require_auth;
 
-// ── Request / response shapes ───────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct BundleEntry {
-    pub alias: String,
-    pub directory: String,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BundlesResponse {
-    pub bundles: Vec<BundleEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SkillEntry {
-    pub bundle: String,
-    pub name: String,
-    pub directory: String,
-    pub frontmatter: SkillFrontmatter,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SkillsListResponse {
-    pub skills: Vec<SkillEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SkillReadResponse {
-    pub bundle: String,
-    pub name: String,
-    pub frontmatter: SkillFrontmatter,
-    pub body: String,
-}
+// ── HTTP-specific request shapes (not shared) ───────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct SkillCreateBody {
@@ -97,10 +68,10 @@ pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderM
     let service = SkillsService::new(&config, install_root);
 
     match service.list_bundles() {
-        Ok(bundles) => Json(BundlesResponse {
+        Ok(bundles) => Json(SkillsBundlesResult {
             bundles: bundles
                 .into_iter()
-                .map(|b| BundleEntry {
+                .map(|b| SkillBundleEntry {
                     alias: b.alias,
                     directory: b.directory.display().to_string(),
                     include: b.include,
@@ -127,10 +98,10 @@ pub async fn handle_list_skills(
     let service = SkillsService::new(&config, install_root);
 
     match service.list_skills(Some(&alias)) {
-        Ok(skills) => Json(SkillsListResponse {
+        Ok(skills) => Json(SkillsListResult {
             skills: skills
                 .into_iter()
-                .map(|s| SkillEntry {
+                .map(|s| SkillListEntry {
                     bundle: s.r#ref.bundle().to_string(),
                     name: s.r#ref.name().to_string(),
                     directory: s.directory.display().to_string(),
@@ -140,6 +111,53 @@ pub async fn handle_list_skills(
         })
         .into_response(),
         Err(e) => service_error_response(e),
+    }
+}
+
+/// `GET /api/agents/:alias/skills` — the agent's *effective* resolved skill set
+/// (workspace / open-skills / plugin / bundle), with provenance (#7757). Unlike
+/// `/api/skills/bundles/:alias/skills` (bundle-only), this mirrors what the
+/// runtime actually loads for the agent, so the dashboard stops rendering an
+/// empty page when an agent has workspace/open-skills/plugin skills.
+pub async fn handle_agent_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(alias): Path<String>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(&config, install_root);
+
+    match service.resolve_effective_skills(&alias) {
+        Ok(skills) => Json(AgentSkillsResult {
+            agent: alias,
+            skills: skills.into_iter().map(agent_skill_entry).collect(),
+        })
+        .into_response(),
+        Err(e) => service_error_response(e),
+    }
+}
+
+/// Map a runtime [`EffectiveSkill`] to its flat wire shape (`origin` string +
+/// optional `plugin`/`bundle` detail). `editable`/`directory` pass through.
+fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
+    let (origin, plugin, bundle) = match s.origin {
+        SkillOrigin::Workspace => ("workspace", None, None),
+        SkillOrigin::OpenSkills => ("open-skills", None, None),
+        SkillOrigin::Plugin(p) => ("plugin", Some(p), None),
+        SkillOrigin::Bundle(a) => ("bundle", None, Some(a)),
+    };
+    AgentSkillEntry {
+        name: s.name,
+        description: s.description,
+        origin: origin.to_string(),
+        plugin,
+        bundle,
+        directory: s.directory.map(|d| d.display().to_string()),
+        editable: s.editable,
     }
 }
 
@@ -200,7 +218,7 @@ pub async fn handle_read_skill(
         Err(e) => return service_error_response(e),
     };
     match service.read_skill(&target) {
-        Ok(doc) => Json(SkillReadResponse {
+        Ok(doc) => Json(SkillsReadResult {
             bundle: target.bundle().to_string(),
             name: target.name().to_string(),
             frontmatter: doc.frontmatter,

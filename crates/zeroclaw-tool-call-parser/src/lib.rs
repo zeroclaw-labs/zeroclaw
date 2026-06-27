@@ -923,8 +923,9 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
     Some((text, calls))
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
+const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
     "<tool_call>",
+    "<tool_calls>",
     "<toolcall>",
     "<tool-call>",
     "<invoke>",
@@ -932,8 +933,9 @@ const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
     "<minimax:toolcall>",
 ];
 
-const TOOL_CALL_CLOSE_TAGS: [&str; 6] = [
+const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
     "</tool_call>",
+    "</tool_calls>",
     "</toolcall>",
     "</tool-call>",
     "</invoke>",
@@ -1612,6 +1614,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         let Some(close_tag) = (match open_tag {
             "<tool_call>" => Some("</tool_call>"),
+            "<tool_calls>" => Some("</tool_calls>"),
             "<toolcall>" => Some("</toolcall>"),
             "<tool-call>" => Some("</tool-call>"),
             "<invoke>" => Some("</invoke>"),
@@ -2422,6 +2425,23 @@ I will now call the tool with this payload:
             calls[0].arguments.get("query").unwrap().as_str().unwrap(),
             "project roadmap"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_plural_tool_calls_wrapper() {
+        // Regression: Llama 4 Scout (via Groq) emits a plural `<tool_calls>`
+        // wrapper rather than the singular `<tool_call>`. The parser must
+        // enter it and execute the call instead of exposing raw XML. See #6875.
+        let (text, calls) = parse_tool_calls(
+            "<tool_calls>\n{\"name\":\"myserver__some_tool\",\"arguments\":{\"key\":\"value\"}}\n</tool_calls>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "myserver__some_tool");
+        assert_eq!(
+            calls[0].arguments.get("key").unwrap().as_str().unwrap(),
+            "value"
+        );
+        assert!(text.is_empty());
     }
 
     #[test]

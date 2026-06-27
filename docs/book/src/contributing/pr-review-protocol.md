@@ -1,6 +1,6 @@
 # PR Review Protocol
 
-This is the procedure followed when reviewing a pull request in `zeroclaw-labs/zeroclaw`. It's loaded by the `github-pr-review-session` skill and read by human reviewers — it's authoritative for both.
+This is the procedure followed when reviewing a pull request in `zeroclaw-labs/zeroclaw`. It's loaded by the `github-pr-review-session` skill and read by human reviewers, it's authoritative for both.
 
 The `gh` CLI is assumed available and authenticated.
 
@@ -10,38 +10,62 @@ Run all of these. The data informs every step that follows.
 
 1. **PR overview**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Description, labels, linked issues, validation evidence.
 
 2. **Top-level conversation**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --comments --repo zeroclaw-labs/zeroclaw
    ```
 
+   </div>
+
 3. **Inline threads (every reply chain)**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/comments --paginate
    ```
 
-   Read full reply chains before drawing any conclusion about whether something is open or settled. Note author commitments made in replies — they're load-bearing.
+   </div>
+
+   Read full reply chains before drawing any conclusion about whether something is open or settled. Note author commitments made in replies, they're load-bearing.
 
 4. **Formal reviews**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/reviews --paginate
    ```
+
+   </div>
 
    Note which `CHANGES_REQUESTED` are still active (not superseded by a later `APPROVED` or `DISMISSED`). Check whether you've already reviewed this PR.
 
 5. **Relevant foundations documents**
 
    Always read FND-005 (Contribution Culture). For others, use the relevance
-   table below — read what applies to the PR's scope. The ratified versions
+   table below, read what applies to the PR's scope. The ratified versions
    are local files; no API call needed.
 
    | Foundation | Local file |
@@ -55,9 +79,15 @@ Run all of these. The data informs every step that follows.
 
 6. **Diff**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr diff <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Read the full diff. Cross-check author commitments from step 3 against what actually shipped. Cross-check against the local repository where the change lands.
 
@@ -92,11 +122,11 @@ Ask the author about labels only when the right label choice is ambiguous or nob
 
 Findings in review bodies and inline comments use this PR-review scale, adapted from FND-005. The `✅ [resolved]` entry is for re-reviews that acknowledge addressed findings.
 
-- **🔴 [blocking]** — must be addressed before merge. Use sparingly; every blocker is real or the scale loses meaning.
-- **🟡 [warning]** — should be addressed; not blocking but the reviewer wants the author to look.
-- **🔵 [suggestion]** — optional. Author can accept or pass.
-- **🟢 [praise]** — what's working. Specific praise teaches what to repeat. Generic "great work" teaches nothing.
-- **✅ [resolved]** — explicitly acknowledging that a prior finding has been addressed in a later commit. Use this when you're re-reviewing — it shows the author their work registered.
+- **🔴 [blocking]**: must be addressed before merge. Use sparingly; every blocker is real or the scale loses meaning.
+- **🟡 [warning]**: should be addressed; not blocking but the reviewer wants the author to look.
+- **🔵 [suggestion]**: optional. Author can accept or pass.
+- **🟢 [praise]**: what's working. Specific praise teaches what to repeat. Generic "great work" teaches nothing.
+- **✅ [resolved]**: explicitly acknowledging that a prior finding has been addressed in a later commit. Use this when you're re-reviewing, it shows the author their work registered.
 
 ## Review body Markdown format
 
@@ -129,20 +159,26 @@ Write as a thoughtful senior contributor who has read everything and cares about
   finding tied to a specific line. Anchor the feedback to the code so the
   author can resolve it inline.
 - **Review body** for overall verdict, comprehension summary, cross-references to other PRs, and template-level issues that aren't tied to a specific line.
-- **Bare commit hashes** (never wrap in backticks — GitHub auto-links bare hashes; backticks block the auto-link).
+- **Bare commit hashes** (never wrap in backticks: GitHub auto-links bare hashes; backticks block the auto-link).
 - **`@`-prefixed usernames** in all review content (chat, body, inline). `@WareWolf-MoonWall`, not `WareWolf-MoonWall`.
 
 ## Posting
 
-Write the review body to a file under `tmp/review-<number>.md` first — this is the source of truth for what was posted and lets the user inspect before publishing. Then:
+Write the review body to a file under `tmp/review-<number>.md` first: this is the source of truth for what was posted and lets the user inspect before publishing. Then:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh pr review <number> --repo zeroclaw-labs/zeroclaw \
   <--approve | --request-changes | --comment> \
   --body-file tmp/review-<number>.md
 ```
 
-Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval — only an unambiguous "yes" / "approve" / "go" does.
+</div>
+
+Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval, only an unambiguous "yes" / "approve" / "go" does.
 
 ## After posting
 

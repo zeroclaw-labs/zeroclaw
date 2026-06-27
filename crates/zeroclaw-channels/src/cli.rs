@@ -27,6 +27,16 @@ impl ::zeroclaw_api::attribution::Attributable for CliChannel {
 
 #[async_trait]
 impl Channel for CliChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // The CLI surface has no remote typing indicator to drive.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // The CLI surface has no remote typing indicator to drive.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "cli"
     }
@@ -37,6 +47,7 @@ impl Channel for CliChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let _utf8_erase_guard = zeroclaw_runtime::cli_input::ensure_terminal_utf8_erase();
         let stdin = io::stdin();
         let reader = BufReader::new(stdin);
         let mut lines = reader.lines();

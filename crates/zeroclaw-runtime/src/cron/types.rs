@@ -161,7 +161,9 @@ pub struct CronJob {
     pub delete_after_run: bool,
     /// Optional allowlist of tool names this cron job may use.
     /// When `Some(list)`, only tools whose name is in the list are available.
-    /// When `None`, all tools are available (backward compatible default).
+    /// When `None`, this job does not add an allowlist. Agent cron jobs may
+    /// still receive scheduler-level default exclusions for scheduler mutation
+    /// tools unless they opt back in with an explicit allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.

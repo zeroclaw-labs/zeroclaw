@@ -71,7 +71,7 @@ ZeroClaw supports layered secret management for local development.
 **Storage options:**
 
 1. **Environment variables** (recommended for development) — copy `.env.example` to `.env` and fill in values. `.env` is git-ignored.
-2. **Config file** (`~/.zeroclaw/config.toml`) — when `secrets.encrypt = true` (default), values are encrypted with the key at `~/.zeroclaw/.secret_key`. Use `zeroclaw onboard` for guided setup.
+2. **Config file** (`~/.zeroclaw/config.toml`) — when `secrets.encrypt = true` (default), values are encrypted with the key at `~/.zeroclaw/.secret_key`. Use `zeroclaw quickstart` for guided setup.
 
 **API key resolution order:**
 

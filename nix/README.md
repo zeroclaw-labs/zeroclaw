@@ -85,8 +85,10 @@ services.zeroclaw.instances = {
 
 Each instance gets its own systemd unit, state directory, and per-instance
 system user. The module asserts at evaluation time that no two instances
-share a `dataDir` or `user`, and that instance names are valid systemd unit
-component names (`[A-Za-z0-9._-]+`).
+share a `dataDir`, that no two module-created users have the same `user`, and
+that instance names are valid systemd unit component names
+(`[A-Za-z0-9._-]+`). Instances may intentionally share a user when exactly one
+instance creates it and the others set `createUser = false`.
 
 ## Option summary
 
@@ -218,6 +220,8 @@ Requires KVM on the builder.
 
 ## Status
 
-Initial drop, not yet wired into ZeroClaw's CI. The CI workflow at
-`.github/workflows/ci.yml` is Rust-only today; adding a `nix-test` job to
-exercise `nix/test.nix` is a natural follow-up.
+The required CI gate runs a low-cost Nix module eval check through
+`checks.x86_64-linux.nixos-module-eval`. That check covers assertion-level
+contract regressions without requiring KVM. The full `nix/test.nix` VM test
+remains a manual or future heavier CI check because it needs a KVM-capable
+builder.

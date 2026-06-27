@@ -860,6 +860,11 @@ mod tests {
                 .cloned()
                 .or_else(|| self.inner.get_session_metadata(session_key))
         }
+
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.metadata.lock().unwrap().contains_key(session_key)
+                || self.inner.session_exists(session_key)
+        }
     }
 
     fn session_metadata(

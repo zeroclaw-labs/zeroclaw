@@ -1,6 +1,6 @@
 # Privacy and PII Discipline
 
-ZeroClaw artifacts are public — git history, releases, fixtures, snapshots, the docs book, every rendered locale. Anything you commit ships with the project forever. Treat privacy as a merge gate, not best-effort.
+ZeroClaw artifacts are public, git history, releases, fixtures, snapshots, the docs book, every rendered locale. Anything you commit ships with the project forever. Treat privacy as a merge gate, not best-effort.
 
 ## Never commit any of these
 
@@ -27,13 +27,13 @@ Test fixtures, examples, error messages, and snapshots use generic project-scope
 | Hostnames | `example.com`, `host.invalid`, `192.0.2.x` (RFC 5737 documentation range) |
 | Email addresses | `user@example.com`, `bot@zeroclaw.invalid` |
 
-Test names, assertion messages, and fixture content stay impersonal and system-focused — avoid first-person language and identity-specific framing.
+Test names, assertion messages, and fixture content stay impersonal and system-focused: avoid first-person language and identity-specific framing.
 
 ## When you have to reference identity
 
-If a test or doc genuinely needs a role-shaped identity, use ZeroClaw-scoped roles only: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`. Don't borrow real names, even pseudonyms — pseudonyms drift back into being real over time.
+If a test or doc genuinely needs a role-shaped identity, use ZeroClaw-scoped roles only: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`. Don't borrow real names, even pseudonyms: pseudonyms drift back into being real over time.
 
-GitHub `@`-mentions in PR/issue comments are different — addressing a contributor by their handle is how you talk to people on GitHub, and `@WareWolf-MoonWall` is not a privacy violation. The rule is about **content stored in the repo** (code, tests, fixtures, docs), not about conversation in PR/issue threads.
+GitHub `@`-mentions in PR/issue comments are different: addressing a contributor by their handle is how you talk to people on GitHub, and `@WareWolf-MoonWall` is not a privacy violation. The rule is about **content stored in the repo** (code, tests, fixtures, docs), not about conversation in PR/issue threads.
 
 ## Reproducing external incidents
 
@@ -43,14 +43,20 @@ If you're capturing an incident trace, log payload, or external response in a te
 
 Before pushing, scan the staged diff specifically for identity leakage:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git diff --cached
 ```
 
+</div>
+
 The shapes to look for: anything that looks like an email, a URL with a non-public hostname, a long random-looking string that might be a token, a name that isn't yours and didn't come from a project-scoped placeholder.
 
-If a CI run captured a real value (a real session ID in a snapshot, a real user agent string with identifying info, etc.) and got committed, it's a privacy incident — open an issue, scrub, force-push if it just landed, and contact the maintainers if it landed on `master`.
+If a CI run captured a real value (a real session ID in a snapshot, a real user agent string with identifying info, etc.) and got committed, it's a privacy incident: open an issue, scrub, force-push if it just landed, and contact the maintainers if it landed on `master`.
 
 ## Why this is strict
 
-The last category — accidentally committing a real identity — is hard to undo. Once a real name or email lands on `master` it propagates through forks, mirrors, and clones immediately. Squashing or force-pushing fixes the public branch but doesn't reach the copies. The cheapest fix is the pre-commit scan; everything after that is harm reduction.
+The last category, accidentally committing a real identity, is hard to undo. Once a real name or email lands on `master` it propagates through forks, mirrors, and clones immediately. Squashing or force-pushing fixes the public branch but doesn't reach the copies. The cheapest fix is the pre-commit scan; everything after that is harm reduction.

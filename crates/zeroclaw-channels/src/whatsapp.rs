@@ -271,7 +271,7 @@ impl WhatsAppChannel {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"normalized_from": normalized_from})),
-                            "ignoring message from unauthorized number: . Add to channels.whatsapp.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                            "ignoring message from unauthorized number: . Add to channels.whatsapp.allowed_numbers in config.toml, or run `zeroclaw config set channels.whatsapp.allowed-numbers='[\"<msisdn>\"]'`."
                         );
                         continue;
                     }
@@ -484,6 +484,16 @@ impl Channel for WhatsAppChannel {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing indicator not wired for the WhatsApp Cloud API path.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing indicator not wired for the WhatsApp Cloud API path.
+        Ok(())
     }
 }
 

@@ -4,80 +4,12 @@ Routing happens at the **agent layer**. Each agent points at exactly one provide
 
 Two layers of decisions:
 
-1. **Per-call backend selection** — "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
-2. **Provider reliability** — vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
+1. **Per-call backend selection**: "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
+2. **Provider reliability**: vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
 
 ## Per-agent dispatch
 
 Define each routing target as its own agent, then point channels at the agent that should handle their traffic.
-
-```toml
-[providers.models.anthropic.sonnet]
-model   = "claude-sonnet-4-6"
-api_key = "sk-ant-..."
-
-[providers.models.anthropic.haiku]
-model   = "claude-haiku-4-5-20251001"
-api_key = "sk-ant-..."
-
-[providers.models.deepseek.reasoner]
-model   = "deepseek-reasoner"
-api_key = "sk-..."
-
-[providers.models.gemini.vision]
-model   = "gemini-2.5-pro"
-api_key = "..."
-
-[channels.telegram.home]
-bot_token = "..."
-
-[channels.slack.engineering]
-bot_token = "..."
-
-[channels.slack.research]
-bot_token = "..."
-
-[channels.discord.media]
-bot_token = "..."
-
-[agents.fast]
-model_provider  = "anthropic.haiku"
-risk_profile    = "hardened"
-runtime_profile = "tight"             # snappy public replies
-channels        = ["telegram.home"]
-
-[agents.deep]
-model_provider  = "anthropic.sonnet"
-risk_profile    = "hardened"
-runtime_profile = "deep"              # extended engineering tasks
-channels        = ["slack.engineering"]
-
-[agents.reasoner]
-model_provider  = "deepseek.reasoner"
-risk_profile    = "hardened"
-runtime_profile = "deep"              # research-style reasoning chains
-channels        = ["slack.research"]
-
-[agents.eyes]
-model_provider  = "gemini.vision"
-risk_profile    = "hardened"
-runtime_profile = "tight"             # quick image-bearing replies
-channels        = ["discord.media"]
-
-[risk_profiles.hardened]
-level                            = "supervised"
-workspace_only                   = true
-require_approval_for_medium_risk = true
-block_high_risk_commands         = true
-
-[runtime_profiles.tight]
-max_tool_iterations  = 5
-max_actions_per_hour = 30
-
-[runtime_profiles.deep]
-max_tool_iterations  = 50
-max_actions_per_hour = 200
-```
 
 Each channel binds to one agent. Channels move between agents by editing `channels = [...]` on the agent that should pick them up; `Config::validate()` makes sure references resolve.
 
@@ -85,16 +17,21 @@ For ad-hoc multi-step routing inside a single conversation, the `spawn_subagent`
 
 ## Hint-based model routes
 
-A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent.
-
-```toml
-[[model_routes]]
-hint           = "reasoning"
-model_provider = "deepseek"
-model          = "deepseek-reasoner"
-```
+A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent. Each route entry carries a `hint` (the string a prompt must declare to fire it), a `model_provider` (the dotted `<type>.<alias>` profile to switch to, e.g. `deepseek.reasoner`), and a `model` (the provider-local model id, e.g. `deepseek-reasoner`). Configure routes through the gateway, zerocode, or `zeroclaw config set`; see the [Config reference](../reference/config.md#model_routes) for the field schema.
 
 Routes only fire when a prompt explicitly carries the matching hint. The default request path uses the agent's primary `model_provider`.
+
+`model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model. The `model` field is provider-local state under that profile.
+
+## Runtime model switching
+
+Runtime switches use the same provider-profile contract as config-backed routing:
+
+- `/models <type>.<alias>` selects the active provider profile for the sender session. Channel runtimes can also accept a bare `<type>` shorthand when exactly one configured alias exists for that provider family.
+- `/model <model-id>` selects a model within the active provider profile. If the value matches a `[[model_routes]]` hint or model, that route can switch both provider profile and model together.
+- The `model_switch` tool uses `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`.
+
+Runtime switches are session/runtime state. They do not edit `config.toml`; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as `openai` are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.
 
 ## Observability
 
@@ -110,6 +47,6 @@ For production deployments, wire the log output to Loki / Grafana. See [Operatio
 
 ## See also
 
-- [Overview](./overview.md) — provider model and per-agent dispatch
-- [Configuration](./configuration.md) — full `[providers.*]` schema
-- [Provider catalog](./catalog.md) — every canonical slot
+- [Overview](./overview.md): provider model and per-agent dispatch
+- [Configuration](./configuration.md): full `[providers.*]` schema
+- [Provider catalog](./catalog.md): every canonical slot

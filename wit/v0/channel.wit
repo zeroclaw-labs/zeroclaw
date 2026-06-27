@@ -1,0 +1,310 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Plugin interface for a messaging platform channel.
+@unstable(feature = plugins-wit-v0)
+interface channel {
+    @unstable(feature = plugins-wit-v0)
+    use types.{json-string};
+
+    // ── Types ─────────────────────────────────────────────────────────────────
+
+    /// A media file attached to an inbound or outbound message.
+    ///
+    /// Note: `data` carries the full raw bytes across the WASM boundary. For
+    /// large attachments (audio, video) this may be several megabytes. A
+    /// resource-handle model can be introduced in a future revision if needed.
+    @unstable(feature = plugins-wit-v0)
+    record media-attachment {
+        /// Original file name (e.g. `voice.ogg`, `photo.jpg`).
+        file-name: string,
+        /// Raw file bytes.
+        data: list<u8>,
+        /// MIME type when known (e.g. `audio/ogg`, `image/jpeg`).
+        mime-type: option<string>,
+    }
+
+    /// An inbound message received from the platform.
+    @unstable(feature = plugins-wit-v0)
+    record inbound-message {
+        id: string,
+        sender: string,
+        reply-target: string,
+        content: string,
+        /// Platform type identifier (e.g. `"telegram"`, `"discord"`).
+        channel: string,
+        /// ZeroClaw channel alias, when the platform supports multiple bot
+        /// instances. Used to compute distinct session IDs per bot.
+        channel-alias: option<string>,
+        /// Unix timestamp in milliseconds.
+        timestamp: u64,
+        /// Platform thread identifier for threaded replies (e.g. Slack `ts`).
+        thread-ts: option<string>,
+        /// Thread scope ID for interruption/cancellation grouping. `none` for
+        /// top-level messages.
+        interruption-scope-id: option<string>,
+        attachments: list<media-attachment>,
+        /// Email subject for reply threading.
+        subject: option<string>,
+    }
+
+    /// A message to send through the channel.
+    ///
+    /// Note: `cancellation-token` from the Rust `SendMessage` is omitted; it is
+    /// a host-side Rust concept with no meaning inside the plugin boundary.
+    @unstable(feature = plugins-wit-v0)
+    record send-message {
+        content: string,
+        recipient: string,
+        subject: option<string>,
+        /// Platform thread identifier for threaded replies.
+        thread-ts: option<string>,
+        attachments: list<media-attachment>,
+        /// Message-ID to set as `In-Reply-To` for email threading.
+        in-reply-to: option<string>,
+    }
+
+    /// A compact description of a tool call presented to the operator for
+    /// approval.
+    @unstable(feature = plugins-wit-v0)
+    record approval-request {
+        tool-name: string,
+        arguments-summary: string,
+        /// JSON-encoded raw arguments; `none` when not available.
+        raw-arguments: option<json-string>,
+    }
+
+    /// The operator's response to a channel-presented approval prompt.
+    @unstable(feature = plugins-wit-v0)
+    variant approval-response {
+        /// Execute this one call.
+        approve,
+        /// Deny this call.
+        deny,
+        /// Execute and add the tool to the session-scoped allowlist.
+        always-approve,
+        /// Deny this call and supply an edited replacement for the arguments.
+        deny-with-edit(string),
+    }
+
+    /// Bitmask of optional capabilities this plugin implements.
+    ///
+    /// The runtime calls `get-channel-capabilities` once at load time. For each
+    /// unset flag it uses the Rust trait default instead of calling the plugin:
+    ///   `health-check`                     → `true`
+    ///   `self-handle`                      → `none`
+    ///   `self-addressed-mention`           → `none`
+    ///   `drop-self-message`                → `false`
+    ///   `start-typing` / `stop-typing`     → `ok(())`
+    ///   `supports-draft-updates`           → `false`
+    ///   `send-draft`                       → `ok(none)`
+    ///   `update-draft` /
+    ///   `update-draft-progress` /
+    ///   `finalize-draft` /
+    ///   `cancel-draft`                     → `ok(())`
+    ///   `supports-multi-message-streaming` → `false`
+    ///   `multi-message-delay-ms`           → `800`
+    ///   `add-reaction` / `remove-reaction` /
+    ///   `pin-message` / `unpin-message` /
+    ///   `redact-message`                   → `ok(())`
+    ///   `request-approval`                 → `ok(none)`
+    ///   `request-choice`                   → `ok(none)`
+    ///   `supports-free-form-ask`           → `true`
+    ///
+    /// All corresponding functions must still be exported by the plugin
+    /// (stub implementations are sufficient); the runtime simply never calls
+    /// them when the flag is absent.
+    @unstable(feature = plugins-wit-v0)
+    flags channel-capabilities {
+        health-check,
+        self-handle,
+        self-addressed-mention,
+        drop-self-message,
+        start-typing,
+        stop-typing,
+        supports-draft-updates,
+        supports-multi-message-streaming,
+        multi-message-delay-ms,
+        send-draft,
+        update-draft,
+        update-draft-progress,
+        finalize-draft,
+        cancel-draft,
+        add-reaction,
+        remove-reaction,
+        pin-message,
+        unpin-message,
+        redact-message,
+        request-approval,
+        request-choice,
+        supports-free-form-ask,
+    }
+
+    // ── Required methods (no Rust default) ────────────────────────────────────
+
+    /// Human-readable channel name.
+    name: func() -> string;
+
+    /// Send a message through this channel.
+    send: func(message: send-message) -> result<_, string>;
+
+    /// Non-blocking poll for the next inbound message.
+    ///
+    /// Returns `none` immediately if no message is queued. The runtime is
+    /// expected to yield between calls (e.g. with exponential back-off up to
+    /// ~50 ms) to avoid busy-looping on the blocking-thread pool.
+    poll-message: func() -> option<inbound-message>;
+
+    /// Return the set of optional capabilities this plugin implements.
+    /// Called once by the runtime at plugin load time.
+    get-channel-capabilities: func() -> channel-capabilities;
+
+    // ── Capability-gated methods ──────────────────────────────────────────────
+    // The runtime only calls these when the corresponding flag is set in the
+    // value returned by `get-channel-capabilities`. Export a stub returning the
+    // Rust trait default value for any capability you do not implement.
+
+    /// Return `true` if the channel is reachable and operational.
+    /// Stub: return `true`.
+    health-check: func() -> bool;
+
+    /// Return the bot's own handle on this platform (e.g. `@my_bot`).
+    /// Used by the runtime's self-loop guard to drop inbound messages sent by
+    /// the bot itself.
+    /// Stub: return `none`.
+    self-handle: func() -> option<string>;
+
+    /// Return the mention form of the bot's handle as users would address it
+    /// (e.g. `<@123456>` on Discord, `@my_bot` on Telegram). Injected verbatim
+    /// into the per-channel system prompt.
+    /// Stub: return `none`.
+    self-addressed-mention: func() -> option<string>;
+
+    /// Whether the orchestrator should drop an inbound message as
+    /// self-authored (multi-agent self-loop guard).
+    /// Stub: return `false`.
+    drop-self-message: func(msg: inbound-message) -> bool;
+
+    /// Signal that the bot is composing a response (typing indicator).
+    /// Stub: return `ok(())`.
+    start-typing: func(recipient: string) -> result<_, string>;
+
+    /// Clear any active typing indicator.
+    /// Stub: return `ok(())`.
+    stop-typing: func(recipient: string) -> result<_, string>;
+
+    /// Return `true` if this channel supports progressive draft-message edits.
+    /// Stub: return `false`.
+    supports-draft-updates: func() -> bool;
+
+    /// Send an initial draft message. Returns a platform message-ID for later
+    /// edits via `update-draft`, `finalize-draft`, or `cancel-draft`.
+    /// Stub: return `ok(none)`.
+    send-draft: func(message: send-message) -> result<option<string>, string>;
+
+    /// Replace a draft's content with new accumulated text.
+    /// Stub: return `ok(())`.
+    update-draft: func(
+        recipient: string,
+        message-id: string,
+        text: string,
+    ) -> result<_, string>;
+
+    /// Replace a draft's content with a progress/status update.
+    /// Stub: return `ok(())`.
+    update-draft-progress: func(
+        recipient: string,
+        message-id: string,
+        text: string,
+    ) -> result<_, string>;
+
+    /// Finalize a draft with the complete response (may apply platform
+    /// formatting such as Markdown rendering).
+    /// Stub: return `ok(())`.
+    finalize-draft: func(
+        recipient: string,
+        message-id: string,
+        text: string,
+    ) -> result<_, string>;
+
+    /// Cancel and remove a previously sent draft.
+    /// Stub: return `ok(())`.
+    cancel-draft: func(recipient: string, message-id: string) -> result<_, string>;
+
+    /// Return `true` if this channel supports multi-message streaming delivery.
+    /// Stub: return `false`.
+    supports-multi-message-streaming: func() -> bool;
+
+    /// Minimum delay in milliseconds between paragraphs in multi-message mode.
+    /// Stub: return `800`.
+    multi-message-delay-ms: func() -> u64;
+
+    /// Add an emoji reaction to a message.
+    /// Stub: return `ok(())`.
+    add-reaction: func(
+        channel-id: string,
+        message-id: string,
+        emoji: string,
+    ) -> result<_, string>;
+
+    /// Remove an emoji reaction previously added by this bot.
+    /// Stub: return `ok(())`.
+    remove-reaction: func(
+        channel-id: string,
+        message-id: string,
+        emoji: string,
+    ) -> result<_, string>;
+
+    /// Pin a message in the channel.
+    /// Stub: return `ok(())`.
+    pin-message: func(channel-id: string, message-id: string) -> result<_, string>;
+
+    /// Unpin a previously pinned message.
+    /// Stub: return `ok(())`.
+    unpin-message: func(channel-id: string, message-id: string) -> result<_, string>;
+
+    /// Delete (redact) a message from the channel.
+    /// Stub: return `ok(())`.
+    redact-message: func(
+        channel-id: string,
+        message-id: string,
+        reason: option<string>,
+    ) -> result<_, string>;
+
+    /// Present a tool-call approval prompt to the operator. Returns `none` if
+    /// the channel does not implement interactive approval (caller falls back to
+    /// auto-deny).
+    /// Stub: return `ok(none)`.
+    request-approval: func(
+        recipient: string,
+        request: approval-request,
+    ) -> result<option<approval-response>, string>;
+
+    /// Ask the operator a multiple-choice question. `timeout-secs` is the
+    /// maximum time to wait for a response. Returns `none` on timeout or when
+    /// the channel does not implement choice prompts.
+    /// Stub: return `ok(none)`.
+    request-choice: func(
+        question: string,
+        choices: list<string>,
+        timeout-secs: u64,
+    ) -> result<option<string>, string>;
+
+    /// Return `true` if this channel can handle free-form (no-choices)
+    /// `ask-user` questions via the standard send + poll flow.
+    /// Stub: return `true`.
+    supports-free-form-ask: func() -> bool;
+}
+
+/// A component that exports `channel` is a messaging-platform channel plugin.
+///
+/// Required (no Rust default): `name`, `send`, `poll-message`,
+/// `get-channel-capabilities`.
+///
+/// All other methods are capability-gated; see `channel-capabilities` for the
+/// Rust trait default each unset flag resolves to.
+@unstable(feature = plugins-wit-v0)
+world channel-plugin {
+    import logging;
+    export plugin-info;
+    export channel;
+}

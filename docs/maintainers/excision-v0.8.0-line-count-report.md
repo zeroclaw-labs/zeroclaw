@@ -60,7 +60,7 @@ The v0.8.0 branch grows the repo by **+17,660 lines total**, of which:
 | zeroclaw-gateway           | 8,759        | 9,323        | +564   |
 | zeroclaw-channels          | 34,556       | 34,576       | +20    |
 | zeroclaw-api               | 1,511        | 1,536        | +25    |
-| zeroclaw-tui               | 704          | 705          | +1     |
+| zerocode               | 704          | 705          | +1     |
 | zeroclaw-tool-call-parser  | 1,168        | 1,168        | 0      |
 | zeroclaw-hardware          | 5,760        | 5,760        | 0      |
 | zeroclaw-plugins           | 954          | 954          | 0      |

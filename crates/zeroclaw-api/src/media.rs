@@ -20,6 +20,18 @@ pub struct MediaAttachment {
 
 impl MediaAttachment {
     /// Load an attachment from a file path on disk.
+    ///
+    /// # Caller path-validation contract
+    ///
+    /// This method reads the path supplied by the caller verbatim.  **Callers
+    /// are responsible for validating or constraining `path` before calling
+    /// this function when the path originates from untrusted input** (e.g. a
+    /// user message, an HTTP request body, or any external data source).  No
+    /// sandboxing or path canonicalization is performed here.
+    ///
+    /// Read errors are propagated as `Err` rather than silently producing an
+    /// empty attachment, so the caller can decide how to handle missing or
+    /// unreadable files.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let p = std::path::Path::new(path);
         let data = std::fs::read(p)?;

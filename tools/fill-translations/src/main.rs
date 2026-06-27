@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use xtask::cmd::mdbook::protected::{contains_generated_toml_block, preservation_prompt};
 
 #[derive(Parser)]
 #[command(about = "Fill empty/fuzzy .po entries via a configured model_provider")]
@@ -17,9 +18,13 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// ModelProvider name from [providers.models.<name>] in config.toml
+    /// ModelProvider alias from `[providers.models.<kind>.<alias>]` in config.toml
     #[arg(long)]
     model_provider: String,
+    /// Config directory holding config.toml and .secret-key (default:
+    /// ~/.zeroclaw). Mirrors `zeroclaw --config-dir`.
+    #[arg(long)]
+    config_dir: Option<String>,
     /// Path for appending full input/output on every failure (default: {po}.failures.log)
     #[arg(long)]
     log_failures: Option<PathBuf>,
@@ -59,53 +64,6 @@ fn chrono_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("epoch={secs}")
-}
-
-struct ProviderConfig {
-    base_url: String,
-    model: String,
-}
-
-fn read_model_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
-    let home =
-        std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
-    let candidates = [
-        format!("{home}/.zeroclaw/config.toml"),
-        format!("{home}/.config/zeroclaw/config.toml"),
-    ];
-    let raw = candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .ok_or_else(|| {
-            anyhow::Error::msg("config.toml not found (tried ~/.zeroclaw/config.toml)")
-        })?;
-    let table: toml::Table = raw.parse()?;
-    let model_provider = table
-        .get("providers")
-        .and_then(|v| v.get("models"))
-        .and_then(|v| v.get(provider_name))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "[providers.models.{provider_name}] not found in config.toml"
-            ))
-        })?;
-    let model = model_provider
-        .get("model")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "No model set for model_provider '{provider_name}': add `model = \"...\"` to [providers.models.{provider_name}]"
-            ))
-        })?
-        .to_string();
-    Ok(ProviderConfig {
-        base_url: model_provider
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:11434")
-            .to_string(),
-        model,
-    })
 }
 
 /// A parsed .po entry, carrying line positions so we can rewrite in place.
@@ -164,6 +122,10 @@ enum LeakCheck {
 /// often appends the actual translation at the end. The leak is structural: the response
 /// is far longer than any plausible translation of `source`, or starts with a bullet list.
 fn check_for_leak(source: &str, response: &str) -> LeakCheck {
+    if contains_generated_toml_block(source, response) {
+        return LeakCheck::Unrecoverable;
+    }
+
     let leak_threshold = source.len().saturating_mul(4).max(120);
     let looks_like_bullets = response.trim_start().starts_with("- ") && response.contains("\\n- ");
     let too_long = response.len() > leak_threshold;
@@ -203,6 +165,22 @@ fn encode_po_string(s: &str) -> String {
         }
     }
     out
+}
+
+fn replace_msgstr_line(lines: &mut Vec<String>, msgstr_line: usize, value: &str) {
+    lines[msgstr_line] = format!("msgstr \"{}\"", encode_po_string(value));
+    let i = msgstr_line + 1;
+    while i < lines.len() && lines[i].trim_start().starts_with('"') {
+        lines.remove(i);
+    }
+}
+
+fn normalize_translated_text(msgid: &str, text: String) -> String {
+    if !text.is_empty() && msgid.ends_with('\n') && !text.ends_with('\n') {
+        format!("{text}\n")
+    } else {
+        text
+    }
 }
 
 fn commit_entry(
@@ -377,12 +355,13 @@ fn fail(err: anyhow::Error, raw_response: impl Into<String>) -> BatchFailure {
     }
 }
 
-/// Call Ollama's native `/api/chat` endpoint with a JSON schema constraining the output.
-/// Ollama enforces the schema at generation time, so the model cannot emit anything but the
-/// exact shape we request — no wrapping characters, no JSON leaks, no prose.
+/// Translate each source string via the shared runtime provider. The provider
+/// stack handles endpoint, auth, and wire protocol per family — this tool
+/// builds no HTTP. One request per source string keeps the per-entry mapping
+/// unambiguous (the .po model is one msgid -> one msgstr).
 async fn translate_batch(
-    client: &reqwest::Client,
-    model_provider: &ProviderConfig,
+    provider: &dyn zeroclaw_api::model_provider::ModelProvider,
+    model: &str,
     locale: &str,
     batch: &[&str],
 ) -> BatchResult {
@@ -392,66 +371,31 @@ async fn translate_batch(
            they appear in the source, character-for-character.\n\
          - Do not translate: brand and project names, command names, CLI flags, file paths, \
            environment variables, code literals, function/type names.\n\
+         - Do not add examples, configuration snippets, TOML blocks, code fences, or extra \
+           explanatory text that is not present in the source.\n\
          - If the input is already in {locale}, a code literal, a URL, or a single identifier, \
            return it unchanged.\n\
          - Use established software-localization terminology in {locale} rather than literal \
-           morpheme-by-morpheme translation."
+           morpheme-by-morpheme translation.\n\
+         - Return ONLY the translated string, no quotes, no preamble, no explanation."
     );
 
-    // Send each source as its own user message; the model responds with one translation per
-    // request as plain text in `message.content`. Ollama's schema enforcement is unreliable
-    // in practice (varies by model and version), so we ask for plain text and trust the prompt.
     let mut out = Vec::with_capacity(batch.len());
     for source in batch {
-        let body = serde_json::json!({
-            "model": model_provider.model,
-            "messages": [
-                {"role": "system", "content": &system},
-                {"role": "user", "content": *source},
-            ],
-            "stream": false,
-            // Disable reasoning/thinking — field name differs by Ollama endpoint and version, so
-            // include every variant we've seen. Unknown fields are silently ignored.
-            "think": false,
-            "reasoning_effort": "none",
-            "options": {"temperature": 0},
-        });
-        let content = fetch_ollama_content(client, model_provider, &body).await?;
+        let scoped_system;
+        let system_ref = if let Some(prompt) = preservation_prompt(source) {
+            scoped_system = format!("{system}\n{prompt}");
+            scoped_system.as_str()
+        } else {
+            system.as_str()
+        };
+        let content = zeroclaw_providers::ProviderDispatch::from_ref(provider)
+            .chat_with_system(Some(system_ref), source, model, None)
+            .await
+            .map_err(|e| fail(e, String::new()))?;
         out.push(content.trim().to_string());
     }
     Ok(out)
-}
-
-/// POST to Ollama's native `/api/chat` and return `message.content` from the response.
-async fn fetch_ollama_content(
-    client: &reqwest::Client,
-    model_provider: &ProviderConfig,
-    body: &serde_json::Value,
-) -> Result<String, BatchFailure> {
-    let resp = client
-        .post(format!("{}/api/chat", model_provider.base_url))
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| fail(e.into(), String::new()))?;
-    let status = resp.status();
-    let raw = resp
-        .text()
-        .await
-        .map_err(|e| fail(e.into(), String::new()))?;
-    if !status.is_success() {
-        return Err(fail(anyhow::Error::msg(format!("HTTP {status}")), raw));
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        fail(
-            anyhow::Error::msg(format!("response body JSON parse: {e}")),
-            raw.clone(),
-        )
-    })?;
-    parsed["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| fail(anyhow::Error::msg("no message.content"), raw))
 }
 
 #[tokio::main]
@@ -465,12 +409,43 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--po path does not exist: {}", args.po.display());
     }
 
-    let model_provider = read_model_provider_config(&args.model_provider)?;
+    let (provider, model) =
+        xtask::util::build_model_provider(&args.model_provider, args.config_dir.as_deref())?;
 
     let raw = std::fs::read_to_string(&args.po)?;
-    let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+    let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
 
-    let entries = parse_po(&lines);
+    let mut entries = parse_po(&lines);
+
+    // Repair entries where the model previously leaked its instructions instead of translating.
+    // Recover the real translation from the response tail when possible, otherwise clear to ""
+    // so the entry gets re-translated on this run.
+    let mut leak_recovered = 0;
+    let mut leak_blanked = 0;
+    for entry in entries.iter().rev() {
+        if entry.msgstr.is_empty() {
+            continue;
+        }
+        match check_for_leak(&entry.msgid, &entry.msgstr) {
+            LeakCheck::Clean => {}
+            LeakCheck::Recovered(r) => {
+                replace_msgstr_line(&mut lines, entry.msgstr_line, &r);
+                leak_recovered += 1;
+            }
+            LeakCheck::Unrecoverable => {
+                replace_msgstr_line(&mut lines, entry.msgstr_line, "");
+                leak_blanked += 1;
+            }
+        }
+    }
+    if leak_recovered + leak_blanked > 0 {
+        println!(
+            "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
+        );
+    }
+    if leak_recovered + leak_blanked > 0 {
+        entries = parse_po(&lines);
+    }
 
     let mut translations: HashMap<usize, String> = HashMap::new();
 
@@ -487,40 +462,6 @@ async fn main() -> anyhow::Result<()> {
     if repaired > 0 {
         println!("==> Repairing {repaired} entries missing trailing \\n");
     }
-
-    // Repair entries where the model previously leaked its instructions instead of translating.
-    // Recover the real translation from the response tail when possible, otherwise clear to ""
-    // so the entry gets re-translated on this run.
-    let mut leak_recovered = 0;
-    let mut leak_blanked = 0;
-    let mut lines: Vec<String> = lines;
-    for entry in &entries {
-        if entry.msgstr.is_empty() {
-            continue;
-        }
-        match check_for_leak(&entry.msgid, &entry.msgstr) {
-            LeakCheck::Clean => {}
-            LeakCheck::Recovered(r) => {
-                lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&r));
-                leak_recovered += 1;
-            }
-            LeakCheck::Unrecoverable => {
-                lines[entry.msgstr_line] = "msgstr \"\"".to_string();
-                leak_blanked += 1;
-            }
-        }
-    }
-    if leak_recovered + leak_blanked > 0 {
-        println!(
-            "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
-        );
-    }
-    // Re-parse with repaired lines
-    let entries = if leak_recovered + leak_blanked > 0 {
-        parse_po(&lines)
-    } else {
-        entries
-    };
 
     // Entries with empty msgstr need AI translation.
     // Fuzzy entries already have a translation — accept it as-is, just drop the flag.
@@ -545,10 +486,9 @@ async fn main() -> anyhow::Result<()> {
         to_translate.len(),
         to_accept.len(),
         args.model_provider,
-        model_provider.model,
+        model,
     );
 
-    let client = reqwest::Client::new();
     let total = to_translate.len();
     let total_chunks = total.div_ceil(args.batch).max(1);
 
@@ -567,15 +507,16 @@ async fn main() -> anyhow::Result<()> {
             chunk.len()
         );
 
-        match translate_batch(&client, &model_provider, &args.locale, &msgids).await {
+        match translate_batch(provider.as_ref(), &model, &args.locale, &msgids).await {
             Ok(translated) => {
                 for (entry, text) in chunk.iter().zip(translated.iter()) {
                     // If msgid ends with \n, msgstr must too — gettext requires it.
-                    let text = if entry.msgid.ends_with('\n') && !text.ends_with('\n') {
-                        format!("{text}\n")
-                    } else {
-                        text.clone()
+                    let text = match check_for_leak(&entry.msgid, text) {
+                        LeakCheck::Clean => text.clone(),
+                        LeakCheck::Recovered(recovered) => recovered,
+                        LeakCheck::Unrecoverable => String::new(),
                     };
+                    let text = normalize_translated_text(&entry.msgid, text);
                     translations.insert(entry.msgstr_line, text);
                 }
                 write_po(
@@ -615,4 +556,47 @@ async fn main() -> anyhow::Result<()> {
         translations.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_msgstr_line_removes_multiline_continuations() {
+        let mut lines = vec![
+            "msgid \"source\"".to_string(),
+            "msgstr \"old\"".to_string(),
+            "\" continuation\"".to_string(),
+            String::new(),
+            "msgid \"next\"".to_string(),
+            "msgstr \"kept\"".to_string(),
+        ];
+
+        replace_msgstr_line(&mut lines, 1, "");
+
+        assert_eq!(
+            lines,
+            vec![
+                "msgid \"source\"",
+                "msgstr \"\"",
+                "",
+                "msgid \"next\"",
+                "msgstr \"kept\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_unrecoverable_translation_stays_empty_for_newline_source() {
+        assert_eq!(normalize_translated_text("source\n", String::new()), "");
+    }
+
+    #[test]
+    fn non_empty_translation_preserves_required_trailing_newline() {
+        assert_eq!(
+            normalize_translated_text("source\n", "translated".to_string()),
+            "translated\n"
+        );
+    }
 }

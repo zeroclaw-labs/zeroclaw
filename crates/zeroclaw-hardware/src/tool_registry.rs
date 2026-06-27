@@ -288,35 +288,28 @@ mod tests {
         assert!(registry.len() >= 2);
     }
 
-    /// With the `hardware` feature, exactly 6 built-in tools must be present:
-    /// gpio_read, gpio_write, pico_flash, device_read_code, device_write_code, device_exec.
+    /// With the `hardware` feature, the built-in tools must match the canonical
+    /// catalog (`catalog::BASE_TOOLS`) exactly — that list is the single source
+    /// the docs render and this test enforces.
     #[cfg(feature = "hardware")]
     #[tokio::test]
-    async fn hardware_feature_registers_all_six_tools() {
+    async fn hardware_feature_registers_catalog_base_tools() {
         let devices = empty_device_registry();
         let registry = ToolRegistry::load(devices).await.expect("load failed");
 
         let names = registry.list();
-        let expected = [
-            "device_exec",
-            "device_read_code",
-            "device_write_code",
-            "gpio_read",
-            "gpio_write",
-            "pico_flash",
-        ];
-        for tool_name in &expected {
+        for tool_name in super::super::catalog::BASE_TOOLS {
             assert!(
                 names.contains(tool_name),
-                "expected tool '{}' missing; got: {:?}",
+                "catalog tool '{}' missing; got: {:?}",
                 tool_name,
                 names
             );
         }
         assert_eq!(
             registry.len(),
-            6,
-            "expected exactly 6 built-in tools, got {} (names: {:?})",
+            super::super::catalog::BASE_TOOLS.len(),
+            "registry tool count must equal catalog::BASE_TOOLS (got {}, names: {:?})",
             registry.len(),
             names
         );

@@ -71,6 +71,8 @@ pub enum Role {
 pub enum ChannelKind {
     #[strum(serialize = "acp")]
     AcpChannel,
+    #[strum(serialize = "amqp")]
+    Amqp,
     Bluesky,
     #[strum(serialize = "clawdtalk")]
     ClawdTalk,
@@ -98,6 +100,7 @@ pub enum ChannelKind {
     Signal,
     Slack,
     Telegram,
+    Twitch,
     Twitter,
     VoiceCall,
     VoiceWake,
@@ -189,8 +192,8 @@ pub enum ModelProviderKind {
     Copilot,
     Glm,
     KiloCli,
+    Kilo,
     Router,
-    Reliable,
     Moonshot,
     Qwen,
     Minimax,
@@ -225,6 +228,7 @@ pub enum ModelProviderKind {
     Avian,
     Deepmyst,
     Venice,
+    Nearai,
     Novita,
     Nvidia,
     Vercel,
@@ -370,7 +374,7 @@ impl Role {
         }
     }
 
-    /// Closest [`zeroclaw_log::EventCategory`] for this role, used by
+    /// Closest `zeroclaw_log::EventCategory` for this role, used by
     /// the layer to default `event.category` when the call site doesn't
     /// override. Returned as a `&'static str` to keep `zeroclaw-api`
     /// free of a back-dep on `zeroclaw-log`.
@@ -381,13 +385,10 @@ impl Role {
             Self::Channel(_) => "channel",
             Self::Tool(_) => "tool",
             Self::Cron(_) => "cron",
-            Self::Provider(ProviderKind::Model(_)) => "model_provider",
-            Self::Provider(ProviderKind::Tts(_)) => "tts_provider",
-            Self::Provider(ProviderKind::Transcription(_)) => "transcription_provider",
-            Self::Provider(ProviderKind::Tunnel(_)) => "tunnel_provider",
+            Self::Provider(_) => "provider",
             Self::Memory(_) => "memory",
             Self::Session => "session",
-            Self::Sop => "sop",
+            Self::Sop => "system",
             Self::PeerGroup | Self::Skill | Self::Mcp | Self::System => "system",
         }
     }

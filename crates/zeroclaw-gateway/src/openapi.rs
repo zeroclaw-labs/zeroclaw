@@ -297,8 +297,67 @@ pub fn build_spec() -> serde_json::Value {
         "paths": paths,
         "components": components,
     });
+    #[cfg(feature = "a2a")]
+    augment_spec_with_a2a(
+        &mut spec,
+        schema_value::<crate::a2a::JsonRpcRequest>(),
+        schema_value::<crate::a2a::OutTask>(),
+    );
     flatten_defs_into_components(&mut spec);
     spec
+}
+
+/// Add the A2A task endpoint and its request/response schemas to the spec.
+/// Gated on `feature = "a2a"` so `--no-default-features --features
+/// schema-export` (a2a off) still compiles and renders a coherent spec.
+#[cfg(all(feature = "schema-export", feature = "a2a"))]
+fn augment_spec_with_a2a(
+    spec: &mut serde_json::Value,
+    task_request_schema: serde_json::Value,
+    task_schema: serde_json::Value,
+) {
+    if let Some(schemas) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|v| v.as_object_mut())
+    {
+        schemas.insert("A2aTaskRequest".to_string(), task_request_schema);
+        schemas.insert("A2aTask".to_string(), task_schema);
+    }
+    if let Some(paths) = spec.pointer_mut("/paths").and_then(|v| v.as_object_mut()) {
+        paths.insert(
+            "/a2a/{alias}".to_string(),
+            serde_json::json!({
+                "post": {
+                    "tags": ["a2a"],
+                    "summary": "Send a task to a published A2A agent",
+                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                    "parameters": [{
+                        "name": "alias",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" },
+                        "description": "Published agent alias, as listed in the discovery catalog."
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTaskRequest" } } }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
+                        },
+                        "401": {
+                            "description": "Missing or invalid bearer token while pairing is required."
+                        },
+                        "404": {
+                            "description": "Server disabled, alias unpublished, or alias unknown."
+                        }
+                    }
+                }
+            }),
+        );
+    }
 }
 
 /// schemars emits nested types under each component's `$defs` and
@@ -424,6 +483,17 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        #[cfg(feature = "a2a")]
+        assert!(paths.get("/a2a/{alias}").is_some());
+    }
+
+    #[cfg(all(feature = "schema-export", feature = "a2a"))]
+    #[test]
+    fn spec_registers_a2a_task_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("A2aTaskRequest").is_some());
+        assert!(schemas.get("A2aTask").is_some());
     }
 
     #[cfg(feature = "schema-export")]
@@ -434,5 +504,26 @@ mod tests {
             .pointer("/components/securitySchemes/bearerAuth/scheme")
             .and_then(|v| v.as_str());
         assert_eq!(scheme, Some("bearer"));
+    }
+
+    #[cfg(all(feature = "schema-export", feature = "a2a"))]
+    #[test]
+    fn a2a_task_operation_requires_bearer_auth() {
+        let spec = build_spec();
+        // No per-operation security override: the endpoint inherits the
+        // global `bearerAuth` requirement. A tool-enabled agent turn is never
+        // served unauthenticated.
+        let security = spec.pointer("/paths/~1a2a~1{alias}/post/security");
+        assert_eq!(security, None);
+        let global = spec
+            .pointer("/security")
+            .and_then(|v| v.as_array())
+            .expect("global security present");
+        assert!(
+            global
+                .iter()
+                .any(|scheme| scheme.get("bearerAuth").is_some()),
+            "global security must require bearerAuth"
+        );
     }
 }

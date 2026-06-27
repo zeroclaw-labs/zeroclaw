@@ -55,7 +55,7 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
     (addr, captured)
@@ -123,7 +123,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         AliasedAgentConfig {
             enabled: true,
             model_provider: format!("{provider_type}.default").into(),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..Default::default()
         },
     );

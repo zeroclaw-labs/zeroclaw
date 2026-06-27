@@ -40,7 +40,9 @@ another_fake = 42
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -80,18 +82,24 @@ fn config_out_of_range_temperature_fails() {
     // Temperature validation now happens at the model_provider level.
     let toml_str = r#"
 [providers.models.openai.default]
+api_key = "sk-test"
 temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(
+    assert_eq!(
         config
             .providers
             .models
             .find("openai", "default")
             .expect("entry exists")
-            .temperature
-            == Some(99.0)
+            .temperature,
+        Some(99.0)
+    );
+    let err = config.validate().expect_err("temperature 99.0 should fail");
+    assert!(
+        err.to_string().contains("temperature"),
+        "expected temperature validation error, got: {err}"
     );
 }
 
@@ -99,17 +107,23 @@ temperature = 99.0
 fn config_negative_temperature_fails() {
     let toml_str = r#"
 [providers.models.openai.default]
+api_key = "sk-test"
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(
+    assert_eq!(
         config
             .providers
             .models
             .find("openai", "default")
             .expect("entry exists")
-            .temperature
-            == Some(-0.5)
+            .temperature,
+        Some(-0.5)
+    );
+    let err = config.validate().expect_err("temperature -0.5 should fail");
+    assert!(
+        err.to_string().contains("temperature"),
+        "expected temperature validation error, got: {err}"
     );
 }
 
@@ -415,7 +429,11 @@ fn config_empty_toml_uses_default_temperature() {
     let config = migrate("");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -427,12 +445,10 @@ fn config_empty_toml_uses_default_temperature() {
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let config = migrate("default_temperature = 0.7\ndefault_provider = \"openai\"\n");
-    // Migration synthesizes [agents.default] from the V2 shape; assert
-    // its tunables match AliasedAgentConfig defaults.
-    let agent = config
+    // Migration synthesizes [agents.default] from the V2 shape.
+    config
         .agent("default")
         .expect("migration synthesized agents.default");
-    assert_eq!(agent.max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
@@ -441,7 +457,9 @@ fn config_only_temperature_parses() {
     let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
@@ -451,7 +469,7 @@ fn config_only_temperature_parses() {
     let agent = config
         .agent("default")
         .expect("migration synthesized agents.default");
-    assert_eq!(agent.max_tool_iterations, 10);
+    assert!(agent.enabled);
 }
 
 #[test]
@@ -459,7 +477,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_model_provider = "openai"
+default_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123
@@ -467,7 +485,9 @@ value = 123
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -622,7 +642,11 @@ fn config_empty_parses_with_all_defaults() {
     assert!(config.channels.whatsapp.is_empty());
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)

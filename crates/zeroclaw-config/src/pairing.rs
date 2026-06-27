@@ -33,6 +33,15 @@ struct FailedAttemptState {
     last_attempt: Instant,
 }
 
+/// Why a `generate_pairing_code_if_vacant` call failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeneratePairingCodeError {
+    /// A pairing code is already pending; redeem or wait before issuing a new one.
+    Pending,
+    /// Pairing is disabled on this gateway.
+    PairingDisabled,
+}
+
 /// Manages pairing state for the gateway.
 ///
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
@@ -219,10 +228,44 @@ impl PairingGuard {
         tokens.iter().cloned().collect()
     }
 
-    /// Generate a new pairing code, even if already paired.
+    /// Revoke a paired token by plaintext. Returns true if removed.
     ///
-    /// This allows adding additional clients without restarting the gateway.
-    /// The new code can be used exactly once to pair a new client.
+    /// Test/convenience wrapper that hashes the plaintext, then defers to
+    /// [`revoke_token_hash`](Self::revoke_token_hash). Production revoke paths
+    /// already hold the hash (the device registry stores it) and should call
+    /// `revoke_token_hash` directly rather than re-hashing the plaintext.
+    ///
+    /// In-memory only; the caller must persist `tokens()` to config or a
+    /// restart will resurrect the token from disk.
+    pub fn revoke_token(&self, token: &str) -> bool {
+        let hashed = hash_token(token);
+        let mut tokens = self.paired_tokens.lock();
+        tokens.remove(&hashed)
+    }
+
+    /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
+    pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
+        let mut tokens = self.paired_tokens.lock();
+        tokens.remove(token_hash)
+    }
+
+    /// Revoke every paired token at once. Returns the number of tokens
+    /// invalidated. This is the "rotate after compromise — nuke everything"
+    /// path: when an operator does not know which token leaked, the only safe
+    /// action is to invalidate all of them and force every client to re-pair.
+    /// The caller must persist `tokens()` to config so a daemon restart does
+    /// not resurrect the revoked set.
+    pub fn revoke_all_tokens(&self) -> usize {
+        let mut tokens = self.paired_tokens.lock();
+        let count = tokens.len();
+        tokens.clear();
+        count
+    }
+
+    /// Generate a new pairing code that pairs an additional client.
+    ///
+    /// Does not revoke existing tokens. To rotate a compromised token,
+    /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.
     pub fn generate_new_pairing_code(&self) -> Option<String> {
         if !self.require_pairing {
             return None;
@@ -230,6 +273,26 @@ impl PairingGuard {
         let new_code = generate_code();
         *self.pairing_code.lock() = Some(new_code.clone());
         Some(new_code)
+    }
+
+    /// Generate a new pairing code only when no code is already pending.
+    ///
+    /// Returns `Ok(code)` on success, `Err(GeneratePairingCodeError::Pending)`
+    /// when the slot is already occupied, and
+    /// `Err(GeneratePairingCodeError::PairingDisabled)` when pairing is off.
+    /// The check + write is atomic — concurrent callers cannot both observe
+    /// the slot vacant and then both write into it.
+    pub fn generate_pairing_code_if_vacant(&self) -> Result<String, GeneratePairingCodeError> {
+        if !self.require_pairing {
+            return Err(GeneratePairingCodeError::PairingDisabled);
+        }
+        let mut slot = self.pairing_code.lock();
+        if slot.is_some() {
+            return Err(GeneratePairingCodeError::Pending);
+        }
+        let new_code = generate_code();
+        *slot = Some(new_code.clone());
+        Ok(new_code)
     }
 
     /// Get the token hash for a given plaintext token (for device registry lookup).
@@ -749,5 +812,114 @@ mod tests {
             result.is_ok(),
             "Legitimate client should not be locked out by attacker"
         );
+    }
+
+    // ── Token revocation ─────────────────────────────────────
+
+    /// Regression: revoked tokens MUST stop authenticating immediately.
+    /// This was the GHSA-f385-f6h2-3gqj follow-up gap — rotation surfaces
+    /// generated new codes but never removed the old token.
+    #[test]
+    async fn revoked_token_no_longer_authenticates() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        assert!(guard.revoke_token(&token));
+        assert!(!guard.is_authenticated(&token));
+        assert!(!guard.is_paired());
+    }
+
+    /// Enforcement: persisted view (`tokens()`) drops the revoked entry,
+    /// so a daemon restart cannot resurrect it from `gateway.paired_tokens`.
+    #[test]
+    async fn revoked_token_is_dropped_from_persistence_view() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
+        let expected_hash = hash_token(&token);
+        assert!(guard.tokens().contains(&expected_hash));
+
+        assert!(guard.revoke_token(&token));
+        assert!(!guard.tokens().contains(&expected_hash));
+    }
+
+    #[test]
+    async fn revoke_token_hash_matches_revoke_token() {
+        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let hash_a = hash_token("zc_a");
+        assert!(guard.revoke_token_hash(&hash_a));
+        assert!(!guard.is_authenticated("zc_a"));
+        assert!(guard.is_authenticated("zc_b"));
+    }
+
+    #[test]
+    async fn revoke_unknown_token_is_noop() {
+        let guard = PairingGuard::new(true, &["zc_a".into()]);
+        assert!(!guard.revoke_token("zc_never_paired"));
+        assert!(guard.is_authenticated("zc_a"));
+    }
+
+    /// Enforcement: revoking one paired client must not affect siblings.
+    #[test]
+    async fn revoke_is_scoped_to_target_token() {
+        let guard = PairingGuard::new(true, &["zc_keep".into(), "zc_drop".into()]);
+        assert!(guard.revoke_token("zc_drop"));
+        assert!(guard.is_authenticated("zc_keep"));
+        assert!(!guard.is_authenticated("zc_drop"));
+    }
+
+    /// `revoke_all_tokens` invalidates every paired token and reports the
+    /// count. This is the "rotate after compromise — nuke everything" path.
+    #[test]
+    async fn revoke_all_tokens_invalidates_every_token() {
+        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
+        assert_eq!(guard.revoke_all_tokens(), 3);
+        assert!(!guard.is_authenticated("zc_a"));
+        assert!(!guard.is_authenticated("zc_b"));
+        assert!(!guard.is_authenticated("zc_c"));
+        assert!(!guard.is_paired());
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn revoke_all_tokens_on_empty_set_returns_zero() {
+        let guard = PairingGuard::new(true, &[]);
+        assert_eq!(guard.revoke_all_tokens(), 0);
+    }
+
+    // ── Atomic pairing-code generation ───────────────────────
+
+    #[test]
+    async fn generate_pairing_code_if_vacant_succeeds_when_slot_empty() {
+        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        // `new()` does not issue a code once paired; slot is empty here.
+        assert!(guard.pairing_code().is_none());
+        let code = guard.generate_pairing_code_if_vacant().unwrap();
+        assert_eq!(guard.pairing_code().as_deref(), Some(code.as_str()));
+    }
+
+    /// Regression: the check + write must be atomic. The earlier rotate
+    /// handler did `if pairing_code().is_some() { … } else { generate() }`
+    /// across two lock acquisitions; this test fails on that pattern.
+    #[test]
+    async fn generate_pairing_code_if_vacant_refuses_when_slot_occupied() {
+        let guard = PairingGuard::new(true, &[]);
+        let pre_existing = guard.pairing_code().expect("startup code");
+        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        assert_eq!(err, GeneratePairingCodeError::Pending);
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(pre_existing.as_str()),
+            "occupied slot must be preserved"
+        );
+    }
+
+    #[test]
+    async fn generate_pairing_code_if_vacant_refuses_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &[]);
+        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
     }
 }

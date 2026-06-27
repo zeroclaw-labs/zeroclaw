@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::path::Path;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Result of a single diagnostic check.
 pub struct CheckResult {
@@ -55,6 +56,9 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     // 8. Version sanity
     results.push(check_version());
 
+    // 9. gateway.web_dist_dir is a literal path (no shell-style expansion)
+    results.push(check_web_dist_dir(config));
+
     Ok(results)
 }
 
@@ -92,9 +96,24 @@ pub fn print_results(results: &[CheckResult]) {
     }
     println!();
     if failed == 0 {
-        println!("  \x1b[32mAll {total} checks passed.\x1b[0m");
+        println!(
+            "  \x1b[32m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-all-passed",
+                &[("total", &total.to_string())]
+            )
+        );
     } else {
-        println!("  \x1b[31m{failed}/{total} checks failed.\x1b[0m");
+        println!(
+            "  \x1b[31m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-some-failed",
+                &[
+                    ("failed", &failed.to_string()),
+                    ("total", &total.to_string())
+                ],
+            )
+        );
     }
     println!();
 }
@@ -200,6 +219,18 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
     let configured = channels.iter().filter(|e| e.configured).count();
+    let uncompiled = zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+    if !uncompiled.is_empty() {
+        let names = uncompiled
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return CheckResult::fail(
+            "channels",
+            channel_config_uncompiled_detail(channels.len(), configured, &names),
+        );
+    }
     CheckResult::pass(
         "channels",
         format!(
@@ -207,6 +238,23 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
             channels.len(),
             configured
         ),
+    )
+}
+
+fn channel_config_uncompiled_detail(
+    compiled: usize,
+    compiled_configured: usize,
+    names: &str,
+) -> String {
+    let compiled = compiled.to_string();
+    let configured = compiled_configured.to_string();
+    get_required_cli_string_with_args(
+        "cli-selftest-channel-config-uncompiled",
+        &[
+            ("compiled", compiled.as_str()),
+            ("configured", configured.as_str()),
+            ("names", names),
+        ],
     )
 }
 
@@ -243,6 +291,77 @@ fn check_security_policy(config: &crate::config::Config) -> CheckResult {
 fn check_version() -> CheckResult {
     let version = env!("CARGO_PKG_VERSION");
     CheckResult::pass("version", format!("v{version}"))
+}
+
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw self-test`
+/// time instead of at runtime.
+///
+/// User-facing strings (check name + detail) go through Fluent
+/// (`cli-self-test-web-dist-dir-*` keys) per AGENTS.md § Localization —
+/// no bare Rust literals for CLI output. The check `name` field is
+/// `&'static str`, so we resolve the Fluent string once into a leaked
+/// static at first call. Reason phrases are Fluent keys too
+/// (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
+    let name = web_dist_dir_check_name();
+    match config.gateway.web_dist_dir.as_deref() {
+        None => CheckResult::pass(
+            name,
+            zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-self-test-web-dist-dir-pass-unset",
+            ),
+        ),
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => CheckResult::pass(
+                name,
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-self-test-web-dist-dir-pass-literal",
+                    &[("path", value)],
+                ),
+            ),
+            Some(reason_key) => {
+                let reason = zeroclaw_runtime::i18n::get_required_cli_string(reason_key);
+                CheckResult::fail(
+                    name,
+                    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-self-test-web-dist-dir-fail-expansion",
+                        &[("path", value), ("reason", reason.as_str())],
+                    ),
+                )
+            }
+        },
+    }
+}
+
+/// Resolve the localized check name once and cache it as a `&'static str`
+/// (CheckResult::name is `&'static str` to stay copyable across the table
+/// renderer). Falls back to the bare identifier if the Fluent string is
+/// missing (mirrors the `missing_cli_string` warn-log behavior).
+fn web_dist_dir_check_name() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let resolved =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        Box::leak(resolved.into_boxed_str())
+    })
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("cli-web-dist-dir-reason-tilde")
+    } else if value.contains('$') {
+        Some("cli-web-dist-dir-reason-dollar")
+    } else {
+        None
+    }
 }
 
 /// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
@@ -293,13 +412,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .first_model_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
+    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };
@@ -337,12 +450,52 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
 
 #[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header;
+
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
-    let probe_url = format!("ws://{probe_host}:{port}/ws/chat");
+    let alias = config.agents.keys().next().map(String::as_str);
+    let token = resolve_gateway_bearer_token(config);
     let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
-    match tokio_tungstenite::connect_async(&probe_url).await {
+    if config.gateway.require_pairing && token.is_none() {
+        return CheckResult::fail(
+            "websocket",
+            format!(
+                "pairing required but no bearer token available for self-test \
+                 (set ZEROCLAW_GATEWAY_TOKEN or keep a plaintext zc_* entry in \
+                 gateway.paired_tokens): {display_url}"
+            ),
+        );
+    }
+
+    let probe_url = build_websocket_probe_url(
+        probe_host,
+        port,
+        alias,
+        config.gateway.require_pairing,
+        token.as_deref(),
+    );
+
+    let request = match probe_url.as_str().into_client_request() {
+        Ok(mut req) => {
+            if let Some(token) = token {
+                if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                    req.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+            }
+            req
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                "websocket",
+                format!("failed to build websocket request for {display_url}: {e}"),
+            );
+        }
+    };
+
+    match tokio_tungstenite::connect_async(request).await {
         Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {display_url}")),
         Err(e) => CheckResult::fail(
             "websocket",
@@ -351,9 +504,152 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
     }
 }
 
+/// Build the websocket probe URL for the self-test handshake.
+///
+/// When `require_pairing` is true, the resolved plaintext token (if any) is
+/// appended as a query parameter so the browser-compatible query-token path
+/// is exercised alongside the `Authorization: Bearer` header. The separator
+/// is `?` when the URL has no query string yet (no-agent fallback) and `&`
+/// when `?agent=` is already present, so the appended segment is always a
+/// valid query pair on the `/ws/chat` route.
+#[cfg(feature = "gateway")]
+fn build_websocket_probe_url(
+    probe_host: &str,
+    port: u16,
+    alias: Option<&str>,
+    require_pairing: bool,
+    token: Option<&str>,
+) -> String {
+    let mut url = match alias {
+        Some(alias) => format!("ws://{probe_host}:{port}/ws/chat?agent={alias}"),
+        None => format!("ws://{probe_host}:{port}/ws/chat"),
+    };
+    if require_pairing {
+        if let Some(token) = token {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            url.push(sep);
+            url.push_str("token=");
+            url.push_str(token);
+        }
+    }
+    url
+}
+
+/// Resolve a plaintext gateway bearer token for local diagnostics.
+///
+/// Precedence: `ZEROCLAW_GATEWAY_TOKEN`, then `ZEROCLAW_ACP_BRIDGE_TOKEN`,
+/// then the first plaintext (`zc_*`) entry in `gateway.paired_tokens`.
+#[cfg(feature = "gateway")]
+fn resolve_gateway_bearer_token(config: &crate::config::Config) -> Option<String> {
+    for key in ["ZEROCLAW_GATEWAY_TOKEN", "ZEROCLAW_ACP_BRIDGE_TOKEN"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    config
+        .gateway
+        .paired_tokens
+        .iter()
+        .map(|t| t.trim())
+        .find(|t| t.starts_with("zc_"))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host};
+    #[cfg(feature = "gateway")]
+    use super::{build_websocket_probe_url, resolve_gateway_bearer_token};
+    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    #[cfg(feature = "gateway")]
+    use zeroclaw_config::schema::Config;
+
+    #[test]
+    fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
+        // Issue #6079: `~/web-dist` is read verbatim and silently fails.
+        // #6961 Round 3: predicate now returns Fluent key, not bare phrase.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
+        // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("/srv/$USER/dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        // Absolute and relative literal paths must NOT be flagged.
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_fail_for_tilde() {
+        // #6961 Round 3: the failure detail goes through Fluent
+        // (cli-self-test-web-dist-dir-fail-expansion) — assert the
+        // resolved English string contains the inlined path + reason.
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(!result.passed, "tilde path must fail the check");
+
+        let expected_reason =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-fail-expansion",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+        assert_eq!(result.detail, expected_detail);
+
+        let expected_name =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        assert_eq!(result.name, expected_name.as_str());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_for_literal() {
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-pass-literal",
+            &[("path", "/srv/zeroclaw/web-dist")],
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_when_unset() {
+        let config = crate::config::Config::default();
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string(
+            "cli-self-test-web-dist-dir-pass-unset",
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
 
     #[test]
     fn resolve_probe_host_ipv4_wildcard() {
@@ -415,5 +711,60 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_reads_plaintext_paired_token() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["zc_test".into()];
+        assert_eq!(
+            resolve_gateway_bearer_token(&config).as_deref(),
+            Some("zc_test")
+        );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_ignores_hashed_paired_tokens() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["a".repeat(64)];
+        assert!(resolve_gateway_bearer_token(&config).is_none());
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_uses_amp_when_agent_alias_present() {
+        // Agent-alias branch: URL already has `?agent=`, so the token appends
+        // with `&` to keep the query string valid.
+        let url = build_websocket_probe_url("127.0.0.1", 42617, Some("dev"), true, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?agent=dev&token=zc_test");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_uses_question_mark_when_no_alias() {
+        // Regression for PR #7732: previously the no-alias fallback appended
+        // `&token=` to a URL with no `?`, producing
+        // `ws://.../ws/chat&token=...` which is not a valid query string and
+        // would fail the handshake for the wrong reason on instances that
+        // have no configured agents but do require pairing.
+        let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?token=zc_test");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_omits_token_when_pairing_not_required() {
+        let url =
+            build_websocket_probe_url("127.0.0.1", 42617, Some("dev"), false, Some("zc_test"));
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?agent=dev");
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn build_websocket_probe_url_omits_token_when_none_resolved() {
+        let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, None);
+        assert_eq!(url, "ws://127.0.0.1:42617/ws/chat");
     }
 }

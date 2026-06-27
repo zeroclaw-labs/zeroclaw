@@ -4,52 +4,65 @@ import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
+import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import { ErrorBoundary } from '@/App';
+import { t } from '@/lib/i18n';
 
-const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
+// First-path-segment → i18n title key, so the browser tab/history/bookmark
+// reflects the current page instead of a constant "ZeroClaw".
+const TITLE_KEYS: Record<string, string> = {
+  agents: 'nav.agents',
+  config: 'nav.config',
+  setup: 'nav.config',
+  tools: 'nav.tools',
+  integrations: 'nav.integrations',
+  cron: 'nav.cron',
+  logs: 'nav.logs',
+  doctor: 'nav.doctor',
+  pairing: 'nav.pairing',
+  canvas: 'nav.canvas',
+  'acp-console': 'nav.acp',
+  quickstart: 'nav.quickstart',
+  memory: 'nav.memory',
+};
 
 export default function Layout() {
   const { pathname } = useLocation();
+  const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  });
 
-  // Close sidebar on route change (mobile navigation)
+  // Close the mobile drawer on route change.
   useEffect(() => {
     setSidebarOpen(false);
   }, [pathname]);
 
-  // Persist collapsed state
+  // Per-route browser tab title.
   useEffect(() => {
-    try {
-      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(collapsed));
-    } catch {
-      // localStorage may not be available
+    const seg = pathname.split('/').filter(Boolean);
+    const first = seg[0];
+    let name: string | null;
+    if (!first) {
+      name = t('nav.dashboard');
+    } else if (first === 'agent' && seg[1]) {
+      name = `${decodeURIComponent(seg[1])} · ${t('nav.group.chat')}`;
+    } else {
+      const key = TITLE_KEYS[first];
+      name = key ? t(key) : null;
     }
-  }, [collapsed]);
+    document.title = name ? `${name} — ZeroClaw` : 'ZeroClaw';
+  }, [pathname]);
 
   return (
-    <div className="min-h-screen text-white" style={{ background: 'var(--pc-bg-base)' }}>
-      {/* Fixed sidebar */}
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} collapsed={collapsed} />
+    <div className="min-h-screen bg-pc-base text-pc-text">
+      {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
-      {/* Main area — offset by sidebar width on desktop, full-width on mobile */}
-      <div
-        className={`
-          flex flex-col flex-1 min-w-0 h-screen transition-all duration-300 ease-in-out
-          ${collapsed ? 'md:ml-14' : 'md:ml-60'}
-          ml-0
-        `}
-      >
+      {/* Main area — offset by the fixed 56px rail on desktop, full-width on
+          mobile. The rail is always slim, so the offset is constant. */}
+      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
-          onCollapseToggle={() => setCollapsed((c) => !c)}
-          collapsed={collapsed}
+          onOpenPalette={openPalette}
         />
         <ReloadBanner />
         <UnsavedChangesBanner />
@@ -66,6 +79,10 @@ export default function Layout() {
           </ErrorBoundary>
         </main>
       </div>
+
+      {/* Command palette — mounted once for the whole app. Toggled globally
+          via ⌘K / Ctrl+K and from the Header search trigger. */}
+      <CommandPalette open={paletteOpen} onClose={closePalette} />
     </div>
   );
 }

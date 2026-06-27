@@ -1,13 +1,20 @@
+pub mod approval;
 pub mod audit;
 pub mod condition;
 pub mod dispatch;
 pub mod engine;
 pub mod metrics;
+pub mod payload_safety;
+pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
 pub use engine::SopEngine;
 pub use metrics::SopMetricsCollector;
+pub use store::{
+    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
+    SqliteRunStore, StoreError, build_run_store,
+};
 #[allow(unused_imports)]
 pub use types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
@@ -17,8 +24,47 @@ pub use types::{
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use types::{SopManifest, SopMeta};
+use zeroclaw_config::schema::SopConfig;
+use zeroclaw_memory::traits::Memory;
+
+/// Build a single shared SopEngine + SopAuditLogger pair.
+///
+/// This is the sole construction site for SOP state within a daemon.
+/// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
+/// handles — never call `SopEngine::new` or `SopAuditLogger::new`
+/// directly outside this module.
+pub fn build_sop_engine(
+    config: SopConfig,
+    workspace_dir: &Path,
+    audit_memory: Arc<dyn Memory>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    // Select the run-state backend from config (default: ephemeral in-memory,
+    // unchanged behavior). A backend-open failure must not crash daemon startup,
+    // so fall back to in-memory with a loud log. `workspace_dir` here is the
+    // daemon data dir (every caller passes `config.data_dir`), so a durable store
+    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
+    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "SOP: run-store init failed; falling back to in-memory"
+        );
+        Arc::new(store::InMemoryRunStore::new())
+    });
+    let mut engine = SopEngine::new(config)
+        .with_store(store)
+        .with_metrics(SopMetricsCollector::shared());
+    engine.reload(workspace_dir);
+    engine.restore_runs();
+    let engine = Arc::new(Mutex::new(engine));
+    let audit = Arc::new(SopAuditLogger::new(audit_memory));
+    (engine, audit)
+}
 
 /// Parse an execution mode string into `SopExecutionMode`, falling back to
 /// `Supervised` for unknown values.

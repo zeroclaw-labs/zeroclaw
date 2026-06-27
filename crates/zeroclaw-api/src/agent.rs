@@ -40,6 +40,14 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
+    /// Older whole turns were dropped from the context window to fit the token
+    /// budget. Surfaces a user-visible "context was cut here" marker so trimming
+    /// is never silent. Emitted once per turn boundary when a trim occurs.
+    HistoryTrimmed {
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
+    },
     /// Per-LLM-call token usage and cost.
     ///
     /// Emitted once per LLM response the agent loop processes; a single turn
@@ -49,6 +57,11 @@ pub enum TurnEvent {
     /// unavailable for this call" rather than zero.
     Usage {
         input_tokens: Option<u64>,
+        /// Tokens served from the provider's prompt cache (e.g. Anthropic
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). These count
+        /// toward the context window and must be added to `input_tokens` to
+        /// get the true total context size.
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },

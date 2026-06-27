@@ -1,8 +1,16 @@
+use crate::openai_codex::{
+    ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
+    build_responses_input, convert_tools, first_nonempty, process_sse_chunk,
+};
+use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, TokenUsage, ToolCall as ProviderToolCall,
+    ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use futures_util::stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
@@ -10,19 +18,24 @@ use zeroclaw_api::tool::ToolSpec;
 /// OpenAI's public API endpoint.
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Default endpoint for the OpenAI Responses API.
+const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+
 pub struct OpenAiModelProvider {
-    /// `[model_providers.openai.<alias>]` config-key alias.
+    /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -65,7 +78,8 @@ impl ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,7 +217,14 @@ impl OpenAiModelProvider {
                 .unwrap_or_else(|| BASE_URL.to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            timeout_secs: 120,
         }
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 
     /// Set the maximum output tokens for API requests.
@@ -229,6 +250,8 @@ impl OpenAiModelProvider {
                 | "gpt-5.3-chat-latest"
                 | "o1"
                 | "o1-2024-12-17"
+                | "o1-mini"
+                | "o1-mini-2024-09-12"
                 | "o3"
                 | "o3-2025-04-16"
                 | "o3-mini"
@@ -355,7 +378,7 @@ impl OpenAiModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.openai",
-            120,
+            self.timeout_secs,
             10,
         )
     }
@@ -386,8 +409,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let mut messages = Vec::new();
 
@@ -457,10 +480,11 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let tools = Self::convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -469,6 +493,22 @@ impl ModelProvider for OpenAiModelProvider {
             tools,
             max_tokens: self.max_tokens,
         };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "openai provider request prepared"
+            );
+        }
 
         let response = self
             .http_client()
@@ -529,8 +569,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -622,6 +662,521 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiModelProvider {
     }
 }
 
+// ── OpenAI Responses API provider (wire_api = "responses") ────────────────
+//
+// Uses the OpenAI Responses API (`/v1/responses`) with a standard API key.
+// Supports full streaming tool calls, unlike the chat-completions `OpenAiModelProvider`.
+// Constructed by the factory when `wire_api = "responses"` without Codex OAuth.
+
+/// Request body for the standard OpenAI Responses API.
+#[derive(Debug, Serialize)]
+struct ResponsesApiRequest {
+    model: String,
+    input: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesApiReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesApiReasoning {
+    effort: String,
+}
+
+/// Non-streaming response body from `/v1/responses`.
+#[derive(Debug, Deserialize)]
+struct ResponsesApiBody {
+    #[serde(default)]
+    output: Vec<serde_json::Value>,
+    #[serde(default)]
+    output_text: Option<String>,
+}
+
+fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
+    if let Some(text) = first_nonempty(body.output_text.as_deref()) {
+        return Some(text);
+    }
+    for item in &body.output {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        if let Some(parts) = item.get("content").and_then(serde_json::Value::as_array) {
+            for part in parts {
+                if part.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
+                    && let Some(text) =
+                        first_nonempty(part.get("text").and_then(serde_json::Value::as_str))
+                {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderToolCall> {
+    body.output
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+        })
+        .filter_map(|item| {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
+            let arguments = item
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            let id = item
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.get("id").and_then(serde_json::Value::as_str))
+                .map(ToString::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            Some(ProviderToolCall {
+                id,
+                name,
+                arguments,
+                extra_content: None,
+            })
+        })
+        .collect()
+}
+
+/// Drive a Responses API SSE connection to completion, emitting events on `tx`.
+///
+/// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
+/// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
+pub(crate) async fn run_responses_sse(
+    request_builder: reqwest::RequestBuilder,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    count_tokens: bool,
+) {
+    let http_response = match request_builder.send().await {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = tx
+                .send(Err(StreamError::ModelProvider(err.to_string())))
+                .await;
+            return;
+        }
+    };
+
+    if !http_response.status().is_success() {
+        let status = http_response.status();
+        let body = http_response.text().await.unwrap_or_default();
+        let sanitized = super::sanitize_api_error(&body);
+        let _ = tx
+            .send(Err(StreamError::ModelProvider(format!(
+                "OpenAI API error ({status}): {sanitized}"
+            ))))
+            .await;
+        return;
+    }
+
+    let mut state = ResponsesStreamState::default();
+    let mut byte_stream = http_response.bytes_stream();
+    let mut pending_utf8: Vec<u8> = Vec::new();
+    let mut chunk_buf = String::new();
+
+    loop {
+        match byte_stream.next().await {
+            Some(Ok(bytes)) => {
+                if let Err(err) =
+                    append_utf8_stream_chunk(&mut chunk_buf, &mut pending_utf8, &bytes)
+                {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            }
+            Some(Err(err)) => {
+                let _ = tx
+                    .send(Err(StreamError::ModelProvider(err.to_string())))
+                    .await;
+                return;
+            }
+            None => break,
+        }
+
+        while let Some(idx) = chunk_buf.find("\n\n") {
+            let chunk_str = chunk_buf[..idx].to_string();
+            chunk_buf = chunk_buf[idx + 2..].to_string();
+
+            match process_sse_chunk(&chunk_str, &mut state) {
+                Ok(events) => {
+                    for event in events {
+                        if let StreamEvent::TextDelta(ref chunk) = event {
+                            let event = if count_tokens {
+                                StreamEvent::TextDelta(
+                                    StreamChunk::delta(chunk.delta.clone()).with_token_estimate(),
+                                )
+                            } else {
+                                event
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        } else if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(err.to_string())))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    if !chunk_buf.trim().is_empty()
+        && let Ok(events) = process_sse_chunk(&chunk_buf, &mut state)
+    {
+        for event in events {
+            let _ = tx.send(Ok(event)).await;
+        }
+    }
+
+    if !state.saw_text_delta
+        && let Some(text) = state.fallback_text.filter(|t| !t.is_empty())
+    {
+        let chunk = if count_tokens {
+            StreamChunk::delta(text).with_token_estimate()
+        } else {
+            StreamChunk::delta(text)
+        };
+        let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
+    }
+
+    let _ = tx.send(Ok(StreamEvent::Final)).await;
+}
+
+pub struct OpenAiResponsesModelProvider {
+    alias: String,
+    responses_url: String,
+    credential: Option<String>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+}
+
+impl OpenAiResponsesModelProvider {
+    pub fn new(alias: &str, api_url: Option<&str>, credential: Option<&str>) -> Self {
+        let responses_url = api_url
+            .map(|url| {
+                let trimmed = url.trim_end_matches('/');
+                if trimmed.ends_with("/responses") {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed}/responses")
+                }
+            })
+            .unwrap_or_else(|| RESPONSES_URL.to_string());
+        Self {
+            alias: alias.to_string(),
+            responses_url,
+            credential: credential.map(ToString::to_string),
+            max_tokens: None,
+            reasoning_effort: None,
+        }
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    fn build_request(
+        &self,
+        instructions: Option<String>,
+        input: Vec<serde_json::Value>,
+        tools: Option<Vec<ResponsesToolSpec>>,
+        model: &str,
+        temperature: Option<f64>,
+        stream: bool,
+    ) -> ResponsesApiRequest {
+        let has_tools = tools.is_some();
+        let reasoning = self
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| ResponsesApiReasoning {
+                effort: effort.to_string(),
+            });
+        ResponsesApiRequest {
+            model: model.to_string(),
+            input,
+            instructions,
+            stream,
+            tools,
+            tool_choice: has_tools.then(|| "auto".to_string()),
+            parallel_tool_calls: has_tools.then_some(true),
+            temperature,
+            max_output_tokens: self.max_tokens,
+            reasoning,
+        }
+    }
+
+    fn streaming_client(&self) -> Client {
+        Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiResponsesModelProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+            prompt_caching: false,
+            extended_thinking: false,
+        }
+    }
+
+    /// Reports the instance's resolved endpoint so callers can verify which
+    /// host a responses provider will actually hit (e.g. a compat family's
+    /// default base vs. OpenAI's).
+    fn default_base_url(&self) -> Option<&str> {
+        Some(&self.responses_url)
+    }
+
+    fn default_wire_api(&self) -> &str {
+        "responses"
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(ChatMessage::system(sys));
+        }
+        messages.push(ChatMessage::user(message));
+        let (instructions, input) = build_responses_input(&messages);
+        let instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+        let req = self.build_request(instructions, input, None, model, temperature, false);
+        let response = Client::new()
+            .post(&self.responses_url)
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&req)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+        let body: ResponsesApiBody = response.json().await?;
+        extract_responses_api_text(&body)
+            .ok_or_else(|| anyhow::Error::msg("No response from OpenAI"))
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+        let (instructions, input) = build_responses_input(request.messages);
+        let instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+        let tools = convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
+        let req = self.build_request(instructions, input, tools, model, temperature, false);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "responses",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": req.tool_choice.as_deref(),
+                        "parallel_tool_calls": req.parallel_tool_calls,
+                    })),
+                "openai responses provider request prepared"
+            );
+        }
+        let response = Client::new()
+            .post(&self.responses_url)
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&req)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+        let body: ResponsesApiBody = response.json().await?;
+        Ok(ProviderChatResponse {
+            text: extract_responses_api_text(&body),
+            tool_calls: extract_responses_api_tool_calls(&body),
+            usage: None,
+            reasoning_content: None,
+        })
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.clone() {
+            Some(c) => c,
+            None => {
+                let err = StreamError::ModelProvider("OpenAI API key not set".to_string());
+                return stream::once(async move { Err(err) }).boxed();
+            }
+        };
+
+        let messages_owned = request.messages.to_vec();
+        let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
+        let model = model.to_string();
+        let responses_url = self.responses_url.clone();
+        let count_tokens = options.count_tokens;
+        let reasoning_effort = self.reasoning_effort.clone();
+        let max_tokens = self.max_tokens;
+        let client = self.streaming_client();
+        let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+        let handle = ::zeroclaw_spawn::spawn!(async move {
+            let (instructions, input) = build_responses_input(&messages_owned);
+            let instructions = if instructions.is_empty() {
+                None
+            } else {
+                Some(instructions)
+            };
+            let tools = convert_tools(tools_owned.as_deref());
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
+            let has_tools = tools.is_some();
+            let reasoning = reasoning_effort
+                .as_deref()
+                .map(|effort| ResponsesApiReasoning {
+                    effort: effort.to_string(),
+                });
+            let req = ResponsesApiRequest {
+                model,
+                input,
+                instructions,
+                stream: true,
+                tools,
+                tool_choice: has_tools.then(|| "auto".to_string()),
+                parallel_tool_calls: has_tools.then_some(true),
+                temperature,
+                max_output_tokens: max_tokens,
+                reasoning,
+            };
+            if let Some(alias) = alias.as_deref() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "openai",
+                            "alias": alias,
+                            "request_api": "responses",
+                            "model": &req.model,
+                            "stream": true,
+                            "tools_count": tools_count,
+                            "tool_choice": req.tool_choice.as_deref(),
+                            "parallel_tool_calls": req.parallel_tool_calls,
+                        })),
+                    "openai responses streaming provider request prepared"
+                );
+            }
+
+            let request_builder = client
+                .post(&responses_url)
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("Accept", "text/event-stream")
+                .json(&req);
+
+            run_responses_sse(request_builder, &tx, count_tokens).await;
+        });
+
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
+        })
+        .boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +1191,19 @@ mod tests {
     fn creates_without_key() {
         let p = OpenAiModelProvider::new("test", None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn responses_url_appends_responses_to_custom_base() {
+        let p =
+            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_defaults_to_openai_when_base_absent() {
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
     #[test]
@@ -675,7 +1243,7 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -692,7 +1260,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.0,
+            temperature: Some(0.0),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -1000,6 +1568,14 @@ mod tests {
             OpenAiModelProvider::adjust_temperature_for_model("o1-2024-12-17", 0.5),
             1.0
         );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o1-mini", 0.5),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o1-mini-2024-09-12", 0.7),
+            1.0
+        );
     }
 
     #[test]
@@ -1113,6 +1689,305 @@ mod tests {
         assert_eq!(
             OpenAiModelProvider::adjust_temperature_for_model("gpt-4o", 1.0),
             1.0
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Responses-wire option propagation (#7690)
+    //
+    // Pinned regression: non-default options configured on
+    // `OpenAiResponsesModelProvider` (via the `with_*` builders) must
+    // survive into `ResponsesApiRequest` at the wire boundary. Without
+    // these tests, a future refactor could silently drop
+    // `max_tokens` / `reasoning_effort` / `responses_url` / tools /
+    // instructions / temperature while existing smoke tests still pass.
+    //
+    // Test seam: `build_request` is private but reachable via `super::*`
+    // from this `#[cfg(test)] mod tests`. We construct the provider with
+    // the non-default option, call `build_request` with minimal
+    // required arguments, serialize to JSON, and assert each option is
+    // present in the wire body (or, for URL, in the field
+    // `responses_url`).
+    //
+    // No live network dependency. No provider credentials required.
+    // ----------------------------------------------------------
+    //
+    // Supported options (asserted below with `propagates_*_when_set`
+    // tests, and pinned for `None` propagation with `omits_*_when_unset`
+    // tests):
+    //
+    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
+    // |-------------------------|--------------------------------------|----------------------------------------|
+    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
+    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
+    // | (model arg)             | `model`                              | Always present                         |
+    // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
+    // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
+    // | (stream arg)            | `stream`                             | Always present (bool)                  |
+    // | (tools arg)             | `tools`                              | Omits when `None`                      |
+    // | (tool_choice arg)       | `tool_choice`                        | Omits when `None` AND tools absent     |
+    // | (parallel arg)          | `parallel_tool_calls`                | Omits when `None` AND tools absent     |
+    //
+    // Intentionally NOT propagated by the responses wire (these would
+    // be silently dropped — listed here as known-unsupported for this
+    // code path so future maintainers do not "fix" them by quietly
+    // adding fields the OpenAI Responses API does not accept):
+    //
+    // - `top_p` — Responses API has no `top_p`; callers who need it
+    //   must use the legacy `OpenAiModelProvider` (chat-completions
+    //   path).
+    // - `frequency_penalty` / `presence_penalty` — Responses API
+    //   rejects both. Same fallback path as `top_p`.
+    // - `stop` / `seed` — not exposed by
+    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
+    //   list if/when a `with_seed` builder is introduced.
+    // - `logprobs` — Responses API uses `top_logprobs` instead; not
+    //   propagated. Same fallback path as `top_p`.
+    //
+    // Runtime options not yet wired into the responses provider
+    // (`OpenAiResponsesModelProvider` carries no fields for these;
+    // `build_responses_provider_if_requested` in factory.rs drops them
+    // on the floor rather than forwarding to the responses path).
+    // Listed here so the gap is visible from the test mod rather than
+    // only discoverable by reading the factory:
+    //
+    // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` has no
+    //   `timeout_secs` field; non-streaming responses calls use
+    //   `Client::new()` with no client-builder timeout override, and
+    //   the streaming responses path likewise. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Callers who
+    //   need a custom timeout on the responses path must extend
+    //   `OpenAiResponsesModelProvider` with a `timeout_secs` field,
+    //   mirror it through the non-streaming client builder, and add
+    //   the corresponding `with_timeout_secs` builder + wire-shape
+    //   test here.
+    // - `extra_headers` — `OpenAiResponsesModelProvider`'s
+    //   `build_request` only sets `Authorization` (plus `Accept` for
+    //   SSE); there is no header-merge step. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Same
+    //   follow-up shape as `provider_timeout_secs`.
+    // - `api_path` — already routed correctly: the `api_url` argument
+    //   to `OpenAiResponsesModelProvider::new` lands in the
+    //   `responses_url` field, and the request-time URL is read from
+    //   there (covered by the `responses_url_appends_responses_to_custom_base`
+    //   test and the pre-existing propagation tests above). The
+    //   `opts.api_path` runtime option is therefore not separately
+    //   needed — the factory maps `api_url` (from the provider
+    //   config) into `OpenAiResponsesModelProvider::new`, which
+    //   composes the final URL with the `/responses` suffix.
+    //
+    // Issue #7690 acceptance criterion #1 explicitly listed timeout,
+    // headers, and API path as targets. This commit scopes down to
+    // option-propagation test pinning only; the timeout / headers
+    // implementation work is intentionally deferred to a follow-up
+    // PR that wires the missing fields through both the provider and
+    // the factory.
+    // ----------------------------------------------------------
+
+    #[test]
+    fn responses_request_propagates_max_tokens_when_set() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048),
+            "max_tokens configured on the provider must survive into max_output_tokens on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_max_tokens_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.max_tokens.is_none(),
+            "fresh provider must default max_tokens to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("max_output_tokens").is_none()
+                || json
+                    .get("max_output_tokens")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset max_tokens must not surface as a wire-bound integer (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_reasoning_effort_when_set() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
+            .with_reasoning_effort(Some("high".to_string()));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "o3",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        let reasoning = json
+            .get("reasoning")
+            .expect("reasoning_effort must populate the `reasoning` object");
+        assert_eq!(
+            reasoning.get("effort").and_then(serde_json::Value::as_str),
+            Some("high"),
+            "with_reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_reasoning_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.reasoning_effort.is_none(),
+            "fresh provider must default reasoning_effort to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("reasoning").is_none()
+                || json
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset reasoning_effort must not surface as a wire-bound object (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_instructions_and_temperature_and_model() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
+        let req = provider.build_request(
+            Some("You are a careful assistant.".to_string()),
+            vec![serde_json::json!({"role": "user", "content": "summarize"})],
+            None,
+            "gpt-5-mini",
+            Some(0.3),
+            true,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5-mini"),
+            "model argument must reach the wire body verbatim"
+        );
+        assert_eq!(
+            json.get("instructions").and_then(serde_json::Value::as_str),
+            Some("You are a careful assistant."),
+            "non-None instructions argument must reach the wire body"
+        );
+        assert_eq!(
+            json.get("temperature").and_then(serde_json::Value::as_f64),
+            Some(0.3),
+            "temperature argument must reach the wire body as f64"
+        );
+        assert_eq!(
+            json.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "stream argument must reach the wire body as bool"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
+        let tools = Some(vec![ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: "lookup_weather".to_string(),
+            description: "Look up the weather for a city.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }),
+            strict: true,
+        }]);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "with tools present, wire body must carry tool_choice = \"auto\""
+        );
+        assert_eq!(
+            json.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "with tools present, wire body must carry parallel_tool_calls = true"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert_eq!(
+            wire_tools.len(),
+            1,
+            "exactly one tool spec must reach the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → tool_choice must be omitted (skipped via skip_serializing_if)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → parallel_tool_calls must be omitted (skipped via skip_serializing_if)"
         );
     }
 }

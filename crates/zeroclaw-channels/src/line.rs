@@ -194,7 +194,7 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
             .peer_groups
             .entry(group_name)
             .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref.to_string(),
+                channel: channel_ref,
                 ..PeerGroupConfig::default()
             });
         if group
@@ -1024,6 +1024,15 @@ impl Channel for LineChannel {
             .await;
         matches!(resp, Ok(r) if r.status().is_success())
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the LINE Messaging API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +1179,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel(16);
         let bot_id = bot_user_id.to_string();
-        let jh = tokio::spawn(async move {
+        let jh = zeroclaw_spawn::spawn!(async move {
             ch.listen_with_listener(listener, bot_id, tx).await.ok();
         });
         // Give the server a moment to begin accepting connections.

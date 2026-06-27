@@ -1,11 +1,13 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
+
+mod registry;
+pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -29,9 +31,55 @@ pub enum DaemonExit {
 /// The reload trigger is a tokio watch channel (not an OS signal) so it
 /// works identically on Linux, macOS, and Windows. The Sender is owned by
 /// the daemon (created in `run`) and cloned to the gateway for AppState.
+/// Default grace period (seconds) before ephemeral shutdown after last client disconnects.
+const EPHEMERAL_GRACE_SECS: u64 = 1;
+
 async fn wait_for_exit_signal(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
+    ephemeral: bool,
+    client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<DaemonExit> {
+    use std::sync::atomic::Ordering;
+
+    // Future that resolves when ephemeral shutdown is triggered:
+    // waits for at least one client to connect, then for all clients to
+    // disconnect, then sleeps the grace period. Pending forever if not
+    // ephemeral.
+    let ephemeral_shutdown = async {
+        if !ephemeral {
+            return std::future::pending::<()>().await;
+        }
+        // Wait until at least one client has connected.
+        loop {
+            if client_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // Wait until all clients disconnect.
+        loop {
+            if client_count.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"grace_secs": EPHEMERAL_GRACE_SECS})),
+            "All socket clients disconnected; starting ephemeral grace period"
+        );
+        // Grace period — if a client reconnects, abort.
+        for _ in 0..EPHEMERAL_GRACE_SECS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if client_count.load(Ordering::Relaxed) > 0 {
+                // Client reconnected — restart the whole wait.
+                return Box::pin(wait_for_ephemeral(client_count.clone())).await;
+            }
+        }
+    };
+    tokio::pin!(ephemeral_shutdown);
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -55,9 +103,6 @@ async fn wait_for_exit_signal(
                 }
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
-                        // Sender dropped — treat as shutdown (shouldn't
-                        // happen in normal operation; the gateway holds a
-                        // clone for the lifetime of the daemon).
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
                         return Ok(DaemonExit::Shutdown);
                     }
@@ -65,6 +110,10 @@ async fn wait_for_exit_signal(
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         return Ok(DaemonExit::Reload);
                     }
+                }
+                _ = &mut ephemeral_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
+                    return Ok(DaemonExit::Shutdown);
                 }
             }
         }
@@ -89,62 +138,51 @@ async fn wait_for_exit_signal(
                         return Ok(DaemonExit::Reload);
                     }
                 }
+                _ = &mut ephemeral_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
+                    return Ok(DaemonExit::Shutdown);
+                }
             }
         }
     }
 }
 
-/// Optional subsystem start functions injected by the binary crate.
-/// This allows the daemon to spawn subsystems without depending on their crates.
-#[allow(clippy::type_complexity)]
-pub struct DaemonSubsystems {
-    /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
-    /// The fifth argument is the reload sender — the gateway hands it to its
-    /// AppState so /admin/reload can signal the daemon to re-init.
-    pub gateway_start: Option<
-        Box<
-            dyn Fn(
-                    String,
-                    u16,
-                    Config,
-                    Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-                    Option<tokio::sync::watch::Sender<bool>>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start supervised channels. Injected by the binary when channels crate is available.
-    /// The cancellation token is fired on reload so listener tasks drop their channel Arcs
-    /// before the new supervisor starts.
-    pub channels_start: Option<
-        Box<
-            dyn Fn(
-                    Config,
-                    tokio_util::sync::CancellationToken,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the MQTT SOP listener. Injected by the binary when channels crate is available.
-    pub mqtt_start: Option<
-        Box<
-            dyn Fn(
-                    zeroclaw_config::schema::MqttConfig,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+/// Recursive helper: wait for clients to connect then all disconnect, with grace period.
+async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    // Wait until all clients disconnect again.
+    loop {
+        if client_count.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"grace_secs": EPHEMERAL_GRACE_SECS})),
+        "All socket clients disconnected; starting ephemeral grace period"
+    );
+    for _ in 0..EPHEMERAL_GRACE_SECS {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if client_count.load(Ordering::Relaxed) > 0 {
+            return Box::pin(wait_for_ephemeral(client_count)).await;
+        }
+    }
 }
 
 pub async fn run(
-    config: Config,
+    mut config: Config,
     host: String,
     port: u16,
-    subsystems: DaemonSubsystems,
+    mut registry: DaemonRegistry,
+    ephemeral: bool,
 ) -> Result<DaemonExit> {
+    config.gateway.host = host.clone();
+    if port != 0 {
+        config.gateway.port = port;
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -157,6 +195,13 @@ pub async fn run(
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
+    // Wire the log broadcast hook so every record!() emission reaches the
+    // RPC logs/subscribe stream. Without this, tool calls and agent events
+    // logged via record!() are invisible to the zerocode Logs pane when
+    // connected over the Unix socket (the gateway wires this separately for
+    // its own event_tx; the daemon's RPC event_tx must be wired here).
+    zeroclaw_log::set_broadcast_hook(event_tx.clone());
+
     if config.heartbeat.enabled {
         let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.data_dir)
             .await;
@@ -167,12 +212,22 @@ pub async fn run(
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
-    if let Some(gateway_start) = subsystems.gateway_start {
+    // Construct the TUI registry early so both the gateway (for /api/tuis)
+    // and the RPC socket (for tui/list) share the same Arc.
+    let tui_registry =
+        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
+
+    if let Some(gateway_start) = registry.take_gateway_start() {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
-        let gateway_reload_tx = reload_tx.clone();
+        let gateway_reload_controls = GatewayReloadControls {
+            shutdown_tx: gateway_shutdown_tx.clone(),
+            reload_tx: reload_tx.clone(),
+        };
+        let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
             "gateway",
@@ -182,16 +237,61 @@ pub async fn run(
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
-                let reload = gateway_reload_tx.clone();
+                let reload_controls = gateway_reload_controls.clone();
+                let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload)).await }
+                async move {
+                    start(
+                        host,
+                        port,
+                        cfg,
+                        Some(tx),
+                        Some(reload_controls),
+                        Some(tui_reg),
+                    )
+                    .await
+                }
             },
         ));
     }
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
 
-    if let Some(channels_start) = subsystems.channels_start {
+    // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
+    // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
+    // before channels so a delegating turn finds the plane live. Best-effort and
+    // additive: on failure the plane stays absent and every producer runs as today.
+    //
+    // `daemon::run` is re-entered on every reload. The handle is installed ONCE (an
+    // OnceLock), so producers and the reaper always agree on one `boot_id`. We therefore
+    // only START on first boot; on reload we reuse the installed handle and just respawn
+    // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
+    // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
+    // would then reap the daemon's OWN live tasks as "prior-boot orphans".
+    if crate::control_plane::control_plane().is_none()
+        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+            .await
+            .map(crate::control_plane::init_control_plane)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+            "control-plane failed to start; supervision disabled for this run"
+        );
+    }
+    // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
+    // boot_id matches what producers stamp via `control_plane()`.
+    if let Some(handle) = crate::control_plane::control_plane() {
+        handle.spawn_reaper(
+            crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            channels_cancel.clone(),
+        );
+        crate::health::mark_component_ok("control-plane");
+    }
+
+    if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
@@ -224,8 +324,181 @@ pub async fn run(
         );
     }
 
+    // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
+    // Build the shared RpcContext if either transport is configured.
+    let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
+
+    // Extract shared SOP engine from registry for RpcContext.
+    let (sop_engine, sop_audit) = registry.take_sop_engine();
+
+    let rpc_ctx = if need_rpc_ctx {
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::session::SessionStore;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let session_queue = std::sync::Arc::new(SessionActorQueue::new(32, 30, 600));
+        let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue.clone()));
+
+        {
+            let reaper_queue = std::sync::Arc::clone(&session_queue);
+            zeroclaw_spawn::spawn!(async move {
+                const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+                let mut interval = tokio::time::interval(TICK);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let queue_evicted = reaper_queue.evict_idle().await;
+                    if queue_evicted > 0 {
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            channel = "rpc",
+                        );
+                        let _guard = span.enter();
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "evicted_queue_slots": queue_evicted,
+                            })),
+                            "Session queue: released idle actor-queue slots"
+                        );
+                        crate::util::release_freed_heap();
+                    }
+                }
+            });
+        }
+        let session_backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .ok();
+
+        // Wire the memory subsystem so `memory/list` and `memory/search`
+        // work over RPC transports (same pattern as the gateway).
+        let rpc_memory: Option<std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory>> = if config
+            .agents
+            .is_empty()
+        {
+            None
+        } else {
+            match zeroclaw_memory::create_memory_with_storage_and_routes(
+                &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
+                &config.data_dir,
+                None,
+                Some(&config.providers.models),
+            ) {
+                Ok(mem) => Some(std::sync::Arc::from(mem)),
+                Err(_e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "RPC memory subsystem unavailable"
+                    );
+                    None
+                }
+            }
+        };
+
+        // Open the ACP session DB at boot so the file exists from the
+        // moment the daemon is up, not when (if ever) `zeroclaw acp`
+        // runs. Best-effort: on failure, log and continue with `None`.
+        let acp_session_store: Option<
+            std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        > = match zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir) {
+            Ok(s) => Some(std::sync::Arc::new(s)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "Failed to open ACP session store at daemon boot"
+                );
+                None
+            }
+        };
+
+        Some(std::sync::Arc::new(RpcContext {
+            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
+            sessions,
+            session_backend,
+            memory: rpc_memory,
+            // Process-global tracker shared with the gateway and channel
+            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // tracker to record into and model cost is silently dropped (#5221).
+            cost_tracker: crate::cost::CostTracker::get_or_init_global(
+                config.cost.clone(),
+                &config.data_dir,
+            ),
+            event_tx: Some(event_tx.clone()),
+            reload_tx: Some(reload_tx.clone()),
+            gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
+            approval_pending: std::sync::Arc::new(
+                crate::rpc::context::ApprovalPendingMap::default(),
+            ),
+            tui_registry,
+            acp_session_store,
+            sop_engine,
+            sop_audit,
+        }))
+    } else {
+        None
+    };
+
+    // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
+    if let Some(socket_start) = registry.take_socket_start() {
+        let rpc_ctx = rpc_ctx
+            .clone()
+            .expect("rpc_ctx built when socket_start is Some");
+        let socket_start = std::sync::Arc::new(socket_start);
+        let socket_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
+        handles.push(spawn_component_supervisor(
+            "socket",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let ctx = rpc_ctx.clone();
+                let start = socket_start.clone();
+                let cancel = socket_cancel.clone();
+                let count = count.clone();
+                async move { start(ctx, cancel, count).await }
+            },
+        ));
+    }
+
+    // WSS RPC listener (remote TUI connections).
+    if let Some(wss_start) = registry.take_wss_start() {
+        let rpc_ctx = rpc_ctx
+            .clone()
+            .expect("rpc_ctx built when wss_start is Some");
+        let wss_start = std::sync::Arc::new(wss_start);
+        let wss_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
+        handles.push(spawn_component_supervisor(
+            "wss",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let ctx = rpc_ctx.clone();
+                let start = wss_start.clone();
+                let cancel = wss_cancel.clone();
+                let count = count.clone();
+                async move { start(ctx, cancel, count).await }
+            },
+        ));
+    }
+
     // Wire up MQTT SOP listener if configured and referenced by an enabled agent
-    if let Some(mqtt_start) = subsystems.mqtt_start {
+    if let Some(mqtt_start) = registry.take_mqtt_start() {
         let active_mqtt: std::collections::HashSet<String> = config
             .agents
             .values()
@@ -294,16 +567,10 @@ pub async fn run(
         );
     }
 
-    println!("🧠 ZeroClaw daemon started");
-    println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
-    if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
-    }
-    println!("   Ctrl+C or SIGTERM to stop");
+    record_daemon_started(&config, &host, port);
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
-    let exit = wait_for_exit_signal(reload_rx).await?;
+    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
     crate::health::mark_component_error(
         "daemon",
         match exit {
@@ -336,11 +603,28 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("state")
         .join("daemon_state.json")
 }
 
+fn record_daemon_started(config: &Config, host: &str, port: u16) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "requested_gateway": format!("http://{host}:{port}"),
+                "socket": crate::rpc::local::socket_path(config).display().to_string(),
+                "pairing_enabled": config.gateway.require_pairing,
+                "stop_signal": "Ctrl+C or SIGTERM",
+            })),
+        "ZeroClaw daemon started"
+    );
+}
+
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -372,7 +656,7 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
@@ -446,7 +730,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let dm_metrics = Arc::clone(&metrics);
         let dm_config = config.clone();
         let dm_delivery = delivery.clone();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let check_interval = Duration::from_secs(60);
             let timeout = chrono::Duration::minutes(i64::from(deadman_timeout));
             loop {
@@ -642,14 +926,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
-        // Create memory once per tick for recall + consolidation.
+        // Create memory once per tick for recall + consolidation. Use the
+        // routes-aware factory with the provider catalog so `[[embedding_routes]]`
+        // (and dotted `model_provider` refs) resolve here exactly as on the
+        // gateway/RPC paths — otherwise heartbeat recall would silently fall
+        // back to keyword-only for hint-routed embeddings.
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
                 &config.data_dir,
                 config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
+                Some(&config.providers.models),
             )
             .ok();
 
@@ -1150,51 +1441,33 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            if config.channels.telegram.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels.telegram is not configured"
-                );
-            }
-        }
-        "discord" => {
-            if config.channels.discord.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to discord but channels.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels.slack.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels.mattermost.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels.mattermost is not configured"
-                );
-            }
-        }
-        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
+    if !config.channels.is_known_channel(channel) {
+        anyhow::bail!("unsupported heartbeat.target channel: {channel}");
     }
-
+    if !config.channels.is_channel_configured(channel) {
+        anyhow::bail!(
+            "heartbeat.target is set to {channel} but channels.{channel} is not configured"
+        );
+    }
+    if !config.channels.is_channel_deliverable(channel) {
+        anyhow::bail!(
+            "heartbeat.target is set to {channel} but {channel} is an input-only channel that cannot deliver outbound messages"
+        );
+    }
     Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config
-        .channels
-        .channels()
-        .iter()
-        .any(|info| info.configured)
+    // Check that at least one channel entry has `enabled = true`.
+    // A config with only `enabled = false` entries (e.g. partially-configured
+    // or intentionally disabled bots) must not start the supervisor — the
+    // channels component would find nothing to listen on, return Ok(()), and
+    // the daemon supervisor would restart it in a tight loop.
+    config.channels.has_any_enabled()
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
-// The daemon now receives it as a callback via DaemonSubsystems::mqtt_start.
+// The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
 #[cfg(test)]
 mod tests {
@@ -1211,13 +1484,71 @@ mod tests {
         config
     }
 
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message}");
+    }
+
     #[test]
-    fn state_file_path_uses_config_directory() {
+    fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let path = state_file_path(&config);
-        assert_eq!(path, tmp.path().join("daemon_state.json"));
+        assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_startup_diagnostics_are_logged_as_structured_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+
+        record_daemon_started(&config, "127.0.0.1", 0);
+
+        let value = recv_log_event(&mut rx, "ZeroClaw daemon started").await;
+        assert_eq!(value["event"]["category"], "system");
+        assert_eq!(value["event"]["action"], "start");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(
+            value["attributes"]["requested_gateway"],
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(value["attributes"]["pairing_enabled"].as_bool(), Some(true));
+        assert_eq!(value["attributes"]["stop_signal"], "Ctrl+C or SIGTERM");
+        assert_eq!(
+            value["attributes"]["socket"],
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
     }
 
     #[tokio::test]
@@ -1269,6 +1600,69 @@ mod tests {
     }
 
     #[test]
+    fn all_disabled_channels_not_supervised() {
+        // Regression test: a config with channel entries that all have
+        // `enabled = false` must not start the channels supervisor.
+        // Previously, has_supervised_channels only checked map non-emptiness,
+        // causing the supervisor to start, find nothing to listen on, return
+        // Ok(()), and restart in a tight loop.
+        let mut config = Config::default();
+        config.channels.discord.insert(
+            "clamps".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
+                bot_token: "token".into(),
+                guild_ids: vec![],
+                channel_ids: vec![],
+                listen_to_bots: false,
+                mention_only: true,
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 0,
+                multi_message_delay_ms: 0,
+                stall_timeout_secs: 0,
+                slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
+                interrupt_on_new_message: false,
+                archive: false,
+                approval_timeout_secs: 0,
+                proxy_url: None,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
+        config.channels.discord.insert(
+            "glados".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
+                bot_token: "token2".into(),
+                guild_ids: vec![],
+                channel_ids: vec![],
+                listen_to_bots: false,
+                mention_only: true,
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 0,
+                multi_message_delay_ms: 0,
+                stall_timeout_secs: 0,
+                slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
+                interrupt_on_new_message: false,
+                archive: false,
+                approval_timeout_secs: 0,
+                proxy_url: None,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
+        assert!(!has_supervised_channels(&config));
+    }
+
+    #[test]
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
         config.channels.telegram.insert(
@@ -1276,6 +1670,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1284,6 +1679,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1324,6 +1721,8 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1379,6 +1778,11 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+                max_retries: None,
+                retry_base_delay_ms: None,
+                retry_max_delay_ms: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1416,12 +1820,71 @@ mod tests {
     #[test]
     fn resolve_delivery_rejects_unsupported_channel() {
         let mut config = Config::default();
-        config.heartbeat.target = Some("email".into());
+        config.heartbeat.target = Some("carrier_pigeon".into());
         config.heartbeat.to = Some("ops@example.com".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("unsupported heartbeat.target channel")
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_matrix_target() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room:example.org".into());
+        config
+            .channels
+            .matrix
+            .insert("default".to_string(), Default::default());
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room:example.org".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_configured_but_undeliverable_channel() {
+        // #7681 review: a configured input-only channel (mqtt is a fan-in
+        // listener whose Channel::send is a no-op) must not pass heartbeat
+        // validation just because its table exists. Otherwise the validator
+        // claims a target the delivery surface silently drops.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("mqtt".into());
+        config.heartbeat.to = Some("ops/heartbeat".into());
+        config
+            .channels
+            .mqtt
+            .insert("default".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_voice_duplex_target() {
+        // #7680 review: voice_duplex has a configured table and a WebSocket
+        // event protocol but no Channel::send outbound path, so a heartbeat
+        // target pointing at it must be rejected like the other input-only
+        // transports rather than falling through to the dotted-ref error.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("voice_duplex".into());
+        config.heartbeat.to = Some("ops".into());
+        config
+            .channels
+            .voice_duplex
+            .insert("default".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
         );
     }
 
@@ -1447,6 +1910,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1455,6 +1919,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -1472,6 +1938,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1480,6 +1947,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
@@ -1488,7 +1957,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_default".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },
@@ -1517,7 +1986,8 @@ mod tests {
         use tokio::time::{Duration, timeout};
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, false, count));
 
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1540,7 +2010,8 @@ mod tests {
         use tokio::time::{Duration, timeout};
 
         let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, false, count));
         tokio::time::sleep(Duration::from_millis(50)).await;
         reload_tx.send(true).expect("send reload");
 
@@ -1550,5 +2021,150 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Reload);
+    }
+
+    #[tokio::test]
+    async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let expected_data_dir = config.data_dir.clone();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |host, port, config, event_tx, reload_controls, tui_registry| {
+                let seen_tx = seen_tx.clone();
+                Box::pin(async move {
+                    let has_event_tx = event_tx.is_some();
+                    let has_gateway_shutdown_tx = reload_controls.is_some();
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let has_reload_tx = !reload_tx.is_closed();
+                    let has_tui_registry = tui_registry.is_some();
+                    seen_tx
+                        .send((
+                            host,
+                            port,
+                            config.data_dir.clone(),
+                            has_event_tx,
+                            has_gateway_shutdown_tx,
+                            has_reload_tx,
+                            has_tui_registry,
+                        ))
+                        .expect("record gateway starter inputs");
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+        )
+        .await
+        .expect("daemon should return after gateway-triggered reload")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        let (
+            host,
+            port,
+            data_dir,
+            has_event_tx,
+            has_gateway_shutdown_tx,
+            has_reload_tx,
+            has_tui_registry,
+        ) = seen_rx
+            .try_recv()
+            .expect("gateway starter should record its daemon inputs");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 4242);
+        assert_eq!(data_dir, expected_data_dir);
+        assert!(has_event_tx);
+        assert!(has_gateway_shutdown_tx);
+        assert!(has_reload_tx);
+        assert!(has_tui_registry);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_does_not_exit_before_client_connects() {
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count));
+
+        // No clients ever connect — should NOT shut down.
+        let result = timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_err(),
+            "ephemeral daemon should not exit before any client connects"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_exits_after_client_disconnects() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count2));
+
+        // Simulate client connect then disconnect.
+        count.store(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        count.store(0, Ordering::Relaxed);
+
+        // Should exit within grace period + buffer.
+        let result = timeout(Duration::from_secs(EPHEMERAL_GRACE_SECS + 5), handle)
+            .await
+            .expect("ephemeral daemon should shut down after last client disconnects")
+            .expect("task should not panic")
+            .expect("signal handler should not error");
+        assert_eq!(result, DaemonExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_grace_period_resets_on_reconnect() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let mut handle = zeroclaw_spawn::spawn!(wait_for_exit_signal(reload_rx, true, count2));
+
+        // Client connects, disconnects.
+        count.store(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        count.store(0, Ordering::Relaxed);
+
+        // Reconnect partway through the grace period — must be strictly
+        // less than EPHEMERAL_GRACE_SECS so the daemon hasn't already
+        // exited. With the 1s grace window we sleep ~200ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        count.store(1, Ordering::Relaxed);
+
+        // Should NOT shut down while client is connected.
+        let result = timeout(Duration::from_millis(500), &mut handle).await;
+        assert!(
+            result.is_err(),
+            "ephemeral daemon should not exit while client is connected"
+        );
+
+        // Disconnect again — should eventually shut down.
+        count.store(0, Ordering::Relaxed);
+        let result = timeout(Duration::from_secs(EPHEMERAL_GRACE_SECS + 5), handle)
+            .await
+            .expect("ephemeral daemon should shut down after second disconnect")
+            .expect("task should not panic")
+            .expect("signal handler should not error");
+        assert_eq!(result, DaemonExit::Shutdown);
     }
 }

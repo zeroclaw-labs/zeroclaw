@@ -1,0 +1,12 @@
+# Per-service rc.conf(5) drop-in for the ZeroClaw rc.d script.
+#
+# Install as /etc/rc.conf.d/zeroclaw (the basename must match the rc.d script
+# name, which both zeroclaw.rc and zeroclaw-hardened.rc install as "zeroclaw"):
+#
+#     doas install -m 644 rc.conf.zeroclaw /etc/rc.conf.d/zeroclaw
+#
+# Equivalent to the sysrc lines in README.md, but version-controllable as a
+# file. Replace youruser with the account that owns ~/.zeroclaw.
+
+zeroclaw_enable="YES"
+zeroclaw_runas="youruser"
