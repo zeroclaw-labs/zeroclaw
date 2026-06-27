@@ -456,6 +456,24 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
+        // Reject userinfo before host extraction. Without this, a URL like
+        // `http://example.com@127.0.0.1/` is parsed by `extract_host` (a
+        // hand-rolled prefix-strip helper) as host `example.com@127.0.0.1`,
+        // which can satisfy `allowed_domains` (especially the default `["*"]`)
+        // while the browser backend actually navigates to `127.0.0.1`
+        // (loopback). Mirror `browser_open::validate_url`'s authority check.
+        let after_scheme = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let authority = after_scheme
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(after_scheme);
+        if authority.contains('@') {
+            anyhow::bail!("URL userinfo is not allowed");
+        }
+
         if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool enabled but no allowed_domains configured. \
@@ -2924,5 +2942,52 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
+    }
+
+    // ── userinfo SSRF regression tests ──────────────────────────
+    //
+    // `extract_host` is a hand-rolled prefix-strip and does NOT parse `@`
+    // userinfo. Without an explicit reject, a URL like
+    // `http://example.com@127.0.0.1/` is classified by its `example.com@…`
+    // host string (which satisfies the default `["*"]` public allowlist)
+    // while the browser backend actually navigates to `127.0.0.1`. Pin both
+    // the public-wildcard case and the private-wildcard case so neither
+    // allowlist surface can be used to smuggle a private destination.
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        // Default-shipped posture: allowed_domains = ["*"], no private
+        // allowlist. `extract_host` would otherwise treat
+        // `example.com@127.0.0.1` as the host and accept it.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_private_allowlist() {
+        // Even with the private bypass wide open, userinfo is rejected before
+        // host classification — so this is a parser-mismatch defense, not a
+        // policy decision the operator can opt around.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_with_password_rejected() {
+        // `user:pass@host` form — same parser hole, same fix.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://user:pass@10.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
     }
 }
