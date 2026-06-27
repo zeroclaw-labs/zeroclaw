@@ -93,13 +93,14 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         }
     }
 
-    setup_signing_key(&base_url, &api_key, &mut fields)?;
-    setup_realtime(&mut fields)?;
-
-    // SMS opt-in walkthrough (only meaningful with a provisioned number).
+    // SMS opt-in walkthrough — right after provisioning, while the number's fresh.
     if let Some(number) = phone_number.as_deref() {
         sms_opt_in(&base_url, &api_key, &handle, number)?;
     }
+
+    setup_signing_key(&base_url, &api_key, &mut fields)?;
+    setup_realtime(&mut fields)?;
+
     // iMessage connect walkthrough.
     setup_imessage(&base_url, &api_key, &handle)?;
 
