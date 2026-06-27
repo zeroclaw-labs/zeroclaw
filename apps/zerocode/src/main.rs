@@ -477,6 +477,93 @@ fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
     confirm_insecure_tls_with(stdin.lock(), &mut stderr, url)
 }
 
+/// Operator choice when a relay presents an untrusted OUTER certificate.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayTrustChoice {
+    Trust,
+    Abort,
+}
+
+/// Prompt seam (testable): show the relay's leaf fingerprint and ask whether to
+/// trust + remember it. `reader`/`writer` are injected so the decision logic can
+/// be unit-tested without a real terminal.
+fn confirm_relay_cert_with<R: std::io::BufRead, W: std::io::Write>(
+    mut reader: R,
+    writer: &mut W,
+    relay_addr: &str,
+    fingerprint: &str,
+) -> anyhow::Result<RelayTrustChoice> {
+    writeln!(
+        writer,
+        "\nThe relay at {relay_addr} presented a certificate that is not yet trusted\n\
+         (self-signed or an unknown issuer). Its SHA-256 fingerprint is:\n\n  \
+         {fingerprint}\n\n\
+         Confirm this matches the value the relay operator published, out of band.\n\
+         Trusting it pins this leaf for future runs (under <config-dir>/relay). The\n\
+         relay only forwards encrypted traffic; the inner mutual TLS to the daemon is\n\
+         unaffected either way.\n\
+         [y] trust and remember this relay   [N] abort"
+    )?;
+    write!(writer, "Trust this relay certificate? [y/N] ")?;
+    writer.flush().ok();
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(RelayTrustChoice::Trust),
+        _ => Ok(RelayTrustChoice::Abort),
+    }
+}
+
+/// Production entry point: lock `stdin`, prompt on `stderr`.
+fn confirm_relay_cert(relay_addr: &str, fingerprint: &str) -> anyhow::Result<RelayTrustChoice> {
+    let stdin = std::io::stdin();
+    let mut stderr = std::io::stderr();
+    confirm_relay_cert_with(stdin.lock(), &mut stderr, relay_addr, fingerprint)
+}
+
+/// Resolve the relay's OUTER-certificate trust. When trust was set explicitly
+/// (`--relay-ca`/`--relay-pin`/`--relay-tofu`/`--relay-insecure`, or a remembered
+/// pin) it is used as-is. Otherwise, rather than failing the connect with a bare
+/// `UnknownIssuer`, fetch the relay leaf, show its fingerprint, and offer to trust
+/// + remember it (interactive only); a non-interactive run gets an actionable
+/// error pointing at the explicit flags.
+async fn resolve_relay_trust(
+    existing_pin: Option<String>,
+    relay_addr: &str,
+    relay_host: &str,
+    cli: &Cli,
+    pin_store: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    use std::io::IsTerminal as _;
+    let explicit =
+        cli.relay_ca.is_some() || cli.relay_insecure || cli.relay_tofu || existing_pin.is_some();
+    if explicit {
+        return Ok(existing_pin);
+    }
+    if !std::io::stderr().is_terminal() {
+        return Err(anyhow::Error::msg(format!(
+            "the relay at {relay_addr} presents an untrusted certificate and no relay \
+             trust was configured. Pass --relay-ca <file>, --relay-pin <sha256>, or \
+             --relay-tofu (this run is non-interactive, so it cannot prompt)."
+        )));
+    }
+    let fp = match client::probe_relay_cert_pin(relay_addr, relay_host).await {
+        Ok(fp) => fp,
+        // Probe failed (relay unreachable etc.): let the normal connect surface it.
+        Err(_) => return Ok(existing_pin),
+    };
+    match confirm_relay_cert(relay_addr, &fp)? {
+        RelayTrustChoice::Trust => {
+            client::persist_relay_pin(pin_store, &fp);
+            eprintln!("Trusted the relay; pinned {fp} for future connections.");
+            Ok(Some(fp))
+        }
+        RelayTrustChoice::Abort => Err(anyhow::Error::msg(
+            "relay certificate not trusted; aborting.",
+        )),
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -617,13 +704,19 @@ async fn run() -> anyhow::Result<()> {
                         .map(|(h, _)| h.to_string())
                         .unwrap_or_else(|| relay_addr.clone())
                 });
+                // Resolve the relay outer-cert trust: explicit flags/remembered pin
+                // win; otherwise offer interactive trust-on-first-use instead of a
+                // bare UnknownIssuer at connect time.
+                let relay_pin =
+                    resolve_relay_trust(relay_pin, &relay_addr, &relay_host, &cli, &pin_store)
+                        .await?;
                 Some(client::RelayDial {
                     relay_addr,
                     relay_host,
                     node_id,
                     relay_ca_path: cli.relay_ca.clone(),
                     relay_insecure: cli.relay_insecure,
-                    relay_pin: relay_pin.clone(),
+                    relay_pin,
                     relay_tofu: cli.relay_tofu,
                     pin_store: Some(pin_store.clone()),
                     outer_client_cert: cli.relay_client_cert.clone(),
@@ -966,6 +1059,38 @@ mod confirm_insecure_tls_tests {
     #[test]
     fn confirm_input_yes_returns_once() {
         assert!(matches!(run("yes\n", "wss://example.test:1").0, Once));
+    }
+
+    #[test]
+    fn relay_cert_prompt_y_trusts_and_shows_fingerprint() {
+        let mut output = Vec::new();
+        let choice = confirm_relay_cert_with(
+            Cursor::new("y\n"),
+            &mut output,
+            "relay.example:8443",
+            "abcd1234ef",
+        )
+        .expect("relay prompt must read");
+        assert_eq!(choice, RelayTrustChoice::Trust);
+        let shown = String::from_utf8(output).expect("prompt is UTF-8");
+        assert!(
+            shown.contains("abcd1234ef"),
+            "fingerprint must be shown: {shown}"
+        );
+        assert!(shown.contains("relay.example:8443"));
+    }
+
+    #[test]
+    fn relay_cert_prompt_default_and_no_abort() {
+        let mut out = Vec::new();
+        assert_eq!(
+            confirm_relay_cert_with(Cursor::new("\n"), &mut out, "r:1", "fp").unwrap(),
+            RelayTrustChoice::Abort
+        );
+        assert_eq!(
+            confirm_relay_cert_with(Cursor::new("n\n"), &mut out, "r:1", "fp").unwrap(),
+            RelayTrustChoice::Abort
+        );
     }
 
     #[test]

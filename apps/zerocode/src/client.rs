@@ -515,7 +515,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 /// Persist a TOFU-observed relay outer-leaf pin (sha256 hex) to `path` at `0600`,
 /// creating parent dirs. Best-effort: a write failure just means we TOFU again
 /// next run (the connection already succeeded).
-fn persist_relay_pin(path: &std::path::Path, pin: &str) {
+pub(crate) fn persist_relay_pin(path: &std::path::Path, pin: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -537,6 +537,36 @@ fn persist_relay_pin(path: &std::path::Path, pin: &str) {
     {
         let _ = std::fs::write(path, pin.as_bytes());
     }
+}
+
+/// Outer TLS to the relay with a trust-on-first-use verifier purely to OBSERVE
+/// its leaf certificate fingerprint (it is not yet trusted/pinned), so the
+/// operator can confirm it interactively before it is remembered. Returns the
+/// SHA-256 pin the relay would be pinned to. The outer TLS is a metadata boundary;
+/// the inner mutual TLS to the daemon is unaffected (A2).
+pub async fn probe_relay_cert_pin(relay_addr: &str, relay_host: &str) -> Result<String> {
+    let tcp = tokio::net::TcpStream::connect(relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {relay_addr}"))?;
+    let verifier = Arc::new(zeroclaw_tls::RelayPinVerifier::tofu());
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(verifier.clone())
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let server_name = rustls::pki_types::ServerName::try_from(relay_host.to_string())
+        .with_context(|| format!("relay host '{relay_host}' as a TLS server name"))?;
+    let _tls = connector
+        .connect(server_name, tcp)
+        .await
+        .with_context(|| format!("relay outer TLS handshake to {relay_addr}"))?;
+    verifier
+        .observed_pin()
+        .context("the relay presented no certificate to pin")
 }
 
 /// Load PEM certificates from a file into DER.
