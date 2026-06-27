@@ -48,9 +48,9 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         return Ok(None);
     };
 
-    // Resolve the identity by signup or pasted key. Each flow owns the phone
-    // question (mirroring Hermes' per-flow provisioning) and reports back the
-    // resolved number plus whether it was *just* provisioned this run.
+    // Resolve the identity by signup or pasted key. Each flow owns its own
+    // phone question and reports back the resolved number plus whether it was
+    // *just* provisioned this run.
     let Some((api_key, handle, phone_number, did_provision)) = (if has_key {
         api_key_flow(&base_url)?
     } else {
@@ -66,7 +66,7 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         fields.insert("base_url".into(), base_url.clone());
     }
 
-    // Hermes order: SMS opt-in (only when we just provisioned — a pre-existing
+    // Order: SMS opt-in (only when we just provisioned — a pre-existing
     // number is assumed already opted in) → realtime → iMessage → signing key.
     if did_provision {
         if let Some(number) = phone_number.as_deref() {
@@ -94,9 +94,8 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
     Ok(Some((alias, fields)))
 }
 
-/// Offer to provision a local number when the identity has none, mirroring
-/// Hermes `_offer_phone_for_existing`: stay silent and provision nothing if it
-/// already has one.
+/// Offer to provision a local number when the identity has none: stay silent
+/// and provision nothing if it already has one.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -113,7 +112,7 @@ fn offer_phone_for_existing(
     handle: &str,
     current: Option<String>,
 ) -> anyhow::Result<(Option<String>, bool)> {
-    // Already has one — say nothing and move on (Hermes returns immediately).
+    // Already has one — say nothing and move on.
     if current.is_some() {
         return Ok((current, false));
     }
@@ -296,8 +295,8 @@ fn signup_flow(
             ),
         }
     }
-    // Fresh identity has no number yet — offer to provision one (Hermes signup
-    // provisions here too), which also arms the SMS opt-in poll.
+    // Fresh identity has no number yet — offer to provision one, which also
+    // arms the SMS opt-in poll.
     let (phone, did_provision) =
         offer_phone_for_existing(base_url, &signup.api_key, &signup.agent_handle, None)?;
     Ok(Some((
@@ -329,7 +328,7 @@ fn api_key_flow(
         return Ok(None);
     }
 
-    // Hermes parity: whoami validates + classifies the key, then we resolve the
+    // whoami validates + classifies the key, then we resolve the
     // identity from the key — never by asking. Agent-scoped keys map to exactly
     // one identity; admin keys list and let the operator pick.
     let info = match ob::whoami_scope(base_url, &api_key) {
@@ -382,7 +381,7 @@ fn api_key_flow(
     // handled during creation (so we don't re-offer it afterwards).
     let (effective_key, handle, created_new): (String, String, bool) = match info.auth {
         // Agent-scoped: bound to one identity — use it (warn if the API ever
-        // returns more), exactly like Hermes `_pick_agent_scoped`.
+        // returns more).
         ob::KeyAuth::AgentScoped => {
             if handles.is_empty() {
                 eprintln!(
@@ -419,8 +418,7 @@ fn api_key_flow(
             (api_key.clone(), handles[0].clone(), false)
         }
         // Admin-scoped: pick an existing identity OR create a new one, then mint
-        // an agent-scoped key so the gateway never stores the admin key
-        // (Hermes `_pick_admin_scoped` + `_create_identity` + `_mint_agent_scoped_key`).
+        // an agent-scoped key so the gateway never stores the admin key.
         _ => {
             let create_label = crate::t(
                 "cli-quickstart-inkbox-create-new",
@@ -492,7 +490,7 @@ fn api_key_flow(
             let (phone, did_provision) = if created_new {
                 // The create sub-flow already asked about (and may have minted)
                 // a number — don't re-offer; a number present means we just
-                // minted it, which arms the SMS opt-in poll (Hermes parity).
+                // minted it, which arms the SMS opt-in poll.
                 let just_provisioned = id.phone_number.is_some();
                 (id.phone_number, just_provisioned)
             } else {
@@ -516,8 +514,8 @@ fn api_key_flow(
     }
 }
 
-/// Admin-key "create a new identity" sub-flow (Hermes `_create_identity`):
-/// prompt handle + optional display name, offer a phone number, then create it.
+/// Admin-key "create a new identity" sub-flow: prompt handle + optional display
+/// name, offer a phone number, then create it.
 fn create_new_identity(base_url: &str, api_key: &str) -> anyhow::Result<Option<String>> {
     let Some(handle) = input(
         &crate::t(
@@ -811,7 +809,7 @@ fn prompt_alias() -> anyhow::Result<Option<String>> {
 const POLL_SECS: u64 = 90;
 
 /// SMS opt-in walkthrough: tell the user to text START, then poll for the
-/// inbound START that unlocks outbound SMS (Hermes parity; time-bounded poll).
+/// inbound START that unlocks outbound SMS (time-bounded poll).
 fn sms_opt_in(base_url: &str, api_key: &str, handle: &str, number: &str) -> anyhow::Result<()> {
     println!(
         "\n  {}",
@@ -909,9 +907,9 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             "No number to provision — you connect through the Inkbox iMessage router.",
         )
     );
-    // Hermes parity: skip the enable prompt entirely when iMessage is already
-    // on; surface phones already connected so a rerun doesn't read like a
-    // first-time setup (and defaults the walkthrough off when one exists).
+    // Skip the enable prompt entirely when iMessage is already on; surface
+    // phones already connected so a rerun doesn't read like a first-time setup
+    // (and defaults the walkthrough off when one exists).
     let status = match ob::imessage_status(base_url, api_key, handle) {
         Ok(s) => s,
         Err(err) => {
@@ -976,8 +974,8 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             connected.join(", "),
         );
     }
-    // Default the walkthrough off when a phone is already connected (Hermes
-    // `not connected`): reconnecting another iPhone is the rare case.
+    // Default the walkthrough off when a phone is already connected:
+    // reconnecting another iPhone is the rare case.
     let connect_q = if connected.is_empty() {
         crate::t(
             "cli-quickstart-inkbox-imsg-connect",

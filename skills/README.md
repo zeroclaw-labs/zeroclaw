@@ -1,8 +1,7 @@
 # Inkbox skills
 
 Workflow guidance for the native `inkbox` channel and its agent tools (email,
-SMS/MMS, iMessage, voice). Ported from the Inkbox OpenClaw / Hermes plugins and
-re-pointed at the ZeroClaw tool names (`inkbox_send_email`,
+SMS/MMS, iMessage, voice), using the ZeroClaw tool names (`inkbox_send_email`,
 `inkbox_list_text_conversations`, `inkbox_place_call`, …).
 
 ## Install

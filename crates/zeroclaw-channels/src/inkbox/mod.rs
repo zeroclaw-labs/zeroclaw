@@ -1,11 +1,10 @@
 //! Inkbox channel — email, SMS/MMS, iMessage, and voice for an agent identity.
 //!
-//! A native port of the Inkbox OpenClaw / Hermes plugins into the ZeroClaw
-//! runtime. Inbound email/SMS/iMessage/voice arrive over the **Inkbox
-//! tunnel** (the in-repo `inkbox` SDK's `tunnels-runtime` data plane): this
-//! channel runs a loopback HTTP/WebSocket server and the tunnel forwards
-//! inbound traffic to it, exactly as the Hermes plugin ran a local server
-//! behind the tunnel. Outbound replies go back through the Inkbox API.
+//! A native Inkbox integration for the ZeroClaw runtime. Inbound
+//! email/SMS/iMessage/voice arrive over the **Inkbox tunnel** (the `inkbox`
+//! SDK's `tunnels-runtime` data plane): this channel runs a loopback
+//! HTTP/WebSocket server and the tunnel forwards inbound traffic to it.
+//! Outbound replies go back through the Inkbox API.
 
 use std::sync::Arc;
 

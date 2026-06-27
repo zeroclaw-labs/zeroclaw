@@ -2,8 +2,8 @@
 //!
 //! The native [`crate::inkbox`](super) channel handles *inbound* email / SMS /
 //! iMessage / voice and lets the agent *reply*. These tools add the *outbound*
-//! surface the OpenClaw / Hermes plugins exposed: send on any channel, place a
-//! call, and triage conversations — without waiting for an inbound message.
+//! surface: send on any channel, place a call, and triage conversations —
+//! without waiting for an inbound message.
 //!
 //! Each tool acts as one configured Inkbox identity (`[channels.inkbox.<alias>]`).
 //! The `inkbox` SDK is blocking, so every call runs on the blocking pool via

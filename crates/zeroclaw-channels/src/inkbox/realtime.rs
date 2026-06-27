@@ -1,5 +1,4 @@
-//! OpenAI Realtime bridge for Inkbox calls — a faithful port of the hermes
-//! plugin's `realtime.py`.
+//! OpenAI Realtime bridge for Inkbox calls.
 //!
 //! In realtime mode the call-media WebSocket is accepted with
 //! `x-use-inkbox-speech-to-text: false` / `x-use-inkbox-text-to-speech: false`,
@@ -144,8 +143,8 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
 
 // ── instructions / greeting / session ──────────────────────────────────────
 
-/// Port of hermes `build_realtime_instructions`, adapted to ZeroClaw identity
-/// and first-person `consult_agent` (it's the same agent, not a handoff).
+/// Build the realtime model instructions for the ZeroClaw identity and
+/// first-person `consult_agent` (it's the same agent, not a handoff).
 fn build_instructions(meta: &CallMeta) -> String {
     let name = if meta.agent_handle.is_empty() {
         "ZeroClaw".to_string()
@@ -242,7 +241,7 @@ fn build_instructions(meta: &CallMeta) -> String {
     lines.join("\n")
 }
 
-/// Port of hermes `build_realtime_greeting`, adapted to ZeroClaw.
+/// Build the realtime greeting for the ZeroClaw agent.
 fn build_greeting(meta: &CallMeta) -> String {
     let first_name = meta
         .contact_name
@@ -272,7 +271,7 @@ fn build_greeting(meta: &CallMeta) -> String {
     )
 }
 
-/// The realtime function tools exposed to the model (ported from hermes).
+/// The realtime function tools exposed to the model.
 fn realtime_tools() -> Value {
     json!([
         {

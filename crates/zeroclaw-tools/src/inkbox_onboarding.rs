@@ -127,8 +127,8 @@ pub fn resend(base_url: &str, api_key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How a pasted key authenticates, from `whoami` — mirrors the Hermes wizard's
-/// branch on `auth_subtype`.
+/// How a pasted key authenticates, from `whoami` — used to branch on
+/// `auth_subtype`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyAuth {
     /// Agent-scoped key — bound to exactly one identity.
@@ -150,7 +150,7 @@ pub struct WhoamiInfo {
     pub organization_id: String,
 }
 
-/// Call `whoami` to validate a pasted key and classify it (Hermes parity).
+/// Call `whoami` to validate a pasted key and classify it.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -190,7 +190,7 @@ pub fn whoami_scope(base_url: &str, api_key: &str) -> anyhow::Result<WhoamiInfo>
 }
 
 /// List the agent handles a key can see (one for an agent-scoped key, many for
-/// an admin key). Mirrors Hermes's `list_identities()` use in the key flow.
+/// an admin key). Used in the paste-a-key flow.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -310,8 +310,8 @@ pub fn check_sms_start(
     })
 }
 
-/// iMessage configuration state for an identity (Hermes parity), so reruns can
-/// skip the enable prompt and not read like a first-time setup.
+/// iMessage configuration state for an identity, so reruns can skip the enable
+/// prompt and not read like a first-time setup.
 #[derive(Debug, Clone, Default)]
 pub struct ImessageStatus {
     /// Whether shared-iMessage reachability is already enabled.
@@ -321,7 +321,7 @@ pub struct ImessageStatus {
 }
 
 /// Read whether iMessage is enabled for the identity and which phones are
-/// already connected. Mirrors the front of Hermes `_configure_imessage`.
+/// already connected.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -459,7 +459,7 @@ pub fn send_imessage_welcome(
 }
 
 /// Create a new agent identity (admin-key path), optionally provisioning a
-/// local phone number. Mirrors Hermes `_create_identity`.
+/// local phone number.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -502,7 +502,7 @@ pub fn create_identity(
 }
 
 /// Mint an agent-scoped API key for an identity so the gateway never stores the
-/// admin key (admin-key path). Mirrors Hermes `_mint_agent_scoped_key`.
+/// admin key (admin-key path).
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
