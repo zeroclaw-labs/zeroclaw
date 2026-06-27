@@ -39,7 +39,9 @@ import FieldForm, {
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
-import SectionPicker from "../components/sections/SectionPicker";
+import SectionPicker, {
+  badgeIsGood,
+} from "../components/sections/SectionPicker";
 import SectionNavigator from "../components/sections/SectionNavigator";
 import AddEntityDialog from "../components/sections/AddEntityDialog";
 import SectionTabs, {
@@ -1579,9 +1581,7 @@ function ConfiguredOnlyPicker({
         .then((resp) => {
           if (cancelled) return;
           setItems(
-            resp.items.filter(
-              (i) => i.badge === "configured" || i.badge === "active",
-            ),
+            resp.items.filter((i) => badgeIsGood(i.badge)),
           );
         })
         .catch((e) => {
