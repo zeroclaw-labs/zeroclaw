@@ -3,14 +3,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::sop::SopEngine;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::{SopRunAction, SopRunStatus};
+use crate::sop::{SopAuditLogger, SopEngine};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
     agent_alias: String,
 }
 
@@ -18,8 +19,14 @@ impl SopApproveTool {
     pub fn new(engine: Arc<Mutex<SopEngine>>) -> Self {
         Self {
             engine,
+            audit: None,
             agent_alias: "agent".to_string(),
         }
+    }
+
+    pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Set the agent alias recorded as the approval principal (default `"agent"`).
@@ -111,6 +118,11 @@ impl Tool for SopApproveTool {
 
         match result {
             Ok(ResolveOutcome::Resumed(action)) => {
+                crate::sop::executor::enqueue_live_action(
+                    Arc::clone(&self.engine),
+                    self.audit.clone(),
+                    &action,
+                );
                 let output = match action {
                     SopRunAction::ExecuteStep {
                         run_id, context, ..

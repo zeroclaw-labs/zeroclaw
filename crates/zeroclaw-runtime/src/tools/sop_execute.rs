@@ -117,6 +117,14 @@ impl Tool for SopExecuteTool {
             );
         }
 
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
+        }
+
         match action {
             Ok(action) => {
                 let output = match action {

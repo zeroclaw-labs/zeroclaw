@@ -204,6 +204,14 @@ impl Tool for SopAdvanceTool {
             collector.record_run_complete(run);
         }
 
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
+        }
+
         match action {
             Ok(action) => {
                 let result_output = match action {

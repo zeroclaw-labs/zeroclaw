@@ -169,6 +169,11 @@ impl SopEngine {
         &self.sops
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_sops_for_test(&mut self, sops: Vec<Sop>) {
+        self.sops = sops;
+    }
+
     /// Return all active (in-flight) runs.
     pub fn active_runs(&self) -> &HashMap<String, SopRun> {
         &self.active_runs
