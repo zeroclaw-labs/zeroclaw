@@ -2771,10 +2771,12 @@ enum SecurityCommands {
 /// zero-config and headless bring-up are unaffected. The daemon sources it
 /// identically at CA generation (the WSS path) and at every CA read (enrollment
 /// + this CLI), so the on-disk form always matches.
+#[cfg(feature = "agent-runtime")]
 fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
     zeroclaw_tls::CaKeyProtection::from_env()
 }
 
+#[cfg(feature = "agent-runtime")]
 fn issue_wss_client_cert(
     config: &Config,
     name: &str,
