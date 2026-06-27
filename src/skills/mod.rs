@@ -1287,4 +1287,54 @@ mod install_location_tests {
             "data/skills must NOT be loaded by the runtime (this was #8334); got {loaded:?}"
         );
     }
+
+    /// End-to-end #8334 (requested in review): drive the *real* `skills install`
+    /// command handler with a local skill source, then assert the runtime loader
+    /// the agent boot/loop uses actually returns it — covering the full
+    /// install → read path, not just the resolved destination.
+    #[tokio::test]
+    async fn install_command_then_runtime_loads_the_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A local skill source directory a user would `skills install`.
+        let source_parent = root.join("source");
+        write_skill(&source_parent, "e2e-skill");
+        let source = source_parent.join("e2e-skill");
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Run the actual bin handler — no flags, so it resolves to the default
+        // agent's single assigned bundle, exactly like `zeroclaw skills install`.
+        handle_command(
+            crate::SkillCommands::Install {
+                source: source.to_string_lossy().into_owned(),
+                agent: None,
+                bundle: None,
+                no_tier_banner: true,
+            },
+            &c,
+        )
+        .await
+        .expect("skills install should succeed for a local source");
+
+        // The runtime loader must now see what install just wrote.
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "e2e-skill"),
+            "an installed skill must be loaded by the runtime; got {loaded:?}"
+        );
+    }
 }
