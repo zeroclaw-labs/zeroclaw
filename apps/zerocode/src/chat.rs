@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -768,9 +768,9 @@ impl Chat {
                 return false;
             }
             ChatPhase::Error(_) => {
-                use crate::keymap::GlobalAction;
+                use crate::keymap::{ChatTabAction, GlobalAction};
                 return GlobalAction::from_chord(&key) == Some(GlobalAction::Quit)
-                    || crate::keymap::Chord::char('q').matches(&key);
+                    || ChatTabAction::from_chord(&key) == Some(ChatTabAction::ErrorDismiss);
             }
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
@@ -783,12 +783,11 @@ impl Chat {
         // ── Model / model_provider picker overlay key handling ───
         // Takes priority over all other Active-phase keys while open.
         if state.model_picker.is_open() {
-            use crate::keymap::{Chord, ModalAction};
-            use crossterm::event::KeyCode;
+            use crate::keymap::ModalAction;
 
-            let up = Chord::key(KeyCode::Up).matches(&key);
-            let down = Chord::key(KeyCode::Down).matches(&key);
-            let modal = ModalAction::from_chord(&key);
+            let action = ModalAction::from_chord(&key);
+            let up = action == Some(ModalAction::Up);
+            let down = action == Some(ModalAction::Down);
 
             // Movement first.
             if up || down {
@@ -807,7 +806,7 @@ impl Chat {
                 return false;
             }
 
-            match modal {
+            match action {
                 Some(ModalAction::Cancel) => {
                     state.model_picker = ModelPickerOverlay::None;
                     state.mark_dirty_full();
@@ -832,7 +831,7 @@ impl Chat {
                 sessions,
                 list_state,
             } => {
-                use crate::keymap::{Chord, ModalAction};
+                use crate::keymap::ModalAction;
                 match ModalAction::from_chord(&key) {
                     Some(ModalAction::Cancel) => {
                         state.session_overlay = SessionOverlay::None;
@@ -873,17 +872,17 @@ impl Chat {
                             }
                         }
                     }
-                    _ => {
-                        if Chord::key(crossterm::event::KeyCode::Up).matches(&key) {
-                            let i = list_state.selected().unwrap_or(0);
-                            list_state.select(Some(i.saturating_sub(1)));
-                        } else if Chord::key(crossterm::event::KeyCode::Down).matches(&key) {
-                            let i = list_state.selected().unwrap_or(0);
-                            if i + 1 < sessions.len() {
-                                list_state.select(Some(i + 1));
-                            }
+                    Some(ModalAction::Up) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    Some(ModalAction::Down) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < sessions.len() {
+                            list_state.select(Some(i + 1));
                         }
                     }
+                    _ => {}
                 }
                 return false;
             }
@@ -999,10 +998,6 @@ impl Chat {
                 }
                 return false;
             }
-        }
-
-        if state.in_browse_mode() && key.code == KeyCode::Enter {
-            state.exit_browse_mode();
         }
 
         // Enter (slash commands + submit), text input, cursor, backspace.
@@ -1770,6 +1765,18 @@ impl Chat {
                         }
                         return;
                     }
+                    if let Some(text) = state
+                        .copy_hit_regions
+                        .iter()
+                        .find(|r| mouse::in_rect(col, row, r.rect))
+                        .map(|r| r.text.clone())
+                    {
+                        if !text.is_empty() {
+                            crate::mouse::copy_osc52(&text);
+                            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                        }
+                        return;
+                    }
                     let hit = state
                         .entry_rects
                         .iter()
@@ -1996,59 +2003,124 @@ impl crate::widgets::HelpContext for Chat {
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
+                use crate::keymap::{
+                    ChatTabAction as C, GlobalAction, ModalAction, action_key_labels,
+                };
                 if *loading {
                     HelpNode::entries(vec![E::key("", crate::i18n::t("zc-chat-loading-agents"))])
                 } else {
+                    let nav = action_key_labels(C::BrowseUp)
+                        .into_iter()
+                        .chain(action_key_labels(C::BrowseDown))
+                        .chain(action_key_labels(C::BrowseUpVim))
+                        .chain(action_key_labels(C::BrowseDownVim));
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-chat-help-select-agent")),
-                        E::key("q", crate::i18n::t("zc-chat-help-quit")),
+                        E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                        E::new(
+                            action_key_labels(ModalAction::Confirm),
+                            crate::i18n::t("zc-chat-help-select-agent"),
+                        ),
+                        E::new(
+                            action_key_labels(GlobalAction::Quit),
+                            crate::i18n::t("zc-chat-help-quit"),
+                        ),
                     ])
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
             ChatPhase::Error(_) => {
-                HelpNode::entries(vec![E::key("q", crate::i18n::t("zc-chat-help-quit"))])
+                use crate::keymap::{ChatTabAction as C, GlobalAction, action_key_labels};
+                let keys = action_key_labels(C::ErrorDismiss)
+                    .into_iter()
+                    .chain(action_key_labels(GlobalAction::Quit));
+                HelpNode::entries(vec![E::new(keys, crate::i18n::t("zc-chat-help-quit"))])
             }
             ChatPhase::Active(state) => {
                 match &state.session_overlay {
                     SessionOverlay::List { .. } => {
+                        use crate::keymap::{ModalAction as M, action_key_labels};
+                        let nav = action_key_labels(M::Up)
+                            .into_iter()
+                            .chain(action_key_labels(M::Down));
                         return HelpNode::entries(vec![
-                            E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
-                            E::key("Enter", crate::i18n::t("zc-chat-help-switch-session")),
-                            E::key("Esc", crate::i18n::t("zc-chat-help-close")),
+                            E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                            E::new(
+                                action_key_labels(M::Confirm),
+                                crate::i18n::t("zc-chat-help-switch-session"),
+                            ),
+                            E::new(
+                                action_key_labels(M::Cancel),
+                                crate::i18n::t("zc-chat-help-close"),
+                            ),
                         ]);
                     }
                     SessionOverlay::None => {}
                 }
                 if state.pending_approval().is_some() {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
                     return HelpNode::entries(vec![
-                        E::key("Enter", crate::i18n::t("zc-chat-help-approve")),
-                        E::key("a", crate::i18n::t("zc-chat-help-always-approve")),
-                        E::key("Ctrl+D", crate::i18n::t("zc-chat-help-deny")),
-                        E::key("Ctrl+C", crate::i18n::t("zc-chat-help-cancel-turn")),
+                        E::new(
+                            action_key_labels(C::ApprovalApprove),
+                            crate::i18n::t("zc-chat-help-approve"),
+                        ),
+                        E::new(
+                            action_key_labels(C::ApprovalApproveAll),
+                            crate::i18n::t("zc-chat-help-always-approve"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CancelTurn),
+                            crate::i18n::t("zc-chat-help-deny"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CancelTurn),
+                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                        ),
                     ]);
                 }
                 if state.in_browse_mode() {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    let mut return_keys = action_key_labels(C::BrowseExit);
+                    return_keys.extend(action_key_labels(C::BrowseExitSelection));
                     return HelpNode::entries(vec![
-                        E::new(vec!["↑", "k"], crate::i18n::t("zc-chat-help-move-up")),
-                        E::new(vec!["↓", "j"], crate::i18n::t("zc-chat-help-move-down")),
-                        E::key("Shift+↑/↓", crate::i18n::t("zc-chat-help-extend-selection")),
-                        E::key("y", crate::i18n::t("zc-chat-help-yank-selection")),
                         E::new(
-                            vec!["Ctrl+↓", "Esc"],
-                            crate::i18n::t("zc-chat-help-return-to-input"),
+                            action_key_labels(C::BrowseUp)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseUpVim)),
+                            crate::i18n::t("zc-chat-help-move-up"),
                         ),
+                        E::new(
+                            action_key_labels(C::BrowseDown)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseDownVim)),
+                            crate::i18n::t("zc-chat-help-move-down"),
+                        ),
+                        E::new(
+                            action_key_labels(C::BrowseSelectExtend)
+                                .into_iter()
+                                .chain(action_key_labels(C::BrowseSelectExtendDown)),
+                            crate::i18n::t("zc-chat-help-extend-selection"),
+                        ),
+                        E::new(
+                            action_key_labels(C::CopySelection),
+                            crate::i18n::t("zc-chat-help-yank-selection"),
+                        ),
+                        E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
                     ]);
                 }
                 if state.turn_in_flight {
+                    use crate::keymap::{ChatTabAction as C, action_key_labels};
+                    let mut cancel_keys = action_key_labels(C::CancelTurn);
+                    cancel_keys.extend(action_key_labels(C::BrowseExitSelection));
                     let mut entries = vec![
+                        E::new(cancel_keys, crate::i18n::t("zc-chat-help-cancel-turn")),
                         E::new(
-                            vec!["Ctrl+C", "Esc"],
-                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                            action_key_labels(crate::keymap::InputBarAction::Submit),
+                            crate::i18n::t("zc-queue-help-enqueue"),
                         ),
-                        E::key("Enter", crate::i18n::t("zc-queue-help-enqueue")),
-                        E::key("Ctrl+Enter", crate::i18n::t("zc-queue-help-inject")),
+                        E::new(
+                            action_key_labels(crate::keymap::InputBarAction::Inject),
+                            crate::i18n::t("zc-queue-help-inject"),
+                        ),
                     ];
                     // Queue-management keys are only live while the sidebar is
                     // open — surface them here too so a mid-turn open queue is
@@ -2056,7 +2128,9 @@ impl crate::widgets::HelpContext for Chat {
                     if state.queue_sidebar_open() {
                         entries.extend(queue_sidebar_help_entries());
                     }
-                    return HelpNode::entries(entries);
+                    // The input box stays editable mid-turn for queuing, so its
+                    // bindings belong in help too.
+                    return HelpNode::entries(entries).with_child(state.input_bar.help_context());
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
@@ -2762,6 +2836,71 @@ fn render_entry_into(
     }
 }
 
+/// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
+/// starting column (display cells from line start) and its trimmed width in
+/// cells, or `None` if the line has no copy label.
+fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    let mut col = 0u16;
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        if content == copy_lbl {
+            let lead = copy_lbl.len() - copy_lbl.trim_start().len();
+            let trimmed = copy_lbl.trim();
+            return Some((col + lead as u16, UnicodeWidthStr::width(trimmed) as u16));
+        }
+        col += UnicodeWidthStr::width(content) as u16;
+    }
+    None
+}
+
+/// Recover the fence language token from a code-fence header bar line. The
+/// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
+/// empty info string both yield `None` so the rebuilt fence stays unlabelled.
+fn header_fence_lang(line: &Line<'static>) -> Option<String> {
+    let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+    let token = first
+        .trim_start_matches('\u{250c}')
+        .trim_matches('\u{2500}')
+        .trim();
+    if token.is_empty() || token == "code" {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Wrap recovered fence body text in its Markdown fence so a copied fence round-
+/// trips to the same source the model emitted, language tag included.
+fn fenced_text(lang: Option<&str>, body: &str) -> String {
+    format!("```{}\n{body}\n```", lang.unwrap_or(""))
+}
+
+/// Wrapped screen-row count for a single cached line at the given width.
+fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
+    Paragraph::new(vec![borrow_line(line)])
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
+}
+
+/// Build a `[Copy]` region if its global wrapped row is on-screen.
+fn copy_region(
+    global_row: u16,
+    col: u16,
+    cells: u16,
+    scroll: u16,
+    body: Rect,
+    text: &str,
+) -> Option<CopyHitRegion> {
+    if global_row < scroll || global_row >= scroll + body.height {
+        return None;
+    }
+    Some(CopyHitRegion {
+        rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
+        text: text.to_string(),
+    })
+}
+
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
     let spans: Vec<Span<'a>> = line
         .spans
@@ -2787,32 +2926,13 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.rebuild_lines(inner_width);
     }
 
-    let mut lines: Vec<Line> = state.cached_lines.iter().map(borrow_line).collect();
-    let mut transient = false;
-
-    if !state.streaming_text.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-            theme::agent_label_style(),
-        )]));
-        lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
-        transient = true;
-    }
-
-    if state.show_thoughts && !state.streaming_thought.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("(thinking) ", theme::thought_style()),
-            Span::styled(state.streaming_thought.as_str(), theme::dim_style()),
-        ]));
-        transient = true;
-    }
-
-    if state.pending_approval().is_some() {
-        for _ in 0..APPROVAL_OVERLAY_HEIGHT {
-            lines.push(Line::default());
-        }
-        transient = true;
-    }
+    // Determine transient overlays (live streaming / approval) up front from
+    // cheap state reads. Transient frames append uncached lines and must use
+    // the full-buffer path; idle/scroll frames render only the viewport slice.
+    let has_stream_text = !state.streaming_text.is_empty();
+    let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
+    let has_approval = state.pending_approval().is_some();
+    let transient = has_stream_text || has_stream_thought || has_approval;
 
     // Reserve a pinned top row inside the panel for the session's first user
     // message — a recovery reminder that stays put across scroll and reload.
@@ -2843,10 +2963,38 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         inner.height.saturating_sub(first_row_h),
     );
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Build the full line buffer (history + transient overlays) only on
+    // transient frames; idle/scroll frames never materialize the whole
+    // history and instead slice the viewport below.
+    let transient_lines: Vec<Line<'static>> = if transient {
+        let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
+        if has_stream_text {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                theme::agent_label_style(),
+            )]));
+            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
+        }
+        if has_stream_thought {
+            lines.push(Line::from(vec![
+                Span::styled("(thinking) ", theme::thought_style()),
+                Span::styled(state.streaming_thought.clone(), theme::dim_style()),
+            ]));
+        }
+        if has_approval {
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
+        }
+        lines
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
-        p.line_count(inner_width) as u16
+        Paragraph::new(transient_lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16
     } else {
         state.cached_total_rows
     };
@@ -2857,7 +3005,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.scroll_offset.min(max_scroll)
     };
 
-    let p = p.scroll((scroll, 0));
+    // Non-transient frames (idle, scrolling) render only the viewport slice so
+    // per-frame work stays O(visible) instead of O(history). Transient frames
+    // (live streaming, approval overlay) append uncached lines and keep the
+    // full-buffer path.
+    let (render_lines, render_scroll) = if transient {
+        (transient_lines, scroll)
+    } else {
+        state.visible_line_slice(scroll, inner_height)
+    };
+
+    let p = Paragraph::new(render_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
@@ -2886,6 +3046,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.entry_rects.push((entry_idx, rect));
     }
 
+    let body_rect = Rect::new(body_x, body_y, body_w, body_h);
+    state.rebuild_copy_regions(inner_width, scroll, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -3064,6 +3226,70 @@ fn render_session_list_overlay(
 /// `width` is the available rendering width in cells (the chat-area inner
 /// width). It only matters for tables, which compute their column budgets
 /// from it; non-table content ignores it.
+/// Emit the body lines of a code fence into `lines`, two-space indented to
+/// match the no-gutter body convention the copy-region recovery relies on.
+/// When `lang` resolves to a known language the body is syntax-highlighted via
+/// the theme palette; otherwise every line falls back to the flat code-block
+/// style.
+fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.is_empty() {
+        return;
+    }
+    let plain_fg = theme::active().body;
+    let highlighted = lang.and_then(|token| crate::diff::highlight_code(body, token, plain_fg));
+    match highlighted {
+        Some(hl) => {
+            for line in hl {
+                let mut spans = vec![Span::styled("  ".to_string(), theme::code_block_style())];
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+        None => {
+            for code_line in body.split('\n') {
+                lines.push(Line::from(Span::styled(
+                    format!("  {code_line}"),
+                    theme::code_block_style(),
+                )));
+            }
+        }
+    }
+}
+
+/// Builds one full-width code-block border bar: `corner_l`, an optional left
+/// label (the language), then dashes wrapping a centered `[Copy]`, then
+/// `corner_r`. Header and footer share this so their geometry can never drift.
+fn code_block_bar(
+    width: u16,
+    corner_l: char,
+    corner_r: char,
+    label: Option<&str>,
+) -> Line<'static> {
+    let label = label.unwrap_or("");
+    let copy_lbl = " [Copy] ";
+    let label_len = label.chars().count();
+    let copy_len = copy_lbl.chars().count();
+    let inner = (width as usize).saturating_sub(2);
+    let left_total = inner.saturating_sub(copy_len) / 2;
+    let right = inner.saturating_sub(copy_len).saturating_sub(left_total);
+    let left_dashes = left_total.saturating_sub(label_len);
+    Line::from(vec![
+        Span::styled(
+            format!("{corner_l}{label}{}", "\u{2500}".repeat(left_dashes)),
+            theme::dim_style(),
+        ),
+        Span::styled(
+            copy_lbl.to_string(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}{corner_r}", "\u{2500}".repeat(right)),
+            theme::dim_style(),
+        ),
+    ])
+}
+
 fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     use pulldown_cmark::{Alignment as MdAlign, HeadingLevel};
 
@@ -3080,9 +3306,15 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut in_strike = false;
     let mut in_code_block = false;
     let mut code_block_text: String = String::new();
+    let mut code_block_lang: Option<String> = None;
     let mut heading_level: Option<HeadingLevel> = None;
     let mut blockquote_depth: u32 = 0;
     let mut link_url: Option<String> = None;
+
+    // Stack of enclosing lists. `Some(next)` is an ordered list whose next item
+    // renders `next.` and then increments; `None` is a bullet list. The stack
+    // depth drives per-level indentation so nested lists step inward.
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
 
     // Table state. While non-`None`, text/inline events accumulate into the
     // current cell instead of the live `current_spans` line.
@@ -3169,90 +3401,65 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = true;
                 code_block_text.clear();
-                let code_block_lang = match kind {
-                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
-                        let s = info.trim();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(s.to_string())
-                        }
-                    }
+                code_block_lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
 
-                // Render header bar, exactly `width` columns wide:
-                //   ┌─── lang ───── [Copy] ───────┐
+                // Header bar: ┌─ lang ──── [Copy] ────┐
                 let lang_display = code_block_lang.clone().unwrap_or_default();
-                let header_text_owned = if lang_display.is_empty() {
+                let label = if lang_display.is_empty() {
                     " code ".to_string()
                 } else {
                     format!(" {} ", lang_display.as_str())
                 };
-                let hdr_text = header_text_owned.as_str();
-                let hdr_visible = hdr_text.len();
-                let copy_lbl = " [Copy] ";
-                let copy_visible = copy_lbl.len();
-                // fixed = ┌ + ─ after ┌ + spaces around header/copy + ┐
-                let fixed = 5; // ┌ + ─ + (space) + (space) + ┐
-                let middle = (width as usize).saturating_sub(fixed + hdr_visible + copy_visible);
-                let left_dots = middle / 2;
-                let right_dots = middle.saturating_sub(left_dots);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "\u{250c}\u{2500}{}{}",
-                            hdr_text,
-                            "\u{2500}".repeat(left_dots)
-                        ),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(
-                        copy_lbl.to_string(),
-                        theme::accent_style().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{}\u{2510}", "\u{2500}".repeat(right_dots)),
-                        theme::dim_style(),
-                    ),
-                ]));
+                lines.push(code_block_bar(
+                    width,
+                    '\u{250c}',
+                    '\u{2510}',
+                    Some(&format!("\u{2500}{label}")),
+                ));
             }
             MdEvent::End(TagEnd::CodeBlock) => {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = false;
 
-                // Render footer bar, exactly `width` columns wide:
-                //   └─── [Copy] ──────────────────┘
-                let copy_lbl = " [Copy] ";
-                let copy_visible = copy_lbl.len();
-                // fixed = └ + spaces around copy + ┘
-                let fixed = 3; // └ + (space) + ┘
-                let dots = (width as usize).saturating_sub(fixed + copy_visible);
-                let left_dots = dots / 2;
-                let right_dots = dots.saturating_sub(left_dots);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("\u{2514}{}", "\u{2500}".repeat(left_dots)),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(
-                        copy_lbl.to_string(),
-                        theme::accent_style().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{}\u{2518}", "\u{2500}".repeat(right_dots)),
-                        theme::dim_style(),
-                    ),
-                ]));
+                emit_code_block_body(&mut lines, &code_block_text, code_block_lang.as_deref());
+
+                // Footer bar: └──── [Copy] ────┘
+                lines.push(code_block_bar(width, '\u{2514}', '\u{2518}', None));
 
                 // Accumulated code text is ready for clipboard copy;
                 // the Copy action is handled by the chat pane.
                 code_block_text.clear();
+                code_block_lang = None;
+            }
+            MdEvent::Start(Tag::List(start)) => {
+                push_line(&mut lines, &mut current_spans);
+                list_stack.push(start);
+            }
+            MdEvent::End(TagEnd::List(_)) => {
+                push_line(&mut lines, &mut current_spans);
+                list_stack.pop();
             }
             MdEvent::Start(Tag::Item) => {
                 push_line(&mut lines, &mut current_spans);
                 current_spans.extend(blockquote_gutter(blockquote_depth));
-                current_spans.push(Span::styled("  \u{2022} ", theme::dim_style()));
+                let depth = list_stack.len().saturating_sub(1);
+                current_spans.push(Span::styled("  ".repeat(depth + 1), theme::dim_style()));
+                let marker = match list_stack.last_mut() {
+                    Some(Some(next)) => {
+                        let label = format!("{next}. ");
+                        *next += 1;
+                        label
+                    }
+                    _ => "\u{2022} ".to_string(),
+                };
+                current_spans.push(Span::styled(marker, theme::dim_style()));
             }
             MdEvent::End(TagEnd::Item) if !current_spans.is_empty() => {
                 push_line(&mut lines, &mut current_spans);
@@ -3324,13 +3531,6 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 let owned = t.to_string();
                 if in_code_block {
                     code_block_text.push_str(&owned);
-                    for code_line in owned.split('\n') {
-                        push_line(&mut lines, &mut current_spans);
-                        current_spans.push(Span::styled(
-                            format!("\u{2502} {code_line}"),
-                            theme::code_block_style(),
-                        ));
-                    }
                 } else {
                     let mut style = theme::body_style();
                     if let Some(level) = heading_level {
@@ -3648,6 +3848,14 @@ struct TitleHitRect {
     rect: Rect,
 }
 
+/// A clickable `[Copy]` label on a code-fence header bar. `text` is the exact
+/// fence contents; `rect` is the label's screen cells from the last draw.
+#[derive(Debug, Clone)]
+struct CopyHitRegion {
+    rect: Rect,
+    text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueItemStatus {
     Pending,
@@ -3716,6 +3924,8 @@ pub struct ChatState {
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Clickable `[Copy]` code-fence labels from the last draw.
+    copy_hit_regions: Vec<CopyHitRegion>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -3809,6 +4019,7 @@ impl ChatState {
             highlighted_entry: None,
             mouse_down_entry: None,
             entry_rects: Vec::new(),
+            copy_hit_regions: Vec::new(),
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -4109,6 +4320,63 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
+    /// Collect only the cached lines whose wrapped screen rows intersect the
+    /// viewport `[scroll, scroll + height)`, plus the residual scroll within
+    /// the first partially-visible entry. Lets `render_conversation` build a
+    /// `Paragraph` sized to the viewport instead of cloning the whole history
+    /// every frame, so scroll and keystroke latency stay flat as a session
+    /// grows. Returns `(lines, local_scroll)`; an empty slice yields the full
+    /// `scroll` so the caller's clamping is unchanged.
+    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), scroll);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), scroll);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        let local_scroll = scroll.saturating_sub(self.cached_screen_ranges[first].1);
+        (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
+    }
+
+    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), 0);
+        }
+        let view_end = scroll.saturating_add(height);
+        let mut first: Option<usize> = None;
+        let mut last: usize = 0;
+        for (i, &(_, screen_lo, screen_hi)) in self.cached_screen_ranges.iter().enumerate() {
+            if screen_hi > scroll && screen_lo < view_end {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let Some(first) = first else {
+            return (self.cached_lines.clone(), 0);
+        };
+        let line_lo = self.cached_line_ranges[first].1;
+        let line_hi = self.cached_line_ranges[last].2;
+        (
+            self.cached_lines[line_lo..line_hi].to_vec(),
+            self.cached_screen_ranges[first].1,
+        )
+    }
+
     /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
     /// each entry's `Line`s individually, so screen row positions reflect
     /// markdown wrapping (code blocks, tables, etc.). Called after every
@@ -4132,6 +4400,52 @@ impl ChatState {
             self.cached_screen_ranges
                 .push((entry_idx, screen_lo, screen_cursor));
         }
+    }
+
+    fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
+        let copy_lbl = " [Copy] ";
+        let mut regions: Vec<CopyHitRegion> = Vec::new();
+        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
+        let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
+        for line in &lines {
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            if first.starts_with('\u{250c}') {
+                let lang = header_fence_lang(line);
+                pending = label_cells(line, copy_lbl)
+                    .map(|(col, cells)| (screen_cursor, col, cells, lang, String::new()));
+            } else if first.starts_with('\u{2514}') {
+                if let Some((header_row, header_col, header_cells, lang, acc)) = pending.take() {
+                    let text = fenced_text(lang.as_deref(), &acc);
+                    if let Some(r) =
+                        copy_region(header_row, header_col, header_cells, scroll, body, &text)
+                    {
+                        regions.push(r);
+                    }
+                    if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
+                        && let Some(r) = copy_region(
+                            screen_cursor,
+                            footer_col,
+                            footer_cells,
+                            scroll,
+                            body,
+                            &text,
+                        )
+                    {
+                        regions.push(r);
+                    }
+                }
+            } else if let Some((_, _, _, _, acc)) = pending.as_mut() {
+                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
+                if !acc.is_empty() {
+                    acc.push('\n');
+                }
+                acc.push_str(&body_text);
+            }
+
+            screen_cursor += wrapped_rows(line, width);
+        }
+        self.copy_hit_regions = regions;
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -4959,6 +5273,66 @@ mod tests {
     }
 
     #[test]
+    fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+
+        let total = s.cached_lines.len();
+        assert!(total > 100, "expected a deep history, got {total} lines");
+
+        let height = 20u16;
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let mid_scroll = max_scroll / 2;
+
+        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, height);
+
+        assert!(
+            slice.len() < total,
+            "viewport slice ({}) must be smaller than full history ({total})",
+            slice.len()
+        );
+        assert!(
+            slice.len() <= (height as usize) + 8,
+            "viewport slice ({}) should be bounded near the viewport height ({height}), not the history",
+            slice.len()
+        );
+        assert!(
+            local_scroll < height,
+            "local scroll ({local_scroll}) must land inside the first visible entry, below viewport height ({height})"
+        );
+    }
+
+    #[test]
+    fn visible_line_slice_handles_top_and_bottom_extents() {
+        let mut s = state();
+        for i in 0..50 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        let height = 12u16;
+
+        let (top, top_local) = s.visible_line_slice(0, height);
+        assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
+        assert!(!top.is_empty());
+
+        let max_scroll = s.cached_total_rows.saturating_sub(height);
+        let (bottom, _) = s.visible_line_slice(max_scroll, height);
+        assert!(!bottom.is_empty(), "bottom extent must still yield lines");
+    }
+
+    #[test]
     fn title_shows_agent_uid_provider_model() {
         let mut s = ChatState::new(
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
@@ -5771,6 +6145,230 @@ mod tests {
     }
 
     #[test]
+    fn md_code_block_bars_span_full_width() {
+        let width: u16 = 50;
+        let out = rendered("```rust\nlet x = 1;\n```\n", width);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        let footer = out.lines().find(|l| l.starts_with('\u{2514}')).unwrap();
+        assert_eq!(header.chars().count(), width as usize, "header: {header:?}");
+        assert_eq!(
+            header.chars().count(),
+            footer.chars().count(),
+            "header and footer must match width"
+        );
+        let copy_col = |l: &str| l.chars().take_while(|c| *c != '[').count();
+        assert_eq!(
+            copy_col(header),
+            copy_col(footer),
+            "[Copy] must start at the same column on header and footer\nheader: {header:?}\nfooter: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_header_shows_language() {
+        let out = rendered("```python\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" python "),
+            "header must show the fence language: {header:?}"
+        );
+        assert!(
+            !header.contains(" code "),
+            "labeled fence must not fall back to ` code `: {header:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_header_strips_info_extras() {
+        let out = rendered("```python title=\"x\"\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" python "),
+            "only the language token is used as the label: {header:?}"
+        );
+        assert!(
+            !header.contains("title"),
+            "info-string extras must not leak into the label: {header:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_unlabeled_fence_falls_back() {
+        let out = rendered("```\nx = 1\n```\n", 50);
+        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        assert!(
+            header.contains(" code "),
+            "unlabeled fence keeps the ` code ` fallback: {header:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_body_has_no_left_gutter() {
+        let out = rendered("```rust\nlet x = 1;\n```\n", 50);
+        let body = out
+            .lines()
+            .find(|l| l.contains("let x = 1;"))
+            .expect("code body line");
+        assert!(
+            !body.starts_with('\u{2502}'),
+            "code body must not start with a vertical gutter: {body:?}"
+        );
+        assert_eq!(
+            body.strip_prefix("  ").map(str::trim_end),
+            Some("let x = 1;"),
+            "body line is two-space indented code: {body:?}"
+        );
+    }
+
+    #[test]
+    fn md_code_block_body_is_syntax_highlighted() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let lines = markdown_to_lines("```rust\nfn main() {}\n```\n", 60);
+        let body = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("fn")
+            })
+            .expect("code body line");
+        assert!(
+            body.spans.len() > 2,
+            "highlighted body should split into multiple token spans, got {}",
+            body.spans.len()
+        );
+        let keyword_fg = theme::SyntaxScope::Keyword.color();
+        assert!(
+            body.spans.iter().any(|s| s.style.fg == Some(keyword_fg)),
+            "the `fn` keyword should carry the themed keyword colour"
+        );
+    }
+
+    #[test]
+    fn md_code_block_unknown_language_stays_plain() {
+        let lines = markdown_to_lines("```nonexistent_lang_xyz\nfoo bar\n```\n", 60);
+        let body = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("foo bar")
+            })
+            .expect("code body line");
+        let text: String = body.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text.strip_prefix("  ").map(str::trim_end),
+            Some("foo bar"),
+            "unknown language keeps the flat two-space-indented body: {text:?}"
+        );
+    }
+
+    #[test]
+    fn copy_label_cells_locate_copy_on_header_bar() {
+        let lines = markdown_to_lines("```rust\nlet x = 1;\n```\n", 50);
+        let header = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .map(|s| s.content.starts_with('\u{250c}'))
+                    .unwrap_or(false)
+            })
+            .expect("header bar");
+        let (col, cells) = label_cells(header, " [Copy] ").expect("copy label present");
+        assert_eq!(cells, "[Copy]".chars().count() as u16);
+        // The cell at `col` on the rendered header must be the '[' of [Copy].
+        let rendered: String = header
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            rendered.chars().nth(col as usize),
+            Some('['),
+            "label_cells column must point at '[' of [Copy]: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn copy_region_recovers_full_highlighted_body() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
+        let body = Rect::new(0, 0, 60, 20);
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            !state.copy_hit_regions.is_empty(),
+            "a highlighted fence must still register copy regions"
+        );
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```rust\nfn main() {}\nlet y = 2;\n```",
+            "copy text re-wraps the body in its fence with the language tag"
+        );
+    }
+
+    #[test]
+    fn copy_region_unlabeled_fence_omits_language() {
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
+        let body = Rect::new(0, 0, 60, 20);
+        state.rebuild_copy_regions(60, 0, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```\nplain text\n```",
+            "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+        );
+    }
+
+    #[test]
+    fn copy_regions_track_scroll_with_history_above_viewport() {
+        let _g = theme::set_active_for_test(
+            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
+        );
+        let mut state = ChatState::new("sess".to_string(), "agent".to_string());
+        let pad = "filler line\n".repeat(200);
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(pad.as_str())));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```rust\nfn main() {}\n```\n",
+        )));
+        state.dirty = LinesDirty::Full;
+        state.rebuild_lines(60);
+
+        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
+        let body = Rect::new(0, 0, 60, 20);
+
+        state.rebuild_copy_regions(60, fence_entry.1, body);
+        assert_eq!(
+            state.copy_hit_regions[0].text, "```rust\nfn main() {}\n```",
+            "scrolled-to fence registers a copy region through the bounded scan"
+        );
+
+        state.rebuild_copy_regions(60, 0, body);
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "fence far below the viewport registers nothing"
+        );
+    }
+
+    #[test]
+    fn fenced_text_round_trips_language_and_backticks() {
+        assert_eq!(
+            fenced_text(Some("python"), "x = 1"),
+            "```python\nx = 1\n```"
+        );
+        assert_eq!(fenced_text(None, "x = 1"), "```\nx = 1\n```");
+    }
+
+    #[test]
     fn md_table_renders_box_drawing_borders() {
         let out = rendered("| A | B |\n|---|---|\n| 1 | 2 |\n", 40);
         assert!(out.contains('\u{250C}'), "missing top-left corner: {out}");
@@ -5835,6 +6433,31 @@ mod tests {
         let out = rendered("- [x] done\n- [ ] todo\n", 80);
         assert!(out.contains('\u{2611}'), "expected checked glyph: {out}");
         assert!(out.contains('\u{2610}'), "expected unchecked glyph: {out}");
+    }
+
+    #[test]
+    fn md_ordered_list_renders_numbers_not_bullets() {
+        let out = rendered("1. first\n2. second\n3. third\n", 80);
+        assert!(out.contains("1. first"), "expected ordinal 1: {out}");
+        assert!(out.contains("2. second"), "expected ordinal 2: {out}");
+        assert!(out.contains("3. third"), "expected ordinal 3: {out}");
+        assert!(
+            !out.contains('\u{2022}'),
+            "ordered list must not render bullets: {out}"
+        );
+    }
+
+    #[test]
+    fn md_ordered_list_honors_start_offset() {
+        let out = rendered("5. five\n6. six\n", 80);
+        assert!(out.contains("5. five"), "expected start at 5: {out}");
+        assert!(out.contains("6. six"), "expected continuation 6: {out}");
+    }
+
+    #[test]
+    fn md_unordered_list_still_renders_bullets() {
+        let out = rendered("- one\n- two\n", 80);
+        assert!(out.contains('\u{2022}'), "expected bullet glyph: {out}");
     }
 
     #[test]

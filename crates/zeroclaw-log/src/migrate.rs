@@ -303,4 +303,30 @@ mod tests {
         let lines = read_all_lines(&path);
         assert!(lines.is_empty());
     }
+
+    #[test]
+    fn category_for_action_maps_every_known_action() {
+        assert_eq!(category_for_action("llm_request"), "agent");
+        assert_eq!(category_for_action("agent_start"), "agent");
+        assert_eq!(category_for_action("agent_end"), "agent");
+        assert_eq!(category_for_action("tool_call"), "tool");
+        assert_eq!(category_for_action("tool_call_start"), "tool");
+        assert_eq!(category_for_action("tool_call_result"), "tool");
+        assert_eq!(category_for_action("channel_message_inbound"), "channel");
+        assert_eq!(category_for_action("channel_send"), "channel");
+        assert_eq!(category_for_action("cron_run"), "cron");
+        assert_eq!(category_for_action("memory_store"), "memory");
+        assert_eq!(category_for_action("memory_recall"), "memory");
+        assert_eq!(category_for_action("memory_forget"), "memory");
+        assert_eq!(category_for_action("session_open"), "session");
+        assert_eq!(category_for_action("session_close"), "session");
+        assert_eq!(category_for_action("gateway_ws_turn"), "session");
+        assert_eq!(category_for_action("error"), "system");
+    }
+
+    #[test]
+    fn category_for_action_defaults_unknown_to_system() {
+        assert_eq!(category_for_action("totally_unknown"), "system");
+        assert_eq!(category_for_action(""), "system");
+    }
 }

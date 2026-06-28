@@ -90,6 +90,8 @@ pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
     build_deferred_tools_section_filtered,
 };
+pub use zeroclaw_tools::mcp_prompts_tool::McpPromptsTool;
+pub use zeroclaw_tools::mcp_resources_tool::McpResourcesTool;
 pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
 pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
@@ -411,6 +413,25 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
     arcs
 }
 
+/// Build the two generic MCP capability tools (`mcp_resources`, `mcp_prompts`),
+/// including each only when the access `policy` admits its name. A `None` policy
+/// admits both. Returned as `Arc<dyn Tool>` ready to register and/or expose to
+/// delegates.
+pub fn build_mcp_capability_tools(
+    registry: &Arc<McpRegistry>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> Vec<Arc<dyn Tool>> {
+    let admit = |name: &str| policy.is_none_or(|p| p.is_tool_allowed(name));
+    let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+    if admit("mcp_resources") {
+        out.push(Arc::new(McpResourcesTool::new(Arc::clone(registry))));
+    }
+    if admit("mcp_prompts") {
+        out.push(Arc::new(McpPromptsTool::new(Arc::clone(registry))));
+    }
+    out
+}
+
 /// Always-on built-in tools that surface in the integrations panel as
 /// `(display_name, description)` pairs. The integrations registry consumes
 /// this verbatim — adding a new always-on built-in is one row here, no
@@ -577,7 +598,11 @@ pub fn all_tools_with_runtime(
             agent_alias,
         )),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronRemoveTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronUpdateTool::new(
             config.clone(),
             security.clone(),
@@ -1167,18 +1192,11 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
@@ -1402,7 +1420,15 @@ pub fn all_tools_with_runtime(
         let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+            let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
+                &config.plugins.security.signature_mode,
+            );
+            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                &plugin_path,
+                signature_mode,
+                trusted_publisher_keys,
+            ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
@@ -1490,6 +1516,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+
+    #[tokio::test]
+    async fn mcp_capability_tools_respect_policy() {
+        use zeroclaw_tools::tool_search::ToolAccessPolicy;
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+
+        // No policy → both tools present.
+        let both = build_mcp_capability_tools(&registry, None);
+        let names: Vec<_> = both.iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains(&"mcp_resources".to_string()));
+        assert!(names.contains(&"mcp_prompts".to_string()));
+
+        // Deny mcp_prompts → only mcp_resources present.
+        let policy =
+            ToolAccessPolicy::from_security(None, Some(&["mcp_prompts".to_string()]), None);
+        let one = build_mcp_capability_tools(&registry, policy.as_ref());
+        let names: Vec<_> = one.iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains(&"mcp_resources".to_string()));
+        assert!(!names.contains(&"mcp_prompts".to_string()));
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {

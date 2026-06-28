@@ -71,6 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_runtime::sop::approval::{
+    ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
+};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -259,6 +262,88 @@ async fn resolve_ws_memory_handle(
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
+}
+
+/// Resolve a SOP approval gate from a WebSocket `kind:"sop"` `approval_response`
+/// frame and reply with the result/error frame. Returns `true` when the frame was
+/// a SOP frame (handled), so the caller stops further processing.
+///
+/// EPIC C: the principal is transport-derived (ws + session id), never from the
+/// frame. Shared by the idle connection loop AND the mid-turn forward loop so a
+/// SOP approval over the same connection is answered, never silently dropped, no
+/// matter when it arrives.
+async fn handle_ws_sop_frame<S>(
+    parsed: &serde_json::Value,
+    state: &AppState,
+    session_id: &str,
+    sender: &mut S,
+) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if parsed["kind"].as_str() != Some("sop") {
+        return false;
+    }
+    let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+    let decision = match parsed["decision"].as_str().unwrap_or("") {
+        "approve" => Some(SopApprovalDecision::Approve),
+        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
+        // the ledger records it.
+        "deny" => Some(SopApprovalDecision::Deny {
+            reason: parsed["reason"].as_str().map(str::to_string),
+        }),
+        _ => None,
+    };
+    // run_id + a valid decision are both required; the let-else avoids an expect()
+    // on the downstream resolve (codebase rule: no expect/unwrap in production).
+    let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-invalid-approval"
+            ),
+            "code": "INVALID_APPROVAL_RESPONSE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return true;
+    };
+    let frame = if let Some(engine) = state.sop_engine.as_ref() {
+        let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
+        match engine.lock() {
+            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
+                Ok(outcome) => serde_json::json!({
+                    "type": "sop_approval_result",
+                    "run_id": run_id,
+                    "outcome": outcome.label(),
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "error",
+                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-sop-ws-resolve-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    "code": "SOP_RESOLVE_FAILED"
+                }),
+            },
+            Err(_) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-sop-ws-engine-lock-poisoned"
+                ),
+                "code": "SOP_LOCK_POISONED"
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-subsystem-disabled"
+            ),
+            "code": "SOP_DISABLED"
+        })
+    };
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    true
 }
 
 async fn handle_socket(
@@ -452,6 +537,7 @@ async fn handle_socket(
                 return;
             }
         };
+    agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -529,6 +615,7 @@ async fn handle_socket(
                         &ws_memory,
                         &content,
                         &session_key,
+                        &session_id,
                     )
                     .await;
                 }
@@ -599,6 +686,13 @@ async fn handle_socket(
 
                 // ── approval_response (operator answered a tool prompt) ──
                 if msg_type == "approval_response" {
+                    // EPIC C: a SOP-kind frame resolves a SOP gate via the shared
+                    // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
+                    // pending_approvals map (keyed by request_id). The principal is
+                    // transport-derived (ws + session id), never from the frame.
+                    if handle_ws_sop_frame(&parsed, &state, &session_id, &mut sender).await {
+                        continue;
+                    }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
                     let decision_str = parsed["decision"].as_str().unwrap_or("");
                     let decision = match decision_str {
@@ -671,6 +765,7 @@ async fn handle_socket(
                     &ws_memory,
                     &content,
                     &session_key,
+                    &session_id,
                 )
                 .await;
             }
@@ -892,6 +987,7 @@ async fn process_chat_message(
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
+    session_id: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -1054,6 +1150,15 @@ async fn process_chat_message(
                     };
                     match parsed["type"].as_str() {
                         Some("approval_response") => {
+                            // A SOP-kind frame is a gate resolution (keyed by run_id),
+                            // not a tool-prompt response (keyed by request_id). Resolve
+                            // it here too so it is answered mid-turn instead of being
+                            // silently dropped on the request_id path below.
+                            if handle_ws_sop_frame(&parsed, state, session_id, &mut *sender)
+                                .await
+                            {
+                                continue;
+                            }
                             let request_id = parsed["request_id"].as_str().unwrap_or("");
                             let decision = match parsed["decision"].as_str().unwrap_or("") {
                                 "approve" => Some(ChannelApprovalResponse::Approve),
@@ -1477,6 +1582,32 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn sop_ws_error_frames_resolve_via_fluent() {
+        // The SOP WebSocket error frames are UI-surfaced and route through the
+        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
+        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+        for key in [
+            "cli-sop-ws-invalid-approval",
+            "cli-sop-ws-engine-lock-poisoned",
+            "cli-sop-ws-subsystem-disabled",
+        ] {
+            let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
+            assert!(
+                !s.starts_with('{') || !s.ends_with('}'),
+                "fluent missing-key fallback leaked for {key}: {s:?}"
+            );
+        }
+        let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-sop-ws-resolve-failed",
+            &[("error", "boom")],
+        );
+        assert!(
+            resolved.contains("boom"),
+            "the resolve-failed frame must interpolate the error: {resolved:?}"
+        );
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {

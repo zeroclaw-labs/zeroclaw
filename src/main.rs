@@ -73,6 +73,183 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// Replaces `dialoguer::Password::interact()` for `agent-runtime` builds.
+/// Uses `crossterm` raw mode to read keystrokes one at a time. When the
+/// input buffer transitions from empty to non-empty, a fixed-length
+/// indicator line ("● Value captured — press Enter to save") appears
+/// immediately — giving the user visible feedback *before* pressing Enter.
+/// The indicator is removed if the buffer becomes empty again (e.g. after
+/// backspace). No secret length is disclosed at any point.
+///
+/// When `allow_empty` is false, submitting an empty/whitespace-only value
+/// re-prompts (matching `dialoguer::Password` interactive behavior) instead
+/// of bailing. Ctrl+C and Esc remain the explicit cancellation paths.
+///
+/// Returns the raw buffer — callers that historically trimmed (e.g.
+/// `config set secret`, `read_auth_input`) must trim themselves. This
+/// avoids silently rewriting secrets/tokens/OTP codes that may contain
+/// significant leading or trailing whitespace.
+///
+/// For non-`agent-runtime` builds, callers fall through to `dialoguer::Password`,
+/// which provides no pre-submit feedback (the pre-existing behavior).
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        execute,
+        style::Print,
+        terminal::{disable_raw_mode, enable_raw_mode},
+    };
+    use std::io::{self, Write as IoWrite};
+
+    enable_raw_mode()?;
+
+    // RAII guard ensures raw mode is disabled even if the closure panics.
+    // Without this, a panic would leave the terminal in raw mode (no echo),
+    // requiring the user to manually run `stty sane` or `reset`.
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let _raw_guard = RawModeGuard;
+
+    let result: Result<String> = (|| {
+        // Outer loop: re-prompts on empty submit when allow_empty is false,
+        // matching dialoguer::Password's interactive behavior.
+        loop {
+            eprintln!("{prompt_text}");
+            io::stderr().flush()?;
+
+            let mut buffer = String::new();
+            let mut feedback_shown = false;
+
+            // Inner loop: raw-mode keystroke reading.
+            loop {
+                if event::poll(std::time::Duration::from_millis(200))? {
+                    if let Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind,
+                        ..
+                    }) = event::read()?
+                    {
+                        // Only respond to key press / repeat; ignore release events
+                        // (crossterm sends Press, Repeat, Release under kitty keyboard protocol).
+                        if kind != crossterm::event::KeyEventKind::Press
+                            && kind != crossterm::event::KeyEventKind::Repeat
+                        {
+                            continue;
+                        }
+
+                        match code {
+                            KeyCode::Enter => {
+                                // Clear the feedback line before submitting so it doesn't
+                                // linger in the terminal scrollback.
+                                if feedback_shown {
+                                    // Move cursor up one line, clear it, then move back down
+                                    // so the cursor ends up on the correct line for any
+                                    // subsequent output from the caller.
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0),
+                                        crossterm::cursor::MoveDown(1)
+                                    )?;
+                                }
+                                break;
+                            }
+                            KeyCode::Char(c) => {
+                                if c == 'c' && modifiers.contains(KeyModifiers::CONTROL) {
+                                    // Ctrl+C — clear feedback, then return an Interrupted-style
+                                    // error so callers that map Interrupted → Ok(None) / bail
+                                    // continue to work.
+                                    if feedback_shown {
+                                        execute!(
+                                            io::stderr(),
+                                            crossterm::cursor::MoveUp(1),
+                                            crossterm::terminal::Clear(
+                                                crossterm::terminal::ClearType::CurrentLine
+                                            ),
+                                            crossterm::cursor::MoveToColumn(0)
+                                        )?;
+                                    }
+                                    bail!("Interrupted");
+                                }
+                                buffer.push(c);
+                                if !feedback_shown && !buffer.is_empty() {
+                                    feedback_shown = true;
+                                    // Show fixed-length indicator — no {$count} to avoid
+                                    // disclosing secret length (issue #7808 requirement).
+                                    let indicator = ta(
+                                        "cli-secret-captured",
+                                        &[], // i18n-exempt: no args; length not disclosed
+                                        "  ● Value captured — press Enter to save",
+                                    );
+                                    execute!(io::stderr(), Print(format!("{indicator}\r\n")))?;
+                                    io::stderr().flush()?;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                buffer.pop();
+                                if buffer.is_empty() && feedback_shown {
+                                    feedback_shown = false;
+                                    // Remove the indicator line: move up, clear, return cursor.
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0)
+                                    )?;
+                                    io::stderr().flush()?;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                // Treat Esc the same as Ctrl+C for consistency with
+                                // the existing Password Ctrl+C-as-back-out mapping.
+                                if feedback_shown {
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0)
+                                    )?;
+                                }
+                                bail!("Interrupted");
+                            }
+                            _ => {} // Ignore other keys (arrows, Home, etc.)
+                        }
+                    }
+                    // Ignore mouse / resize events
+                }
+            }
+
+            if !allow_empty && buffer.trim().is_empty() {
+                // Re-prompt on empty submit for required fields,
+                // preserving dialoguer::Password interactive behavior.
+                continue;
+            }
+
+            // Return raw buffer — callers trim if they need to (matching the
+            // pre-PR behavior at each call site individually).
+            return Ok(buffer);
+        }
+    })();
+
+    // RawModeGuard's Drop impl calls disable_raw_mode() here (or on panic).
+    result
+}
+
 #[cfg(feature = "agent-runtime")]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
@@ -283,6 +460,8 @@ mod observability;
 mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
@@ -2439,22 +2618,52 @@ fn prompt_for_field(
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
+        // Use crossterm-based secret_prompt for pre-submit feedback
+        // when agent-runtime is available; otherwise fall through to
+        // dialoguer::Password (no pre-submit feedback).
+        #[cfg(feature = "agent-runtime")]
         {
-            Ok(pw) => return Ok(Some(pw)),
-            Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
-                    return Ok(None);
+            match secret_prompt(&prompt, true) {
+                Ok(pw) => {
+                    if !pw.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    return Ok(Some(pw));
                 }
-                return Err(io.into());
+                Err(e) => {
+                    // secret_prompt returns "Interrupted" for Ctrl+C / Esc,
+                    // matching the existing Password Ctrl+C-as-back-out mapping.
+                    if e.to_string() == "Interrupted" {
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "agent-runtime"))]
+        {
+            // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
+            // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
+            // Map that to `Ok(None)` so the caller treats it as "user backed
+            // out" instead of bubbling a confusing IO-error message.
+            match Password::new()
+                .with_prompt(prompt.clone())
+                .allow_empty_password(true)
+                .interact()
+            {
+                Ok(pw) => {
+                    if !pw.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    return Ok(Some(pw));
+                }
+                Err(e) => {
+                    let io: std::io::Error = e.into();
+                    if io.kind() == std::io::ErrorKind::Interrupted {
+                        return Ok(None);
+                    }
+                    return Err(io.into());
+                }
             }
         }
     }
@@ -2577,10 +2786,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search an installable plugin registry
+    Search {
+        /// Query to match against plugin names and descriptions
+        query: String,
+        /// Registry JSON URL to search
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory/manifest or registry name
     Install {
-        /// Path to plugin directory or manifest
+        /// Path to plugin directory/manifest, or registry name/version
         source: String,
+        /// Registry JSON URL used for install-by-name
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2594,6 +2814,23 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_host_with_configured_security(
+    config: &crate::config::schema::Config,
+) -> Result<zeroclaw::plugins::host::PluginHost> {
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted = config.plugins.security.trusted_publisher_keys.clone();
+    Ok(
+        zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            &config.plugins.resolved_plugins_dir(),
+            mode,
+            trusted,
+        )?,
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -2730,9 +2967,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2742,13 +2979,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2782,9 +3019,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -2813,6 +3050,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3148,7 +3394,7 @@ async fn main() -> Result<()> {
     // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
     match &cli.command {
         Commands::MarkdownHelp => {
-            clap_markdown::print_help_markdown::<Cli>();
+            print_markdown_help();
             return Ok(());
         }
         Commands::MarkdownSchema => {
@@ -3873,6 +4119,45 @@ async fn main() -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+
+            // #7895: probe the configured gateway address ONCE, before the
+            // reload loop, as a startup guard. The daemon supervises its own
+            // in-process gateway (shared event bus / canvas / reload channel);
+            // it cannot adopt a separate gateway process, so an already-bound
+            // address fails fast with a clear, actionable message instead of
+            // degrading into a noisy supervisor retry loop. A free address (or
+            // an ephemeral port) proceeds normally. Checked once at startup —
+            // the per-reload gateway teardown/restart is the supervisor's job.
+            match daemon::detect_gateway_bind_mode(&current_config, &host, port).await {
+                daemon::GatewayBindMode::StartFresh => {}
+                daemon::GatewayBindMode::GatewayAlreadyRunning => {
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-already-running",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "A ZeroClaw gateway is already running on {host}:{port}. The daemon \
+                             supervises its own gateway and will not start a second one on the \
+                             same address. Stop that gateway (or point the daemon at a free port \
+                             with `zeroclaw config set gateway.port <port>`), then run the daemon \
+                             again."
+                        ),
+                    ));
+                }
+                daemon::GatewayBindMode::PortOccupied => {
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-port-occupied",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "Gateway address {host}:{port} is already in use by another process. \
+                             Free the port or point the daemon at a free port (`zeroclaw config \
+                             set gateway.port <port>`), then run the daemon again."
+                        ),
+                    ));
+                }
+            }
+
             loop {
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
@@ -4513,16 +4798,28 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match &model_command {
-            ModelCommands::List {
-                model_provider,
-                check,
-            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
-            ModelCommands::Refresh { model_provider, .. } => {
-                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+        Commands::Models { model_command } => {
+            #[cfg(feature = "agent-runtime")]
+            {
+                dispatch_models_command(model_command, &mut config).await
             }
-            _ => doctor::run_models(&config, None, false, false).await,
-        },
+            #[cfg(not(feature = "agent-runtime"))]
+            {
+                match model_command {
+                    ModelCommands::List {
+                        model_provider,
+                        check,
+                    } => {
+                        doctor::run_configured_models(&config, model_provider.as_deref(), check)
+                            .await
+                    }
+                    ModelCommands::Refresh { model_provider, .. } => {
+                        doctor::run_models(&config, model_provider.as_deref(), false, false).await
+                    }
+                    _ => doctor::run_models(&config, None, false, false).await,
+                }
+            }
+        }
 
         Commands::Providers {
             providers_command: None,
@@ -4643,7 +4940,15 @@ async fn main() -> Result<()> {
 
         Commands::Browse { path } => browse::handle_browse(path, &config),
 
-        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+        Commands::Sop { sop_command } => match sop_command {
+            // Out-of-band approval verbs talk to the running daemon over the
+            // gateway (they must see the daemon's runs, not a throwaway local
+            // engine). List/Validate/Show stay local + synchronous.
+            cmd @ (SopCommands::Approve { .. }
+            | SopCommands::Deny { .. }
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            other => sop::handle_command(other, &config),
+        },
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -5106,10 +5411,25 @@ async fn main() -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    #[cfg(feature = "agent-runtime")]
+                    let secret_value = {
+                        let raw = secret_prompt(&format!("Enter value for {path}"), false)?;
+                        raw.trim().to_string()
+                    };
+                    #[cfg(not(feature = "agent-runtime"))]
+                    let secret_value = {
+                        let raw = dialoguer::Password::new()
+                            .with_prompt(format!("Enter value for {path}"))
+                            .interact()?;
+                        raw.trim().to_string()
+                    };
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    // Safety net for the `not(agent-runtime)` dialoguer fallback path,
+                    // which does not enforce non-empty input at the prompt level.
+                    // Under agent-runtime, secret_prompt(_, false) re-prompts on empty
+                    // input, making this check unreachable for that path.
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -5700,9 +6020,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5731,25 +6049,100 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
-                    )
-                );
+            PluginCommands::Search { query, registry } => {
+                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                let matches = plugin_registry::search_entries(&index, &query);
+                if matches.is_empty() {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-none",
+                            &[("query", &query)],
+                            "No matching plugins."
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-results",
+                            &[("query", &query), ("count", &matches.len().to_string())],
+                            "Plugins matching query:"
+                        )
+                    );
+                    for plugin in &matches {
+                        let missing_description;
+                        let description = if let Some(description) = plugin.description.as_deref() {
+                            description
+                        } else {
+                            missing_description =
+                                t("cli-plugin-no-description", "(no description)");
+                            &missing_description
+                        };
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-search-result",
+                                &[
+                                    ("name", &plugin.name),
+                                    ("version", &plugin.version),
+                                    ("description", description),
+                                ],
+                                "Plugin search result"
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source, registry } => {
+                if plugin_registry::looks_like_url(&source) {
+                    bail!(
+                        "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
+                    );
+                }
+                let mut host = plugin_host_with_configured_security(&config)?;
+                if plugin_registry::is_local_plugin_source(&source) {
+                    host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                } else {
+                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-install-resolving",
+                            &[("source", &source)],
+                            "Resolving plugin from registry..."
+                        )
+                    );
+                    let downloaded =
+                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    host.install(&plugin_dir)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-name-version",
+                            &[
+                                ("name", &downloaded.manifest().name),
+                                ("version", &downloaded.manifest().version),
+                            ],
+                            "Plugin installed"
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let mut host = plugin_host_with_configured_security(&config)?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5758,9 +6151,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -5889,10 +6280,16 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
+                    #[cfg(feature = "agent-runtime")]
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    #[cfg(not(feature = "agent-runtime"))]
                     let entered = Password::new()
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -6125,6 +6522,117 @@ fi"#
     Ok(())
 }
 
+fn print_markdown_help() {
+    print!(
+        "{}",
+        escape_mdbook_placeholder_tags(&clap_markdown::help_markdown::<Cli>())
+    );
+}
+
+#[must_use]
+fn escape_mdbook_placeholder_tags(markdown: &str) -> String {
+    let mut escaped = String::with_capacity(markdown.len());
+    let mut in_fence = false;
+
+    for line in markdown.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        let starts_fence = is_markdown_fence_line(body);
+
+        if in_fence {
+            escaped.push_str(body);
+            escaped.push_str(newline);
+            if starts_fence {
+                in_fence = false;
+            }
+            continue;
+        }
+
+        if starts_fence {
+            in_fence = true;
+            escaped.push_str(body);
+        } else {
+            escaped.push_str(&escape_mdbook_placeholder_tags_in_line(body));
+        }
+        escaped.push_str(newline);
+    }
+
+    escaped
+}
+
+#[must_use]
+fn escape_mdbook_placeholder_tags_in_line(line: &str) -> String {
+    let mut escaped = String::with_capacity(line.len());
+    let mut index = 0;
+    let mut in_code_span = false;
+
+    while index < line.len() {
+        let Some(ch) = line[index..].chars().next() else {
+            break;
+        };
+
+        if ch == '`' {
+            in_code_span = !in_code_span;
+            escaped.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        if !in_code_span
+            && ch == '<'
+            && let Some(end_offset) = line[index + 1..].find('>')
+        {
+            let name_start = index + 1;
+            let name_end = name_start + end_offset;
+            let name = &line[name_start..name_end];
+
+            if is_cli_placeholder_name(name) {
+                escaped.push('`');
+                escaped.push_str(&line[index..=name_end]);
+                escaped.push('`');
+                index = name_end + 1;
+                continue;
+            }
+        }
+
+        escaped.push(ch);
+        index += ch.len_utf8();
+    }
+
+    escaped
+}
+
+#[must_use]
+fn is_markdown_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+#[must_use]
+fn is_cli_placeholder_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && !is_common_html_tag(name)
+}
+
+#[must_use]
+fn is_common_html_tag(name: &str) -> bool {
+    const COMMON_HTML_TAGS: &[&str] = &[
+        "a", "abbr", "br", "code", "details", "div", "em", "img", "kbd", "li", "ol", "p", "samp",
+        "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr", "ul", "var",
+    ];
+
+    let normalized = name.to_ascii_lowercase();
+    COMMON_HTML_TAGS.contains(&normalized.as_str())
+}
+
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
@@ -6191,6 +6699,148 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
                 "Failed to connect to gateway: {e}"
             )))
         }
+    }
+}
+
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
+/// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
+/// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
+/// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    let host = config.gateway.host.clone();
+    let port = config.gateway.port;
+    let prefix = config.gateway.path_prefix.as_deref();
+    let client = reqwest::Client::new();
+    match cmd {
+        SopCommands::Pending => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            let pending = body
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
+            } else {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
+                for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
+                    );
+                }
+            }
+            Ok(())
+        }
+        SopCommands::Approve { run_id } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
+        }
+        SopCommands::Deny { run_id, reason } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            sop_admin_post(
+                &client,
+                &url,
+                serde_json::json!({ "run_id": run_id, "reason": reason }),
+            )
+            .await
+        }
+        // List/Validate/Show are dispatched on the local synchronous path.
+        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+    }
+}
+
+/// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+    let status = resp.status();
+    let out: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        println!(
+            "{}",
+            out.get("outcome").and_then(|v| v.as_str()).unwrap_or("ok")
+        );
+        Ok(())
+    } else {
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("request failed");
+        anyhow::bail!("Gateway responded {status}: {detail}");
     }
 }
 
@@ -6478,11 +7128,11 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
-    Ok(input.trim().to_string())
+    let raw = secret_prompt(prompt, false)?;
+    if !raw.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
+    Ok(raw.trim().to_string())
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -6517,6 +7167,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6531,6 +7183,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6549,6 +7202,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6645,6 +7299,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
@@ -6767,6 +7422,51 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 println!("  {model_provider}: {profile_id}");
             }
 
+            Ok(())
+        }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
+            }
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
             Ok(())
         }
     }
@@ -6963,6 +7663,85 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     None
 }
 
+/// Persist `model` as the default for the first configured provider.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let (type_key, alias) = {
+        let entry = config
+            .providers
+            .models
+            .iter_entries()
+            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "No model provider configured. Run `zeroclaw config init` first.",
+                )
+            })?;
+        (entry.0, entry.1.to_string())
+    };
+    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    config.set_prop_persistent(&prop_path, model)?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-models-set-ok",
+            &[
+                ("model", model),
+                ("provider", &format!("{type_key}.{alias}")),
+            ]
+        )
+    );
+    Ok(())
+}
+
+/// Dispatch `ModelCommands` variants to their handlers.
+///
+/// Extracted from `main()` so that the #7087 regression test enters the
+/// same dispatch boundary that `zeroclaw models set <model>` uses.  If
+/// someone changes the `Set` arm back to the read-only doctor path, the
+/// test will fail.
+#[cfg(feature = "agent-runtime")]
+async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
+    match model_command {
+        ModelCommands::List {
+            model_provider,
+            check,
+        } => doctor::run_configured_models(config, model_provider.as_deref(), check).await,
+        ModelCommands::Refresh { model_provider, .. } => {
+            doctor::run_models(config, model_provider.as_deref(), false, false).await
+        }
+        ModelCommands::Set { model } => handle_models_set(config, &model).await,
+        ModelCommands::Status => {
+            match config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            {
+                Some((ty, alias, entry)) => {
+                    let model = entry.model.as_deref().unwrap_or("unknown");
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-models-status-current",
+                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string("cli-models-status-none")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7121,6 +7900,41 @@ mod tests {
         assert!(
             !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
             "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
+        );
+    }
+
+    #[test]
+    fn markdown_help_escapes_plain_placeholders_for_mdbook() {
+        assert_eq!(
+            escape_mdbook_placeholder_tags("Send a note to <to> with <MESSAGE>.\n"),
+            "Send a note to `<to>` with `<MESSAGE>`.\n"
+        );
+    }
+
+    #[test]
+    fn markdown_help_preserves_existing_code_spans() {
+        let markdown = "Use `<to>` or `zeroclaw send <to>` from a shell.\n";
+
+        assert_eq!(escape_mdbook_placeholder_tags(markdown), markdown);
+    }
+
+    #[test]
+    fn markdown_help_preserves_fenced_code_blocks() {
+        let markdown = "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass <message>.\n";
+
+        assert_eq!(
+            escape_mdbook_placeholder_tags(markdown),
+            "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass `<message>`.\n"
+        );
+    }
+
+    #[test]
+    fn markdown_help_does_not_escape_common_html_or_autolinks() {
+        let markdown = "Use <br> for HTML, see <https://example.com>, then pass <arg-name>.\n";
+
+        assert_eq!(
+            escape_mdbook_placeholder_tags(markdown),
+            "Use <br> for HTML, see <https://example.com>, then pass `<arg-name>`.\n"
         );
     }
 
@@ -7960,6 +8774,100 @@ mod tests {
         assert!(
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
+        );
+    }
+
+    /// Regression for #7087: `ModelCommands::Set` must write config, not
+    /// route silently to the read-only `doctor::run_models()` path.
+    /// Covers a normal model ID and a slash-bearing (OpenRouter-style) ID.
+    ///
+    /// Calls `dispatch_models_command` — the same function `main()` uses —
+    /// so changing the `Set` arm back to the read-only doctor path will fail
+    /// this test.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-opus-4-7".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // ── Test 1: Normal model ID persists via the dispatch boundary ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "claude-sonnet-4-6".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("normal model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("claude-sonnet-4-6"),
+            "normal model ID must be persisted to config.toml; got:\n{contents}"
+        );
+
+        // ── Test 2: Slash-bearing model ID preserved as-is ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("slash-bearing model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("anthropic/claude-sonnet-4-20250514"),
+            "slash-bearing model ID must be stored as-is; got:\n{contents}"
+        );
+
+        // ── Test 3: No configured provider → error surfaced by dispatch ──
+        let mut empty_config = Config {
+            config_path: tmp.path().join("empty.toml"),
+            data_dir: tmp.path().join("empty_workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        let err = dispatch_models_command(
+            ModelCommands::Set {
+                model: "any-model".to_string(),
+            },
+            &mut empty_config,
+        )
+        .await
+        .expect_err("empty config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No model provider configured"),
+            "error must mention missing provider; got: {msg}"
         );
     }
 }
