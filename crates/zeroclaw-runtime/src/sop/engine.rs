@@ -543,7 +543,7 @@ impl SopEngine {
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
 
         if last_status == SopStepStatus::Failed {
-            let attempts = run
+            let failed_executions = run
                 .step_results
                 .iter()
                 .filter(|result| {
@@ -553,9 +553,10 @@ impl SopEngine {
                 .count()
                 .try_into()
                 .unwrap_or(u32::MAX);
+            let retries_consumed = failed_executions.saturating_sub(1);
             let decision = route::failure::route_failure(
                 &current_step.on_failure,
-                attempts,
+                retries_consumed,
                 self.config.max_step_retries,
             );
             return Ok(match decision {
@@ -2588,7 +2589,7 @@ mod tests {
 
         assert!(
             matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 1),
-            "first failed attempt should retry step 1"
+            "initial failed attempt should allow the first retry of step 1"
         );
         assert_eq!(engine.active_runs()[&run_id].current_step, 1);
 
@@ -2599,6 +2600,25 @@ mod tests {
                     step_number: 1,
                     status: SopStepStatus::Failed,
                     output: "second failure".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 1),
+            "first failed retry should allow the second retry of step 1"
+        );
+        assert_eq!(engine.active_runs()[&run_id].current_step, 1);
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "third failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
                 },
