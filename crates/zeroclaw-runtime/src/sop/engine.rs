@@ -8,12 +8,14 @@ use anyhow::{Result, bail};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
+use super::schema;
 use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
     SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
     SopTrigger, SopTriggerSource,
 };
+use serde_json::Value;
 use zeroclaw_config::schema::SopConfig;
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
@@ -307,6 +309,10 @@ impl SopEngine {
 
         // Determine first action based on execution mode
         let step = sop.steps[0].clone();
+        let input = step_input_value(&self.active_runs[&run_id], step.number);
+        if let Some(action) = self.schema_input_failure_action(&run_id, &step, &input) {
+            return Ok(action);
+        }
         let context = format_step_context(&sop, &self.active_runs[&run_id], &step);
         let action = resolve_step_action(&sop, &step, run_id.clone(), context);
 
@@ -325,6 +331,79 @@ impl SopEngine {
     /// Report the result of the current step and advance the run.
     /// Returns the next action to take.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
+        let (sop_name, current_step_number, total_steps) = {
+            let run = self.active_runs.get(run_id).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?;
+            (run.sop_name.clone(), run.current_step, run.total_steps)
+        };
+
+        let sop = self
+            .sops
+            .iter()
+            .find(|s| s.name == sop_name)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sop_name": sop_name})),
+                    "SOP engine: sop no longer loaded (definition removed mid-run)"
+                );
+                anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded"))
+            })?
+            .clone();
+
+        let current_step = sop
+            .steps
+            .get((current_step_number.saturating_sub(1)) as usize)
+            .cloned()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"sop_name": sop_name, "step": current_step_number})
+                        ),
+                    "SOP engine: step no longer exists (definition changed mid-run)"
+                );
+                anyhow::Error::msg(format!(
+                    "SOP '{sop_name}' step {current_step_number} no longer exists (definition changed mid-run)"
+                ))
+            })?;
+
+        // Deterministic runs are driven through the dedicated piping path so the
+        // same `sop_advance` tool advances every execution mode. A failed step
+        // fails the run; otherwise the step output is piped to the next step.
+        if sop.execution_mode == SopExecutionMode::Deterministic {
+            if result.status == SopStepStatus::Failed {
+                let reason = format!("Step {} failed: {}", result.step_number, result.output);
+                return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
+            }
+            let piped = step_result_value(&result);
+            return self.advance_deterministic_step(
+                run_id,
+                piped,
+                Some((result.started_at.clone(), result.completed_at.clone())),
+            );
+        }
+
+        if result.status == SopStepStatus::Completed {
+            let output = step_result_value(&result);
+            if let Some(action) = self.schema_output_failure_action(run_id, &current_step, &output)
+            {
+                return Ok(action);
+            }
+        }
+
         let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -335,39 +414,6 @@ impl SopEngine {
             );
             anyhow::Error::msg(format!("Active run not found: {run_id}"))
         })?;
-
-        let sop = self
-            .sops
-            .iter()
-            .find(|s| s.name == run.sop_name)
-            .ok_or_else(|| {
-                let sop_name = run.sop_name.clone();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"sop_name": sop_name})),
-                    "SOP engine: sop no longer loaded (definition removed mid-run)"
-                );
-                anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
-            })?
-            .clone();
-
-        // Deterministic runs are driven through the dedicated piping path so the
-        // same `sop_advance` tool advances every execution mode. A failed step
-        // fails the run; otherwise the step output is piped to the next step.
-        if sop.execution_mode == SopExecutionMode::Deterministic {
-            if result.status == SopStepStatus::Failed {
-                let reason = format!("Step {} failed: {}", result.step_number, result.output);
-                return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
-            }
-            let piped = serde_json::Value::String(result.output.clone());
-            return self.advance_deterministic_step(
-                run_id,
-                piped,
-                Some((result.started_at.clone(), result.completed_at.clone())),
-            );
-        }
 
         // Record step result
         run.step_results.push(result.clone());
@@ -388,8 +434,8 @@ impl SopEngine {
         }
 
         // Advance to next step
-        let next_step_num = run.current_step + 1;
-        if next_step_num > run.total_steps {
+        let next_step_num = current_step_number + 1;
+        if next_step_num > total_steps {
             // All steps completed
             ::zeroclaw_log::record!(
                 INFO,
@@ -406,6 +452,11 @@ impl SopEngine {
 
         let step_idx = (next_step_num - 1) as usize;
         let step = sop.steps[step_idx].clone();
+        let input = step_input_value(run, step.number);
+        if let Some(action) = self.schema_input_failure_action(run_id, &step, &input) {
+            return Ok(action);
+        }
+        let run = self.active_runs.get(run_id).unwrap();
         let context = format_step_context(&sop, run, &step);
         let run_id_str = run_id.to_string();
         let action = resolve_step_action(&sop, &step, run_id_str.clone(), context);
@@ -420,6 +471,85 @@ impl SopEngine {
 
         self.persist_active(run_id);
         Ok(action)
+    }
+
+    fn schema_input_failure_action(
+        &mut self,
+        run_id: &str,
+        step: &SopStep,
+        input: &Value,
+    ) -> Option<SopRunAction> {
+        match self.validate_step_input(step, input) {
+            Ok(()) => None,
+            Err(reason) => {
+                Some(self.fail_step_schema_validation(run_id, step.number, "input", reason))
+            }
+        }
+    }
+
+    fn schema_output_failure_action(
+        &mut self,
+        run_id: &str,
+        step: &SopStep,
+        output: &Value,
+    ) -> Option<SopRunAction> {
+        match self.validate_step_output(step, output) {
+            Ok(()) => None,
+            Err(reason) => {
+                Some(self.fail_step_schema_validation(run_id, step.number, "output", reason))
+            }
+        }
+    }
+
+    fn validate_step_input(&self, step: &SopStep, input: &Value) -> Result<(), String> {
+        if !self.config.step_schema_enforce {
+            return Ok(());
+        }
+        let Some(schema) = step
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.input.as_ref())
+        else {
+            return Ok(());
+        };
+        schema::validate_value(schema, input).map_err(|e| e.to_string())
+    }
+
+    fn validate_step_output(&self, step: &SopStep, output: &Value) -> Result<(), String> {
+        if !self.config.step_schema_enforce {
+            return Ok(());
+        }
+        let Some(schema) = step
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.output.as_ref())
+        else {
+            return Ok(());
+        };
+        schema::validate_value(schema, output).map_err(|e| e.to_string())
+    }
+
+    fn fail_step_schema_validation(
+        &mut self,
+        run_id: &str,
+        step_number: u32,
+        phase: &str,
+        reason: String,
+    ) -> SopRunAction {
+        let reason = format!("Step {step_number} {phase} schema validation failed: {reason}");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "step": step_number,
+                    "phase": phase,
+                    "reason": reason,
+                })),
+            "SOP step schema validation failed"
+        );
+        self.finish_run(run_id, SopRunStatus::Failed, Some(reason))
     }
 
     /// Cancel an active run.
@@ -473,7 +603,7 @@ impl SopEngine {
         let piped = run
             .step_results
             .last()
-            .map(|r| serde_json::Value::String(r.output.clone()))
+            .map(step_result_value)
             .unwrap_or(serde_json::Value::Null);
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
@@ -528,6 +658,17 @@ impl SopEngine {
                 "SOP '{sop_name}' step {current_step} no longer exists (definition changed mid-run)"
             ))
         })?;
+
+        let input = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            step_input_value(run, step.number)
+        };
+        if let Some(action) = self.schema_input_failure_action(run_id, &step, &input) {
+            return Ok(action);
+        }
 
         // The lookups succeeded; commit the transition.
         let run = self
@@ -648,6 +789,60 @@ impl SopEngine {
         step_output: serde_json::Value,
         step_timestamps: Option<(String, Option<String>)>,
     ) -> Result<SopRunAction> {
+        let (sop_name, current_step_number) = {
+            let run = self.active_runs.get(run_id).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?;
+            (run.sop_name.clone(), run.current_step)
+        };
+
+        let sop = self
+            .sops
+            .iter()
+            .find(|s| s.name == sop_name)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sop_name": sop_name})),
+                    "SOP engine: sop no longer loaded (definition removed mid-run)"
+                );
+                anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded"))
+            })?
+            .clone();
+
+        let current_step = sop
+            .steps
+            .get((current_step_number.saturating_sub(1)) as usize)
+            .cloned()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"sop_name": sop_name, "step": current_step_number})
+                        ),
+                    "SOP engine: step no longer exists (definition changed mid-run)"
+                );
+                anyhow::Error::msg(format!(
+                    "SOP '{sop_name}' step {current_step_number} no longer exists (definition changed mid-run)"
+                ))
+            })?;
+
+        if let Some(action) = self.schema_output_failure_action(run_id, &current_step, &step_output)
+        {
+            return Ok(action);
+        }
+
         let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -658,23 +853,6 @@ impl SopEngine {
             );
             anyhow::Error::msg(format!("Active run not found: {run_id}"))
         })?;
-
-        let sop = self
-            .sops
-            .iter()
-            .find(|s| s.name == run.sop_name)
-            .ok_or_else(|| {
-                let sop_name = run.sop_name.clone();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"sop_name": sop_name})),
-                    "SOP engine: sop no longer loaded (definition removed mid-run)"
-                );
-                anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
-            })?
-            .clone();
 
         // Record step result
         let (started_at, completed_at) = match step_timestamps {
@@ -807,6 +985,10 @@ impl SopEngine {
         step: &SopStep,
         input: serde_json::Value,
     ) -> Result<SopRunAction> {
+        if let Some(action) = self.schema_input_failure_action(run_id, step, &input) {
+            return Ok(action);
+        }
+
         if step.kind == SopStepKind::Checkpoint {
             // Pause at checkpoint — persist state and wait for approval
             if let Some(run) = self.active_runs.get_mut(run_id) {
@@ -1290,6 +1472,30 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
     ctx
 }
 
+fn step_input_value(run: &SopRun, step_number: u32) -> Value {
+    if step_number <= 1 {
+        return run
+            .trigger_event
+            .payload
+            .as_deref()
+            .map(jsonish_value)
+            .unwrap_or(Value::Null);
+    }
+
+    run.step_results
+        .last()
+        .map(step_result_value)
+        .unwrap_or(Value::Null)
+}
+
+fn step_result_value(result: &SopStepResult) -> Value {
+    jsonish_value(&result.output)
+}
+
+fn jsonish_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
+}
+
 // ── Utilities ───────────────────────────────────────────────────
 
 pub fn now_iso8601() -> String {
@@ -1373,7 +1579,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
-    use crate::sop::types::SopExecutionMode;
+    use crate::sop::types::{SopExecutionMode, StepSchema};
 
     /// Clear a WaitingApproval gate through the production out-of-band chokepoint
     /// (a CLI principal), returning the resumed action. Mirrors what a real
@@ -1448,9 +1654,20 @@ mod tests {
     }
 
     fn engine_with_sops(sops: Vec<Sop>) -> SopEngine {
-        let mut engine = SopEngine::new(SopConfig::default());
+        engine_with_config_sops(SopConfig::default(), sops)
+    }
+
+    fn engine_with_config_sops(config: SopConfig, sops: Vec<Sop>) -> SopEngine {
+        let mut engine = SopEngine::new(config);
         engine.sops = sops;
         engine
+    }
+
+    fn required_object_schema(key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": [key]
+        })
     }
 
     /// Extract run_id from any SopRunAction variant.
@@ -1876,6 +2093,91 @@ mod tests {
             matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("valve stuck"))
         );
         assert!(engine.active_runs().is_empty());
+    }
+
+    #[test]
+    fn schema_input_failure_fails_run_before_first_action() {
+        let mut sop = test_sop("schema-in", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some("{}".into()),
+            timestamp: now_iso8601(),
+        };
+
+        let action = engine.start_run("schema-in", event).unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("input schema validation failed"))
+        );
+        assert!(engine.active_runs().is_empty());
+        assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
+    }
+
+    #[test]
+    fn schema_output_failure_fails_run_before_next_step() {
+        let mut sop = test_sop("schema-out", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("schema-out", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "{}".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("output schema validation failed"))
+        );
+        assert!(engine.active_runs().is_empty());
+        assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
+    }
+
+    #[test]
+    fn schema_enforcement_disabled_allows_invalid_output() {
+        let mut sop = test_sop("schema-off", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        let mut config = SopConfig::default();
+        config.step_schema_enforce = false;
+        let mut engine = engine_with_config_sops(config, vec![sop]);
+        let action = engine.start_run("schema-off", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "{}".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert_eq!(engine.active_runs()[&run_id].current_step, 2);
     }
 
     #[test]
@@ -2812,6 +3114,28 @@ type = "manual"
             matches!(action, SopRunAction::Failed { .. }),
             "a failed deterministic step must fail the run"
         );
+    }
+
+    #[test]
+    fn deterministic_output_schema_failure_fails_run() {
+        let mut sop = deterministic_sop_all_execute("det-schema");
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("det-schema", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({}), None)
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("output schema validation failed"))
+        );
+        assert!(engine.active_runs().is_empty());
+        assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
     }
 
     #[test]
