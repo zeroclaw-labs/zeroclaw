@@ -87,13 +87,13 @@ pub(crate) fn render_missing_skill_install_suggestion(
     #[cfg(feature = "plugins-wasm")]
     {
         let catalog = load_cached_installable_plugin_capabilities(workspace_dir);
-        return suggest_missing_skill_install(
+        suggest_missing_skill_install(
             prompt,
             installed_skills,
             installed_runtime_capabilities,
             &catalog,
         )
-        .map(|suggestion| suggestion.render_user_message());
+        .map(|suggestion| suggestion.render_user_message())
     }
 
     #[cfg(not(feature = "plugins-wasm"))]
