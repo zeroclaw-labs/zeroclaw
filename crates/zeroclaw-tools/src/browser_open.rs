@@ -568,16 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn listed_private_host_still_rejects_http_scheme() {
-        // browser_open stays HTTPS-only regardless of allowed_private_hosts: the
-        // scheme guard runs before the private-host bypass, so `http://` to a listed
-        // host is rejected by the scheme check, not the allowlist. (The `browser`
-        // tool, by contrast, accepts http:// for listed hosts.)
+    fn listed_private_host_permits_http_scheme() {
+        // `browser_open` accepts `http://` (since it was relaxed to accept
+        // both schemes upstream), so a listed private host can be reached
+        // over plain HTTP — internal services frequently lack a public TLS
+        // cert. The unlisted-host SSRF guard still applies; this test just
+        // pins that the scheme guard does not pre-empt the allowlist for
+        // listed hosts.
         let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
-        let err = tool
-            .validate_url("http://10.0.0.1")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("https://"));
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
     }
 }
