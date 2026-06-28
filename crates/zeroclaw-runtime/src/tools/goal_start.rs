@@ -4,7 +4,7 @@ use serde_json::json;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 use crate::control_plane::{
-    GoalAdmissionContext, GoalCommand, GoalCommandAction, admit_goal_command,
+    GoalCommand, GoalCommandAction, admit_goal_command, current_goal_admission_context,
 };
 
 pub struct GoalStartTool {
@@ -31,7 +31,7 @@ impl Tool for GoalStartTool {
     }
 
     fn description(&self) -> &str {
-        "Start a durable goal run. The objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw."
+        crate::i18n::get_tool_description("goal.start").unwrap_or("Start a durable goal run.")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -60,8 +60,27 @@ impl Tool for GoalStartTool {
             });
         }
 
+        let Some(ctx) = current_goal_admission_context() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-goal-start-error-missing-context",
+                )),
+            });
+        };
+        if ctx.agent_alias != self.agent_alias {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-goal-start-error-agent-context-mismatch",
+                )),
+            });
+        }
+
         let admission = admit_goal_command(
-            GoalAdmissionContext::new(self.agent_alias.clone()),
+            ctx,
             GoalCommand {
                 action: GoalCommandAction::Start,
                 objective: Some(objective.to_string()),
@@ -81,6 +100,11 @@ impl Tool for GoalStartTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{
+        GoalAdmissionContext, GoalCommand, GoalCommandAction, TaskRegistry, admit_goal_command,
+        control_plane, init_control_plane, scope_goal_admission_context,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn tool_schema_requires_only_untrusted_objective() {
@@ -90,5 +114,57 @@ mod tests {
         assert!(schema["properties"].get("agent_alias").is_none());
         assert!(schema["properties"].get("principal_id").is_none());
         assert!(schema["properties"].get("originator_route").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_started_goal_uses_scoped_trusted_route() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn TaskRegistry> = match control_plane() {
+            Some(control_plane) => Arc::clone(&control_plane.store),
+            None => {
+                let store: Arc<dyn TaskRegistry> =
+                    Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                let _ = init_control_plane(crate::control_plane::ControlPlaneHandle {
+                    store: Arc::clone(&store),
+                    boot_id: "test-boot".into(),
+                });
+                Arc::clone(&control_plane().unwrap().store)
+            }
+        };
+        let tool = GoalStartTool::new(agent.clone());
+        let owner = GoalAdmissionContext::new(agent.clone())
+            .with_originator_route(Some("channel:route-a".into()))
+            .with_principal_id(Some("principal-a".into()));
+
+        let result = scope_goal_admission_context(
+            Some(owner.clone()),
+            tool.execute(serde_json::json!({"objective": "ship trusted goal"})),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{result:?}");
+
+        let task = store
+            .latest_active_goal_for_agent(&agent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.originator_route.as_deref(), Some("channel:route-a"));
+        assert_eq!(task.principal_id.as_deref(), Some("principal-a"));
+
+        let wrong_route = GoalAdmissionContext::new(agent)
+            .with_originator_route(Some("channel:route-b".into()))
+            .with_principal_id(Some("principal-a".into()));
+        let err = admit_goal_command(
+            wrong_route,
+            GoalCommand {
+                action: GoalCommandAction::Status,
+                objective: None,
+                task_id: Some(task.id),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not visible from this route"));
     }
 }

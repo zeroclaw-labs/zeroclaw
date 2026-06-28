@@ -1,6 +1,4 @@
-use crate::agent::cost::{
-    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, record_tool_loop_cost_usage,
-};
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, record_tool_loop_cost_usage};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
@@ -35,12 +33,20 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
-fn current_goal_cost_context() -> Option<ToolLoopCostTrackingContext> {
-    TOOL_LOOP_COST_TRACKING_CONTEXT
+async fn active_goal_task_id_from_cost_context() -> Option<String> {
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
+        .flatten()?;
+    let agent_alias = ctx.agent_alias.as_deref()?;
+    let control_plane = crate::control_plane::control_plane()?;
+    control_plane
+        .store
+        .latest_active_goal_for_agent(agent_alias)
+        .await
+        .ok()
         .flatten()
-        .filter(|ctx| ctx.goal_task_id.is_some())
+        .map(|goal| goal.id)
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -1140,7 +1146,7 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
-            if current_goal_cost_context().is_some() {
+            if active_goal_task_id_from_cost_context().await.is_some() {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -1345,7 +1351,7 @@ impl DelegateTool {
         match result {
             Ok(response) => {
                 if let Some(usage) = &response.usage {
-                    record_tool_loop_cost_usage(&provider_type, &model, usage);
+                    record_tool_loop_cost_usage(&provider_type, &model, usage).await;
                 }
                 let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
@@ -1775,7 +1781,10 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
-        let parent_goal_cost_context = current_goal_cost_context();
+        let parent_goal_cost_context = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -3574,9 +3583,45 @@ mod tests {
 
     #[tokio::test]
     async fn background_delegation_rejected_when_goal_context_active() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            boot_id: "test-boot".into(),
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let goal_context =
-            ToolLoopCostTrackingContext::usage_only().with_goal_task_id("goal-active");
+            crate::agent::cost::ToolLoopCostTrackingContext::usage_only().with_agent_alias(agent);
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(goal_context),

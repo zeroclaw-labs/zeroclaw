@@ -12,6 +12,10 @@ use super::task_registry::{
     TaskRecord, TaskRegistry, TaskStatus,
 };
 
+tokio::task_local! {
+    static GOAL_ADMISSION_CONTEXT: Option<GoalAdmissionContext>;
+}
+
 fn msg(key: &str, args: &[(&str, &str)]) -> String {
     crate::i18n::get_required_cli_string_with_args(key, args)
 }
@@ -91,6 +95,20 @@ impl GoalAdmissionContext {
     }
 }
 
+pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
+    GOAL_ADMISSION_CONTEXT.try_with(Clone::clone).ok().flatten()
+}
+
+pub async fn scope_goal_admission_context<F>(
+    ctx: Option<GoalAdmissionContext>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    GOAL_ADMISSION_CONTEXT.scope(ctx, future).await
+}
+
 pub fn parse_goal_command(input: &str) -> Result<GoalCommand> {
     let trimmed = input.trim();
     let without_prefix = if trimmed.starts_with('/') {
@@ -103,14 +121,14 @@ pub fn parse_goal_command(input: &str) -> Result<GoalCommand> {
     };
     let mut parts = without_prefix.splitn(2, char::is_whitespace);
     let Some(action) = parts.next().filter(|s| !s.is_empty()) else {
-        bail!("goal command requires an action: start, status, or cancel");
+        bail!("{}", msg("goal-command-error-missing-action", &[]));
     };
     let action = action.to_ascii_lowercase();
     let rest = parts.next().unwrap_or("").trim();
     match action.as_str() {
         "start" => {
             if rest.is_empty() {
-                bail!("goal start requires an objective");
+                bail!("{}", msg("goal-command-error-missing-objective", &[]));
             }
             Ok(GoalCommand {
                 action: GoalCommandAction::Start,
@@ -139,7 +157,10 @@ pub fn parse_goal_command(input: &str) -> Result<GoalCommand> {
             task_id: nonempty(rest),
         }),
         other => {
-            bail!("unknown goal action `{other}`; use start, status, pause, resume, or cancel")
+            bail!(
+                "{}",
+                msg("goal-command-error-unknown-action", &[("action", other)])
+            )
         }
     }
 }
@@ -153,7 +174,7 @@ pub async fn admit_goal_command(
         GoalCommandAction::Start => {
             let objective = command
                 .objective
-                .context("goal start requires an objective")?;
+                .with_context(|| msg("goal-command-error-missing-objective", &[]))?;
             start_goal(cp.store.as_ref(), &cp.boot_id, ctx, objective).await
         }
         GoalCommandAction::Status => status_goal(cp.store.as_ref(), &ctx, command.task_id).await,
@@ -360,20 +381,35 @@ async fn resolve_goal_task(
 
 fn ensure_goal_visible(task: &TaskRecord, ctx: &GoalAdmissionContext) -> Result<()> {
     if task.kind != TaskKind::Goal {
-        bail!("task `{}` is not a goal", task.id);
+        bail!(
+            "{}",
+            msg("goal-command-error-not-goal", &[("task_id", &task.id)])
+        );
     }
     if task.agent != ctx.agent_alias {
-        bail!("goal `{}` is not owned by this agent", task.id);
+        bail!(
+            "{}",
+            msg("goal-command-error-wrong-agent", &[("task_id", &task.id)])
+        );
     }
     if let Some(route) = task.originator_route.as_deref()
         && ctx.originator_route.as_deref() != Some(route)
     {
-        bail!("goal `{}` is not visible from this route", task.id);
+        bail!(
+            "{}",
+            msg("goal-command-error-wrong-route", &[("task_id", &task.id)])
+        );
     }
     if let Some(principal_id) = task.principal_id.as_deref()
         && ctx.principal_id.as_deref() != Some(principal_id)
     {
-        bail!("goal `{}` is not visible to this principal", task.id);
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-wrong-principal",
+                &[("task_id", &task.id)]
+            )
+        );
     }
     Ok(())
 }

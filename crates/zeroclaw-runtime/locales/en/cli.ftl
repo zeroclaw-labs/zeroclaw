@@ -859,6 +859,13 @@ goal-command-cancelled = Goal `{$task_id}` cancelled.
 goal-command-status = Goal `{$task_id}` is {$status}: {$objective}
 goal-command-status-paused = Goal `{$task_id}` is {$status}: {$objective} (paused: {$reason})
 goal-terminal-reason-cancelled-by-controller = cancelled by goal controller
+goal-command-error-missing-action = Goal command requires an action: start, status, pause, resume, or cancel.
+goal-command-error-missing-objective = Goal start requires an objective.
+goal-command-error-unknown-action = Unknown goal action `{$action}`; use start, status, pause, resume, or cancel.
+goal-command-error-not-goal = Task `{$task_id}` is not a goal.
+goal-command-error-wrong-agent = Goal `{$task_id}` is not owned by this agent.
+goal-command-error-wrong-route = Goal `{$task_id}` is not visible from this route.
+goal-command-error-wrong-principal = Goal `{$task_id}` is not visible to this principal.
 channel-goal-command-failed = Goal command failed: {$error}
 channel-goal-command-invalid = Invalid goal command: {$raw}
 

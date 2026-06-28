@@ -5041,6 +5041,12 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+    let goal_admission_context = Some(
+        zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+            ctx.agent_alias.as_ref().clone(),
+        )
+        .with_originator_route(Some(history_key.clone())),
+    );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5117,6 +5123,10 @@ async fn process_channel_message_body(
                 .scope(receipt_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
+            let tool_loop = zeroclaw_runtime::control_plane::scope_goal_admission_context(
+                goal_admission_context.clone(),
+                tool_loop,
+            );
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let timed_tool_loop =

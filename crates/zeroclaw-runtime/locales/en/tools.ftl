@@ -96,6 +96,8 @@ tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. 
 
 tool-goal-start = Start a durable goal run. The objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
 tool-goal-start-error-empty-objective = goal.start requires a non-empty objective
+tool-goal-start-error-missing-context = goal.start is unavailable because trusted runtime admission context was not supplied.
+tool-goal-start-error-agent-context-mismatch = goal.start is unavailable because trusted runtime admission context does not match this agent.
 
 tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 

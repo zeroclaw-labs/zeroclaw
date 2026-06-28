@@ -157,9 +157,6 @@ pub struct ToolLoopCostTrackingContext {
     /// Alias of the agent driving this turn. Stamped onto persisted
     /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
     pub agent_alias: Option<String>,
-    /// Active durable goal task id. Stamped onto persisted `CostRecord`s so
-    /// goal usage is derived from the canonical cost ledger.
-    pub goal_task_id: Option<String>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -172,7 +169,6 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing,
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
-            goal_task_id: None,
         }
     }
 
@@ -188,7 +184,6 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing: Arc::new(ModelProviderPricing::new()),
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
-            goal_task_id: None,
         }
     }
 
@@ -197,14 +192,6 @@ impl ToolLoopCostTrackingContext {
     #[must_use]
     pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
         self.agent_alias = Some(agent_alias.into());
-        self
-    }
-
-    /// Attach an active goal task id so subsequent
-    /// `record_tool_loop_cost_usage` calls stamp ledger rows with it.
-    #[must_use]
-    pub fn with_goal_task_id(mut self, goal_task_id: impl Into<String>) -> Self {
-        self.goal_task_id = Some(goal_task_id.into());
         self
     }
 
@@ -277,7 +264,7 @@ fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64)
 
 /// Record token usage from an LLM response via the task-local cost tracker.
 /// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
-pub fn record_tool_loop_cost_usage(
+pub async fn record_tool_loop_cost_usage(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
@@ -341,17 +328,48 @@ pub fn record_tool_loop_cost_usage(
         turn_usage.cost_usd += cost_usage.cost_usd;
     }
 
+    let goal_task_id = match ctx.agent_alias.as_deref() {
+        Some(agent_alias) => active_goal_task_id_for_agent(agent_alias).await,
+        None => None,
+    };
+
     if let Some(tracker) = &ctx.tracker
         && let Err(error) = tracker.record_usage_with_attribution(
             cost_usage.clone(),
             ctx.agent_alias.as_deref(),
-            ctx.goal_task_id.as_deref(),
+            goal_task_id.as_deref(),
         )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+async fn active_goal_task_id_for_agent(agent_alias: &str) -> Option<String> {
+    let control_plane = crate::control_plane::control_plane()?;
+    match control_plane
+        .store
+        .latest_active_goal_for_agent(agent_alias)
+        .await
+    {
+        Ok(Some(goal)) => Some(goal.id),
+        Ok(None) => None,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "agent_alias": agent_alias,
+                        "error": format!("{error}")
+                    })),
+                "Failed to resolve active goal for cost attribution"
+            );
+            None
+        }
+    }
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
@@ -722,7 +740,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (total_tokens, cost_usd) = runtime
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
-                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
             }))
             .expect("cost usage");
 
@@ -771,7 +789,7 @@ mod tests {
             .block_on(TOOL_LOOP_TURN_USAGE.scope(
                 Some(Arc::clone(&turn_usage)),
                 TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
-                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
                 }),
             ))
             .expect("cost usage");
@@ -791,6 +809,7 @@ mod tests {
     #[test]
     fn record_tool_loop_cost_usage_stamps_active_goal_task_id() {
         let workspace = tempfile::TempDir::new().unwrap();
+        let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
         let config = zeroclaw_config::schema::CostConfig {
             track_per_agent: true,
             ..zeroclaw_config::schema::CostConfig::default()
@@ -806,8 +825,7 @@ mod tests {
                 ]),
             )])),
         )
-        .with_agent_alias("agent-a")
-        .with_goal_task_id("goal-a");
+        .with_agent_alias("agent-a");
         let usage = zeroclaw_providers::traits::TokenUsage {
             input_tokens: Some(1_000),
             output_tokens: Some(500),
@@ -815,13 +833,52 @@ mod tests {
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime
-            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
-                record_tool_loop_cost_usage("mock-provider", "mock-model", &usage)
-            }))
-            .expect("cost usage");
+        runtime.block_on(async {
+            let store: Arc<dyn crate::control_plane::TaskRegistry> =
+                match crate::control_plane::control_plane() {
+                    Some(control_plane) => Arc::clone(&control_plane.store),
+                    None => {
+                        let store: Arc<dyn crate::control_plane::TaskRegistry> = Arc::new(
+                            crate::control_plane::SqliteTaskStore::new_in_memory().unwrap(),
+                        );
+                        let _ = crate::control_plane::init_control_plane(
+                            crate::control_plane::ControlPlaneHandle {
+                                store: Arc::clone(&store),
+                                boot_id: "test-boot".into(),
+                            },
+                        );
+                        Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                    }
+                };
+            store
+                .create(crate::control_plane::TaskRecord {
+                    id: goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                })
+                .await
+                .unwrap();
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("mock-provider", "mock-model", &usage).await
+                })
+                .await
+                .expect("cost usage");
+        });
 
-        let summary = tracker.get_summary_for_goal("goal-a").unwrap();
+        let summary = tracker.get_summary_for_goal(&goal_id).unwrap();
         assert_eq!(summary.request_count, 1);
         assert_eq!(summary.total_tokens, 1_500);
         assert_eq!(

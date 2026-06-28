@@ -249,7 +249,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         usage: "/goal <start|status|pause|resume|cancel> ...",
         description_key: "command-goal-description",
         short_description: "Manage a durable goal run",
-        surfaces: WEB_TUI_CHANNEL,
+        surfaces: CHANNEL_ONLY,
         execution: CommandExecution::GoalAdmission,
     },
 ];
@@ -328,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn goal_is_advertised_on_user_surfaces() {
-        assert!(parse_command_token("/goal", CommandSurface::Web).is_some());
-        assert!(parse_command_token("/goal", CommandSurface::Tui).is_some());
+    fn goal_is_advertised_only_where_admission_is_implemented() {
+        assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
+        assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
         assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
     }
 }

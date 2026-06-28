@@ -170,27 +170,6 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
-async fn attach_active_goal_cost_context(
-    context: Option<ToolLoopCostTrackingContext>,
-    agent_alias: &str,
-) -> Result<Option<ToolLoopCostTrackingContext>> {
-    let Some(context) = context else {
-        return Ok(None);
-    };
-    let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Ok(Some(context));
-    };
-    match control_plane
-        .store
-        .latest_active_goal_for_agent(agent_alias)
-        .await
-        .with_context(|| format!("resolve active goal for agent `{agent_alias}`"))?
-    {
-        Some(goal) => Ok(Some(context.with_goal_task_id(goal.id))),
-        None => Ok(Some(context)),
-    }
-}
-
 /// Get the global model switch request state
 pub fn get_model_switch_state() -> ModelSwitchCallback {
     Arc::clone(&MODEL_SWITCH_REQUEST)
@@ -1860,7 +1839,7 @@ pub async fn run(
         });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
-        let base_cost_tracking_context =
+        let cost_tracking_context =
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
@@ -1873,9 +1852,6 @@ pub async fn run(
         let base_system_prompt = system_prompt.clone();
 
         if let Some(msg) = message {
-            let cost_tracking_context =
-                attach_active_goal_cost_context(base_cost_tracking_context.clone(), agent_alias)
-                    .await?;
             // ── Parse thinking directive from user message ─────────
             let (thinking_directive, effective_msg) =
                 match crate::agent::thinking::parse_thinking_directive(&msg) {
@@ -2409,12 +2385,6 @@ pub async fn run(
                     &agent.resolved.tool_filter_groups,
                     &effective_input,
                 );
-                let cost_tracking_context = attach_active_goal_cost_context(
-                    base_cost_tracking_context.clone(),
-                    agent_alias,
-                )
-                .await?;
-
                 let runtime_capability_names = tools_registry
                     .iter()
                     .map(|tool| tool.name())
@@ -2822,7 +2792,7 @@ pub async fn run(
         // reads the context's own accumulator, which holds the session-wide
         // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
         // even though usage was tracked.
-        let tokens_used = base_cost_tracking_context.as_ref().and_then(|ctx| {
+        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
             let usage = ctx.snapshot_turn_usage();
             (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
                 zeroclaw_api::observability_traits::TurnTokenUsage {

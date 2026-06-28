@@ -65,15 +65,14 @@ pub async fn verify_goal_completion(
             )
             .await?;
         if let Some(usage) = &response.usage {
-            record_tool_loop_cost_usage(&provider_name, &model, usage);
+            record_tool_loop_cost_usage(&provider_name, &model, usage).await;
         }
         Ok::<_, anyhow::Error>(response.text.unwrap_or_default())
     };
 
     let text = match CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir) {
         Some(tracker) => {
-            let ctx = tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker)
-                .with_goal_task_id(goal.task_id.clone());
+            let ctx = tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker);
             TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), verifier_call)
                 .await?
@@ -191,9 +190,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verifier_usage_records_with_goal_attribution() {
+    #[tokio::test]
+    async fn verifier_usage_records_with_goal_attribution() {
         let temp = tempfile::tempdir().unwrap();
+        let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
         let mut config = Config {
             data_dir: temp.path().to_path_buf(),
             ..Config::default()
@@ -211,21 +211,61 @@ mod tests {
         );
         let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
             .expect("tracker");
-        let ctx = tool_loop_cost_tracking_context_from_tracker(&config, "main", tracker.clone())
-            .with_goal_task_id("goal-123");
-        TOOL_LOOP_COST_TRACKING_CONTEXT.sync_scope(Some(ctx), || {
-            record_tool_loop_cost_usage(
-                "custom.main",
-                "model",
-                &zeroclaw_api::model_provider::TokenUsage {
-                    input_tokens: Some(100),
-                    output_tokens: Some(50),
-                    cached_input_tokens: None,
-                },
-            );
-        });
+        let store: std::sync::Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => std::sync::Arc::clone(&control_plane.store),
+                None => {
+                    let store: std::sync::Arc<dyn crate::control_plane::TaskRegistry> =
+                        std::sync::Arc::new(
+                            crate::control_plane::SqliteTaskStore::new_in_memory().unwrap(),
+                        );
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: std::sync::Arc::clone(&store),
+                            boot_id: "test-boot".into(),
+                        },
+                    );
+                    std::sync::Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: goal_id.clone(),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: "main".into(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let ctx = tool_loop_cost_tracking_context_from_tracker(&config, "main", tracker.clone());
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                record_tool_loop_cost_usage(
+                    "custom.main",
+                    "model",
+                    &zeroclaw_api::model_provider::TokenUsage {
+                        input_tokens: Some(100),
+                        output_tokens: Some(50),
+                        cached_input_tokens: None,
+                    },
+                )
+                .await
+                .unwrap();
+            })
+            .await;
 
-        let summary = tracker.get_summary_for_goal("goal-123").unwrap();
+        let summary = tracker.get_summary_for_goal(&goal_id).unwrap();
         assert_eq!(summary.total_tokens, 150);
         assert!(summary.session_cost_usd > 0.0);
 
