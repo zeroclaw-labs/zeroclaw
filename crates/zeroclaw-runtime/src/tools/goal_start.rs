@@ -54,7 +54,9 @@ impl Tool for GoalStartTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("goal.start requires a non-empty objective".to_string()),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-goal-start-error-empty-objective",
+                )),
             });
         }
 

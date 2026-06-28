@@ -12,6 +12,33 @@ use super::task_registry::{
     TaskRecord, TaskRegistry, TaskStatus,
 };
 
+fn msg(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Running => "running",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Lost => "lost",
+        TaskStatus::TimedOut => "timed_out",
+    }
+}
+
+fn pause_reason_label(reason: GoalPauseReason) -> &'static str {
+    match reason {
+        GoalPauseReason::NeedsUserInput => "needs_user_input",
+        GoalPauseReason::HumanEscalation => "human_escalation",
+        GoalPauseReason::ExternalDependency => "external_dependency",
+        GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+        GoalPauseReason::VerifierBlocked => "verifier_blocked",
+        GoalPauseReason::DaemonRestart => "daemon_restart",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalCommandAction {
     Start,
@@ -198,7 +225,7 @@ async fn start_goal(
     Ok(GoalAdmission {
         task_id: task_id.clone(),
         status: TaskStatus::Running,
-        message: format!("Goal `{task_id}` started."),
+        message: msg("goal-command-started", &[("task_id", &task_id)]),
     })
 }
 
@@ -215,15 +242,26 @@ async fn status_goal(
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: task.status,
-        message: format!(
-            "Goal `{}` is {:?}: {}{}",
-            task.id,
-            task.status,
-            goal.objective,
-            goal.pause_reason
-                .map(|reason| format!(" (paused: {reason:?})"))
-                .unwrap_or_default()
-        ),
+        message: if let Some(reason) = goal.pause_reason {
+            msg(
+                "goal-command-status-paused",
+                &[
+                    ("task_id", &task.id),
+                    ("status", status_label(task.status)),
+                    ("objective", &goal.objective),
+                    ("reason", pause_reason_label(reason)),
+                ],
+            )
+        } else {
+            msg(
+                "goal-command-status",
+                &[
+                    ("task_id", &task.id),
+                    ("status", status_label(task.status)),
+                    ("objective", &goal.objective),
+                ],
+            )
+        },
     })
 }
 
@@ -247,7 +285,7 @@ async fn pause_goal_for_blocker(
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Paused,
-        message: format!("Goal `{}` paused.", task.id),
+        message: msg("goal-command-paused", &[("task_id", &task.id)]),
     })
 }
 
@@ -270,7 +308,7 @@ async fn resume_goal(
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Running,
-        message: format!("Goal `{}` resumed.", task.id),
+        message: msg("goal-command-resumed", &[("task_id", &task.id)]),
     })
 }
 
@@ -288,13 +326,13 @@ async fn cancel_goal(
             &task.id,
             TaskStatus::Cancelled,
             None,
-            Some("cancelled by goal controller".to_string()),
+            Some(msg("goal-terminal-reason-cancelled-by-controller", &[])),
         )
         .await?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Cancelled,
-        message: format!("Goal `{}` cancelled.", task.id),
+        message: msg("goal-command-cancelled", &[("task_id", &task.id)]),
     })
 }
 

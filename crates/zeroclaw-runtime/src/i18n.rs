@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
+static TOOL_FTL_SOURCES: OnceLock<ToolFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
 /// The canonical locale registry, embedded from repo-root `locales.toml` at
@@ -60,19 +61,35 @@ struct CliFtlSources {
     builtin: Option<&'static str>,
 }
 
+struct ToolFtlSources {
+    locale: String,
+    disk: Option<String>,
+}
+
 /// Initialize with a specific locale. No-op after first call.
 pub fn init(locale: &str) {
     let locale = LOCALE.get_or_init(|| normalize_locale(locale));
     DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
     CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(locale));
+    TOOL_FTL_SOURCES.get_or_init(|| load_tool_ftl_sources(locale));
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
 pub fn get_tool_description(tool_name: &str) -> Option<&'static str> {
     let map = DESCRIPTIONS.get_or_init(|| load_descriptions(active_locale()));
-    let key = format!("tool-{}", tool_name.replace('_', "-"));
+    let key = format!("tool-{}", tool_name.replace(['_', '.'], "-"));
     map.get(&key).map(String::as_str)
+}
+
+/// Get a tool-surface string by key and format it with Fluent external arguments.
+pub fn get_tool_string_with_args(key: &str, args: &[(&str, &str)]) -> Option<String> {
+    format_tool_string_with_args(tool_ftl_sources(), key, args)
+}
+
+/// Get a required tool-surface string by key.
+pub fn get_required_tool_string(key: &str) -> String {
+    get_tool_string_with_args(key, &[]).unwrap_or_else(|| missing_tool_string(key))
 }
 
 /// Get a CLI string by key (e.g. "cli-config-about").
@@ -104,6 +121,10 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
+fn tool_ftl_sources() -> &'static ToolFtlSources {
+    TOOL_FTL_SOURCES.get_or_init(|| load_tool_ftl_sources(active_locale()))
+}
+
 /// Resolve a CLI string against the embedded English catalogue only, ignoring
 /// the process locale and the filesystem. Used by tests that assert the
 /// canonical English wording without depending on the host's configured
@@ -125,6 +146,17 @@ fn missing_cli_string(key: &str) -> String {
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})),
         "missing CLI Fluent string"
+    );
+    format!("{{{key}}}")
+}
+
+fn missing_tool_string(key: &str) -> String {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error_key": "i18n.missing_tool_string", "key": key})),
+        "missing tool Fluent string"
     );
     format!("{{{key}}}")
 }
@@ -164,6 +196,15 @@ fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
     }
 }
 
+fn load_tool_ftl_sources(locale: &str) -> ToolFtlSources {
+    ToolFtlSources {
+        locale: locale.to_string(),
+        disk: (locale != "en")
+            .then(|| load_ftl_from_disk(locale, "tools.ftl"))
+            .flatten(),
+    }
+}
+
 fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
         "zh-CN" => Some(include_str!("../locales/zh-CN/cli.ftl")),
@@ -187,6 +228,19 @@ fn format_cli_string_with_args(
         return Some(value);
     }
     format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+}
+
+fn format_tool_string_with_args(
+    sources: &ToolFtlSources,
+    key: &str,
+    args: &[(&str, &str)],
+) -> Option<String> {
+    if let Some(locale_ftl) = sources.disk.as_deref()
+        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+    {
+        return Some(value);
+    }
+    format_ftl_message(include_str!("../locales/en/tools.ftl"), "en", key, args)
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
@@ -374,7 +428,29 @@ mod tests {
         let map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
         assert!(map.contains_key("tool-shell"));
         assert!(map.contains_key("tool-file-read"));
+        assert!(map.contains_key("tool-goal-start"));
         assert!(!map.contains_key("tool-nonexistent"));
+    }
+
+    #[test]
+    fn dotted_tool_names_resolve_to_fluent_description_keys() {
+        assert!(
+            get_tool_description("goal.start")
+                .is_some_and(|description| description.contains("durable goal run"))
+        );
+    }
+
+    #[test]
+    fn tool_strings_format_from_tool_fluent_catalogue() {
+        let sources = ToolFtlSources {
+            locale: "en".to_string(),
+            disk: None,
+        };
+        let value =
+            format_tool_string_with_args(&sources, "tool-goal-start-error-empty-objective", &[])
+                .expect("goal.start tool error should format");
+
+        assert_eq!(value, "goal.start requires a non-empty objective");
     }
 
     #[test]

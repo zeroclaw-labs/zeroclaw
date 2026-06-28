@@ -1144,10 +1144,9 @@ impl Tool for DelegateTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(
-                        "Background delegation is disabled while a durable goal is active; use synchronous delegation until parent-linked completion and usage reporting are available."
-                            .into(),
-                    ),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-delegate-error-background-goal-context",
+                    )),
                 });
             }
             return self.execute_background(agent_name, prompt, &args).await;

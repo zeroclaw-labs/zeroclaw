@@ -851,6 +851,17 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 
+# ── Goal mode runtime surfaces (#8303 / ADR-008) ─────────────────────
+goal-command-started = Goal `{$task_id}` started.
+goal-command-paused = Goal `{$task_id}` paused.
+goal-command-resumed = Goal `{$task_id}` resumed.
+goal-command-cancelled = Goal `{$task_id}` cancelled.
+goal-command-status = Goal `{$task_id}` is {$status}: {$objective}
+goal-command-status-paused = Goal `{$task_id}` is {$status}: {$objective} (paused: {$reason})
+goal-terminal-reason-cancelled-by-controller = cancelled by goal controller
+channel-goal-command-failed = Goal command failed: {$error}
+channel-goal-command-invalid = Invalid goal command: {$raw}
+
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})
 cli-alias-created = created {$section}.{$alias}

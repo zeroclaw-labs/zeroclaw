@@ -59,6 +59,7 @@ tool-cron-update = Patch an existing cron job (schedule, command, prompt, enable
 tool-data-management = Workspace data retention, purge, and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
+tool-delegate-error-background-goal-context = Background delegation is disabled while a durable goal is active; use synchronous delegation until parent-linked completion and usage reporting are available.
 
 tool-file-edit = Edit a file by replacing an exact string match with new content
 
@@ -92,6 +93,9 @@ tool-file-write = Write contents to a file in the workspace
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+
+tool-goal-start = Start a durable goal run. The objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
+tool-goal-start-error-empty-objective = goal.start requires a non-empty objective
 
 tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 

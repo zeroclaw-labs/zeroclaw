@@ -2833,11 +2833,17 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => admission.message,
-                Err(error) => format!("Goal command failed: {error}"),
+                Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-goal-command-failed",
+                    &[("error", &error.to_string())],
+                ),
             }
         }
         ChannelRuntimeCommand::InvalidGoal(raw) => {
-            format!("Invalid goal command: {raw}")
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-command-invalid",
+                &[("raw", &raw)],
+            )
         }
     };
 
