@@ -1,0 +1,58 @@
+# SBOM generation — CycloneDX Software Bill of Materials for supply-chain
+# transparency. Covers Rust crates (cargo-cyclonedx) and npm packages
+# (npm sbom). Container OS-layer SBOM handled separately by Trivy (Phase 2).
+#
+# On push to master: generate and upload SBOM as a CI artifact.
+# On schedule: regenerate to catch dependency changes between PRs.
+
+name: SBOM
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '17 6 * * *'   # daily at 06:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # ── Rust SBOM (cargo-cyclonedx) ──────────────────────────────────
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate Rust SBOM
+        run: |
+          mkdir -p sbom
+          cargo cyclonedx --all -f json
+          mv *.cdx.json sbom/
+
+      # ── npm SBOM (built-in npm sbom, Node 24) ────────────────────────
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Generate npm SBOM
+        working-directory: web
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund
+          npm sbom --sbom-format cyclonedx > ../sbom/web.cdx.json
+
+      - name: Upload SBOM artifact
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom/

@@ -315,6 +315,8 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: Check licenses, sources, and advisories
         run: cargo deny check
+      - name: Lockfile integrity
+        run: cargo verify-project && cargo fetch --locked
 
   nix-eval:
     name: Nix Module Eval
@@ -384,6 +386,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test installer target detection
+        run: bash scripts/ci/install_target_triple_test.sh
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
