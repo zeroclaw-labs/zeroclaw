@@ -4119,6 +4119,45 @@ async fn main() -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+
+            // #7895: probe the configured gateway address ONCE, before the
+            // reload loop, as a startup guard. The daemon supervises its own
+            // in-process gateway (shared event bus / canvas / reload channel);
+            // it cannot adopt a separate gateway process, so an already-bound
+            // address fails fast with a clear, actionable message instead of
+            // degrading into a noisy supervisor retry loop. A free address (or
+            // an ephemeral port) proceeds normally. Checked once at startup —
+            // the per-reload gateway teardown/restart is the supervisor's job.
+            match daemon::detect_gateway_bind_mode(&current_config, &host, port).await {
+                daemon::GatewayBindMode::StartFresh => {}
+                daemon::GatewayBindMode::GatewayAlreadyRunning => {
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-already-running",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "A ZeroClaw gateway is already running on {host}:{port}. The daemon \
+                             supervises its own gateway and will not start a second one on the \
+                             same address. Stop that gateway (or point the daemon at a free port \
+                             with `zeroclaw config set gateway.port <port>`), then run the daemon \
+                             again."
+                        ),
+                    ));
+                }
+                daemon::GatewayBindMode::PortOccupied => {
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-port-occupied",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "Gateway address {host}:{port} is already in use by another process. \
+                             Free the port or point the daemon at a free port (`zeroclaw config \
+                             set gateway.port <port>`), then run the daemon again."
+                        ),
+                    ));
+                }
+            }
+
             loop {
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the

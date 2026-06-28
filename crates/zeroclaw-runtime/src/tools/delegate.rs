@@ -1843,14 +1843,14 @@ impl DelegateTool {
         // bundles, load + concat skills from each. With none, fall back to
         // the workspace default.
         let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
-        let skills = if bundle_dirs.is_empty() {
+        let skills: Vec<_> = if bundle_dirs.is_empty() {
             let default_dir = crate::skills::skills_dir(workspace_dir);
-            crate::skills::load_skills_from_directory(&default_dir, false)
+            crate::skills::load_skills_from_directory(&default_dir, false).0
         } else {
             bundle_dirs
                 .into_iter()
                 .flat_map(|dir| {
-                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false)
+                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false).0
                 })
                 .collect()
         };
@@ -4339,6 +4339,27 @@ mod tests {
             !DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
             "non-MCP names outside allow-list must be rejected"
         );
+    }
+
+    /// Characterization test for the MCP resource/prompt capability tools'
+    /// subagent-propagation guarantee (issue #4467). `mcp_resources` and
+    /// `mcp_prompts` contain no `__`, so they are NOT auto-admitted the way
+    /// runtime `<server>__<tool>` MCP wrappers are: a narrowed `caller_allowed`
+    /// list that omits them must exclude them. This locks the boundary so a
+    /// narrowed delegate/spawn_subagent cannot reach resources/prompts unless
+    /// explicitly granted.
+    #[test]
+    fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
+        use zeroclaw_tools::tool_search::ToolAccessPolicy;
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string()]),
+        )
+        .expect("policy");
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("mcp_resources"));
+        assert!(!policy.is_tool_allowed("mcp_prompts"));
     }
 
     /// PR #7547 review (Audacity88) — blocking comment: the PR body

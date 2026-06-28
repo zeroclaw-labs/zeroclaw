@@ -724,6 +724,7 @@ cli-channels-build-hint = {"  "}请从源码构建：`./install.sh --source --pr
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
 cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
 cli-models-status-current = 默认模型: { $model } (provider: { $provider })
 cli-models-status-none = 未配置默认模型。
@@ -735,6 +736,12 @@ history-trim-reason-budget = context token budget exceeded
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-new-session = 对话历史已清除。重新开始。
+channel-runtime-stop-sent = 已发送停止信号。
+channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
+channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）
