@@ -11566,7 +11566,6 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
- "zeroclaw-commands",
 ]
 
 [[package]]

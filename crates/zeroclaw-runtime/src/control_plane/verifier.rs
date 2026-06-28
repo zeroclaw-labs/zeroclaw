@@ -194,8 +194,10 @@ mod tests {
     #[test]
     fn verifier_usage_records_with_goal_attribution() {
         let temp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.data_dir = temp.path().to_path_buf();
+        let mut config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
         config.providers.models.custom.insert(
             "main".into(),
             zeroclaw_config::schema::CustomModelProviderConfig {
