@@ -498,7 +498,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     ///
     /// Free-form (no-choices) questions are not modeled by this method.
     /// Multiple-choice support landed via ACP `elicitation/create` (see
-    /// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`);
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation);
     /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
@@ -535,7 +535,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     ///
     /// Channels that can only handle structured choices (e.g. ACP in Phase 1
     /// of the elicitation rollout — see
-    /// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`)
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
     /// should return `false` so callers can fail fast with a useful error
     /// instead of timing out on `listen`. Free-form text support flips this
     /// to `true` in Phase 2.

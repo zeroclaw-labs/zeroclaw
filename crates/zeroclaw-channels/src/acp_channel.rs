@@ -14,8 +14,8 @@
 //!   `elicitation.form` in `initialize.clientCapabilities`. Otherwise
 //!   it falls back to the legacy `session/request_permission` overload
 //!   for backward compatibility with clients that haven't yet shipped
-//!   the [elicitation RFD][rfd]. See the design spec at
-//!   `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+//!   the [elicitation RFD][rfd]
+//!   (https://agentclientprotocol.com/rfds/elicitation).
 //! - `request_multi_choice` issues an `elicitation/create` request
 //!   with a `type: array` / `anyOf` schema. There is no legacy
 //!   fallback for multi-select — callers receive `Ok(None)` when the
@@ -71,7 +71,7 @@ pub struct AcpChannel {
     /// block. Drives the capability gate in `request_choice`: if
     /// `client_caps.form` is true we emit `elicitation/create`; otherwise
     /// we fall back to the legacy `session/request_permission` path.
-    /// See `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+    /// See the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation.
     client_caps: ElicitationCapabilities,
 }
 
@@ -385,7 +385,7 @@ impl Channel for AcpChannel {
         // via `request_choice` → `elicitation/create`; free-form text is
         // Phase 2. Until Phase 2 lands, `ask_user` under ACP must supply
         // structured `choices`, which routes through `request_choice`.
-        // Spec: docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md
+        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         anyhow::bail!(
             "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation Phase 2)"
         )

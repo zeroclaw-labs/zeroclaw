@@ -243,7 +243,7 @@ impl Tool for EscalateToHumanTool {
         // without blocking — the alternative is silently timing out for
         // `timeout_secs` seconds. Phase 2 of the elicitation rollout will
         // flip ACP's `supports_free_form_ask` to true.
-        // Spec: docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md
+        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,

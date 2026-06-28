@@ -222,7 +222,7 @@ impl Tool for AskUserTool {
             // talking to ACP clients must supply `choices` so we can route
             // through `request_choice` → `elicitation/create` (or the
             // legacy `session/request_permission` fallback for older clients).
-            // Spec: docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md
+            // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -8,8 +8,8 @@
 //! ACP channel: the multiple-choice elicitation RFD path is wired
 //! through the same `elicitation/create` outbound JSON-RPC method as
 //! `AcpChannel`, gated on the TUI advertising
-//! `clientCapabilities.elicitation.form` during `initialize`. See
-//! `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`
+//! `clientCapabilities.elicitation.form` during `initialize`. See the ACP
+//! elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
 //! for the wire protocol.
 
 use std::sync::Arc;

@@ -92,8 +92,8 @@ pub(crate) struct Chat {
     /// — without blocking the daemon's tool call indefinitely.
     ///
     /// See `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` for the
-    /// emitter side and
-    /// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`
+    /// emitter side and the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
     /// for the wire protocol.
     inbound_rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
     /// Background-fetched git status updates: (session_id, branch, hash).
@@ -520,8 +520,8 @@ impl Chat {
     /// the calling tool can fall back to its non-channel path. This
     /// satisfies the "wire path is complete" contract — the protocol
     /// roundtrip exists and is observable — without blocking on the
-    /// modal UI work tracked as Phase 2 of
-    /// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+    /// modal UI work tracked as a follow-up to the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
     ///
     /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
     /// future daemon-side feature doesn't silently park a request id.
@@ -564,8 +564,8 @@ impl Chat {
     /// session, or its schema is unparseable, we answer `cancel`
     /// immediately so the daemon's tool call doesn't stall.
     ///
-    /// Wire shape per
-    /// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+    /// Wire shape per the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
     fn handle_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
         let params: Option<crate::wire::ElicitationRequestParams> =
             serde_json::from_value(req.params.clone()).ok();
@@ -2216,10 +2216,15 @@ impl Chat {
                 if s.model_picker.is_open() {
                     return true;
                 }
-                // An elicitation modal is modal too: suppress text input so
-                // global single-char keys don't leak while the user picks.
+                // An elicitation modal is modal too: claim text-input (like
+                // the model picker) so global chords — `?` help, `Ctrl+R`
+                // reload — are suppressed by `app.rs` and the pane's own modal
+                // handler owns every key while the daemon waits on the
+                // `elicitation/create` response. Returning `false` here would
+                // let those globals fire *over* an in-flight prompt, breaking
+                // modality (regression caught in review).
                 if s.pending_elicitation().is_some() {
-                    return false;
+                    return true;
                 }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
@@ -4111,8 +4116,8 @@ pub struct PendingApproval {
 ///
 /// `request_id` is a `serde_json::Value` (not `String`) because
 /// JSON-RPC permits numeric ids and we must echo the exact id shape
-/// the daemon sent. See
-/// `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`.
+/// the daemon sent. See the ACP elicitation RFD
+/// (https://agentclientprotocol.com/rfds/elicitation).
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
@@ -5824,6 +5829,31 @@ mod tests {
             ));
         }
         assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_makes_chat_claim_text_input() {
+        // Regression (review: Audacity88): while an `elicitation/create`
+        // prompt is pending the pane MUST be modal — it has to claim
+        // text-input so `app.rs` suppresses global chords (`?` help,
+        // `Ctrl+R` reload) and routes every key to the modal handler. If
+        // this returns `false`, those globals fire over an in-flight
+        // prompt while the daemon waits on the JSON-RPC response, breaking
+        // modality. Mirrors `open_picker_makes_chat_claim_text_input`.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        // Not modal before the prompt arrives (empty input → command mode).
+        assert!(!chat.wants_text_input());
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.set_pending_elicitation(single_elicitation());
+        }
+        assert!(
+            chat.wants_text_input(),
+            "an active pending elicitation must claim modal focus"
+        );
     }
 
     #[tokio::test]

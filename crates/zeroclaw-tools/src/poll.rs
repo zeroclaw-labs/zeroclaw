@@ -267,7 +267,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
         // `ToolResult.output` string (keys: question, answer|answers, channel);
         // the fallback path below returns a human-readable confirmation string.
         // The union is documented in `description()` and tracked for unification
-        // in docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md
+        // (ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
         // (Future Extensions: typed ToolResult.output).
         let interactive_timeout =
             std::time::Duration::from_secs(duration_minutes.saturating_mul(60));

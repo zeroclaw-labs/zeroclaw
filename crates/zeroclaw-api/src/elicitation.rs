@@ -1,8 +1,8 @@
 //! ACP elicitation primitives.
 //!
 //! Implements the subset of the ACP `elicitation/create` RFD that
-//! ZeroClaw uses for multiple-choice prompts. See
-//! `docs/superpowers/specs/2026-06-24-acp-elicitation-multiple-choice-design.md`
+//! ZeroClaw uses for multiple-choice prompts. See the ACP elicitation
+//! RFD: https://agentclientprotocol.com/rfds/elicitation
 //! for the design rationale.
 
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,22 @@ pub fn single_select_schema_with_property_name(property: &str, choices: &[String
 /// Index-based `const` values mirror `single_select_schema` so the
 /// response → text round-trip survives duplicates.
 pub fn multi_select_schema(choices: &[String], min_items: usize, max_items: usize) -> Value {
+    multi_select_schema_with_property_name("choices", choices, min_items, max_items)
+}
+
+/// Internal — mirrors `single_select_schema_with_property_name` so the
+/// `SENSITIVE_PROPERTY_NAMES` trip-wire guards the multi-select path too
+/// (keeps the invariant uniform for future callers; review: Nillth).
+pub fn multi_select_schema_with_property_name(
+    property: &str,
+    choices: &[String],
+    min_items: usize,
+    max_items: usize,
+) -> Value {
+    debug_assert!(
+        !SENSITIVE_PROPERTY_NAMES.contains(&property),
+        "sensitive property name '{property}' in form-mode elicitation schema"
+    );
     let any_of: Vec<Value> = choices
         .iter()
         .enumerate()
@@ -165,7 +181,7 @@ pub fn multi_select_schema(choices: &[String], min_items: usize, max_items: usiz
     serde_json::json!({
         "type": "object",
         "properties": {
-            "choices": {
+            property: {
                 "type": "array",
                 "title": "Choices",
                 "minItems": min_items,
@@ -173,7 +189,7 @@ pub fn multi_select_schema(choices: &[String], min_items: usize, max_items: usiz
                 "items": { "anyOf": any_of },
             }
         },
-        "required": ["choices"],
+        "required": [property],
     })
 }
 
@@ -370,6 +386,14 @@ mod tests {
     #[should_panic(expected = "sensitive")]
     fn single_select_schema_rejects_sensitive_property_names_in_debug() {
         let _ = single_select_schema_with_property_name("password", &["x".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sensitive")]
+    fn multi_select_schema_rejects_sensitive_property_names_in_debug() {
+        // The multi-select path must enforce the same sensitive-name guard
+        // as single-select (review: Nillth — keep the invariant uniform).
+        let _ = multi_select_schema_with_property_name("token", &["x".to_string()], 1, 1);
     }
 
     #[test]
