@@ -1104,6 +1104,7 @@ pub async fn run(
                  Prometheus is intended for long-running (daemon) deployments."
             );
         }
+        let _herdr_guard = crate::integrations::herdr::try_install_hook();
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -1739,6 +1740,9 @@ pub async fn run(
                 )))
             }
         });
+        if let Some(sid) = memory_session_id.as_deref() {
+            crate::integrations::herdr::update_session_id(sid);
+        }
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
