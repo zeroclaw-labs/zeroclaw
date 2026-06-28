@@ -10112,6 +10112,7 @@ fn concurrent_persist_lock_serialization() {
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
