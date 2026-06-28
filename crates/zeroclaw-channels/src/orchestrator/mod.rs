@@ -6012,9 +6012,29 @@ async fn run_message_dispatch_loop(
 
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" && ctx.debouncer.enabled() {
+        let msg = if msg.channel != "cli" {
             let debounce_key = conversation_history_key(&msg);
-            match ctx.debouncer.debounce(&debounce_key, &msg.content).await {
+
+            // Resolve effective debounce window: per-channel override wins,
+            // otherwise falls back to the global default from ChannelsConfig.
+            let debounce_window = {
+                let global_ms = ctx.prompt_config.channels.debounce_ms;
+                let per_channel_ms = if msg.channel == "telegram" {
+                    msg.channel_alias
+                        .as_ref()
+                        .and_then(|alias| ctx.prompt_config.channels.telegram.get(alias))
+                        .and_then(|cfg| cfg.debounce_ms)
+                } else {
+                    None
+                };
+                std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
+            };
+
+            match ctx
+                .debouncer
+                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
+                .await
+            {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
