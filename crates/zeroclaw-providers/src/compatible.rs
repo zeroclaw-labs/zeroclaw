@@ -2033,6 +2033,7 @@ impl OpenAiCompatibleModelProvider {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
+        let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
 
         messages
             .iter()
@@ -2068,6 +2069,9 @@ impl OpenAiCompatibleModelProvider {
                             extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
+
+                    last_assistant_tool_call_ids =
+                        tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
                     let content = value
                         .get("content")
@@ -2131,7 +2135,7 @@ impl OpenAiCompatibleModelProvider {
                 if message.role == "tool"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                 {
-                    let tool_call_id = value
+                    let mut tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
                         .map(|raw_id| {
@@ -2145,6 +2149,13 @@ impl OpenAiCompatibleModelProvider {
                                 normalized_id
                             })
                         });
+                    // Fallback: if the tool result JSON dropped the tool_call_id,
+                    // borrow the first id from the most recent assistant message.
+                    // Some multi-turn reconstruction paths strip this field, and
+                    // strict backends (Groq, Mistral) reject null/missing ids.
+                    if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
+                        tool_call_id = last_assistant_tool_call_ids.first().cloned();
+                    }
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
@@ -6595,5 +6606,53 @@ mod tests {
         assert_eq!(out.input_tokens, Some(1000));
         assert_eq!(out.output_tokens, Some(200));
         assert_eq!(out.cached_input_tokens, Some(400));
+    }
+
+    #[test]
+    fn convert_messages_for_native_strips_reasoning_when_replay_disabled() {
+        let provider = make_model_provider("test", "https://example.com", None)
+            .without_assistant_reasoning_replay();
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"ok","reasoning_content":"step 1"}"#.to_string(),
+        )];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert_eq!(native[0].reasoning_content, None);
+        assert_eq!(native[0].reasoning, None);
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_fallbacks_to_last_assistant_tool_call_id() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ),
+            ChatMessage::tool(
+                r#"{"content":"result"}"#.to_string(), // missing tool_call_id
+            ),
+        ];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[1].role, "tool");
+        assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_123"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_uses_explicit_id_when_present() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"fc_456","content":"result"}"#.to_string(),
+            ),
+        ];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[1].role, "tool");
+        assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
     }
 }

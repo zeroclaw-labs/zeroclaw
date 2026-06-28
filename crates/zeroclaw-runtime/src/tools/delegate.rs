@@ -1975,6 +1975,7 @@ impl DelegateTool {
             let parent_tools = self.parent_tools.read();
             parent_tools.iter().any(|tool| {
                 zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
+                    && self.security.is_tool_allowed(tool.name())
                     && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
             })
         };
@@ -2004,6 +2005,7 @@ impl DelegateTool {
             parent_tools
                 .iter()
                 .filter(|tool| tool.name() != Self::NAME)
+                .filter(|tool| self.security.is_tool_allowed(tool.name()))
                 .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                 .map(|tool| {
                     target_memory_tools
@@ -5543,6 +5545,296 @@ mod tests {
         assert!(
             !stale_is_responses,
             "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+        );
+    }
+
+    struct FileReadTool;
+    #[async_trait]
+    impl Tool for FileReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+        fn description(&self) -> &str {
+            "Read a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "read".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileReadTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct FileWriteTool;
+    #[async_trait]
+    impl Tool for FileWriteTool {
+        fn name(&self) -> &str {
+            "file_write"
+        }
+        fn description(&self) -> &str {
+            "Write a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "written".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileWriteTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct MockShellTool;
+    #[async_trait]
+    impl Tool for MockShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "Execute shell commands."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Shell)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct ToolListInspector {
+        forbidden_names: Vec<String>,
+    }
+    #[async_trait]
+    impl ModelProvider for ToolListInspector {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tools) = request.tools {
+                for tool in tools {
+                    if self.forbidden_names.iter().any(|f| f == &tool.name) {
+                        return Ok(ChatResponse {
+                            text: Some(format!("forbidden_tool_seen:{}", tool.name)),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ToolListInspector {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolListInspector"
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_filters_parent_tools_through_parent_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".to_string(), "delegate".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent policy should have filtered out file_write, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_honors_parent_excluded_tools() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "shell".to_string(),
+                "file_read".to_string(),
+            ]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(MockShellTool),
+                Arc::new(FileReadTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["shell".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent excluded_tools should have filtered out shell, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_parent_none_unrestricted_passes_target_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: None,
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["file_read".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "target policy should have filtered out file_write, but got: {}",
+            result.output
         );
     }
 }

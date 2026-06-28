@@ -274,7 +274,32 @@ pub(crate) fn filter_channel_builtin_tools(
     security: &zeroclaw_config::policy::SecurityPolicy,
 ) {
     let before_filter = tools_registry.len();
-    apply_policy_tool_filter(tools_registry, Some(security), None);
+
+    // At non-Full autonomy, the known default read-only auto-approve
+    // tools (web_search_tool, web_fetch, calculator, etc.) are always
+    // accessible on channels so the bot can fetch real-time information.
+    // Only the canonical builtin default set bypasses allowed_tools;
+    // operator-added auto_approve entries (e.g. shell) still require
+    // explicit allowlisting via allowed_tools.
+    if security.autonomy != AutonomyLevel::Full {
+        let defaults = zeroclaw_config::schema::default_auto_approve();
+        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
+        tools_registry.retain(|t| {
+            let name = t.name();
+            if safe_defaults.contains(name) {
+                // Builtin read-only tool: admit past allowed_tools but
+                // still respect the excluded_tools denylist.
+                return security
+                    .excluded_tools
+                    .as_ref()
+                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
+            }
+            security.is_tool_allowed(name)
+        });
+    } else {
+        apply_policy_tool_filter(tools_registry, Some(security), None);
+    }
+
     if tools_registry.len() != before_filter {
         ::zeroclaw_log::record!(
             INFO,
@@ -1058,6 +1083,27 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
+        // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
+        // exporter's background interval fires. Hold a FlushGuard for the rest of
+        // this body so every return path — including `?` errors — pushes buffered
+        // telemetry before the runtime is torn down. Daemon/cron/subagent callers
+        // pass `interactive = false` and skip this; they rely on periodic export.
+        let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
+        if interactive
+            && matches!(
+                config.observability.backend,
+                zeroclaw_config::schema::ObservabilityBackend::Prometheus
+            )
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Observability backend is Prometheus (pull/scrape model): a one-shot CLI process \
+                 exits before any scraper can pull, so its telemetry will not be collected. \
+                 Prometheus is intended for long-running (daemon) deployments."
+            );
+        }
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -2630,11 +2676,27 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
+        // Populate aggregate token usage from the cost-tracking context that
+        // scoped every `run_tool_call_loop` call above — mirroring the streamed
+        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
+        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
+        // reads the context's own accumulator, which holds the session-wide
+        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
+        // even though usage was tracked.
+        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+            let usage = ctx.snapshot_turn_usage();
+            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+        });
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used: None,
+            tokens_used,
             cost_usd: None,
             channel: Some(channel_name.to_string()),
             agent_alias: Some(agent_alias.to_string()),
@@ -3108,14 +3170,19 @@ pub async fn process_message(
         // tools (and their target identifiers) that the execution denylist
         // would block — a control boundary violation.
         //
-        // Note: compute_excluded_mcp_tools uses the raw message here (before
-        // thinking directive stripping). This is safe — dynamic tool filter
-        // keyword matching works the same, and risk-profile excluded_tools
-        // are message-independent.
+        // We strip the leading `/think:<level>` directive before filtering
+        // so the prompt-construction and request-execution paths see the
+        // same user-message shape. Otherwise a `tool_filter_groups` dynamic
+        // keyword that happens to appear inside `/think:high` (or the
+        // directive token itself — `"think"`, `"high"`, `"max"`, …) would
+        // make the prompt advertise tools the request then excludes, or
+        // vice versa. Issue #8054 Surface 4.
+        let effective_message_for_filter =
+            crate::agent::thinking::strip_thinking_directive(message);
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
-            message,
+            effective_message_for_filter.as_ref(),
         );
         {
             let active_profile = &risk_profile;
@@ -14170,5 +14237,142 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    // ── filter_channel_builtin_tools safe-default bypass ─────────
+    //
+    // At non-Full autonomy the known read-only defaults
+    // (web_search_tool, web_fetch, calculator, etc.) bypass
+    // allowed_tools so the bot can always fetch real-time info.
+    // Operator-added auto_approve entries (e.g. shell) do NOT get
+    // the same bypass — they must be explicitly allowlisted.
+
+    #[test]
+    fn channel_safe_defaults_survive_restrictive_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Restrict allowed_tools to shell only — nothing else is
+        // admitted by the policy itself.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"web_search_tool"),
+            "precondition: web_search_tool in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            filtered.contains(&"web_search_tool"),
+            "safe default web_search_tool must survive restrictive allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"shell"),
+            "shell in allowed_tools must survive, got {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn channel_operator_auto_approve_gated_by_allowed_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        // Operator added shell to auto_approve but allowed_tools
+        // only lists file_read. Under the safe-defaults gate,
+        // shell (NOT a canonical safe default) must still pass
+        // is_tool_allowed — which means it's dropped.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            auto_approve: vec!["shell".into()],
+            autonomy: AutonomyLevel::Supervised,
+            ..TestPolicy::default()
+        };
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let before = tool_names(&registry);
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"file_read"),
+            "precondition: file_read in registry, got {before:?}"
+        );
+
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            !filtered.contains(&"shell"),
+            "operator-added auto_approve shell must be dropped when not in allowed_tools, got {filtered:?}"
+        );
+        assert!(
+            filtered.contains(&"file_read"),
+            "file_read in allowed_tools must survive, got {filtered:?}"
+        );
     }
 }
