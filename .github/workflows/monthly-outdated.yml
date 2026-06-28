@@ -119,13 +119,18 @@ jobs:
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
 
       - name: Propagate scan failure
-        if: steps.scan.outputs.scan_exit_code == '1'
+        if: steps.scan.outputs.scan_exit_code != '0'
         env:
           ISSUE_URL: ${{ steps.outdated_issue.outputs.issue_url }}
+          SCAN_EXIT_CODE: ${{ steps.scan.outputs.scan_exit_code }}
         run: |
-          if [[ -n "$ISSUE_URL" ]]; then
-            echo "::error::Outdated dependencies detected. See $ISSUE_URL for details."
+          if [[ "$SCAN_EXIT_CODE" == "1" ]]; then
+            if [[ -n "$ISSUE_URL" ]]; then
+              echo "::error::Outdated dependencies detected. See $ISSUE_URL for details."
+            else
+              echo "::error::Outdated dependencies detected. Repository issues are disabled or issue creation was skipped; inspect this workflow log for details."
+            fi
           else
-            echo "::error::Outdated dependencies detected. Repository issues are disabled or issue creation was skipped; inspect this workflow log for details."
+            echo "::error::cargo outdated failed with exit code $SCAN_EXIT_CODE. Inspect the scan step log for details."
           fi
           exit 1
