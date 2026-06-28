@@ -1,4 +1,7 @@
-use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
+use crate::cron::store::{
+    RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
+    persist_run_result,
+};
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
     clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
@@ -37,6 +40,7 @@ pub enum CronDeliveryContext {
     Scheduled,
     ToolManual,
     GatewayManual,
+    RpcManual,
 }
 
 impl CronDeliveryContext {
@@ -48,8 +52,20 @@ impl CronDeliveryContext {
             (Self::ToolManual, false) => "cron_run delivery failed",
             (Self::GatewayManual, true) => "manual cron trigger delivery failed (best_effort)",
             (Self::GatewayManual, false) => "manual cron trigger delivery failed",
+            (Self::RpcManual, true) => "RPC cron trigger delivery failed (best_effort)",
+            (Self::RpcManual, false) => "RPC cron trigger delivery failed",
         }
     }
+}
+
+pub struct ManualCronRunResult {
+    pub job_id: String,
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+    pub duration_ms: i64,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
 }
 
 pub struct CronDeliveryOutcome {
@@ -123,6 +139,58 @@ pub async fn deliver_and_classify_run_result(
         success,
         status,
         output,
+    }
+}
+
+pub async fn run_manual_job(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+) -> ManualCronRunResult {
+    let started_at = Utc::now();
+    let (success, output) = execute_job_now(config, job).await;
+    let finished_at = Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+
+    if let Err(e) = persist_manual_run_result(
+        config,
+        job,
+        started_at,
+        finished_at,
+        &outcome.status,
+        Some(&outcome.output),
+        duration_ms,
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "manual cron trigger: failed to persist run history"
+        );
+    }
+
+    if let Some(tx) = event_tx {
+        let _ = tx.send(serde_json::json!({
+            "type": "cron_result",
+            "job_id": job.id,
+            "success": outcome.success,
+            "output": &outcome.output,
+            "manual": true,
+            "timestamp": finished_at.to_rfc3339(),
+        }));
+    }
+
+    ManualCronRunResult {
+        job_id: job.id.clone(),
+        success: outcome.success,
+        status: outcome.status,
+        output: outcome.output,
+        duration_ms,
+        started_at,
+        finished_at,
     }
 }
 
@@ -1353,6 +1421,73 @@ mod tests {
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    async fn run_manual_job_persists_history_and_broadcasts() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            Some("manual-run".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-manual-ok",
+            None,
+            true,
+        )
+        .expect("test job should be persisted");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let event_tx = Some(tx);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &event_tx).await;
+
+        assert!(result.success);
+        assert_eq!(result.status, "ok");
+        assert!(result.output.contains("rpc-manual-ok"));
+
+        let updated = cron::get_job(&config, &job.id).expect("job state should update");
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .is_some_and(|output| output.contains("rpc-manual-ok"))
+        );
+
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or("")
+                .contains("rpc-manual-ok")
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("manual trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], true);
+        assert_eq!(event["manual"], true);
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc-manual-ok")
+        );
     }
 
     #[tokio::test]

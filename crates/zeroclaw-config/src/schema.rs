@@ -130,13 +130,17 @@ pub struct Config {
     /// Model-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -10636,6 +10640,9 @@ pub struct RuntimeProfileConfig {
     /// Shell subprocess timeout in seconds. `0` inherits the global timeout.
     /// Parent-subset enforced for subagents.
     pub shell_timeout_secs: u64,
+    /// Shell and skill-tool subprocess memory ceiling in MiB. `0` disables
+    /// process-memory limiting. Parent-subset enforced for subagents.
+    pub shell_max_memory_mb: u64,
     // ── Delegation tuning ──
     /// Maximum delegation recursion depth. `0` inherits the default.
     pub max_delegation_depth: u32,
@@ -10689,6 +10696,7 @@ impl Default for RuntimeProfileConfig {
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
+            shell_max_memory_mb: 512,
             max_delegation_depth: 0,
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
@@ -11039,17 +11047,31 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "model_routes"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -11067,20 +11089,34 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "embedding_routes"]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted embedding-capable provider profile ref
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local embedding model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -16840,6 +16876,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
+        self.collect_a2a_exposed_skills_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -16859,6 +16896,41 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
+    /// `exposed_skills` is a narrowing filter over the agent's resolved skill
+    /// set, which comes from `skill_bundles`. An agent that lists
+    /// `a2a.exposed_skills` but declares no `skill_bundles` advertises an empty
+    /// `skills: []` array on its agent card with no error, because every wanted
+    /// id is dropped for belonging to a bundle the agent does not declare. The
+    /// same silent emptiness happens when a wanted id names no skill in any
+    /// declared bundle, or when the owning bundle's include/exclude filter
+    /// excludes it; those need disk resolution, so this offline check covers the
+    /// common structural case: exposed skills with zero declared bundles.
+    fn collect_a2a_exposed_skills_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (agent_alias, agent) in &self.agents {
+            if agent.a2a.exposed_skills.is_empty() {
+                continue;
+            }
+            if !agent.skill_bundles.is_empty() {
+                continue;
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "a2a_exposed_skills_without_bundles",
+                format!(
+                    "agent `{agent_alias}` lists a2a.exposed_skills but declares no \
+                     skill_bundles, so its agent card advertises no skills (skills: []). \
+                     exposed_skills is a filter over the agent's resolved skill set; add \
+                     the owning bundle(s) to agents.{agent_alias}.skill_bundles so the \
+                     listed skills resolve."
+                ),
+                format!("agents.{agent_alias}.a2a.exposed_skills"),
+            ));
+        }
     }
 
     /// Surface the #7964 cross-provider shape on a legacy config that has NOT
@@ -19671,8 +19743,9 @@ pub struct SopConfig {
     pub max_concurrent_total: usize,
 
     /// Approval timeout in seconds. When a run waits for approval longer than
-    /// this, Critical/High-priority SOPs auto-approve; others stay waiting.
-    /// Set to 0 to disable timeout.
+    /// this, the configured `approval_timeout_action` is applied (default
+    /// `escalate`: re-surface the gate to the out-of-band approver and never
+    /// self-approve). Set to 0 to disable the timeout sweep.
     #[serde(default = "default_sop_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
@@ -19697,6 +19770,19 @@ pub struct SopConfig {
     /// `<data_dir>/sop`. Never OS-temp.
     #[serde(default)]
     pub run_state_dir: Option<String>,
+
+    /// WHO may clear a SOP approval gate. Layered with execution_mode / priority /
+    /// requires_confirmation (those still apply). Default `both` keeps today's
+    /// behavior (the agent tool OR an out-of-band principal can clear a gate).
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+
+    /// What happens to a SOP gate that times out (after `approval_timeout_secs`).
+    /// Default `escalate` is fail-closed: re-surface to the out-of-band approver and
+    /// keep waiting, never self-approve. (The SOP-gate analog of the channel
+    /// approval-routing fail-closed default; reconcile with that model if both land.)
+    #[serde(default)]
+    pub approval_timeout_action: ApprovalTimeoutAction,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -19717,6 +19803,43 @@ pub enum SopRunStoreBackend {
     Sqlite,
     /// Ephemeral in-memory store: explicitly non-durable, for tests / degraded boot.
     Memory,
+}
+
+/// WHO may clear a SOP approval gate. Layered with execution_mode / priority /
+/// requires_confirmation (all of which still apply). Closed set => serde enum.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Agent `sop_approve` OR an out-of-band principal both clear. Backward-compat default.
+    #[default]
+    Both,
+    /// Only out-of-band principals (CLI / WS / HTTP / timeout) clear; `sop_approve`
+    /// becomes a no-op. Lets an operator require a separate approver without bricking runs.
+    OutOfBandRequired,
+    /// Only the agent tool clears; out-of-band surfaces are read-only pending lists. Niche.
+    AgentTool,
+}
+
+/// What happens to a SOP approval gate when it times out. Default is fail-closed:
+/// the gate never self-approves. Closed set => serde enum.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalTimeoutAction {
+    /// Re-surface to the out-of-band approver and keep waiting; never self-approve.
+    /// Default, fail-closed.
+    #[default]
+    Escalate,
+    /// Terminate the run (fail-safe cancel). Strict mode.
+    Cancel,
+    /// LEGACY: auto-approve on timeout. The ONLY path to the old fail-open behavior;
+    /// opt-in only.
+    AutoApprove,
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19742,6 +19865,8 @@ impl Default for SopConfig {
             persist_runs: false,
             run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
+            approval_mode: ApprovalMode::Both,
+            approval_timeout_action: ApprovalTimeoutAction::Escalate,
         }
     }
 }
@@ -25772,6 +25897,44 @@ group_policy = "disabled"
         assert_eq!(anthropic.natural_key, None);
     }
 
+    /// `model_routes` and `embedding_routes` are `#[nested]` Vec fields
+    /// with `#[natural_key = "hint"]` — they must surface in
+    /// `map_key_sections()` as `List` entries so the dashboard and the
+    /// incremental TOML writer can address individual route entries.
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_model_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "model_routes")
+            .expect("model_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::model_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_embedding_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "embedding_routes")
+            .expect("embedding_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::embedding_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
     /// A dirty path with a kebab-shaped inner field (e.g.
     /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
     /// shared `resolve_dirty_segments` helper inside the natural-key
@@ -29319,13 +29482,37 @@ allowed_users = []
             class_for("channels.matrix.default.access_token"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
+        // model_routes and embedding_routes are now #[nested] Vec fields —
+        // they are surfaced via map_key_sections(), not as flat prop_fields.
+        // After adding a route entry, its api_key sub-field appears in
+        // prop_fields with EncryptedSecret classification (from #[secret]).
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_provider: "openai.default".into(),
+            model: "gpt-4".into(),
+            api_key: None,
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openai.embeddings".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        });
+        let nested_fields = config.prop_fields();
+        let nested_class_for = |name: &str| {
+            nested_fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.credential_class)
+        };
         assert_eq!(
-            class_for("model_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("model_routes.reasoning.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert_eq!(
-            class_for("embedding_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("embedding_routes.semantic.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert!(Config::prop_is_secret(
             "providers.tts.openai.default.api_key"
@@ -30064,6 +30251,69 @@ allowed_users = []
             w.message.contains("beta -> custom.p2"),
             "message names beta + provider: {}",
             w.message
+        );
+    }
+
+    // exposed_skills set with no skill_bundles -> the agent card resolves no
+    // skills (skills: []) silently; the diagnostic fires and names the agent.
+    #[tokio::test]
+    async fn collect_warnings_flags_exposed_skills_without_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get", "ucp_merchant_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "a2a_exposed_skills_without_bundles")
+            .expect("expected a2a_exposed_skills_without_bundles warning");
+        assert_eq!(w.path, "agents.merchant.a2a.exposed_skills");
+        assert!(
+            w.message.contains("merchant"),
+            "message names the agent: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("skill_bundles"),
+            "message points at skill_bundles: {}",
+            w.message
+        );
+    }
+
+    // exposed_skills set alongside at least one declared skill_bundle -> no
+    // structural diagnostic (disk resolution governs whether ids actually
+    // resolve; that is out of scope for this offline check).
+    #[tokio::test]
+    async fn collect_warnings_silent_for_exposed_skills_with_bundles() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.merchant]
+            enabled = true
+            risk_profile = "default"
+            skill_bundles = ["commerce"]
+
+            [agents.merchant.a2a]
+            published = true
+            exposed_skills = ["ucp_discovery_get"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "a2a_exposed_skills_without_bundles"),
+            "no exposed_skills warning when a bundle is declared: {warnings:?}"
         );
     }
 
