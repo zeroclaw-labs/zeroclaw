@@ -4341,6 +4341,27 @@ mod tests {
         );
     }
 
+    /// Characterization test for the MCP resource/prompt capability tools'
+    /// subagent-propagation guarantee (issue #4467). `mcp_resources` and
+    /// `mcp_prompts` contain no `__`, so they are NOT auto-admitted the way
+    /// runtime `<server>__<tool>` MCP wrappers are: a narrowed `caller_allowed`
+    /// list that omits them must exclude them. This locks the boundary so a
+    /// narrowed delegate/spawn_subagent cannot reach resources/prompts unless
+    /// explicitly granted.
+    #[test]
+    fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
+        use zeroclaw_tools::tool_search::ToolAccessPolicy;
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string()]),
+        )
+        .expect("policy");
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("mcp_resources"));
+        assert!(!policy.is_tool_allowed("mcp_prompts"));
+    }
+
     /// PR #7547 review (Audacity88) — blocking comment: the PR body
     /// claims MCP tools can still be blocked via `excluded_tools`. A
     /// target profile that allow-lists `shell` and excludes
