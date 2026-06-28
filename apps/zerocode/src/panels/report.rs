@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -215,14 +215,15 @@ impl Panel for ReportPanel {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> PanelOutcome {
-        match key.code {
-            KeyCode::Char('r') => self.refresh().await,
-            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
-            KeyCode::Home => self.scroll = 0,
-            _ => {}
+        use crate::keymap::PanelAction;
+        match PanelAction::from_chord(&key) {
+            Some(PanelAction::Refresh) => self.refresh().await,
+            Some(PanelAction::ScrollUp) => self.scroll = self.scroll.saturating_sub(1),
+            Some(PanelAction::ScrollDown) => self.scroll = self.scroll.saturating_add(1),
+            Some(PanelAction::PageUp) => self.scroll = self.scroll.saturating_sub(10),
+            Some(PanelAction::PageDown) => self.scroll = self.scroll.saturating_add(10),
+            Some(PanelAction::Top) => self.scroll = 0,
+            None => {}
         }
         PanelOutcome::Continue
     }

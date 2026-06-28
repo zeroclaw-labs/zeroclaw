@@ -134,6 +134,21 @@ keyactions! {
 }
 
 keyactions! {
+    // Shared navigation/refresh actions for pluggable panels (ReportPanel,
+    // ThemePanel, and future panels). Panels route keys through this enum
+    // instead of reading `key.code`, so panel scrolling stays remappable
+    // and passes the no-hardcoded-chords guard.
+    pub enum PanelAction ("panel") {
+        Refresh    [Chord::char('r')]                            => "refresh",
+        ScrollUp   [Chord::key(KeyCode::Up), Chord::char('k')]   => "scroll up",
+        ScrollDown [Chord::key(KeyCode::Down), Chord::char('j')] => "scroll down",
+        PageUp     [Chord::key(KeyCode::PageUp)]                 => "page up",
+        PageDown   [Chord::key(KeyCode::PageDown)]               => "page down",
+        Top        [Chord::key(KeyCode::Home)]                   => "jump to top",
+    }
+}
+
+keyactions! {
     pub enum ChatTabAction ("chat") {
         ScrollUp                [] => "scroll up",
         ScrollDown              [] => "scroll down",
