@@ -139,3 +139,4 @@
   - [Labels](./maintainers/labels.md)
   - [Superseding PRs](./maintainers/superseding.md)
   - [Release runbook](./maintainers/release-runbook.md)
+  - [Release artifact verification](./maintainers/release-verification.md)

@@ -18,7 +18,10 @@ concurrency:
 permissions:
   contents: write
   packages: write
-  id-token: write  # required for keyless cosign OIDC signing and SLSA provenance
+  # OIDC (`id-token: write`) is granted at the job level only — see
+  # `slsa-provenance` and `sign-and-sbom` — so non-signing jobs cannot mint
+  # OIDC tokens. Workflow-level grants would also propagate to validate/build/
+  # publish/redeploy/package-sync, which never need keyless signing.
 
 env:
   CARGO_TERM_COLOR: always
@@ -621,8 +624,14 @@ jobs:
     #
     # Note: job-level `continue-on-error` is not supported for reusable workflow
     # calls. The SLSA generator exposes its own `continue-on-error` input instead.
+    #
+    # `publish` is included in `needs` so the SLSA generator's
+    # `upload-assets: true` cannot create or update the release tag before the
+    # `github-releases` environment gate has approved the canonical publish path.
+    # Without that dependency the provenance upload could become the first writer
+    # to the release, outside the existing publish gate.
     name: SLSA Provenance (non-blocking)
-    needs: [validate, hash-artifacts]
+    needs: [validate, publish, hash-artifacts]
     permissions:
       actions: read
       id-token: write

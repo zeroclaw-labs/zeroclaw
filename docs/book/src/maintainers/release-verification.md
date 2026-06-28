@@ -1,7 +1,7 @@
 # Release Artifact Verification
 
 ZeroClaw signs all release artifacts using [Sigstore](https://sigstore.dev) keyless signing.
-Signatures are recorded in the [Rekor](https://rekor.sigstore.dev) public transparency log — no
+Signatures are recorded in the [Rekor](https://rekor.sigstore.dev) public transparency log, so no
 private key material is stored anywhere.
 
 ## Prerequisites

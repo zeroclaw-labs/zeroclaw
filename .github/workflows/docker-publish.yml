@@ -19,7 +19,9 @@ concurrency:
 permissions:
   contents: read
   packages: write
-  id-token: write  # required for keyless cosign OIDC signing of container images
+  # OIDC (`id-token: write`) is granted at the `publish` job level only — the
+  # `matrix` resolution job does not perform keyless signing and should not
+  # inherit OIDC minting.
 
 env:
   REGISTRY: ghcr.io
@@ -46,6 +48,10 @@ jobs:
     needs: [matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
     strategy:
       fail-fast: false
       matrix:
