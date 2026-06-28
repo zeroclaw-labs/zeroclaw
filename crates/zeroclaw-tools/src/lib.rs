@@ -50,6 +50,7 @@ pub mod linkedin_client;
 pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_deferred;
+pub mod mcp_prompt;
 pub mod mcp_protocol;
 pub mod mcp_resource;
 pub mod mcp_tool;
