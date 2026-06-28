@@ -25,6 +25,7 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
+pub mod goal_start;
 pub mod model_switch;
 pub mod read_skill;
 pub mod schedule;
@@ -136,6 +137,7 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
+pub use goal_start::GoalStartTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
@@ -649,6 +651,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(GoalStartTool::new(agent_alias)),
     ];
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the

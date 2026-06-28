@@ -1000,7 +1000,12 @@ impl TelegramChannel {
     /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
         let mut commands: Vec<serde_json::Value> = commands_for_surface(CommandSurface::Channel)
-            .filter(|spec| spec.execution == CommandExecution::RuntimeCommand)
+            .filter(|spec| {
+                matches!(
+                    spec.execution,
+                    CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
+                )
+            })
             .map(|spec| {
                 serde_json::json!({
                     "command": spec.name,

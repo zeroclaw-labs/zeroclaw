@@ -325,6 +325,8 @@ enum ChannelRuntimeCommand {
     NewSession,
     SetThinking(Option<ThinkingLevel>),
     InvalidThinking(String),
+    Goal(zeroclaw_runtime::control_plane::GoalCommand),
+    InvalidGoal(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1412,6 +1414,12 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         }
         BuiltinCommandId::Config if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
+        }
+        BuiltinCommandId::Goal => {
+            match zeroclaw_runtime::control_plane::goal::parse_goal_command(trimmed) {
+                Ok(command) => Some(ChannelRuntimeCommand::Goal(command)),
+                Err(error) => Some(ChannelRuntimeCommand::InvalidGoal(error.to_string())),
+            }
         }
         _ => None,
     }
@@ -2814,6 +2822,23 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::InvalidThinking(raw) => format!(
             "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
         ),
+        ChannelRuntimeCommand::Goal(command) => {
+            match zeroclaw_runtime::control_plane::admit_goal_command(
+                zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+                    ctx.agent_alias.as_ref().clone(),
+                )
+                .with_originator_route(Some(sender_key.clone())),
+                command,
+            )
+            .await
+            {
+                Ok(admission) => admission.message,
+                Err(error) => format!("Goal command failed: {error}"),
+            }
+        }
+        ChannelRuntimeCommand::InvalidGoal(raw) => {
+            format!("Invalid goal command: {raw}")
+        }
     };
 
     if let Err(err) = channel
@@ -17595,6 +17620,24 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::NewSession)
         );
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_goal_admission() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/goal start ship goal mode"),
+            Some(ChannelRuntimeCommand::Goal(
+                zeroclaw_runtime::control_plane::GoalCommand {
+                    action: zeroclaw_runtime::control_plane::GoalCommandAction::Start,
+                    objective: Some("ship goal mode".into()),
+                    task_id: None,
+                }
+            ))
+        );
+        assert!(matches!(
+            parse_runtime_command("telegram", "/goal"),
+            Some(ChannelRuntimeCommand::InvalidGoal(_))
+        ));
     }
 
     #[test]

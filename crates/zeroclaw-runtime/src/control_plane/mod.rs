@@ -19,6 +19,7 @@
 pub mod authority;
 pub mod boot;
 pub mod global;
+pub mod goal;
 pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;
@@ -26,5 +27,8 @@ pub mod task_store_sqlite;
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
+pub use goal::{
+    GoalAdmission, GoalAdmissionContext, GoalCommand, GoalCommandAction, admit_goal_command,
+};
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;
