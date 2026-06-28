@@ -1,5 +1,6 @@
 zc-pane-dashboard = Tableau de bord
 zc-pane-config = Configuration
+zc-pane-theme = Thème
 zc-pane-doctor = Doctor
 zc-pane-code = Code
 zc-pane-chat = Discussion
@@ -23,6 +24,7 @@ zc-app-reload-status-signalled = Rechargement du démon signalé — reconnexion
 zc-app-reload-confirm-row = { $confirm_chord } = recharger   { $cancel_chord } = annuler
 zc-error-daemon-version-mismatch = Incompatibilité de version : zerocode est en { $client_version }, mais le démon est en { $server_version }. Recompilez et redémarrez le démon depuis le même checkout que zerocode.
 zc-zerocode-tab-theme = Thème
+zc-theme-redirect-hint = Appuyez sur Ctrl+Y pour ouvrir le sélecteur de thème
 zc-zerocode-tab-agent-theme = Thèmes d'agent
 zc-zerocode-tab-presets = Préréglages
 zc-zerocode-tab-bindings = Raccourcis clavier

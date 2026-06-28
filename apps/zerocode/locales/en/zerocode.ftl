@@ -1,5 +1,6 @@
 zc-pane-dashboard = Dashboard
 zc-pane-config = Config
+zc-pane-theme = Theme
 zc-pane-doctor = Doctor
 zc-pane-code = Code
 zc-pane-chat = Chat
@@ -26,6 +27,7 @@ zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = ca
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 
 zc-zerocode-tab-theme = Theme
+zc-theme-redirect-hint = Press Ctrl+Y to open the Theme Picker
 zc-zerocode-tab-agent-theme = Agent Themes
 zc-zerocode-tab-presets = Presets
 zc-zerocode-tab-bindings = Keybindings

@@ -49,9 +49,10 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 7] = [
+const MODES: [Mode; 8] = [
     Mode::Dashboard,
     Mode::Config,
+    Mode::Theme,
     Mode::Acp,
     Mode::Chat,
     Mode::Logs,
@@ -65,6 +66,7 @@ const MODES: [Mode; 7] = [
 enum Mode {
     Dashboard,
     Config,
+    Theme,
     Doctor,
     Acp, // displayed as "Code" in the UI
     Chat,
@@ -77,6 +79,7 @@ impl Mode {
         match self {
             Mode::Dashboard => "zc-pane-dashboard",
             Mode::Config => "zc-pane-config",
+            Mode::Theme => "zc-pane-theme",
             Mode::Doctor => "zc-pane-doctor",
             Mode::Acp => "zc-pane-code",
             Mode::Chat => "zc-pane-chat",
@@ -158,6 +161,7 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let mut theme_return_mode = Mode::Dashboard;
     // Per-agent theme overrides live in a process-global registry (theme.rs),
     // mirroring how the global theme works: the Config pane writes there on
     // assign/clear so changes apply live, and the draw loop reads it each frame
@@ -230,6 +234,7 @@ pub async fn run(
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
+                let theme_pane = crate::theme_pane::ThemePane::new(config_dir);
                 if let Some(alias) = pending_start_chat {
                     chat_pane.focus_agent(&alias).await;
                     mode = Mode::Chat;
@@ -242,6 +247,7 @@ pub async fn run(
                     chat_pane,
                     logs_pane,
                     quickstart,
+                    theme_pane,
                 ))
             }
             .await
@@ -256,6 +262,7 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
+        mut theme_pane,
     ) = build_panes!(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
@@ -329,6 +336,7 @@ pub async fn run(
             match mode {
                 Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
+                Mode::Theme => theme_pane.draw_into(frame, chunks[1]),
                 Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
@@ -396,6 +404,7 @@ pub async fn run(
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
+                    Mode::Theme => theme_pane.help_context(),
                     Mode::Doctor => doctor_pane.help_context(),
                     Mode::Acp => acp_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
@@ -495,6 +504,7 @@ pub async fn run(
                                 chat_pane = panes.4;
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
+                                theme_pane = panes.7;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -543,6 +553,7 @@ pub async fn run(
                 let in_text_input = match mode {
                     Mode::Dashboard => dashboard_pane.wants_text_input(),
                     Mode::Config => config_app.wants_text_input(),
+                    Mode::Theme => theme_pane.wants_text_input(),
                     Mode::Doctor => doctor_pane.wants_text_input(),
                     Mode::Acp => acp_pane.wants_text_input(),
                     Mode::Chat => chat_pane.wants_text_input(),
@@ -629,9 +640,13 @@ pub async fn run(
                 let switch_to: Option<Mode> = match global {
                     Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
                     Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
+                    Some(GlobalAction::ThemePicker) => Some(Mode::Theme),
                     _ => None,
                 };
                 if let Some(next) = switch_to {
+                    if next == Mode::Theme && mode != Mode::Theme {
+                        theme_return_mode = mode;
+                    }
                     switch_mode(
                         &mut mode,
                         next,
@@ -652,13 +667,33 @@ pub async fn run(
 
                 // Skip pane key handlers when disconnected — they may
                 // issue RPC calls that hang on the dead socket.
-                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) && mode != Mode::Theme
+                {
                     continue;
                 }
 
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, term).await?,
+                    Mode::Theme => {
+                        if theme_pane.handle_key(key) {
+                            let next = if theme_return_mode == Mode::Theme {
+                                Mode::Dashboard
+                            } else {
+                                theme_return_mode
+                            };
+                            switch_mode(
+                                &mut mode,
+                                next,
+                                &conn_state,
+                                &mut quickstart,
+                                &mut acp_pane,
+                                &mut chat_pane,
+                            )
+                            .await;
+                        }
+                        false
+                    }
                     Mode::Doctor => doctor_pane.handle_key(key).await,
                     Mode::Acp => acp_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
@@ -701,6 +736,9 @@ pub async fn run(
                         mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
                     {
                         let next = MODES[(n - 1) as usize];
+                        if next == Mode::Theme && mode != Mode::Theme {
+                            theme_return_mode = mode;
+                        }
                         switch_mode(
                             &mut mode,
                             next,
@@ -746,6 +784,9 @@ pub async fn run(
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
                         }
+                        Mode::Theme => {
+                            theme_pane.handle_mouse(mouse);
+                        }
                         Mode::Doctor => {
                             doctor_pane.handle_mouse(mouse, content_area);
                         }
@@ -770,6 +811,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
                     Mode::Config => config_app.handle_paste(&text),
+                    Mode::Theme => {}
                     Mode::Doctor => doctor_pane.handle_paste(&text),
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),

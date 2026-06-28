@@ -40,6 +40,7 @@ mod logs;
 mod mouse;
 mod quickstart_pane;
 mod theme;
+mod theme_pane;
 mod turn_status;
 mod widgets;
 mod wire;

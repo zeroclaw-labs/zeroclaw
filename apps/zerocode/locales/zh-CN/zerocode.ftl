@@ -1,5 +1,6 @@
 zc-pane-dashboard = 仪表盘
 zc-pane-config = 配置
+zc-pane-theme = 主题
 zc-pane-doctor = Doctor
 zc-pane-code = 代码
 zc-pane-chat = 聊天
@@ -23,6 +24,7 @@ zc-app-reload-status-signalled = 已发出守护进程重新加载信号 — 正
 zc-app-reload-confirm-row = { $confirm_chord } = 重新加载   { $cancel_chord } = 取消
 zc-error-daemon-version-mismatch = 版本不匹配：zerocode 是 { $client_version }，但守护进程是 { $server_version }。请从同一个检出重新构建并重启守护进程。
 zc-zerocode-tab-theme = 主题
+zc-theme-redirect-hint = 按 Ctrl+Y 打开主题选择器
 zc-zerocode-tab-agent-theme = 代理主题
 zc-zerocode-tab-presets = 预设
 zc-zerocode-tab-bindings = 键绑定

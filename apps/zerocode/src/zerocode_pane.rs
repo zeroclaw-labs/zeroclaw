@@ -1,8 +1,8 @@
-//! The local `zerocode` config pane: theme selector, keybinding list,
-//! and preset picker, plus the chord-capture modal for per-action
-//! rebinding. All surfaces walk the canonical registries (`theme_names`,
-//! `KEY_PRESETS`, each action enum's `variants()`) — nothing is
-//! hardcoded here.
+//! The local `zerocode` config pane: theme redirect, agent theme overrides,
+//! keybinding list, and preset picker, plus the chord-capture modal for
+//! per-action rebinding. All surfaces walk the canonical registries
+//! (`theme_names`, `KEY_PRESETS`, each action enum's `variants()`) — nothing
+//! is hardcoded here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use crate::config;
 use crate::config::WssSection;
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
+use crate::theme_pane::{theme_swatch_blank, theme_swatch_spans};
 
 /// Which sub-pane of the zerocode tab is focused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,9 +120,7 @@ pub(crate) struct ZerocodePane {
     cursor: PaneCursor,
     // Theme
     themes: Vec<String>,
-    theme_cursor: usize,
-    /// Separate cursor for the assign-to-agent flow so picking a theme for an
-    /// agent never moves the global Theme tab's selection.
+    /// Cursor for the assign-to-agent flow.
     assign_cursor: usize,
     /// When `Some(alias)`, the theme list assigns to that agent's override
     /// rather than the global theme. Cleared after the assignment or on cancel.
@@ -181,11 +180,6 @@ impl ZerocodePane {
         let presets: Vec<String> = config::keybindings::preset_names()
             .map(str::to_string)
             .collect();
-        let active = theme::active();
-        let theme_cursor = themes
-            .iter()
-            .position(|n| theme::theme_by_name(n).map(|t| t.title) == Some(active.title))
-            .unwrap_or(0);
         let agent_overrides: HashMap<String, String> = config::ensure_and_load(config_dir)
             .ok()
             .map(|c| {
@@ -202,7 +196,6 @@ impl ZerocodePane {
             focus: Focus::Theme,
             cursor: PaneCursor::Sections,
             themes,
-            theme_cursor,
             assign_cursor: 0,
             theme_target_agent: None,
             agents: Vec::new(),
@@ -267,7 +260,7 @@ impl ZerocodePane {
         self.draw_focus_list(frame, cols[0]);
 
         match self.focus {
-            Focus::Theme => self.draw_theme(frame, cols[1]),
+            Focus::Theme => self.draw_theme_redirect(frame, cols[1]),
             // While assigning, Agent Themes borrows the theme list as its detail
             // surface; the agent picker returns once the assignment ends.
             Focus::AgentTheme if self.assigning_theme() => self.draw_theme(frame, cols[1]),
@@ -330,22 +323,13 @@ impl ZerocodePane {
     }
 
     /// The cursor the theme list is currently driving: the agent-assign cursor
-    /// while assigning to an agent, the global-theme cursor otherwise. Keeping
-    /// them distinct stops an agent pick from moving the global Theme selection.
+    /// while assigning to an agent.
     fn theme_list_cursor(&self) -> usize {
-        if self.theme_target_agent.is_some() {
-            self.assign_cursor
-        } else {
-            self.theme_cursor
-        }
+        self.assign_cursor
     }
 
     fn theme_list_cursor_mut(&mut self) -> &mut usize {
-        if self.theme_target_agent.is_some() {
-            &mut self.assign_cursor
-        } else {
-            &mut self.theme_cursor
-        }
+        &mut self.assign_cursor
     }
 
     fn draw_theme(&self, frame: &mut Frame, area: Rect) {
@@ -390,6 +374,42 @@ impl ZerocodePane {
             area,
             &mut state,
         );
+    }
+
+    fn draw_theme_redirect(&self, frame: &mut Frame, area: Rect) {
+        let name = self.active_theme_name();
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    crate::i18n::t("zc-zerocode-tab-theme"),
+                    theme::heading_style(),
+                ),
+                Span::styled(": ", theme::dim_style()),
+                Span::styled(name, theme::accent_style()),
+            ]),
+            Line::from(Span::styled(
+                crate::i18n::t("zc-theme-redirect-hint"),
+                theme::body_style(),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    crate::i18n::t("zc-zerocode-tab-theme")
+                ))),
+            area,
+        );
+    }
+
+    fn active_theme_name(&self) -> String {
+        let active = theme::active_raw();
+        self.themes
+            .iter()
+            .find(|name| theme::theme_by_name(name).is_some_and(|t| t == active))
+            .cloned()
+            .unwrap_or_else(|| theme::DEFAULT_THEME_NAME.to_string())
     }
 
     fn draw_agent_theme(&self, frame: &mut Frame, area: Rect) {
@@ -1036,7 +1056,7 @@ impl ZerocodePane {
             self.themes.len()
         } else {
             match self.focus {
-                Focus::Theme => self.themes.len(),
+                Focus::Theme => 0,
                 Focus::AgentTheme => self.agents.len(),
                 Focus::Presets => self.presets.len(),
                 Focus::Bindings => self.rows.len(),
@@ -1051,7 +1071,7 @@ impl ZerocodePane {
             self.theme_list_cursor_mut()
         } else {
             match self.focus {
-                Focus::Theme => self.theme_list_cursor_mut(),
+                Focus::Theme => return,
                 Focus::AgentTheme => &mut self.agent_cursor,
                 Focus::Presets => &mut self.preset_cursor,
                 Focus::Bindings => &mut self.binding_cursor,
@@ -1065,7 +1085,7 @@ impl ZerocodePane {
 
     fn activate(&mut self) {
         match self.focus {
-            Focus::Theme => self.apply_theme(),
+            Focus::Theme => {}
             // Enter on Agent Themes: pick an agent (start assign) or, while the
             // theme list is borrowed, commit the highlighted theme as the
             // agent's override.
@@ -1191,38 +1211,27 @@ impl ZerocodePane {
         let Some(name) = self.themes.get(self.theme_list_cursor()).cloned() else {
             return;
         };
-        // Assign-to-agent mode: write the override and end the assignment so the
-        // detail surface reverts to the agent picker, without touching the
-        // global theme.
-        if let Some(alias) = self.theme_target_agent.take() {
-            if theme::theme_by_name(&name).is_none() {
-                return;
-            }
-            match config::persist_agent_theme(&self.config_dir, &alias, &name) {
-                Ok(()) => {
-                    self.agent_overrides.insert(alias.clone(), name.clone());
-                    // Live-apply, exactly like the global theme: update the
-                    // process-global override registry so the Code/Chat pane
-                    // picks it up on the next frame without an app restart.
-                    if let Some(t) = theme::theme_by_name(&name) {
-                        theme::set_agent_override(&alias, t);
-                    }
-                    self.status = Some(crate::i18n::t_args(
-                        "zc-zerocode-agent-theme-set",
-                        &[("agent", &alias), ("theme", &name)],
-                    ));
-                }
-                Err(e) => self.status = Some(format!("Override save failed: {e}")),
-            }
-            return;
-        }
-        let Some(t) = theme::theme_by_name(&name) else {
+        let Some(alias) = self.theme_target_agent.take() else {
             return;
         };
-        theme::set_active(t);
-        match config::persist_theme(&self.config_dir, &name) {
-            Ok(()) => self.status = Some(format!("Theme set to {name}")),
-            Err(e) => self.status = Some(format!("Theme set (save failed: {e})")),
+        if theme::theme_by_name(&name).is_none() {
+            return;
+        }
+        match config::persist_agent_theme(&self.config_dir, &alias, &name) {
+            Ok(()) => {
+                self.agent_overrides.insert(alias.clone(), name.clone());
+                // Live-apply, exactly like the global theme: update the
+                // process-global override registry so the Code/Chat pane
+                // picks it up on the next frame without an app restart.
+                if let Some(t) = theme::theme_by_name(&name) {
+                    theme::set_agent_override(&alias, t);
+                }
+                self.status = Some(crate::i18n::t_args(
+                    "zc-zerocode-agent-theme-set",
+                    &[("agent", &alias), ("theme", &name)],
+                ));
+            }
+            Err(e) => self.status = Some(format!("Override save failed: {e}")),
         }
     }
 
@@ -1359,12 +1368,7 @@ impl ZerocodePane {
             crate::i18n::t("zc-zerocode-help-navigate-rows"),
         )];
         match self.focus {
-            Focus::Theme => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-apply-theme"),
-                ));
-            }
+            Focus::Theme => {}
             Focus::AgentTheme if self.assigning_theme() => {
                 entries.push(E::new(
                     keys(A::Enter),
@@ -1491,7 +1495,7 @@ impl ZerocodePane {
             return self.themes.len();
         }
         match self.focus {
-            Focus::Theme => self.themes.len(),
+            Focus::Theme => 0,
             Focus::AgentTheme => self.agents.len(),
             Focus::Presets => self.presets.len(),
             Focus::Bindings => self.rows.len(),
@@ -1511,61 +1515,13 @@ impl ZerocodePane {
             return;
         }
         match self.focus {
-            Focus::Theme => *self.theme_list_cursor_mut() = idx,
+            Focus::Theme => {}
             Focus::AgentTheme => self.agent_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
             Focus::Connection => self.conn_cursor = idx,
         }
-    }
-}
-
-/// Number of representative roles previewed per theme (canvas, title, heading,
-/// body, warn, tool). The swatch strip is this many blocks plus a trailing
-/// space; every row reserves that width so names stay aligned.
-const SWATCH_ROLE_COUNT: usize = 6;
-const SWATCH_STRIP_WIDTH: usize = SWATCH_ROLE_COUNT + 1;
-
-/// Inline palette swatches for a theme row: one block per representative role,
-/// in the theme's own colours, followed by a trailing space before the name.
-/// The `terminal` (inherit) theme has every role as `Color::Reset`, so it gets
-/// blank swatches — there is no fixed palette to preview, but the width is kept
-/// so its name aligns with the others.
-fn theme_swatch_spans(name: &str) -> Vec<Span<'static>> {
-    let Some(roles) = theme_swatch_roles(name) else {
-        return vec![Span::raw(" ".repeat(SWATCH_STRIP_WIDTH))];
-    };
-    let mut spans: Vec<Span<'static>> = roles
-        .iter()
-        .map(|c| {
-            // Route through the colour-depth downgrade so swatches stay faithful
-            // on 256/16-colour terminals instead of emitting raw truecolor.
-            let c = crate::color_depth::downgrade(*c);
-            Span::styled("█", ratatui::style::Style::default().fg(c))
-        })
-        .collect();
-    spans.push(Span::raw(" "));
-    spans
-}
-
-/// A blank placeholder the same width as the swatch strip, so an unhighlighted
-/// row keeps the name at the same indent as the highlighted one.
-fn theme_swatch_blank() -> Vec<Span<'static>> {
-    vec![Span::raw(" ".repeat(SWATCH_STRIP_WIDTH))]
-}
-
-/// The representative role colours previewed for a theme, or `None` when the
-/// theme has no fixed palette (the `terminal` inherit theme).
-fn theme_swatch_roles(name: &str) -> Option<[ratatui::style::Color; SWATCH_ROLE_COUNT]> {
-    use ratatui::style::Color;
-    let t = theme::theme_by_name(name)?;
-    // Representative spread: canvas, title/accent, heading, body, warn, tool.
-    let roles = [t.background, t.title, t.heading, t.body, t.warn, t.tool];
-    if roles.iter().all(|c| *c == Color::Reset) {
-        None
-    } else {
-        Some(roles)
     }
 }
 
@@ -1704,45 +1660,17 @@ mod tests {
     }
 
     #[test]
-    fn agent_assign_preserves_global_theme_cursor() {
+    fn theme_redirect_does_not_move_agent_assign_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = ZerocodePane::new(dir.path());
-        pane.set_agents(vec!["coder".to_string()]);
+        pane.assign_cursor = 2.min(pane.themes.len().saturating_sub(1));
+        let assign = pane.assign_cursor;
 
-        // Park the global theme selection on a known, non-zero row.
-        focus_section(&mut pane, Focus::Theme);
-        pane.handle_key(key(KeyCode::Enter)); // into the Theme detail list
-        pane.handle_key(key(KeyCode::Down));
-        pane.handle_key(key(KeyCode::Down));
-        pane.handle_key(key(KeyCode::Down));
-        let global = pane.theme_cursor;
-        assert!(global > 0, "global cursor should have moved off row 0");
-        pane.handle_key(key(KeyCode::Left)); // back to the section list
-
-        // Enter assign mode for the agent and pick a different row.
-        focus_section(&mut pane, Focus::AgentTheme);
-        pane.handle_key(key(KeyCode::Enter)); // into the Agent Themes detail
-        pane.handle_key(key(KeyCode::Enter)); // begin assign (borrow theme list)
-        assert_eq!(pane.focus, Focus::AgentTheme);
-        assert!(pane.theme_target_agent.is_some());
-        // Move the assign cursor; the global cursor must not follow.
+        pane.handle_key(key(KeyCode::Enter)); // into the Theme redirect detail
         pane.handle_key(key(KeyCode::Down));
         assert_eq!(
-            pane.theme_cursor, global,
-            "assign navigation moved the global cursor"
-        );
-        pane.handle_key(key(KeyCode::Enter)); // commit the override
-
-        // Assignment done; global selection intact, override recorded.
-        assert_eq!(pane.focus, Focus::AgentTheme);
-        assert!(pane.theme_target_agent.is_none());
-        assert_eq!(
-            pane.theme_cursor, global,
-            "applying an agent override changed the global cursor"
-        );
-        assert!(
-            pane.agent_overrides.contains_key("coder"),
-            "agent override was not recorded"
+            pane.assign_cursor, assign,
+            "Theme redirect navigation moved the agent assignment cursor"
         );
     }
 
