@@ -95,6 +95,7 @@ tool-git-operations = Perform structured Git operations (status, diff, log, bran
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
 
 tool-goal-start = Start a durable goal run. The objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
+tool-goal-start-objective-description = Goal objective to pursue.
 tool-goal-start-error-empty-objective = goal.start requires a non-empty objective
 tool-goal-start-error-missing-context = goal.start is unavailable because trusted runtime admission context was not supplied.
 tool-goal-start-error-agent-context-mismatch = goal.start is unavailable because trusted runtime admission context does not match this agent.

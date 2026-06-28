@@ -14,6 +14,8 @@ use crate::agent::cost::{
     tool_loop_cost_tracking_context_from_tracker,
 };
 
+use super::global::control_plane;
+use super::goal::GoalAdmissionContext;
 use super::task_registry::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
 };
@@ -72,7 +74,16 @@ pub async fn verify_goal_completion(
 
     let text = match CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir) {
         Some(tracker) => {
-            let ctx = tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker);
+            let mut ctx =
+                tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker);
+            if let Some(control_plane) = control_plane()
+                && let Some(task) = control_plane.store.get(&goal.task_id).await?
+            {
+                let goal_ctx = GoalAdmissionContext::new(task.agent)
+                    .with_originator_route(task.originator_route)
+                    .with_principal_id(task.principal_id);
+                ctx = ctx.with_goal_admission_context(&goal_ctx);
+            }
             TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), verifier_call)
                 .await?
@@ -194,7 +205,11 @@ mod tests {
     async fn verifier_usage_records_with_goal_attribution() {
         let temp = tempfile::tempdir().unwrap();
         let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let other_goal_id = format!("goal-{}", uuid::Uuid::new_v4());
         let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+        let goal_ctx = GoalAdmissionContext::new(agent_alias.clone())
+            .with_originator_route(Some("route-a".into()))
+            .with_principal_id(Some("principal-a".into()));
         let mut config = Config {
             data_dir: temp.path().to_path_buf(),
             ..Config::default()
@@ -240,17 +255,38 @@ mod tests {
                 heartbeat_at: None,
                 depth: 0,
                 parent_id: None,
-                originator_route: None,
+                originator_route: Some("route-a".into()),
                 delivered: false,
                 idem_key: None,
-                principal_id: None,
-                started_at: chrono::Utc::now().to_rfc3339(),
+                principal_id: Some("principal-a".into()),
+                started_at: "2026-06-18T00:00:00Z".into(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: other_goal_id.clone(),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent_alias.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some("route-b".into()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some("principal-a".into()),
+                started_at: "2026-06-19T00:00:00Z".into(),
                 finished_at: None,
             })
             .await
             .unwrap();
         let ctx =
-            tool_loop_cost_tracking_context_from_tracker(&config, &agent_alias, tracker.clone());
+            tool_loop_cost_tracking_context_from_tracker(&config, &agent_alias, tracker.clone())
+                .with_goal_admission_context(&goal_ctx);
         TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 record_tool_loop_cost_usage(
@@ -270,6 +306,13 @@ mod tests {
         let summary = tracker.get_summary_for_goal(&goal_id).unwrap();
         assert_eq!(summary.total_tokens, 150);
         assert!(summary.session_cost_usd > 0.0);
+        assert_eq!(
+            tracker
+                .get_summary_for_goal(&other_goal_id)
+                .unwrap()
+                .total_tokens,
+            0
+        );
 
         let unused = TokenUsage::new("model", 1, 1, 0, 0.0, 0.0, 0.0);
         assert_eq!(unused.total_tokens, 2);

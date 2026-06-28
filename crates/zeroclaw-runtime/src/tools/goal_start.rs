@@ -31,7 +31,8 @@ impl Tool for GoalStartTool {
     }
 
     fn description(&self) -> &str {
-        crate::i18n::get_tool_description("goal.start").unwrap_or("Start a durable goal run.")
+        crate::i18n::get_tool_description("goal.start")
+            .expect("goal.start tool description must be in Fluent catalogue")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -40,7 +41,9 @@ impl Tool for GoalStartTool {
             "properties": {
                 "objective": {
                     "type": "string",
-                    "description": "Goal objective to pursue."
+                    "description": crate::i18n::get_required_tool_string(
+                        "tool-goal-start-objective-description",
+                    )
                 }
             },
             "required": ["objective"]

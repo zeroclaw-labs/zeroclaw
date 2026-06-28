@@ -21,7 +21,7 @@ use super::task_registry::{
     TaskRegistry, TaskStatus,
 };
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 3;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 4;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -162,6 +162,20 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 3;")
             .context("mark control-plane schema v3")?;
+    }
+    if version < 4 {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_goal_context
+                ON tasks(
+                    agent,
+                    COALESCE(originator_route, ''),
+                    COALESCE(principal_id, '')
+                )
+                WHERE kind = 'goal'
+                  AND status NOT IN ('completed','failed','cancelled','lost','timed_out');
+             PRAGMA user_version = 4;",
+        )
+        .context("apply control-plane schema v4")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
