@@ -121,6 +121,12 @@ pub struct DelegateTool {
     caller_alias: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateAdmission {
+    Required,
+    Prevalidated,
+}
+
 impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
@@ -1117,6 +1123,17 @@ impl DelegateTool {
         prompt: &str,
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
+        self.execute_sync_with_admission(agent_name, prompt, args, DelegateAdmission::Required)
+            .await
+    }
+
+    async fn execute_sync_with_admission(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -1164,26 +1181,28 @@ impl DelegateTool {
             });
         }
 
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "delegate")
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            });
-        }
+        if admission == DelegateAdmission::Required {
+            if let Err(error) = self
+                .security
+                .enforce_tool_operation(ToolOperation::Act, "delegate")
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
 
-        if let Err(e) = self.policy_for_target(agent_name) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("{e:#}")),
-            });
-        }
-        if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
-            return Ok(refusal);
+            if let Err(e) = self.policy_for_target(agent_name) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+            if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
+                return Ok(refusal);
+            }
         }
 
         // Create model_provider for this agent
@@ -1214,7 +1233,7 @@ impl DelegateTool {
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
             return self
-                .execute_agentic(
+                .execute_agentic_with_admission(
                     agent_name,
                     agent_config,
                     &provider_type,
@@ -1222,6 +1241,7 @@ impl DelegateTool {
                     &*model_provider,
                     &full_prompt,
                     temperature,
+                    admission,
                 )
                 .await;
         }
@@ -1497,7 +1517,12 @@ impl DelegateTool {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
-                    result = Box::pin(inner.execute_sync(&agent_name_owned, &full_prompt, &args_inner)) => {
+                    result = Box::pin(inner.execute_sync_with_admission(
+                        &agent_name_owned,
+                        &full_prompt,
+                        &args_inner,
+                        DelegateAdmission::Prevalidated,
+                    )) => {
                         match result {
                             Ok(tool_result) => {
                                 if tool_result.success {
@@ -1571,7 +1596,9 @@ impl DelegateTool {
                 }
 
                 // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels().lock().remove(&task_id_clone);
+                Self::background_task_cancels()
+                    .lock()
+                    .remove(&task_id_clone);
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -2183,6 +2210,7 @@ impl DelegateTool {
         }
     }
 
+    #[cfg(test)]
     async fn execute_agentic(
         &self,
         agent_name: &str,
@@ -2192,6 +2220,30 @@ impl DelegateTool {
         model_provider: &dyn ModelProvider,
         full_prompt: &str,
         temperature: Option<f64>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_agentic_with_admission(
+            agent_name,
+            agent_config,
+            provider_type,
+            model,
+            model_provider,
+            full_prompt,
+            temperature,
+            DelegateAdmission::Required,
+        )
+        .await
+    }
+
+    async fn execute_agentic_with_admission(
+        &self,
+        agent_name: &str,
+        agent_config: &AliasedAgentConfig,
+        provider_type: &str,
+        model: &str,
+        model_provider: &dyn ModelProvider,
+        full_prompt: &str,
+        temperature: Option<f64>,
+        admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
         let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
             return Ok(ToolResult {
@@ -2204,15 +2256,23 @@ impl DelegateTool {
             });
         };
 
-        let target_policy = match self.policy_for_target(agent_name) {
-            Ok(policy) => policy,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("{e:#}")),
-                });
-            }
+        let target_policy = match admission {
+            DelegateAdmission::Required => match self.policy_for_target(agent_name) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("{e:#}")),
+                    });
+                }
+            },
+            // Background delegation performs the caller-side authorization before it
+            // returns a task id. The detached worker then runs with the resolved target
+            // policy in `self.security`; re-checking `policy_for_target` here would ask
+            // whether the child is allowed to delegate to itself, which is a different
+            // question and rejects legitimate background delegates after acceptance.
+            DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
         let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
@@ -4246,6 +4306,125 @@ mod tests {
         assert!(result.success, "parallel delegate failed: {result:?}");
         assert!(result.output.contains("reviewer-ok"), "{result:?}");
         assert!(result.output.contains("sysadmin-ok"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_runs_with_caller_authorization_not_child_authorization() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let server = start_final_chat_server(vec!["background-ok"]).await;
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("background-test-model".to_string()),
+            api_key: Some("background-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(workspace_dir.clone())
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "run in background",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+
+        assert_eq!(
+            bg_result.status,
+            BackgroundTaskStatus::Completed,
+            "{bg_result:?}"
+        );
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("background-ok"),
+            "{bg_result:?}"
+        );
+        assert!(bg_result.error.is_none(), "{bg_result:?}");
     }
 
     #[tokio::test]
