@@ -415,6 +415,7 @@ async fn handle_socket(
         "session_id": session_id,
         "resumed": resumed,
         "message_count": message_count,
+        "commands": crate::api::web_visible_commands(),
     });
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());

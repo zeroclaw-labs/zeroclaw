@@ -7,9 +7,10 @@ import { t } from '@/lib/i18n';
  * raw prompt. Commands drive existing frontend/session primitives (clear/reset,
  * model switch) instead of being sent to the model as text.
  *
- * This module is the single source of truth for the command list. The
- * autocomplete hint popover and the `/help` output are both derived from
- * {@link COMMANDS}; nothing duplicates the command names elsewhere.
+ * The autocomplete hint popover and the `/help` output are both derived from
+ * {@link COMMANDS}. Runtime-owned command discovery is exposed by the gateway
+ * command catalogue; this local list remains until the web command dispatcher
+ * can consume catalogue metadata and route non-local commands together.
  */
 
 /** Canonical command name (without the leading slash). */

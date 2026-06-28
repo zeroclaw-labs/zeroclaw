@@ -1780,6 +1780,7 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/commands", get(api::handle_api_commands))
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",

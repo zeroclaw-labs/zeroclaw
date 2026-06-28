@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_commands::{CommandExecution, CommandSurface, commands_for_surface};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -998,14 +999,15 @@ impl TelegramChannel {
     /// Includes built-in runtime commands, user-installed skill commands, and
     /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
-        let mut commands: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
-            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
-            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
-            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
-            serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
-            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
-        ];
+        let mut commands: Vec<serde_json::Value> = commands_for_surface(CommandSurface::Channel)
+            .filter(|spec| spec.execution == CommandExecution::RuntimeCommand)
+            .map(|spec| {
+                serde_json::json!({
+                    "command": spec.name,
+                    "description": spec.short_description,
+                })
+            })
+            .collect();
 
         // Track registered names to deduplicate across skills and tools.
         let mut used_names: std::collections::HashSet<String> = commands

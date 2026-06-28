@@ -118,6 +118,7 @@ use tokio_util::sync::CancellationToken;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::{BuiltinCommandId, CommandSurface, parse_command_token};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
@@ -1353,23 +1354,19 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
 
     let mut parts = trimmed.split_whitespace();
     let command_token = parts.next()?;
-    let base_command = command_token
-        .split('@')
-        .next()
-        .unwrap_or(command_token)
-        .to_ascii_lowercase();
+    let command = parse_command_token(command_token, CommandSurface::Channel)?.command;
 
-    match base_command.as_str() {
+    match command.id {
         // `/new` and bare `/clear` are available on every channel — no model-switch gate.
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
-        "/clear" => {
+        BuiltinCommandId::New => Some(ChannelRuntimeCommand::NewSession),
+        BuiltinCommandId::Clear => {
             if parts.next().is_none() {
                 Some(ChannelRuntimeCommand::NewSession)
             } else {
                 None
             }
         }
-        "/thinking" => {
+        BuiltinCommandId::Thinking => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -1383,7 +1380,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         // Model/model_provider switching is channel-gated.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Models if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     model_provider.trim().to_string(),
@@ -1392,7 +1389,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Model if supports_runtime_model_switch(channel_name) => {
             let rest: Vec<&str> = parts.collect();
             // An optional leading `--user|--agent` flag selects the override
             // scope; without it, bare `/model <ref>` keeps its existing
@@ -1413,7 +1410,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 (Some(scope), false) => Some(ChannelRuntimeCommand::SetModelScoped(scope, model)),
             }
         }
-        "/config" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Config if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
         }
         _ => None,
