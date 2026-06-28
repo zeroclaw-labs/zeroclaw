@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use zeroclaw_api::tool::ToolSpec;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -349,16 +351,7 @@ impl AwsCredentials {
 
 #[cfg(windows)]
 fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut command = std::process::Command::new("cmd.exe");
-    command
-        .raw_arg("/C")
-        .raw_arg(format!("\"{cmd}\""))
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    windows_std_cmd_shell_command(cmd).output()
 }
 
 #[cfg(not(windows))]

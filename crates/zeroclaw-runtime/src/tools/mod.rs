@@ -40,7 +40,6 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod spawn_subagent;
-pub(crate) mod subprocess_limits;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -578,7 +577,11 @@ pub fn all_tools_with_runtime(
             agent_alias,
         )),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronRemoveTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronUpdateTool::new(
             config.clone(),
             security.clone(),

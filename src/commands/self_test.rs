@@ -66,13 +66,13 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
 pub async fn run_full(config: &crate::config::Config) -> Result<Vec<CheckResult>> {
     let mut results = run_quick(config).await?;
 
-    // 9. Gateway health endpoint
+    // 10. Gateway health endpoint
     results.push(check_gateway_health(config).await);
 
-    // 10. Memory write/read round-trip
+    // 11. Memory write/read round-trip
     results.push(check_memory_roundtrip(config).await);
 
-    // 11. WebSocket handshake
+    // 12. WebSocket handshake
     #[cfg(feature = "gateway")]
     results.push(check_websocket_handshake(config).await);
 

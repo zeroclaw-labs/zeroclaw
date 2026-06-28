@@ -115,10 +115,11 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 
 ### Per-channel labels
 
-Each channel gets a `channel:<name>` label in addition to the base `channel` label.
+Each channel gets a `channel:<name>` label in addition to the base `channel` label when the change touches channel crate paths. Cross-surface channel labels such as `channel:acp` may instead pair with the matching base surface label, such as `gateway`, `docs`, or app/web scope labels.
 
 | Label | Matches |
 |---|---|
+| `channel:acp` | `acp_channel.rs`, `acp_server.rs`, `zeroclaw-acp-bridge.rs`, `acp_session_store.rs`, `channels/acp.md`, selected ACP gateway/app/web entrypoints |
 | `channel:bluesky` | `bluesky.rs` |
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
