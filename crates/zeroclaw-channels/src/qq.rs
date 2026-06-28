@@ -1792,6 +1792,15 @@ impl Channel for QQChannel {
     async fn health_check(&self) -> bool {
         self.fetch_access_token_with_retry().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the QQ Bot Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

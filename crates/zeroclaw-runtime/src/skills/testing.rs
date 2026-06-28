@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 const TEST_FILE_NAME: &str = "TEST.sh";
 
@@ -146,15 +148,8 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
 
 #[cfg(windows)]
 fn build_test_command(command: &str, skill_dir: &Path) -> Command {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut cmd = Command::new("cmd.exe");
-    cmd.raw_arg("/C")
-        .raw_arg(format!("\"{command}\""))
-        .current_dir(skill_dir)
-        .creation_flags(CREATE_NO_WINDOW);
+    let mut cmd = windows_std_cmd_shell_command(command);
+    cmd.current_dir(skill_dir);
     cmd
 }
 
