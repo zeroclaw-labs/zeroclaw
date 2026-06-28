@@ -42,6 +42,7 @@ mod panel;
 mod panels;
 mod quickstart_pane;
 mod theme;
+mod theme_picker;
 mod turn_status;
 mod widgets;
 mod wire;

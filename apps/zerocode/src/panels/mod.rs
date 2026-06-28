@@ -4,3 +4,4 @@
 //! [`crate::panel::register_panels`].
 
 pub mod report;
+pub mod theme;

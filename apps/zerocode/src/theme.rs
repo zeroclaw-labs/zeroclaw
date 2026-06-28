@@ -48,20 +48,28 @@ pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
 
 /// The authored inherit-shell sentinel. Real palettes come from
 /// `GENERATED_THEMES`.
-const AUTHORED_THEMES: &[(&str, Theme)] = &[("terminal", TERMINAL)];
+const AUTHORED_THEMES: &[(&str, &str, Theme)] = &[("terminal", "Other", TERMINAL)];
 
 /// Every named preset: the authored pair followed by the generated registry
 /// themes. The single iteration point both lookup helpers walk.
-fn all_themes() -> impl Iterator<Item = &'static (&'static str, Theme)> {
+fn all_themes() -> impl Iterator<Item = &'static (&'static str, &'static str, Theme)> {
     AUTHORED_THEMES.iter().chain(GENERATED_THEMES.iter())
 }
 
 pub(crate) fn theme_by_name(name: &str) -> Option<Theme> {
-    all_themes().find_map(|(n, t)| (*n == name).then_some(*t))
+    all_themes().find_map(|(n, _, t)| (*n == name).then_some(*t))
 }
 
 pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
-    all_themes().map(|(n, _)| *n)
+    all_themes().map(|(n, _, _)| *n)
+}
+
+pub(crate) fn theme_category(name: &str) -> Option<&'static str> {
+    all_themes().find_map(|(n, category, _)| (*n == name).then_some(*category))
+}
+
+pub(crate) fn theme_catalog() -> impl Iterator<Item = (&'static str, &'static str)> {
+    all_themes().map(|(name, category, _)| (*name, *category))
 }
 
 static ACTIVE: LazyLock<RwLock<Theme>> = LazyLock::new(|| RwLock::new(default_theme()));

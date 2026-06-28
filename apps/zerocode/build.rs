@@ -38,7 +38,7 @@ fn main() {
     let mut out = String::from(
         "// GENERATED from web/src/contexts/themes.json by build.rs — DO NOT EDIT BY HAND.\n\n",
     );
-    out.push_str("pub(crate) const GENERATED_THEMES: &[(&str, Theme)] = &[\n");
+    out.push_str("pub(crate) const GENERATED_THEMES: &[(&str, &str, Theme)] = &[\n");
 
     for t in arr {
         let id = t
@@ -46,6 +46,8 @@ fn main() {
             .and_then(Value::as_str)
             .expect("theme missing id");
         let name = snake_case(id);
+        let category = t.get("category").and_then(Value::as_str).unwrap_or("Other");
+        let category = serde_json::to_string(category).expect("serializing category literal");
         let vars = t
             .get("vars")
             .and_then(Value::as_object)
@@ -82,7 +84,7 @@ fn main() {
         let background = role_literal(tui, id, "background", || var("--pc-bg-base"));
 
         out.push_str(&format!(
-            "    (\"{name}\", Theme {{ title: {title}, heading: {heading}, body: {body}, \
+            "    (\"{name}\", {category}, Theme {{ title: {title}, heading: {heading}, body: {body}, \
              dim: {dim}, accent: {accent}, warn: {warn}, selection_bg: {selection_bg}, \
              tool: {tool}, background: {background} }}),\n"
         ));

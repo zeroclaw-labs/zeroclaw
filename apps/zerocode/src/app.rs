@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -198,6 +198,7 @@ pub async fn run(
     let mut show_help = false;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
+    let mut theme_picker: Option<crate::theme_picker::ThemePicker> = None;
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
@@ -260,6 +261,10 @@ pub async fn run(
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
+                let mut plugin_panels = panel::register_panels(rpc.clone(), config_dir);
+                for panel in &mut plugin_panels {
+                    panel.init().await?;
+                }
                 if let Some(alias) = pending_start_chat {
                     chat_pane.focus_agent(&alias).await;
                     mode = Mode::Chat;
@@ -272,6 +277,7 @@ pub async fn run(
                     chat_pane,
                     logs_pane,
                     quickstart,
+                    plugin_panels,
                 ))
             }
             .await
@@ -286,6 +292,7 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
+        mut plugin_panels,
     ) = build_panes!(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
@@ -294,6 +301,10 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+        let modes = all_modes(&plugin_panels);
+        if !modes.contains(&mode) {
+            mode = Mode::Dashboard;
+        }
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
@@ -353,7 +364,7 @@ pub async fn run(
                 .split(frame.area());
 
             bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode);
+            draw_mode_bar(frame, chunks[0], mode, &plugin_panels);
             content_area = chunks[1];
 
             match mode {
@@ -364,6 +375,11 @@ pub async fn run(
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
+                Mode::Plugin(i) => {
+                    if let Some(panel) = plugin_panels.get_mut(i) {
+                        panel.draw(frame, chunks[1]);
+                    }
+                }
             }
 
             let status_idx = if has_info {
@@ -418,6 +434,10 @@ pub async fn run(
                         crate::i18n::t("zc-app-help-reload"),
                     ),
                     HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::ThemePicker.resolved()),
+                        crate::i18n::t("zc-app-help-theme-picker"),
+                    ),
+                    HelpEntry::new(
                         chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
                         crate::i18n::t("zc-app-help-quit"),
                     ),
@@ -431,11 +451,18 @@ pub async fn run(
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
                     Mode::Quickstart => quickstart.help_context(),
+                    Mode::Plugin(i) => plugin_panels
+                        .get(i)
+                        .map(|panel| panel.help_context())
+                        .unwrap_or_default(),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
             }
 
+            if let Some(picker) = &theme_picker {
+                picker.render_overlay(frame, chunks[1]);
+            }
             if reload_confirm {
                 draw_reload_confirm_modal(frame, frame.area());
             }
@@ -525,6 +552,7 @@ pub async fn run(
                                 chat_pane = panes.4;
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
+                                plugin_panels = panes.7;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -561,6 +589,11 @@ pub async fn run(
             if mode == Mode::Quickstart {
                 quickstart.tick().await;
             }
+            if let Mode::Plugin(i) = mode
+                && let Some(panel) = plugin_panels.get_mut(i)
+            {
+                panel.tick().await;
+            }
             continue;
         }
 
@@ -578,6 +611,10 @@ pub async fn run(
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
+                    Mode::Plugin(i) => plugin_panels
+                        .get(i)
+                        .map(|panel| panel.wants_text_input())
+                        .unwrap_or(false),
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -615,8 +652,25 @@ pub async fn run(
                     }
                     show_help = false;
                     reload_confirm = false;
+                    if let Some(picker) = theme_picker.take() {
+                        picker.cancel();
+                    }
                     reload_status = None;
                     quit_confirm = true;
+                    continue;
+                }
+
+                if let Some(picker) = &mut theme_picker {
+                    match picker.handle_key(key) {
+                        crate::theme_picker::ThemePickerOutcome::Continue => {}
+                        crate::theme_picker::ThemePickerOutcome::Confirmed(commit) => {
+                            reload_status = Some(theme_commit_toast(&commit));
+                            theme_picker = None;
+                        }
+                        crate::theme_picker::ThemePickerOutcome::Cancelled => {
+                            theme_picker = None;
+                        }
+                    }
                     continue;
                 }
 
@@ -645,6 +699,13 @@ pub async fn run(
                     reload_status = None;
                 }
 
+                if global == Some(GlobalAction::ThemePicker) {
+                    theme_picker = Some(crate::theme_picker::ThemePicker::new(config_dir));
+                    show_help = false;
+                    reload_confirm = false;
+                    continue;
+                }
+
                 if global == Some(GlobalAction::ReloadDaemon) && !in_text_input {
                     reload_confirm = true;
                     continue;
@@ -657,8 +718,8 @@ pub async fn run(
                 }
 
                 let switch_to: Option<Mode> = match global {
-                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
-                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
+                    Some(GlobalAction::PaneNavLeft) => Some(cycle_mode(&modes, mode, -1)),
+                    Some(GlobalAction::PaneNavRight) => Some(cycle_mode(&modes, mode, 1)),
                     _ => None,
                 };
                 if let Some(next) = switch_to {
@@ -694,6 +755,12 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                     Mode::Quickstart => quickstart.handle_key(key).await,
+                    Mode::Plugin(i) => match plugin_panels.get_mut(i) {
+                        Some(panel) => match panel.handle_key(key).await {
+                            PanelOutcome::Continue => false,
+                        },
+                        None => false,
+                    },
                 };
                 if quit {
                     break;
@@ -721,16 +788,16 @@ pub async fn run(
                 }
                 // Mode bar clicks
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let labels: Vec<(&str, String)> = MODES
+                    let labels: Vec<(&str, String)> = modes
                         .iter()
-                        .map(|m| ("", format!(" {} ", crate::i18n::t(m.fluent_key()))))
+                        .map(|m| ("", format!(" {} ", mode_label(*m, &plugin_panels))))
                         .collect();
                     let label_refs: Vec<(&str, &str)> =
                         labels.iter().map(|(k, l)| (*k, l.as_str())).collect();
                     if let Some(n) =
                         mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
                     {
-                        let next = MODES[(n - 1) as usize];
+                        let next = modes[(n - 1) as usize];
                         switch_mode(
                             &mut mode,
                             next,
@@ -742,6 +809,22 @@ pub async fn run(
                         .await;
                         continue;
                     }
+                }
+                if let Some(picker) = &mut theme_picker {
+                    match handle_theme_picker_mouse(picker, mouse, content_area) {
+                        ThemePickerMouseOutcome::Continue => {}
+                        ThemePickerMouseOutcome::Confirm => {
+                            if let Some(commit) = picker.confirm() {
+                                reload_status = Some(theme_commit_toast(&commit));
+                            }
+                            theme_picker = None;
+                        }
+                        ThemePickerMouseOutcome::Cancel => {
+                            picker.cancel();
+                            theme_picker = None;
+                        }
+                    }
+                    continue;
                 }
                 // Help-hint click: every pane renders the `?=help` indicator at
                 // the bottom-left of the content area; clicking it opens help,
@@ -791,6 +874,7 @@ pub async fn run(
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
+                        Mode::Plugin(_) => {}
                     }
                     consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
                 }
@@ -804,6 +888,11 @@ pub async fn run(
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
+                    Mode::Plugin(i) => {
+                        if let Some(panel) = plugin_panels.get_mut(i) {
+                            panel.handle_paste(&text);
+                        }
+                    }
                 }
             }
             _ => {} // Resize, etc. — just redraw on next iteration
@@ -834,16 +923,65 @@ fn resolve_agent_overrides(
     out
 }
 
+enum ThemePickerMouseOutcome {
+    Continue,
+    Confirm,
+    Cancel,
+}
+
+fn handle_theme_picker_mouse(
+    picker: &mut crate::theme_picker::ThemePicker,
+    mouse: MouseEvent,
+    area: Rect,
+) -> ThemePickerMouseOutcome {
+    let Some(modal_rect) = picker.overlay_area(area) else {
+        return ThemePickerMouseOutcome::Continue;
+    };
+    let col = mouse.column;
+    let row = mouse.row;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !mouse::in_rect(col, row, modal_rect) {
+                return ThemePickerMouseOutcome::Cancel;
+            }
+            if let Some(idx) = mouse::list_click_index(row, modal_rect, 0, picker.item_count())
+                && picker.select_row(idx)
+            {
+                return ThemePickerMouseOutcome::Confirm;
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if mouse::in_rect(col, row, modal_rect) =>
+        {
+            if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                picker.move_up();
+            } else {
+                picker.move_down();
+            }
+        }
+        _ => {}
+    }
+    ThemePickerMouseOutcome::Continue
+}
+
+fn theme_commit_toast(commit: &crate::theme_picker::ThemePickerCommit) -> String {
+    match &commit.error {
+        Some(error) => crate::i18n::t_args("zc-theme-picker-save-failed", &[("error", error)]),
+        None => crate::i18n::t_args("zc-theme-picker-saved", &[("theme", &commit.name)]),
+    }
+}
+
 // ── Mode bar ─────────────────────────────────────────────────────
 
-fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
+fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode, panels: &[Box<dyn Panel>]) {
     use ratatui::widgets::Tabs;
 
-    let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
-    let titles: Vec<ratatui::text::Line> = MODES
+    let modes = all_modes(panels);
+    let active_idx = modes.iter().position(|m| *m == active).unwrap_or(0);
+    let titles: Vec<ratatui::text::Line> = modes
         .iter()
         .map(|m| {
-            let label = crate::i18n::t(m.fluent_key());
+            let label = mode_label(*m, panels);
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 format!(" {} ", label),
                 theme::body_style(),

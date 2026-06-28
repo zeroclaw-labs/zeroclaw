@@ -5,10 +5,24 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-pane-theme = Theme
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon
+zc-app-help-theme-picker = Theme picker
 zc-app-help-quit = Quit
+zc-theme-picker-title = Theme: { $filter }
+zc-theme-picker-filter = Filter: { $filter }
+zc-theme-picker-filter-all = all
+zc-theme-picker-empty = No matching themes
+zc-theme-picker-help = Type to filter   { $confirm } save   { $cancel } cancel
+zc-theme-picker-saved = Theme set to { $theme }
+zc-theme-picker-save-failed = Theme set (save failed: { $error })
+zc-theme-panel-help-desc = Browse themes by category, preview as you move, and save the selected theme.
+zc-theme-help-preview = Preview selection
+zc-theme-help-filter = Filter themes
+zc-theme-help-save = Save selected theme
+zc-theme-help-cancel = Revert preview
 
 zc-app-press-any-key-to-close = Press any key to close
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every

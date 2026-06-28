@@ -318,6 +318,7 @@ use ratatui::{
 pub struct PickerModal<'a> {
     title: &'a str,
     items: &'a [String],
+    selectable: Option<&'a [bool]>,
     cursor: usize,
 }
 
@@ -326,6 +327,21 @@ impl<'a> PickerModal<'a> {
         Self {
             title,
             items,
+            selectable: None,
+            cursor,
+        }
+    }
+
+    pub fn grouped(
+        title: &'a str,
+        items: &'a [String],
+        selectable: &'a [bool],
+        cursor: usize,
+    ) -> Self {
+        Self {
+            title,
+            items,
+            selectable: Some(selectable),
             cursor,
         }
     }
@@ -374,7 +390,12 @@ impl<'a> PickerModal<'a> {
             .iter()
             .enumerate()
             .map(|(i, label)| {
-                let style = if i == self.cursor {
+                let selectable = self
+                    .selectable
+                    .is_none_or(|rows| rows.get(i).copied().unwrap_or(true));
+                let style = if !selectable {
+                    crate::theme::heading_style()
+                } else if i == self.cursor {
                     crate::theme::selected_style()
                 } else {
                     crate::theme::body_style()
@@ -400,6 +421,7 @@ impl<'a> PickerModal<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct PickerState {
     pub items: Vec<String>,
+    pub selectable: Vec<bool>,
     pub cursor: usize,
 }
 
@@ -407,29 +429,79 @@ impl PickerState {
     /// Build a picker over `items`, pre-selecting `default` when present (else
     /// the first row).
     pub fn new(items: Vec<String>, default: Option<&str>) -> Self {
+        let selectable = vec![true; items.len()];
+        Self::new_grouped(items, selectable, default)
+    }
+
+    /// Build a picker over rendered rows, where `selectable` marks which rows
+    /// are actual values and which rows are non-selectable section headers.
+    pub fn new_grouped(items: Vec<String>, selectable: Vec<bool>, default: Option<&str>) -> Self {
+        assert_eq!(
+            items.len(),
+            selectable.len(),
+            "picker items/selectable length drift"
+        );
         let cursor = default
-            .and_then(|d| items.iter().position(|i| i == d))
+            .and_then(|d| {
+                items
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, item)| (selectable[i] && item == d).then_some(i))
+            })
+            .or_else(|| selectable.iter().position(|ok| *ok))
             .unwrap_or(0);
-        Self { items, cursor }
+        Self {
+            items,
+            selectable,
+            cursor,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        !self.selectable.iter().any(|ok| *ok)
     }
 
     pub fn move_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        if self.items.is_empty() {
+            return;
+        }
+        let mut next = self.cursor.saturating_sub(1);
+        while next > 0 && !self.is_selectable(next) {
+            next = next.saturating_sub(1);
+        }
+        if self.is_selectable(next) {
+            self.cursor = next;
+        }
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.items.len() {
-            self.cursor += 1;
+        if self.items.is_empty() {
+            return;
+        }
+        let mut next = (self.cursor + 1).min(self.items.len().saturating_sub(1));
+        while next + 1 < self.items.len() && !self.is_selectable(next) {
+            next += 1;
+        }
+        if self.is_selectable(next) {
+            self.cursor = next;
+        }
+    }
+
+    pub fn select(&mut self, idx: usize) {
+        if self.is_selectable(idx) {
+            self.cursor = idx;
         }
     }
 
     /// The currently highlighted value, if any.
     pub fn selected(&self) -> Option<&str> {
-        self.items.get(self.cursor).map(String::as_str)
+        self.is_selectable(self.cursor)
+            .then(|| self.items.get(self.cursor).map(String::as_str))
+            .flatten()
+    }
+
+    fn is_selectable(&self, idx: usize) -> bool {
+        self.selectable.get(idx).copied().unwrap_or(false)
     }
 }
 
@@ -531,5 +603,21 @@ mod picker_tests {
         let p = PickerState::default();
         assert!(p.is_empty());
         assert_eq!(p.selected(), None);
+    }
+
+    #[test]
+    fn grouped_picker_skips_headers() {
+        let mut p = PickerState::new_grouped(
+            vec!["Section".into(), "a".into(), "Next".into(), "b".into()],
+            vec![false, true, false, true],
+            None,
+        );
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.selected(), Some("a"));
+        p.move_down();
+        assert_eq!(p.cursor, 3);
+        assert_eq!(p.selected(), Some("b"));
+        p.move_up();
+        assert_eq!(p.cursor, 1);
     }
 }

@@ -233,7 +233,10 @@ impl Panel for ReportPanel {
             description: Some(crate::i18n::t("zc-report-help-desc")),
             entries: vec![
                 HelpEntry::new(["r"], crate::i18n::t("zc-report-help-refresh")),
-                HelpEntry::new(["↑", "↓", "k", "j"], crate::i18n::t("zc-report-help-scroll")),
+                HelpEntry::new(
+                    ["↑", "↓", "k", "j"],
+                    crate::i18n::t("zc-report-help-scroll"),
+                ),
             ],
             children: vec![],
         }

@@ -12,6 +12,7 @@
 //! subscribe to daemon notifications (see [`crate::panels::canvas_panel`]),
 //! not by loading external code.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
@@ -26,8 +27,6 @@ use crate::widgets::HelpNode;
 pub enum PanelOutcome {
     /// Keep running.
     Continue,
-    /// Quit the application (mirrors a built-in pane returning `true`).
-    Quit,
 }
 
 /// A registrable TUI panel, surfaced as its own entry in the mode bar.
@@ -84,6 +83,22 @@ pub trait Panel: Send {
 /// it appears in the mode bar after the built-in panes, in the order
 /// returned. Called once at startup and again on every reconnect so each
 /// panel binds to the live [`RpcClient`].
-pub fn register_panels(rpc: Arc<RpcClient>) -> Vec<Box<dyn Panel>> {
-    vec![Box::new(crate::panels::report::ReportPanel::new(rpc.clone()))]
+pub fn register_panels(rpc: Arc<RpcClient>, config_dir: &Path) -> Vec<Box<dyn Panel>> {
+    let panels: Vec<Box<dyn Panel>> = vec![
+        Box::new(crate::panels::report::ReportPanel::new(rpc.clone())),
+        Box::new(crate::panels::theme::ThemePanel::new(config_dir)),
+    ];
+    debug_assert_unique_panel_ids(&panels);
+    panels
+}
+
+fn debug_assert_unique_panel_ids(panels: &[Box<dyn Panel>]) {
+    let mut seen = std::collections::HashSet::new();
+    for panel in panels {
+        debug_assert!(
+            seen.insert(panel.id()),
+            "duplicate panel id '{}'",
+            panel.id()
+        );
+    }
 }
