@@ -425,7 +425,7 @@ mod tests {
         // On Unix the shell is invoked as `<shell> -c "<command>"`. Android
         // ignores the configured shell and pins `/system/bin/sh` (it is not on
         // PATH for spawned processes), so mirror that runtime branch here.
-        #[cfg(unix)]
+        #[cfg(not(target_os = "windows"))]
         {
             assert!(
                 debug.contains("-c"),
@@ -451,10 +451,11 @@ mod tests {
         // On Windows the configured shell is ignored: commands run via
         // `cmd.exe /C` (see the [runtime].shell docs), so there is no `-c`
         // boundary and `bash` never appears.
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             assert!(
-                debug.contains("cmd.exe") && debug.contains("/C"),
+                debug.contains(WINDOWS_COMMAND_INTERPRETER)
+                    && debug.contains(WINDOWS_COMMAND_EXECUTE_ARG),
                 "Windows should use the cmd.exe /C boundary, got: {debug}"
             );
             assert!(
