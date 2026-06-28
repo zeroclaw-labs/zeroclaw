@@ -42,6 +42,19 @@
           - "src/channels/**"
           - "crates/zeroclaw-channels/src/**"
 
+"channel:acp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/bin/zeroclaw-acp-bridge.rs"
+          - "docs/book/src/channels/acp.md"
+          - "apps/zerocode/src/acp.rs"
+          - "web/src/lib/acp.ts"
+          - "web/src/pages/AcpConsole.tsx"
+          - "crates/zeroclaw-channels/src/acp_channel.rs"
+          - "crates/zeroclaw-channels/src/orchestrator/acp_server.rs"
+          - "crates/zeroclaw-gateway/src/acp.rs"
+          - "crates/zeroclaw-infra/src/acp_session_store.rs"
+
 "channel:bluesky":
   - changed-files:
       - any-glob-to-any-file:
