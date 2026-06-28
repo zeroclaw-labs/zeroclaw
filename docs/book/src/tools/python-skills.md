@@ -9,8 +9,6 @@ The default configuration is intentionally conservative. It blocks many copy-pas
 
 This page covers Python scripts invoked through the built-in shell tool. If a `SKILL.toml` defines its own `[[tools]]` entry with `kind = "shell"` or `kind = "script"`, that skill tool currently executes as a host subprocess under shell policy, not through `runtime.kind = "docker"`. For containerized Python execution today, either have the skill instructions call Python scripts through the built-in shell tool, or make the skill tool command explicitly run the container boundary you want.
 
-The `shell_max_memory_mb` limit applies to those host subprocesses and to the built-in shell tool. It does not cap `sop_execute` itself or skill and SOP logic that only dispatches other agent tools without spawning a shell-backed subprocess.
-
 ## The Three Layers
 
 Python skill execution is controlled by three separate layers.
