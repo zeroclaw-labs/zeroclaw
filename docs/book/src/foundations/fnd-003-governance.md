@@ -631,11 +631,11 @@ Use a **namespaced** label system. Each label has a prefix that identifies its c
 
 | Label | Color | Use |
 |---|---|---|
-| `size:xs` | `#dcfce7` Light green | Under 2 hours |
-| `size:s` | `#bbf7d0` Green | Half a day |
-| `size:m` | `#86efac` Medium green | 1–3 days |
-| `size:l` | `#4ade80` Dark green | 1–2 weeks |
-| `size:xl` | `#16a34a` Deep green | More than 2 weeks; should be broken down |
+| `size:XS` | `#dcfce7` Light green | Under 2 hours |
+| `size:S` | `#bbf7d0` Green | Half a day |
+| `size:M` | `#86efac` Medium green | 1–3 days |
+| `size:L` | `#4ade80` Dark green | 1–2 weeks |
+| `size:XL` | `#16a34a` Deep green | More than 2 weeks; should be broken down |
 
 ### `component:` Which part of the system?
 
@@ -745,9 +745,9 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
 
-**PR size labeling (`.github/workflows/pr-size.yml`):**
+**PR size labeling (future/optional):**
 
-Automatically label PRs with `size:xs` through `size:xl` based on lines changed. This gives reviewers and maintainers an immediate sense of scope without opening the diff. Use these thresholds as a starting point: XS < 10 lines, S < 50, M < 250, L < 1000, XL ≥ 1000.
+If size automation is added later, it should follow the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.
 
 **Milestone check on PR merge (`.github/workflows/milestone-check.yml`):**
 

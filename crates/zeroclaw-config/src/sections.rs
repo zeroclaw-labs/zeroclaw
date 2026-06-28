@@ -338,6 +338,26 @@ sections! {
                 can coexist.",
     },
 
+    // Tier 1b — Routing. Named hints that map a short alias to a
+    // provider + model combo. Routes depend on providers, so they
+    // follow Tier 1.
+    ModelRoutes => {
+        key:   "model_routes",
+        shape: OneTierAliasMap,
+        group: Foundation,
+        help:  "Named model routing hints (e.g. reasoning, fast, code). Each \
+                route maps a hint to a specific provider + model combo. Use \
+                `hint:<name>` as the model parameter to dispatch through a route.",
+    },
+    EmbeddingRoutes => {
+        key:   "embedding_routes",
+        shape: OneTierAliasMap,
+        group: Foundation,
+        help:  "Named embedding routing hints (e.g. semantic, archive, faq). \
+                Each route maps a hint to an embedding-capable provider + model \
+                combo. Use `hint:<name>` as the embedding_model parameter.",
+    },
+
     // Tier 2 — Behavior shape. agents.<alias>.risk_profile and
     // .runtime_profile are required alias refs; both must exist before
     // an Agent that points at them can resolve.
@@ -451,7 +471,7 @@ sections! {
         shape: TypedFamilyMap,
         group: Foundation,
         help:  "Pick which chat platforms ZeroClaw should listen on. Global \
-                channel settings live on [channels]; each configured platform \
+                channel settings live on `[channels]`; each configured platform \
                 still gets its own alias.",
     },
     Hardware => {
@@ -612,6 +632,9 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         // booleans (`enabled`, `deferred_loading`) have meaningful
         // defaults that are indistinguishable from user choice.
         Section::McpServers => !cfg.mcp.servers.is_empty(),
+        // Routes' existence in the Vec is the signal, same as McpServers.
+        Section::ModelRoutes => !cfg.model_routes.is_empty(),
+        Section::EmbeddingRoutes => !cfg.embedding_routes.is_empty(),
         // Memory's default backend is "sqlite" and Tunnel's is "none" —
         // both are valid user choices indistinguishable from untouched
         // defaults. TTS / transcription providers and agents start
@@ -987,8 +1010,6 @@ mod tests {
             "escalation",
             "locale",
             "microsoft365",
-            "model_routes",
-            "embedding_routes",
             "file_upload",
             "file_upload_bundle",
             "file_download",

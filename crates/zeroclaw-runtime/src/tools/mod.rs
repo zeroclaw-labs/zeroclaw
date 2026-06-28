@@ -40,6 +40,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod spawn_subagent;
+pub(crate) mod subprocess_limits;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -52,6 +53,7 @@ pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
+pub use zeroclaw_tools::channel_room::ChannelRoomTool;
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
@@ -435,6 +437,7 @@ pub struct AllToolsResult {
     pub tools: Vec<Box<dyn Tool>>,
     pub delegate_handle: Option<DelegateParentToolsHandle>,
     pub ask_user_handle: Option<PerToolChannelHandle>,
+    pub channel_room_handle: Option<PerToolChannelHandle>,
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
@@ -1165,15 +1168,16 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         }
-        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopStatusTool::new(Arc::clone(sop_engine))
+                .with_collector(crate::sop::SopMetricsCollector::shared()),
+        ));
     }
 
     if let Some(key) = composio_key
@@ -1190,6 +1194,15 @@ pub fn all_tools_with_runtime(
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
+
+    // Channel room-management tool — always registered; owns its own late-bound channel map.
+    let channel_room_handle: Option<PerToolChannelHandle> =
+        Some(Arc::new(RwLock::new(HashMap::new())));
+    let channel_room_tool = ChannelRoomTool::new(
+        security.clone(),
+        channel_room_handle.as_ref().cloned().unwrap(),
+    );
+    tool_arcs.push(Arc::new(channel_room_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
@@ -1240,6 +1253,7 @@ pub fn all_tools_with_runtime(
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
                     ask_user_handle,
+                    channel_room_handle,
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
@@ -1382,16 +1396,38 @@ pub fn all_tools_with_runtime(
         let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+            let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
+                &config.plugins.security.signature_mode,
+            );
+            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                &plugin_path,
+                signature_mode,
+                trusted_publisher_keys,
+            ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
                     for (manifest, wasm_path) in details {
+                        // SSOT: `config` is the snapshot the whole tool set is
+                        // built from, identical to every other tool here. A
+                        // config reload tears down and rebuilds the daemon
+                        // iteration (rpc ConfigReload -> reload_tx), so the
+                        // agent and its tools are reconstructed from the new
+                        // Config; plugin config is never hot-swapped into a live
+                        // WasmTool. The owned map below is that fresh snapshot,
+                        // not a second source of truth.
+                        let plugin_config = config
+                            .plugins
+                            .entry_config(&manifest.name)
+                            .cloned()
+                            .unwrap_or_default();
                         tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
+                            plugin_config,
                         )));
                     }
                     ::zeroclaw_log::record!(
@@ -1444,6 +1480,7 @@ pub fn all_tools_with_runtime(
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         ask_user_handle,
+        channel_room_handle,
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,

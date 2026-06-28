@@ -12,6 +12,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
@@ -25,6 +27,7 @@ pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
+pub mod api_sop;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -447,6 +450,150 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+/// The default agent alias for the gateway's no-`?agent=` listings: the
+/// lexicographically smallest ENABLED agent alias, or `None` when no agent is
+/// enabled. Deterministic by design - `config.agents` is a `HashMap` whose
+/// iteration order is randomized per process, so seeding from `iter().find()`
+/// made the WebUI Tools page surface a different agent's tools on each
+/// restart. The smallest-alias pick keeps the default listing stable.
+fn default_agent_alias(config: &Config) -> Option<String> {
+    config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias.clone())
+        .min()
+}
+
+/// Connect the MCP servers granted to `agent_alias` by its `mcp_bundles` and
+/// append the resulting tools to `gw_tools`, gated by the agent's tool-access
+/// policy. Shared by the dashboard-agent seed and the per-agent
+/// `/api/tools` registry builder so both surfaces scope MCP identically
+/// (omission is not a grant; deny wins). A no-op when MCP is disabled or the
+/// agent's bundles grant no servers, and non-fatal on connect failure so the
+/// gateway still boots.
+async fn append_scoped_mcp_tools(
+    config: &Config,
+    agent_alias: &str,
+    security: &Arc<SecurityPolicy>,
+    gw_tools: &mut Vec<Box<dyn tools::Tool>>,
+    gw_delegate: Option<&tools::DelegateParentToolsHandle>,
+) {
+    let agent_mcp_servers = if config.mcp.enabled {
+        config.mcp_servers_for_agent(agent_alias)
+    } else {
+        Vec::new()
+    };
+    if agent_mcp_servers.is_empty() {
+        return;
+    }
+    use ::zeroclaw_log::Instrument;
+    let mcp_policy = mcp_tool_access_policy(security, None);
+    let mcp_model_provider = config
+        .agents
+        .get(agent_alias)
+        .map(|a| a.model_provider.as_str().to_string())
+        .unwrap_or_default();
+    let mcp_model = config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_default();
+    let attribution_span =
+        ::zeroclaw_log::attribution_span!(&zeroclaw_runtime::agent::AgentAttribution(agent_alias));
+    ::zeroclaw_log::scope!(
+        model_provider: mcp_model_provider,
+        model: mcp_model,
+        =>
+        async {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                Ok(registry) => {
+                    let registry = std::sync::Arc::new(registry);
+                    if config.mcp.deferred_loading {
+                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                            std::sync::Arc::clone(&registry),
+                        )
+                        .await;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "Gateway MCP deferred_loading: {} tool stub(s) from {} server(s)",
+                                deferred_set.len(),
+                                registry.server_count()
+                            )
+                        );
+                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                            tools::ActivatedToolSet::new(),
+                        ));
+                        let mut tool_search =
+                            tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        gw_tools.push(Box::new(tool_search));
+                    } else {
+                        let names = registry.tool_names();
+                        let mut registered = 0usize;
+                        let mut skipped = 0usize;
+                        for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
+                            if let Some(def) = registry.get_tool_def(&name).await {
+                                let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                    std::sync::Arc::new(tools::McpToolWrapper::new(
+                                        name,
+                                        def,
+                                        std::sync::Arc::clone(&registry),
+                                    ));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    gw_tools,
+                                    gw_delegate,
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
+                                }
+                            }
+                        }
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"skipped": skipped})),
+                            &format!(
+                                "Gateway MCP: {} tool(s) registered from {} server(s)",
+                                registered,
+                                registry.server_count()
+                            )
+                        );
+                    }
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Fail
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Gateway MCP registry failed to initialize"
+                    );
+                }
+            }
+        }
+    )
+    .instrument(attribution_span)
+    .await;
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -495,8 +642,15 @@ pub struct AppState {
     pub gmail_push: Option<Arc<GmailPushChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
-    /// Registered tool specs (for web dashboard tools page)
+    /// Registered tool specs (for web dashboard tools page). This is the
+    /// default (no `?agent=`) listing, seeded from the deterministically
+    /// smallest enabled agent alias.
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Per-agent tool-spec listings keyed by agent alias, powering the
+    /// agent-aware `GET /api/tools?agent=<alias>` view so the WebUI Tools
+    /// page can show each agent's scoped tool set. Falls back to
+    /// `tools_registry` for an unknown or omitted alias.
+    pub tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -560,10 +714,11 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-    // Reload sender owned by the daemon. /admin/reload writes `true` here;
-    // the daemon's wait loop reacts via `subscribe()` and tears down to
-    // re-init. Cross-platform replacement for the SIGUSR1 hack.
-    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // Reload controls owned by the daemon for supervised runs. RPC reloads
+    // write to `shutdown_tx` before signalling daemon reload so the listener
+    // releases its socket before the replacement gateway binds. /admin/reload
+    // writes to both controls directly. Standalone gateway passes `None`.
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
@@ -731,6 +886,7 @@ pub async fn run_gateway(
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
+            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {
@@ -782,17 +938,17 @@ pub async fn run_gateway(
     // tracked as a follow-up.
     //
     // Agent count is unconstrained at boot. Zero agents is a valid
-    // state — the gateway must come up so `/admin/reload` and
-    // `/quickstart` can install one — and the legacy seed simply stays
-    // empty. With one or more enabled agents, any of them seeds the
-    // vestige; aliases are arbitrary so the iteration-order pick is
-    // load-bearing on nothing.
+    // state (the gateway must come up so `/admin/reload` and
+    // `/quickstart` can install one) and the legacy seed simply stays
+    // empty. With one or more enabled agents, the lexicographically
+    // smallest enabled alias seeds the default (no `?agent=`) listing.
+    // The pick is deterministic on purpose: the previous `HashMap`
+    // iteration-order pick made the WebUI Tools page surface a different
+    // agent's tools on each restart. Every other enabled agent gets its
+    // own scoped listing (`tools_registry_by_agent`, built below) so
+    // `GET /api/tools?agent=<alias>` can show any agent's real tool set.
     let canvas_store = canvas_store.unwrap_or_default();
-    let agent_alias_opt = config
-        .agents
-        .iter()
-        .find(|(_, a)| a.enabled)
-        .map(|(alias, _)| alias.clone());
+    let agent_alias_opt = default_agent_alias(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -837,7 +993,7 @@ pub async fn run_gateway(
                 &security,
                 &risk_profile,
                 agent_alias,
-                runtime,
+                Arc::clone(&runtime),
                 Arc::clone(&mem),
                 composio_key,
                 composio_entity_id,
@@ -865,6 +1021,7 @@ pub async fn run_gateway(
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
+                &all_tools_result.channel_room_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
@@ -882,124 +1039,19 @@ pub async fn run_gateway(
             }
             let mut gw_tools = all_tools_result.tools;
             let gw_delegate = all_tools_result.delegate_handle;
-            // ── MCP tools, scoped to this agent's `mcp_bundles` and gated by
-            // its tool policy (parity with the orchestrator + runtime paths;
-            // omission is not a grant). Wiring here, inside the resolved-agent
-            // arm, means a gateway with no resolved agent gets no MCP servers,
-            // and the previous unscoped/ungated global registration is gone.
-            let agent_mcp_servers = if config.mcp.enabled {
-                config.mcp_servers_for_agent(agent_alias)
-            } else {
-                Vec::new()
-            };
-            if !agent_mcp_servers.is_empty() {
-                use ::zeroclaw_log::Instrument;
-                let mcp_policy = mcp_tool_access_policy(&security, None);
-                let mcp_model_provider = config
-                    .agents
-                    .get(agent_alias)
-                    .map(|a| a.model_provider.as_str().to_string())
-                    .unwrap_or_default();
-                let mcp_model = config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|p| p.model.clone())
-                    .unwrap_or_default();
-                let attribution_span = ::zeroclaw_log::attribution_span!(
-                    &zeroclaw_runtime::agent::AgentAttribution(agent_alias)
-                );
-                ::zeroclaw_log::scope!(
-                    model_provider: mcp_model_provider,
-                    model: mcp_model,
-                    =>
-                    async {
-                        match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                            Ok(registry) => {
-                                let registry = std::sync::Arc::new(registry);
-                                if config.mcp.deferred_loading {
-                                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                                        std::sync::Arc::clone(&registry),
-                                    )
-                                    .await;
-                                    ::zeroclaw_log::record!(
-                                        INFO,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        ),
-                                        &format!(
-                                            "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
-                                            deferred_set.len(),
-                                            registry.server_count()
-                                        )
-                                    );
-                                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                        tools::ActivatedToolSet::new(),
-                                    ));
-                                    let mut tool_search =
-                                        tools::ToolSearchTool::new(deferred_set, activated);
-                                    if let Some(policy) = mcp_policy {
-                                        tool_search = tool_search.with_access_policy(policy);
-                                    }
-                                    gw_tools.push(Box::new(tool_search));
-                                } else {
-                                    let names = registry.tool_names();
-                                    let mut registered = 0usize;
-                                    let mut skipped = 0usize;
-                                    for name in names {
-                                        if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                            skipped += 1;
-                                            continue;
-                                        }
-                                        if let Some(def) = registry.get_tool_def(&name).await {
-                                            let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                                std::sync::Arc::new(tools::McpToolWrapper::new(
-                                                    name,
-                                                    def,
-                                                    std::sync::Arc::clone(&registry),
-                                                ));
-                                            if register_eager_mcp_tool_if_allowed(
-                                                wrapper,
-                                                &mut gw_tools,
-                                                gw_delegate.as_ref(),
-                                                mcp_policy.as_ref(),
-                                            ) {
-                                                registered += 1;
-                                            }
-                                        }
-                                    }
-                                    ::zeroclaw_log::record!(
-                                        INFO,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_attrs(::serde_json::json!({"skipped": skipped})),
-                                        &format!(
-                                            "Gateway MCP: {} tool(s) registered from {} server(s)",
-                                            registered,
-                                            registry.server_count()
-                                        )
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    ERROR,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Fail
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Gateway MCP registry failed to initialize"
-                                );
-                            }
-                        }
-                    }
-                )
-                .instrument(attribution_span)
-                .await;
-            }
+            // MCP tools, scoped to this agent's `mcp_bundles` and gated by its
+            // tool policy (parity with the orchestrator + runtime paths;
+            // omission is not a grant). Factored into `append_scoped_mcp_tools`
+            // so the per-agent registry below scopes MCP identically; a gateway
+            // with no resolved agent gets no MCP servers.
+            append_scoped_mcp_tools(
+                &config,
+                agent_alias,
+                &security,
+                &mut gw_tools,
+                gw_delegate.as_ref(),
+            )
+            .await;
             (gw_tools, gw_delegate)
         }
         (Some(_), None) => {
@@ -1022,6 +1074,93 @@ pub async fn run_gateway(
 
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+
+    // Per-agent tool listings powering the agent-aware
+    // `GET /api/tools?agent=<alias>` view, so the WebUI Tools page can show
+    // each agent's real, scoped tool set instead of one arbitrary agent's.
+    // The dashboard seed above is reused verbatim as the default agent's
+    // entry; every OTHER enabled agent is built here with its own
+    // SecurityPolicy and `mcp_bundles`-scoped MCP tools. Channel handles are
+    // intentionally NOT registered for these agents: the tools are only
+    // enumerated for their specs, never invoked. A per-agent failure is
+    // logged and skipped so one broken agent never starves the rest.
+    let mut tools_registry_by_agent: HashMap<String, Arc<Vec<ToolSpec>>> = HashMap::new();
+    if let Some(default_alias) = agent_alias_opt.as_ref() {
+        tools_registry_by_agent.insert(default_alias.clone(), Arc::clone(&tools_registry));
+    }
+    let mut other_aliases: Vec<String> = config
+        .agents
+        .iter()
+        .filter(|(alias, a)| a.enabled && Some(*alias) != agent_alias_opt.as_ref())
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    other_aliases.sort();
+    for alias in other_aliases {
+        let Some(risk_profile) = config.risk_profile_for_agent(&alias) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"agent_alias": alias})),
+                "Gateway: agent risk_profile does not resolve; skipping its /api/tools listing."
+            );
+            continue;
+        };
+        let risk_profile = risk_profile.clone();
+        let security = match SecurityPolicy::for_agent(&config, &alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent SecurityPolicy failed to build; skipping its /api/tools listing."
+                );
+                continue;
+            }
+        };
+        let agent_tools_result = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &risk_profile,
+            &alias,
+            Arc::clone(&runtime),
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.data_dir,
+            &config.agents,
+            config
+                .model_provider_for_agent(&alias)
+                .and_then(|e| e.api_key.as_deref()),
+            &config,
+            Some(canvas_store.clone()),
+            false,
+            None,
+            sop_engine.clone(),
+            sop_audit.clone(),
+        );
+        let mut agent_tools = agent_tools_result.tools;
+        let agent_delegate = agent_tools_result.delegate_handle;
+        append_scoped_mcp_tools(
+            &config,
+            &alias,
+            &security,
+            &mut agent_tools,
+            agent_delegate.as_ref(),
+        )
+        .await;
+        let specs: Vec<ToolSpec> = agent_tools.iter().map(|t| t.spec()).collect();
+        tools_registry_by_agent.insert(alias, Arc::new(specs));
+    }
+    let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
+        Arc::new(tools_registry_by_agent);
 
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
@@ -1501,7 +1640,11 @@ pub async fn run_gateway(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, reload_tx) = reload_controls
+        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .unwrap_or((owned_shutdown_tx, None));
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
@@ -1571,6 +1714,7 @@ pub async fn run_gateway(
         gmail_push: gmail_push_channel,
         observer: state_observer,
         tools_registry,
+        tools_registry_by_agent,
         cost_tracker,
         event_tx,
         event_buffer,
@@ -1620,6 +1764,9 @@ pub async fn run_gateway(
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
+        .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
+        .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -1822,6 +1969,9 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes());
+
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
     let inner = inner
@@ -1880,12 +2030,15 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger route lives on its own sub-router so it can opt out
-    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
-    // the route through `merge`, so only this endpoint sees the longer
-    // timeout.
-    let cron_run_router: Router = Router::new()
-        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+    // Manual cron-trigger and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // synchronous agent turn inline. Layers attached here travel with the
+    // route through `merge`, so only these endpoints see the longer timeout.
+    let long_running_router: Router<AppState> =
+        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    #[cfg(feature = "a2a")]
+    let long_running_router = long_running_router.merge(a2a::a2a_task_route());
+    let long_running_router: Router = long_running_router
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1893,7 +2046,7 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(cron_run_router);
+    let inner = inner.merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2371,7 +2524,7 @@ fn needs_quickstart_channel_reply() -> String {
 /// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
 /// already validated against `config.agents` by the handler. `None` keeps the
 /// legacy default pick (migration-synthesized "default", else first enabled).
-async fn run_gateway_chat_with_tools(
+pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
@@ -2692,7 +2845,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let (provider_label, model_label) = {
+    let (provider_label, model_label, resolved_agent_alias) = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
         let resolved_provider = resolved_agent_alias
@@ -2713,17 +2866,20 @@ async fn handle_webhook(
             })
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string());
-        (provider_label, model_label)
+        (provider_label, model_label, resolved_agent_alias)
     };
     let started_at = Instant::now();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let agent_alias = resolved_agent_alias.as_deref();
+    let channel_name = "gateway";
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
     state.observer.record_event(
@@ -2731,9 +2887,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
 
@@ -2768,9 +2924,9 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens,
                     output_tokens,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2783,9 +2939,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
 
@@ -2805,9 +2961,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2826,9 +2982,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id),
                 },
             );
 
@@ -4217,6 +4373,39 @@ mod tests {
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
 
+    #[test]
+    fn default_agent_alias_picks_smallest_enabled_and_is_deterministic() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let enabled = || AliasedAgentConfig {
+            enabled: true,
+            ..AliasedAgentConfig::default()
+        };
+
+        // No agents -> no default.
+        let mut config = Config::default();
+        assert_eq!(default_agent_alias(&config), None);
+
+        // Insertion order is deliberately not alphabetical; `config.agents` is
+        // a HashMap whose iteration order is randomized per process. The pick
+        // must still be the lexicographically smallest ENABLED alias so the
+        // Tools page seeds the same agent on every restart.
+        config.agents.insert("zeta".to_string(), enabled());
+        config.agents.insert("alpha".to_string(), enabled());
+        config.agents.insert("mid".to_string(), enabled());
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+
+        // A smaller-but-disabled alias is skipped (omission is not a grant).
+        config.agents.insert(
+            "aaa_disabled".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+    }
+
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
@@ -4483,6 +4672,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5031,6 +5221,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_gateway_uses_external_shutdown_sender() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        shutdown_tx
+            .send(true)
+            .expect("external daemon-owned shutdown sender should stay connected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway should return after external shutdown")
+            .expect("gateway task should not panic")
+            .expect("gateway shutdown should be graceful");
+
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
@@ -5068,6 +5320,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5154,6 +5407,7 @@ mod tests {
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5745,6 +5999,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5849,6 +6104,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5968,6 +6224,7 @@ mod tests {
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6068,6 +6325,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6186,6 +6444,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6270,6 +6529,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6359,6 +6619,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6455,6 +6716,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6547,6 +6809,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -6691,6 +6954,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -7525,6 +7789,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -7610,6 +7875,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -7769,6 +8035,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),

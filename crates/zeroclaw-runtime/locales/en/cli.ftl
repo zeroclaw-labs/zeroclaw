@@ -120,8 +120,8 @@ cli-cron-update-about = Update one or more fields of an existing scheduled task
 cli-cron-pause-about = Pause a scheduled task
 cli-cron-resume-about = Resume a paused task
 
-cli-auth-login-about = Login with OAuth (OpenAI Codex or Gemini)
-cli-auth-refresh-about = Refresh OpenAI Codex access token using refresh token
+cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
 cli-auth-list-about = List auth profiles
@@ -415,10 +415,16 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-doctor-systemd-linger-enabled = systemd user lingering enabled
+cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+
+# Service lifecycle warnings.
+cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -441,6 +447,14 @@ cli-skills-tags = Tags:  {$tags}
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.
+cli-sop-pending-none = No SOP runs waiting for approval.
+cli-sop-pending-header = SOP runs waiting for approval:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+# gateway WebSocket SOP approval error frames (UI-surfaced)
+cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
+cli-sop-ws-resolve-failed = sop resolve failed: {$error}
+cli-sop-ws-engine-lock-poisoned = SOP engine lock poisoned
+cli-sop-ws-subsystem-disabled = SOP subsystem not enabled
 cli-sop-create-hint = {"  "}Create one: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}then add SOP.toml and SOP.md
 cli-sop-loaded-header = Loaded SOPs ({$count}):
@@ -612,6 +626,9 @@ cli-agent-not-created = Your agent was not created — and nothing on disk was c
 cli-onboard-deprecated = `zeroclaw onboard` is deprecated — use `zeroclaw quickstart`.
 cli-otp-initialized = Initialized OTP secret for ZeroClaw.
 cli-otp-enrollment-uri = Enrollment URI: {$uri}
+cli-otp-received = {"  "}✓ OTP received
+cli-secret-captured = {"  "}● Value captured — press Enter to save
+cli-secret-received = {"  "}✓ Secret received
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -704,7 +721,13 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -744,6 +767,16 @@ cli-auth-active-for = Active profile for {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
+cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-xai-device-code-started = xAI device-code login started.
+cli-auth-oauth-visit = Visit: {$uri}
+cli-auth-oauth-code = Code:  {$code}
+cli-auth-oauth-fast-link = Fast link: {$uri}
+cli-auth-xai-open-oauth-url = Open this xAI OAuth URL in your browser and authorize access:
+cli-auth-callback-capture-failed = Callback capture failed: {$error}
+cli-auth-run-paste-redirect = Run `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.
+cli-auth-paste-redirect-requires-input = paste-redirect requires the redirect URL or OAuth code
 
 # ── locales fetch ──
 cli-locales-fetched = {"  "}fetched {$name} -> {$path}
@@ -764,7 +797,10 @@ cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 # ── update (zeroclaw update) ──
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
-cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.
+cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.
+cli-update-available = Update available: v{$current} -> v{$latest}
+cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
+cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
@@ -782,6 +818,10 @@ cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
 
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
+
 # ── Agent turn-engine user-visible markers (#7415) ────────────────────
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
@@ -791,6 +831,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Breadcrumb injected into history where older turns were dropped to fit the
+# context budget; user-visible across channels, WS, RPC, ACP.
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+# Reason carried on every history_trimmed event (WS, SSE, ACP).
+history-trim-reason-budget = context token budget exceeded
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
@@ -826,6 +871,7 @@ cli-alias-delete-refused-hint = delete refused — resolve the hard references f
 cli-alias-not-configured = {$path} is not configured
 cli-alias-delete-failed = delete failed: {$error}
 cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-create-reserved-default = the `default` agent is reserved and cannot be created
 cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
 cli-alias-rename-invalid = invalid new alias: {$message}
 cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
