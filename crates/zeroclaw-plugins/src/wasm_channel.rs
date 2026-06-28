@@ -15,6 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use wasmtime::Store;
@@ -33,6 +34,18 @@ pub struct WasmChannel {
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
+    poll_healthy: Arc<AtomicBool>,
+}
+
+/// Whether the listen loop's last `poll-message` did not trap. A channel whose
+/// poll bridge is trapping is reported unhealthy even when the plugin exposes no
+/// `health-check` export, so a broken plugin cannot masquerade as idle forever.
+fn poll_health_ok(flag: &AtomicBool) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+fn mark_poll_healthy(flag: &AtomicBool, healthy: bool) {
+    flag.store(healthy, Ordering::Relaxed);
 }
 
 impl Attributable for WasmChannel {
@@ -112,6 +125,7 @@ impl WasmChannel {
             cached_self_handle,
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
+            poll_healthy: Arc::new(AtomicBool::new(true)),
         })
     }
 }
@@ -204,6 +218,7 @@ impl Channel for WasmChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         let channel_name = self.alias.clone();
         let state = Arc::clone(&self.state);
+        let poll_healthy = Arc::clone(&self.poll_healthy);
         zeroclaw_spawn::spawn!(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
             const MAX_BACKOFF: Duration = Duration::from_millis(500);
@@ -216,11 +231,10 @@ impl Channel for WasmChannel {
                         .zeroclaw_plugin_channel()
                         .call_poll_message(store)
                         .await
-                        .ok()
-                        .flatten()
                 };
                 match polled {
-                    Some(wit_msg) => {
+                    Ok(Some(wit_msg)) => {
+                        mark_poll_healthy(&poll_healthy, true);
                         backoff = INITIAL_BACKOFF;
                         if tx
                             .send(from_wit_inbound(wit_msg, &channel_name))
@@ -230,7 +244,26 @@ impl Channel for WasmChannel {
                             break;
                         }
                     }
-                    None => {
+                    Ok(None) => {
+                        mark_poll_healthy(&poll_healthy, true);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                    Err(e) => {
+                        mark_poll_healthy(&poll_healthy, false);
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Inbound
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_alias": channel_name,
+                                "error": format!("{e:#}"),
+                            })),
+                            "channel plugin poll-message trapped; backing off"
+                        );
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                     }
@@ -241,6 +274,9 @@ impl Channel for WasmChannel {
     }
 
     async fn health_check(&self) -> bool {
+        if !poll_health_ok(&self.poll_healthy) {
+            return false;
+        }
         if !self
             .capabilities
             .contains(ChannelCapabilities::HEALTH_CHECK)
@@ -677,5 +713,20 @@ mod tests {
         let caps = ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SEND_DRAFT;
         assert!(caps.contains(ChannelCapabilities::HEALTH_CHECK));
         assert!(!caps.contains(ChannelCapabilities::PIN_MESSAGE));
+    }
+
+    #[test]
+    fn poll_trap_marks_channel_unhealthy() {
+        let flag = AtomicBool::new(true);
+        assert!(poll_health_ok(&flag), "starts healthy");
+
+        // A trapping poll clears the flag; a broken plugin can no longer look
+        // like a quiet, idle one.
+        mark_poll_healthy(&flag, false);
+        assert!(!poll_health_ok(&flag), "trap surfaces as unhealthy");
+
+        // A subsequent successful poll clears the condition.
+        mark_poll_healthy(&flag, true);
+        assert!(poll_health_ok(&flag), "recovers after a clean poll");
     }
 }
