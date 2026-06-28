@@ -49,10 +49,14 @@ pub enum TaskStatus {
 /// Lifecycle, ownership, route, principal, timestamps, and terminal state stay on
 /// [`TaskRecord`]. This record owns only goal-specific state that has no meaning
 /// for delegates/subagents.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalTaskRecord {
     pub task_id: String,
     pub objective: String,
+    #[serde(default)]
+    pub effective_token_limit: Option<u64>,
+    #[serde(default)]
+    pub effective_cost_limit_usd: Option<f64>,
 }
 
 impl TaskStatus {
@@ -204,5 +208,17 @@ mod tests {
         assert!(rec.parent_id.is_none());
         assert!(rec.originator_route.is_none());
         assert!(rec.principal_id.is_none()); // EPIC-D attribution not yet stamped; absent
+    }
+
+    #[test]
+    fn goal_task_loads_without_effective_limits() {
+        let legacy = r#"{
+            "task_id": "goal-1",
+            "objective": "ship goal mode"
+        }"#;
+        let rec: GoalTaskRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.task_id, "goal-1");
+        assert!(rec.effective_token_limit.is_none());
+        assert!(rec.effective_cost_limit_usd.is_none());
     }
 }

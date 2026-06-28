@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::authority::is_authoritative;
 use super::task_registry::{GoalTaskRecord, TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 1;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 2;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -120,6 +120,22 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         )
         .context("apply control-plane schema v1")?;
     }
+    if version < 2 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "effective_token_limit",
+            "ALTER TABLE goal_tasks ADD COLUMN effective_token_limit INTEGER",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "effective_cost_limit_usd",
+            "ALTER TABLE goal_tasks ADD COLUMN effective_cost_limit_usd REAL",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 2;")
+            .context("mark control-plane schema v2")?;
+    }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -131,6 +147,26 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             ),
             "control-plane DB was created by a newer schema version"
         );
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("inspect {table} columns"))?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("query {table} columns"))?;
+    let exists = rows.any(|name| matches!(name, Ok(name) if name == column));
+    if !exists {
+        conn.execute_batch(alter_sql)
+            .with_context(|| format!("add {table}.{column}"))?;
     }
     Ok(())
 }
@@ -197,6 +233,10 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
     Ok(GoalTaskRecord {
         task_id: row.get("task_id")?,
         objective: row.get("objective")?,
+        effective_token_limit: row
+            .get::<_, Option<i64>>("effective_token_limit")?
+            .map(|value| value as u64),
+        effective_cost_limit_usd: row.get("effective_cost_limit_usd")?,
     })
 }
 
@@ -341,10 +381,16 @@ impl TaskRegistry for SqliteTaskStore {
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO goal_tasks (task_id, objective)
-             VALUES (?1, ?2)
+            "INSERT INTO goal_tasks
+                (task_id, objective, effective_token_limit, effective_cost_limit_usd)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(task_id) DO NOTHING",
-            params![rec.task_id, rec.objective],
+            params![
+                rec.task_id,
+                rec.objective,
+                rec.effective_token_limit.map(|value| value as i64),
+                rec.effective_cost_limit_usd,
+            ],
         )
         .context("insert goal task record")?;
         Ok(())
@@ -353,7 +399,8 @@ impl TaskRegistry for SqliteTaskStore {
     async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT task_id, objective FROM goal_tasks WHERE task_id = ?1",
+            "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd
+             FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
         )
@@ -458,6 +505,8 @@ mod tests {
         s.create_goal_task(GoalTaskRecord {
             task_id: "goal-1".into(),
             objective: "ship goal mode".into(),
+            effective_token_limit: Some(10_000),
+            effective_cost_limit_usd: Some(1.25),
         })
         .await
         .unwrap();
@@ -469,6 +518,8 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Paused);
         assert_eq!(goal.task_id, task.id);
         assert_eq!(goal.objective, "ship goal mode");
+        assert_eq!(goal.effective_token_limit, Some(10_000));
+        assert_eq!(goal.effective_cost_limit_usd, Some(1.25));
     }
 
     #[tokio::test]
@@ -478,6 +529,8 @@ mod tests {
             .create_goal_task(GoalTaskRecord {
                 task_id: "missing".into(),
                 objective: "orphan objective".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
             })
             .await
             .unwrap_err();

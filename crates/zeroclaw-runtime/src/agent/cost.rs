@@ -157,6 +157,9 @@ pub struct ToolLoopCostTrackingContext {
     /// Alias of the agent driving this turn. Stamped onto persisted
     /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
     pub agent_alias: Option<String>,
+    /// Active durable goal task id. Stamped onto persisted `CostRecord`s so
+    /// goal usage is derived from the canonical cost ledger.
+    pub goal_task_id: Option<String>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -169,6 +172,7 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing,
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
+            goal_task_id: None,
         }
     }
 
@@ -184,6 +188,7 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing: Arc::new(ModelProviderPricing::new()),
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
+            goal_task_id: None,
         }
     }
 
@@ -192,6 +197,14 @@ impl ToolLoopCostTrackingContext {
     #[must_use]
     pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
         self.agent_alias = Some(agent_alias.into());
+        self
+    }
+
+    /// Attach an active goal task id so subsequent
+    /// `record_tool_loop_cost_usage` calls stamp ledger rows with it.
+    #[must_use]
+    pub fn with_goal_task_id(mut self, goal_task_id: impl Into<String>) -> Self {
+        self.goal_task_id = Some(goal_task_id.into());
         self
     }
 
@@ -329,8 +342,11 @@ pub fn record_tool_loop_cost_usage(
     }
 
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) =
-            tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+        && let Err(error) = tracker.record_usage_with_attribution(
+            cost_usage.clone(),
+            ctx.agent_alias.as_deref(),
+            ctx.goal_task_id.as_deref(),
+        )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
@@ -770,5 +786,48 @@ mod tests {
         assert_eq!(recorded.input_tokens, 5_000);
         assert_eq!(recorded.output_tokens, 200);
         assert!((recorded.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_stamps_active_goal_task_id() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::CostConfig::default();
+        config.track_per_agent = true;
+        let tracker = Arc::new(CostTracker::new(config, workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-provider".to_string(),
+                HashMap::from([
+                    ("mock-model.input".to_string(), 1.0),
+                    ("mock-model.output".to_string(), 2.0),
+                ]),
+            )])),
+        )
+        .with_agent_alias("agent-a")
+        .with_goal_task_id("goal-a");
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            cached_input_tokens: None,
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("mock-provider", "mock-model", &usage)
+            }))
+            .expect("cost usage");
+
+        let summary = tracker.get_summary_for_goal("goal-a").unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_500);
+        assert_eq!(
+            summary
+                .by_agent
+                .get("agent-a")
+                .map(|stats| stats.request_count),
+            Some(1)
+        );
     }
 }

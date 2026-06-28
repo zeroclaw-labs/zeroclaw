@@ -136,6 +136,11 @@ pub struct CostRecord {
     /// attribution, or when `[cost].track_per_agent = false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
+    /// Goal task id that incurred this cost. This is an attribution key into
+    /// the runtime control-plane task registry, not a duplicate lifecycle
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_task_id: Option<String>,
 }
 
 impl CostRecord {
@@ -146,6 +151,7 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias: None,
+            goal_task_id: None,
         }
     }
 
@@ -160,6 +166,23 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias,
+            goal_task_id: None,
+        }
+    }
+
+    /// Create a new cost record attributed to an agent and/or active goal.
+    pub fn with_attribution(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        goal_task_id: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
+            goal_task_id,
         }
     }
 }
@@ -333,7 +356,24 @@ mod tests {
         let record = CostRecord::new("session-123", usage);
 
         assert_eq!(record.session_id, "session-123");
+        assert!(record.goal_task_id.is_none());
         assert!(!record.id.is_empty());
         assert_eq!(record.usage.model, "test/model");
+    }
+
+    #[test]
+    fn cost_record_goal_attribution_roundtrips() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record = CostRecord::with_attribution(
+            "session-123",
+            Some("agent-a".into()),
+            Some("goal-123".into()),
+            usage,
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.agent_alias.as_deref(), Some("agent-a"));
+        assert_eq!(parsed.goal_task_id.as_deref(), Some("goal-123"));
     }
 }
