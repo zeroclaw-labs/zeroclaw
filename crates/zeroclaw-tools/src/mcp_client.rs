@@ -39,13 +39,16 @@ const RECONNECT_BACKOFF_MS: u64 = 500;
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
 /// reconnect-after-stale-session path in [`McpServer::call_tool`].
-async fn handshake(transport: &mut dyn McpTransportConn, server_name: &str) -> Result<()> {
+async fn handshake(
+    transport: &mut dyn McpTransportConn,
+    server_name: &str,
+) -> Result<McpServerCapabilities> {
     let init_req = JsonRpcRequest::new(
         1,
         "initialize",
         json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": { "resources": {}, "prompts": {} },
             "clientInfo": {
                 "name": "zeroclaw",
                 "version": env!("CARGO_PKG_VERSION")
@@ -71,12 +74,49 @@ async fn handshake(transport: &mut dyn McpTransportConn, server_name: &str) -> R
         );
     }
 
+    // Parse server-advertised capabilities from the initialize result.
+    let capabilities = init_resp
+        .result
+        .as_ref()
+        .map(McpServerCapabilities::from_init_result)
+        .unwrap_or_default();
+
     // Notify the server the client is initialized (notifications expect no
     // response). Best effort — ignore errors.
     let notif = JsonRpcRequest::notification("notifications/initialized", json!({}));
     let _ = transport.send_and_recv(&notif).await;
 
-    Ok(())
+    Ok(capabilities)
+}
+
+/// Server-advertised MCP capabilities parsed from the `initialize` result.
+/// Sub-flags `subscribe` / `listChanged` are captured but currently unused
+/// (reserved for a future subscriptions spec).
+#[derive(Debug, Clone, Default)]
+pub struct McpServerCapabilities {
+    resources: bool,
+    prompts: bool,
+}
+
+impl McpServerCapabilities {
+    /// Parse from the raw `initialize` result value. A capability counts as
+    /// supported when its object key is present under `capabilities`.
+    pub fn from_init_result(result: &serde_json::Value) -> Self {
+        let caps = result.get("capabilities");
+        let has = |key: &str| caps.and_then(|c| c.get(key)).is_some();
+        Self {
+            resources: has("resources"),
+            prompts: has("prompts"),
+        }
+    }
+
+    pub fn supports_resources(&self) -> bool {
+        self.resources
+    }
+
+    pub fn supports_prompts(&self) -> bool {
+        self.prompts
+    }
 }
 
 // ── Internal server state ──────────────────────────────────────────────────
@@ -89,6 +129,7 @@ struct McpServerInner {
     #[cfg(not(target_has_atomic = "64"))]
     next_id: AtomicU32,
     tools: Vec<McpToolDef>,
+    capabilities: McpServerCapabilities,
 }
 
 // ── McpServer ──────────────────────────────────────────────────────────────
@@ -111,7 +152,7 @@ impl McpServer {
         })?;
 
         // Initialize handshake (initialize + initialized notification)
-        handshake(transport.as_mut(), &config.name).await?;
+        let capabilities = handshake(transport.as_mut(), &config.name).await?;
 
         // Fetch available tools
         let id = 2u64;
@@ -155,6 +196,7 @@ impl McpServer {
             #[cfg(not(target_has_atomic = "64"))]
             next_id: AtomicU32::new(3), // Start at 3 since we used 1 and 2
             tools: tool_list.tools,
+            capabilities,
         };
 
         ::zeroclaw_log::record!(
@@ -268,13 +310,14 @@ impl McpServer {
                                 "MCP server `{server_name}` failed to reset transport during reconnect"
                             )
                         })?;
-                        handshake(inner.transport.as_mut(), &server_name)
+                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
                             .await
                             .with_context(|| {
                                 format!(
                                     "MCP server `{server_name}` failed to re-handshake during reconnect"
                                 )
                             })?;
+                        inner.capabilities = refreshed;
                         continue;
                     }
                     return Err(err).with_context(|| {
@@ -602,6 +645,7 @@ mod tests {
             #[cfg(not(target_has_atomic = "64"))]
             next_id: AtomicU32::new(3),
             tools: vec![],
+            capabilities: McpServerCapabilities::default(),
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -791,6 +835,37 @@ done
             sleep(Duration::from_millis(20)).await;
         }
         panic!("stdio MCP child process {child_pid} survived after registry drop");
+    }
+
+    // ── Server capabilities parsing ──────────────────────────────────────────
+
+    #[test]
+    fn capabilities_parse_from_init_result() {
+        let init = serde_json::json!({
+            "capabilities": {
+                "resources": { "subscribe": true, "listChanged": false },
+                "prompts": { "listChanged": true }
+            }
+        });
+        let caps = McpServerCapabilities::from_init_result(&init);
+        assert!(caps.supports_resources());
+        assert!(caps.supports_prompts());
+    }
+
+    #[test]
+    fn capabilities_absent_means_unsupported() {
+        let init = serde_json::json!({ "capabilities": {} });
+        let caps = McpServerCapabilities::from_init_result(&init);
+        assert!(!caps.supports_resources());
+        assert!(!caps.supports_prompts());
+    }
+
+    #[test]
+    fn capabilities_missing_object_is_unsupported() {
+        let init = serde_json::json!({});
+        let caps = McpServerCapabilities::from_init_result(&init);
+        assert!(!caps.supports_resources());
+        assert!(!caps.supports_prompts());
     }
 
     // ── Reconnect on stale session (streamable HTTP) ───────────────────────
