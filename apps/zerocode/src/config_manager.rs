@@ -183,6 +183,24 @@ fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
         .unwrap_or_default()
 }
 
+fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
+    match kind {
+        PropKind::Integer => value
+            .parse::<i64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-integer"),
+        PropKind::Float => value
+            .parse::<f64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-float"),
+        _ => None,
+    }
+}
+
+fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<String> {
+    scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
+}
+
 /// Joined up/down display chords for list navigation footers.
 fn nav_keys() -> String {
     use crate::keymap::ConfigTabAction as A;
@@ -458,9 +476,9 @@ impl App {
             return;
         }
 
-        // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
+        // Unified bottom-left action hint, matching the Dashboard/Logs panes.
         frame.render_widget(
-            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
+            Paragraph::new(Span::styled(self.bottom_hint(), theme::dim_style())),
             chunks[2],
         );
 
@@ -519,6 +537,113 @@ impl App {
                 let fi = *field_idx;
                 self.draw_field_edit(frame, right, &bc, fi);
             }
+        }
+    }
+
+    fn bottom_hint(&self) -> String {
+        use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
+
+        let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
+
+        match &self.screen {
+            Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
+                if self.filter.is_some() {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}  {}={}  {}={}  ?={}",
+                        nav_keys(),
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::Back),
+                        crate::i18n::t("zc-config-footer-action-clear-filter"),
+                        help,
+                    )
+                } else if self.is_composite_tab() {
+                    match self.tab_names.get(self.active_tab) {
+                        Some(ConfigTab::Personality) if self.personality_active_file.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-files"),
+                            )
+                        }
+                        Some(ConfigTab::Skills) if self.skills_active.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-skills"),
+                            )
+                        }
+                        _ => default(),
+                    }
+                } else {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}={}  {}={}  ?={}",
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::DeleteRow),
+                        crate::i18n::t("zc-config-footer-action-reset"),
+                        help,
+                    )
+                }
+            }
+            Screen::AliasCreate { .. } => {
+                format!(
+                    " {}={}  {}={}",
+                    editor_key(E::Confirm),
+                    crate::i18n::t("zc-config-footer-action-create"),
+                    editor_key(E::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                )
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                if self.is_select_edit() {
+                    if self.filter.is_some() {
+                        let help = crate::i18n::t("zc-config-footer-action-help");
+                        format!(
+                            " {}  {}={}  {}={}  ?={}",
+                            nav_keys(),
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-clear-filter"),
+                            help,
+                        )
+                    } else {
+                        format!(
+                            " {}={}  {}={}",
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-cancel"),
+                        )
+                    }
+                } else if self.fields[*field_idx].kind == PropKind::StringArray {
+                    format!(
+                        " {}={}  {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-new-line"),
+                        editor_key(E::Save),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                } else {
+                    format!(
+                        " {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                }
+            }
+            _ => default(),
         }
     }
 
@@ -3056,6 +3181,12 @@ impl App {
                 } = &self.screen
                 {
                     let field = &self.fields[*field_idx];
+                    if let Some(status) =
+                        scalar_validation_status(field.kind, &self.edit_buf, &field.path)
+                    {
+                        self.status_msg = Some(status);
+                        return Ok(());
+                    }
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
                     let prefix = prefix.clone();
@@ -3427,17 +3558,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_list(
@@ -3550,17 +3671,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     /// Costs-tab body: the resource rate sheets under
@@ -3605,7 +3716,7 @@ impl App {
         self.last_main_area = r.main;
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
-        self.draw_footer(frame, r, "?=help");
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -3632,14 +3743,7 @@ impl App {
         .block(theme::panel_block(" Alias name "));
         frame.render_widget(input, r.main);
 
-        let footer = format!(
-            "{}={}  {}={}",
-            editor_key(crate::keymap::ConfigEditorAction::Confirm),
-            crate::i18n::t("zc-config-footer-action-create"),
-            editor_key(crate::keymap::ConfigEditorAction::Cancel),
-            crate::i18n::t("zc-config-footer-action-cancel"),
-        );
-        self.draw_footer(frame, r, &footer);
+        self.draw_status(frame, r);
     }
 
     fn draw_field_list(
@@ -3799,17 +3903,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=edit  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     // ── Composite tab draw methods ──────────────────────────────
@@ -3849,14 +3943,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-files"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // File picker mode.
             frame.render_widget(
@@ -3911,8 +3998,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -3950,14 +4036,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-skills"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // Skill picker mode.
             frame.render_widget(
@@ -4008,8 +4087,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -4081,17 +4159,7 @@ impl App {
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
-            let hints = if self.filter.is_some() {
-                format!(
-                    "{}  {}=save  {}=clear filter",
-                    nav_keys(),
-                    tab_key(crate::keymap::ConfigTabAction::Enter),
-                    tab_key(crate::keymap::ConfigTabAction::Back),
-                )
-            } else {
-                "?=help".to_string()
-            };
-            self.draw_footer(frame, r, &hints);
+            self.draw_status(frame, r);
         } else {
             // Text input (masked for secrets) — help text always visible.
             frame.render_widget(
@@ -4135,16 +4203,7 @@ impl App {
                     ))),
                     r.main,
                 );
-                let footer = format!(
-                    "{}={}  {}={}  {}={}",
-                    editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                    crate::i18n::t("zc-config-footer-action-new-line"),
-                    editor_key(crate::keymap::ConfigEditorAction::Save),
-                    crate::i18n::t("zc-config-footer-action-save"),
-                    editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                    crate::i18n::t("zc-config-footer-action-cancel"),
-                );
-                self.draw_footer(frame, r, &footer);
+                self.draw_status(frame, r);
                 return;
             }
 
@@ -4162,21 +4221,13 @@ impl App {
 
             frame.render_widget(input, r.main);
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-cancel"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
-    fn draw_footer(&self, frame: &mut Frame, r: Regions, _hints: &str) {
-        // The help indicator is unified at the pane bottom (draw_into); per-screen
-        // hint strings are no longer rendered here. Only the transient status
-        // message remains inline.
+    fn draw_status(&self, frame: &mut Frame, r: Regions) {
+        // The action hint is unified at the pane bottom; only transient status
+        // messages render inline with the active detail pane.
         if let Some(msg) = &self.status_msg {
             frame.render_widget(
                 Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
@@ -4701,6 +4752,24 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_scalar_validation_rejects_invalid_integer() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Integer, "20a"),
+            Some("zc-config-status-invalid-integer")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Integer, "20"), None);
+    }
+
+    #[test]
+    fn config_scalar_validation_rejects_invalid_float() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Float, "0.7x"),
+            Some("zc-config-status-invalid-float")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+    }
 
     #[test]
     fn keyboard_enhancement_flags_disambiguate_modified_enter() {

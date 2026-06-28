@@ -2,6 +2,8 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,6 +22,20 @@ pub struct HttpRequestTool {
     allowed_private_hosts: Vec<String>,
     config_path: Option<PathBuf>,
     secrets_encrypt: bool,
+}
+
+#[derive(Debug)]
+struct ValidatedHttpRequestTarget {
+    url: String,
+    host: String,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+struct HttpRequestUrlPolicy {
+    url: String,
+    host: String,
+    port: u16,
+    private_resolution_allowed: bool,
 }
 
 impl HttpRequestTool {
@@ -76,7 +92,12 @@ impl HttpRequestTool {
         })
     }
 
+    #[cfg(test)]
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
+        Ok(self.validate_url_policy(raw_url)?.url)
+    }
+
+    fn validate_url_policy(&self, raw_url: &str) -> anyhow::Result<HttpRequestUrlPolicy> {
         let url = raw_url.trim();
 
         if url.is_empty() {
@@ -98,6 +119,14 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
+        if host
+            .parse::<IpAddr>()
+            .is_ok_and(domain_guard::is_cloud_metadata_ip)
+        {
+            anyhow::bail!("Blocked cloud metadata host: {host}");
+        }
+        let port = extract_port(url)?;
+
         let private_host = domain_guard::is_private_or_local_host(&host);
         let private_host_explicitly_allowed = private_host
             && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
@@ -106,15 +135,60 @@ impl HttpRequestTool {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if private_host_explicitly_allowed {
-            return Ok(url.to_string());
-        }
-
-        if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
+        if !private_host_explicitly_allowed
+            && !domain_guard::host_matches_allowlist(&host, &self.allowed_domains)
+        {
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
-        Ok(url.to_string())
+        let private_resolution_allowed = self.allow_private_hosts
+            || domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+
+        Ok(HttpRequestUrlPolicy {
+            url: url.to_string(),
+            host,
+            port,
+            private_resolution_allowed,
+        })
+    }
+
+    async fn validate_request_target(
+        &self,
+        raw_url: &str,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget> {
+        self.validate_request_target_with_resolver(raw_url, resolve_host_for_request)
+            .await
+    }
+
+    async fn validate_request_target_with_resolver<F, Fut>(
+        &self,
+        raw_url: &str,
+        resolve_host: F,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<SocketAddr>>>,
+    {
+        let policy = self.validate_url_policy(raw_url)?;
+        let resolved_addrs = if let Ok(ip) = policy.host.parse::<IpAddr>() {
+            vec![SocketAddr::new(ip, policy.port)]
+        } else {
+            resolve_host(policy.host.clone(), policy.port).await?
+        };
+        validate_resolved_ips_for_ssrf(
+            &policy.host,
+            policy.private_resolution_allowed,
+            &resolved_addrs
+                .iter()
+                .map(|addr| addr.ip())
+                .collect::<Vec<_>>(),
+        )?;
+
+        Ok(ValidatedHttpRequestTarget {
+            url: policy.url,
+            host: policy.host,
+            resolved_addrs,
+        })
     }
 
     fn validate_method(&self, method: &str) -> anyhow::Result<reqwest::Method> {
@@ -255,7 +329,7 @@ impl HttpRequestTool {
 
     async fn execute_request(
         &self,
-        url: &str,
+        target: &ValidatedHttpRequestTarget,
         method: reqwest::Method,
         headers: HeaderMap,
         body: Option<&str>,
@@ -277,9 +351,14 @@ impl HttpRequestTool {
             .redirect(reqwest::redirect::Policy::none());
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
+        let builder = if target.host.parse::<IpAddr>().is_ok() {
+            builder
+        } else {
+            builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
+        };
         let client = builder.build()?;
 
-        let mut request = client.request(method, url).headers(headers);
+        let mut request = client.request(method, &target.url).headers(headers);
 
         if let Some(body_str) = body {
             request = request.body(body_str.to_string());
@@ -388,7 +467,7 @@ impl Tool for HttpRequestTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        let url = match self.validate_url(url) {
+        let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -429,7 +508,7 @@ impl Tool for HttpRequestTool {
         }
 
         match self
-            .execute_request(&url, method, request_headers, body)
+            .execute_request(&target, method, request_headers, body)
             .await
         {
             Ok(response) => {
@@ -529,6 +608,40 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     }
 
     Ok(host)
+}
+
+fn extract_port(url: &str) -> anyhow::Result<u16> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+    parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a valid port"))
+}
+
+async fn resolve_host_for_request(host: String, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to resolve host '{host}': {e}")))?
+        .collect::<Vec<_>>();
+
+    if addrs.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    Ok(addrs)
+}
+
+fn validate_resolved_ips_for_ssrf(
+    host: &str,
+    private_resolution_allowed: bool,
+    ips: &[std::net::IpAddr],
+) -> anyhow::Result<()> {
+    if private_resolution_allowed {
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+    } else {
+        domain_guard::validate_resolved_ips_are_public(host, ips)
+    }
 }
 
 #[cfg(test)]
@@ -1245,6 +1358,189 @@ api_token = "Bearer from-secret"
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_checks_dns_for_allowed_public_host() {
+        let tool = test_tool(vec!["example.com"]);
+        let called = std::cell::Cell::new(false);
+
+        let got = tool
+            .validate_request_target_with_resolver("https://api.example.com/v1", |host, port| {
+                called.set(true);
+                assert_eq!(host, "api.example.com");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(got.url, "https://api.example.com/v1");
+        assert_eq!(got.host, "api.example.com");
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                443
+            )]
+        );
+        assert!(
+            called.get(),
+            "allowed public host must still pass DNS SSRF validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_allows_private_resolution_for_private_carveout() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["api.example.com"]);
+
+        let got = tool
+            .validate_request_target_with_resolver("https://api.example.com/v1", |host, port| {
+                assert_eq!(host, "api.example.com");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5)),
+                443
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_checks_metadata_for_explicit_private_host() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["device.local"]);
+
+        let err = tool
+            .validate_request_target_with_resolver("https://device.local/status", |host, port| {
+                assert_eq!(host, "device.local");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_blocks_ec2_ipv6_metadata_for_private_carveout() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["device.local"]);
+
+        let err = tool
+            .validate_request_target_with_resolver("https://device.local/status", |host, port| {
+                assert_eq!(host, "device.local");
+                assert_eq!(port, 443);
+                async move {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V6("fd00:ec2::254".parse().unwrap()),
+                        port,
+                    )])
+                }
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_uses_direct_ip_without_dns_lookup() {
+        let tool = test_tool_with_private(vec!["*"], true);
+
+        let got = tool
+            .validate_request_target_with_resolver(
+                "http://10.0.0.1:8080/status",
+                |_host, _port| async {
+                    unreachable!("direct IP literals should not use DNS resolution")
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                8080
+            )]
+        );
+    }
+
+    #[test]
+    fn validate_resolved_private_ip_is_blocked_by_default() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
+        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_private_ip_is_allowed_with_private_carveout() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
+        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips).is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_metadata_ip_is_blocked_even_with_private_carveout() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 169, 254,
+        ))];
+        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_literal_is_blocked_even_when_private_hosts_are_allowed() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        let err = tool
+            .validate_url("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("metadata"), "unexpected error: {err}");
     }
 
     // ── IPv6 end-to-end coverage ──────────────────────────────

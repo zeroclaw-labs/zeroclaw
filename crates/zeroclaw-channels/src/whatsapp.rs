@@ -485,6 +485,16 @@ impl Channel for WhatsAppChannel {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing indicator not wired for the WhatsApp Cloud API path.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing indicator not wired for the WhatsApp Cloud API path.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

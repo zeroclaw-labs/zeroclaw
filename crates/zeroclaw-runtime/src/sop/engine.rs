@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
-use super::store::{InMemoryRunStore, PersistedRun, SopRunStore};
+use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
     SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
@@ -433,48 +433,72 @@ impl SopEngine {
     }
 
     /// Approve a step that is waiting for approval, transitioning back to Running.
+    /// Resume a deterministic SOP run paused at a checkpoint. This owns ONLY the
+    /// `PausedCheckpoint` resume; clearing a `WaitingApproval` gate is the
+    /// out-of-band `resolve_gate` chokepoint (EPIC C) - the single audited
+    /// gate-clear path. The `sop_approve` tool routes here for checkpoints and to
+    /// `resolve_gate` for approval gates.
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
-        let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"run_id": run_id})),
-                "SOP engine: active run not found"
-            );
-            anyhow::Error::msg(format!("Active run not found: {run_id}"))
-        })?;
+        let status = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?
+            .status;
+
+        if status != SopRunStatus::PausedCheckpoint {
+            bail!("Run {run_id} is not paused at a checkpoint (status: {status})");
+        }
 
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
         // completed and its output (or the previous step's) is piped forward.
-        if run.status == SopRunStatus::PausedCheckpoint {
-            let piped = run
-                .step_results
-                .last()
-                .map(|r| serde_json::Value::String(r.output.clone()))
-                .unwrap_or(serde_json::Value::Null);
-            run.status = SopRunStatus::Running;
-            run.waiting_since = None;
-            return self.advance_deterministic_step(run_id, piped, None);
-        }
-
-        if run.status != SopRunStatus::WaitingApproval {
-            bail!(
-                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {})",
-                run.status
-            );
-        }
-
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let piped = run
+            .step_results
+            .last()
+            .map(|r| serde_json::Value::String(r.output.clone()))
+            .unwrap_or(serde_json::Value::Null);
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
+        self.advance_deterministic_step(run_id, piped, None)
+    }
+
+    /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
+    /// action for the current step, and persist. Shared by `approve_step` (the
+    /// agent path) and `resolve_gate` (the out-of-band path) so the transition
+    /// lives in exactly one place. Caller guarantees the run is `WaitingApproval`.
+    ///
+    /// All-or-nothing: the SOP definition and current step are resolved (and
+    /// bounds-checked) BEFORE any in-memory mutation, so a definition removed or
+    /// shrunk mid-run returns `Err` with the gate left untouched (still
+    /// `WaitingApproval`, re-resolvable) rather than half-transitioned or panicking
+    /// on an out-of-range step index (which would poison the engine mutex).
+    pub(crate) fn clear_waiting_gate(&mut self, run_id: &str) -> Result<SopRunAction> {
+        let (sop_name, current_step) = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            (run.sop_name.clone(), run.current_step)
+        };
 
         let sop = self
             .sops
             .iter()
-            .find(|s| s.name == run.sop_name)
+            .find(|s| s.name == sop_name)
             .ok_or_else(|| {
-                let sop_name = run.sop_name.clone();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -482,12 +506,31 @@ impl SopEngine {
                         .with_attrs(::serde_json::json!({"sop_name": sop_name})),
                     "SOP engine: sop no longer loaded (definition removed mid-run)"
                 );
-                anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
+                anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded"))
             })?
             .clone();
 
-        let step_idx = (run.current_step - 1) as usize;
-        let step = sop.steps[step_idx].clone();
+        let step_idx = (current_step - 1) as usize;
+        let step = sop.steps.get(step_idx).cloned().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"sop_name": sop_name, "step": current_step})),
+                "SOP engine: step no longer exists (definition changed mid-run)"
+            );
+            anyhow::Error::msg(format!(
+                "SOP '{sop_name}' step {current_step} no longer exists (definition changed mid-run)"
+            ))
+        })?;
+
+        // The lookups succeeded; commit the transition.
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        run.status = SopRunStatus::Running;
+        run.waiting_since = None;
         let context = format_step_context(&sop, run, &step);
 
         self.persist_active(run_id);
@@ -854,18 +897,22 @@ impl SopEngine {
 
     // ── Approval timeout ──────────────────────────────────────────
 
-    /// Check all WaitingApproval runs for timeout. For Critical/High-priority SOPs,
-    /// auto-approve and return the resulting actions. Non-critical SOPs stay
-    /// in WaitingApproval indefinitely (or until explicitly approved/cancelled).
+    /// Apply the configured timeout action to every timed-out WaitingApproval run.
+    ///
+    /// FAIL-CLOSED (EPIC C): priority no longer decides fail-open vs fail-closed;
+    /// the typed `approval_timeout_action` does, uniformly. The default `Escalate`
+    /// re-surfaces the gate to the out-of-band approver and NEVER self-approves
+    /// (the old Critical/High auto-approve is gone; it is reachable only via the
+    /// explicit `AutoApprove` opt-in). Returns any actions produced (a `Cancel`
+    /// terminal action, or an `AutoApprove` resumed action); `Escalate` returns none.
     pub fn check_approval_timeouts(&mut self) -> Vec<SopRunAction> {
         let timeout_secs = self.config.approval_timeout_secs;
         if timeout_secs == 0 {
             return Vec::new();
         }
 
-        // Collect timed-out runs with their priority classification
-        // cooldown_elapsed(ts, secs) returns true when (now - ts) >= secs
-        let timed_out: Vec<(String, bool)> = self
+        // cooldown_elapsed(ts, secs) returns true when (now - ts) >= secs.
+        let timed_out: Vec<String> = self
             .active_runs
             .values()
             .filter(|r| r.status == SopRunStatus::WaitingApproval)
@@ -874,51 +921,44 @@ impl SopEngine {
                     .as_deref()
                     .is_some_and(|ts| cooldown_elapsed(ts, timeout_secs))
             })
-            .map(|r| {
-                let is_critical =
-                    self.sops
-                        .iter()
-                        .find(|s| s.name == r.sop_name)
-                        .is_some_and(|s| {
-                            matches!(s.priority, SopPriority::Critical | SopPriority::High)
-                        });
-                (r.run_id.clone(), is_critical)
-            })
+            .map(|r| r.run_id.clone())
             .collect();
 
+        let action_cfg = self.config.approval_timeout_action;
         let mut actions = Vec::new();
-        for (run_id, is_critical) in timed_out {
-            if is_critical {
-                // Auto-approve: Critical/High priority SOPs fall back to Auto on timeout
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"run_id": run_id})),
-                    "SOP run : approval timeout — auto-approving (critical/high priority)"
-                );
-                match self.approve_step(&run_id) {
-                    Ok(action) => actions.push(action),
-                    Err(e) => ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "run_id": run_id})
-                            ),
-                        "SOP run : auto-approve failed"
-                    ),
-                }
-            } else {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"run_id": run_id})),
-                    "SOP run : approval timeout — waiting indefinitely (non-critical)"
-                );
+        for run_id in timed_out {
+            if let Some(a) =
+                super::approval::timeout::apply_timeout_action(self, &run_id, action_cfg)
+            {
+                actions.push(a);
             }
         }
-
         actions
+    }
+
+    /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
+    /// open but the clock resets so it re-surfaces, not self-approves).
+    pub(crate) fn restamp_waiting(&mut self, run_id: &str) {
+        let restamped = match self.active_runs.get_mut(run_id) {
+            Some(run) => {
+                run.waiting_since = Some(now_iso8601());
+                true
+            }
+            None => false,
+        };
+        // Persist so the re-stamped clock survives a restart; otherwise an
+        // escalated gate would re-time-out immediately on the next boot.
+        if restamped {
+            self.persist_active(run_id);
+        }
+    }
+
+    /// The current step number of an active run (0 if absent). For ledger rows.
+    pub(crate) fn run_current_step(&self, run_id: &str) -> u32 {
+        self.active_runs
+            .get(run_id)
+            .map(|r| r.current_step)
+            .unwrap_or(0)
     }
 
     // ── Test helpers ──────────────────────────────────────────────
@@ -972,6 +1012,98 @@ impl SopEngine {
             },
         }
     }
+
+    // ── EPIC C: out-of-band approval plane ──────────────────────────
+
+    /// Read-only config access for the approval resolver.
+    pub(crate) fn config(&self) -> &SopConfig {
+        &self.config
+    }
+
+    /// Classify a run's approval gate for `resolve_gate` (idempotency + typed
+    /// not-found). `Running` (already approved) and terminal runs are
+    /// `AlreadyResolved`; an unknown run or a non-`WaitingApproval` active status
+    /// (e.g. a deterministic `PausedCheckpoint`, which `approve_step` owns) is
+    /// `NotApplicable`.
+    pub(crate) fn gate_state(&self, run_id: &str) -> GateState {
+        if let Some(run) = self.active_runs.get(run_id) {
+            match run.status {
+                SopRunStatus::WaitingApproval => GateState::Waiting {
+                    step: run.current_step,
+                },
+                SopRunStatus::Running => GateState::AlreadyResolved,
+                _ => GateState::NotApplicable,
+            }
+        } else if self.finished_runs.iter().any(|r| r.run_id == run_id) {
+            GateState::AlreadyResolved
+        } else {
+            GateState::NotApplicable
+        }
+    }
+
+    /// Append an approval-ledger row via EPIC B's append-only event log. The store
+    /// assigns the monotonic seq.
+    ///
+    /// FAIL-LOUD: the `StoreError` is propagated, never swallowed, so the caller
+    /// can fail closed. The run-store gate ledger is the single audit of record
+    /// for gate resolutions (the legacy Memory approval audit was removed), so a
+    /// gate must not clear / deny / escalate / cancel unless its who/what/when row
+    /// is durably written first - matching the store's fail-loud, fail-closed
+    /// persistence contract. Callers append BEFORE mutating gate state.
+    pub(crate) fn record_gate_event(
+        &self,
+        entry: super::approval::GateLedgerEntry,
+    ) -> Result<(), StoreError> {
+        self.store
+            .append_event(&entry.into_event_record())
+            .map(|_| ())
+    }
+
+    /// Ordered event/ledger history for a run (from the durable store).
+    pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+        self.store.list_events(run_id)
+    }
+
+    /// Record the approval completion metric at the gate-clearing chokepoint, so
+    /// every principal (agent tool, CLI, gateway, WS, timeout) meters identically
+    /// and the live counters agree with `SopMetricsCollector::rebuild_from_persistence`.
+    /// `is_system` (the timeout principal) is metered as a timeout auto-approval;
+    /// any other principal is a human approval. No-op if the run is gone.
+    pub(crate) fn record_approval_metric(&self, run_id: &str, is_system: bool) {
+        let Some(run) = self.get_run(run_id) else {
+            return;
+        };
+        if is_system {
+            self.metrics
+                .record_timeout_auto_approve(&run.sop_name, &run.run_id);
+        } else {
+            self.metrics.record_approval(&run.sop_name, &run.run_id);
+        }
+    }
+
+    /// The single out-of-band gate-clearing entry point (EPIC C). All four
+    /// principals (agent tool, CLI, gateway, timeout tick) funnel through here.
+    /// Sibling of `approve_step` (which keeps the deterministic-checkpoint resume
+    /// path); the shared `WaitingApproval -> ExecuteStep` body is `clear_waiting_gate`.
+    pub fn resolve_gate(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::ResolveOutcome> {
+        super::approval::resolve::resolve_gate(self, run_id, decision, principal)
+    }
+}
+
+/// Classification of a run's approval-gate state (EPIC C `resolve_gate`).
+pub(crate) enum GateState {
+    /// Waiting on approval at this step number (resolvable).
+    Waiting { step: u32 },
+    /// Already resolved (running after approve, or terminal) - idempotent no-op.
+    AlreadyResolved,
+    /// Not a waiting-approval gate (unknown run, or a non-WaitingApproval status
+    /// such as a deterministic `PausedCheckpoint`, which `approve_step` owns).
+    NotApplicable,
 }
 
 // ── Trigger matching ────────────────────────────────────────────
@@ -1083,7 +1215,9 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
         }
         SopExecutionMode::StepByStep => true,
         SopExecutionMode::PriorityBased => match sop.priority {
-            SopPriority::Critical | SopPriority::High => false,
+            // [SEC-FLIP] Critical/High are the MOST dangerous runs, so they MUST
+            // gate (was `=> false`, an inversion that auto-ran the riskiest SOPs).
+            SopPriority::Critical | SopPriority::High => true,
             SopPriority::Normal | SopPriority::Low => {
                 // Supervised behavior for normal/low
                 step.number == 1
@@ -1233,7 +1367,25 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::types::SopExecutionMode;
+
+    /// Clear a WaitingApproval gate through the production out-of-band chokepoint
+    /// (a CLI principal), returning the resumed action. Mirrors what a real
+    /// `zeroclaw sop approve` does, replacing the old `approve_step` agent path.
+    fn approve_gate_cli(engine: &mut SopEngine, run_id: &str) -> SopRunAction {
+        match engine
+            .resolve_gate(
+                run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap()
+        {
+            ResolveOutcome::Resumed(action) => action,
+            other => panic!("expected Resumed, got {other:?}"),
+        }
+    }
 
     fn manual_event() -> SopEvent {
         SopEvent {
@@ -1849,7 +2001,7 @@ mod tests {
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
 
         // Approve step 1
-        let action = engine.approve_step(&run_id).unwrap();
+        let action = approve_gate_cli(&mut engine, &run_id);
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
 
         // Complete step 1, step 2 should also WaitApproval
@@ -1869,14 +2021,18 @@ mod tests {
     }
 
     #[test]
-    fn priority_based_critical_auto() {
+    fn priority_based_critical_gates() {
+        // [SEC-FLIP] Critical/High under PriorityBased now GATE (was auto-execute).
         let mut engine = engine_with_sops(vec![test_sop(
             "s1",
             SopExecutionMode::PriorityBased,
             SopPriority::Critical,
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
-        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "critical PriorityBased SOPs must gate, not auto-run"
+        );
     }
 
     #[test]
@@ -1918,7 +2074,7 @@ mod tests {
         assert_eq!(run.status, SopRunStatus::WaitingApproval);
 
         // Approve
-        let action = engine.approve_step(&run_id).unwrap();
+        let action = approve_gate_cli(&mut engine, &run_id);
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
 
         let run = engine.active_runs().get(&run_id).unwrap();
@@ -2047,27 +2203,123 @@ mod tests {
     // ── Approval timeout ─────────────────────────────────
 
     #[test]
-    fn timeout_auto_approves_critical() {
+    fn timeout_escalates_critical_no_self_approve() {
+        // [SEC-FLIP] Under the default fail-closed Escalate, a Critical/High SOP
+        // that times out is NO LONGER auto-approved: it stays WaitingApproval and a
+        // gate_escalated ledger row is recorded. (Was: timeout_auto_approves_critical.)
         let mut engine = SopEngine::new(SopConfig {
-            approval_timeout_secs: 1, // 1 second for test
+            approval_timeout_secs: 1,
             ..SopConfig::default()
         });
-        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Critical);
-        // PriorityBased would auto-execute critical, so use Supervised to force WaitApproval
-        sop.execution_mode = SopExecutionMode::Supervised;
-        engine.set_sops_for_test(vec![sop]);
+        engine.set_sops_for_test(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Critical,
+        )]);
 
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
 
-        // Manually backdate waiting_since to simulate timeout
         let run = engine.active_runs.get_mut(&run_id).unwrap();
         run.waiting_since = Some("2020-01-01T00:00:00Z".into());
 
         let actions = engine.check_approval_timeouts();
+        assert!(actions.is_empty(), "escalate produces no resumed action");
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval,
+            "critical run stays gated under fail-closed escalate"
+        );
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|ev| ev.kind == "gate_escalated"),
+            "escalation is recorded in the ledger"
+        );
+    }
+
+    #[test]
+    fn timeout_cancel_finishes_run() {
+        let mut engine = SopEngine::new(SopConfig {
+            approval_timeout_secs: 1,
+            approval_timeout_action: zeroclaw_config::schema::ApprovalTimeoutAction::Cancel,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
+            Some("2020-01-01T00:00:00Z".into());
+
+        let actions = engine.check_approval_timeouts();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], SopRunAction::Completed { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "cancel terminates the run (retained as a terminal record)"
+        );
+    }
+
+    #[test]
+    fn timeout_auto_approve_legacy_resumes() {
+        // The legacy fail-open behavior is reachable ONLY via the explicit opt-in.
+        let mut engine = SopEngine::new(SopConfig {
+            approval_timeout_secs: 1,
+            approval_timeout_action: zeroclaw_config::schema::ApprovalTimeoutAction::AutoApprove,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Critical,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
+            Some("2020-01-01T00:00:00Z".into());
+
+        let actions = engine.check_approval_timeouts();
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], SopRunAction::ExecuteStep { .. }));
+    }
+
+    #[test]
+    fn escalate_never_self_approves_any_priority() {
+        // [SEC-FLIP] guard: under the default action, NO priority auto-approves.
+        for priority in [
+            SopPriority::Critical,
+            SopPriority::High,
+            SopPriority::Normal,
+            SopPriority::Low,
+        ] {
+            let mut engine = SopEngine::new(SopConfig {
+                approval_timeout_secs: 1,
+                ..SopConfig::default()
+            });
+            engine.set_sops_for_test(vec![test_sop("s1", SopExecutionMode::Supervised, priority)]);
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let run_id = extract_run_id(&action).to_string();
+            engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
+                Some("2020-01-01T00:00:00Z".into());
+
+            let actions = engine.check_approval_timeouts();
+            assert!(
+                actions.is_empty(),
+                "priority {priority:?} must not self-approve under fail-closed default"
+            );
+            assert_eq!(
+                engine.get_run(&run_id).unwrap().status,
+                SopRunStatus::WaitingApproval
+            );
+        }
     }
 
     #[test]
@@ -2221,7 +2473,7 @@ mod tests {
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
-        engine.approve_step(&run_id).unwrap();
+        approve_gate_cli(&mut engine, &run_id);
 
         let run = engine.get_run(&run_id).unwrap();
         assert_eq!(run.status, SopRunStatus::Running);
@@ -2582,9 +2834,10 @@ type = "manual"
 
     #[test]
     fn deterministic_checkpoint_resumes_through_approve_step() {
-        // The sop_approve tool calls approve_step. A deterministic run paused at
-        // a checkpoint must resume through it, not bail. deterministic_sop is
-        // step1=Execute, step2=Checkpoint, step3=Execute.
+        // approve_step owns the deterministic PausedCheckpoint resume (the
+        // sop_approve tool routes here when resolve_gate reports NotWaiting). A run
+        // paused at a checkpoint must resume through it, not bail. deterministic_sop
+        // is step1=Execute, step2=Checkpoint, step3=Execute.
         let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
         let action = engine.start_run("det-cp", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
@@ -2622,6 +2875,42 @@ type = "manual"
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
             "deterministic run should complete after the post-checkpoint step"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_approve_tool_resumes_deterministic_checkpoint() {
+        // Regression guard (#8304 review): the sop_approve tool must route a
+        // PausedCheckpoint to approve_step, because resolve_gate reports NotWaiting
+        // for it. Without that routing the tool answers "not waiting for approval"
+        // and a deterministic run is stuck unresumable through every surface.
+        use crate::tools::SopApproveTool;
+        use zeroclaw_api::tool::Tool;
+
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let tool = SopApproveTool::new(std::sync::Arc::new(std::sync::Mutex::new(engine)));
+        let result = tool
+            .execute(serde_json::json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "sop_approve must resume a deterministic checkpoint, not report not-waiting: {result:?}"
+        );
+        assert!(
+            result.output.contains("Approved"),
+            "checkpoint resume should be reported as approved: {result:?}"
         );
     }
 
