@@ -2606,14 +2606,17 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-model-empty")
             } else {
                 apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                let mut resp = format!(
-                    "Model switched to `{}` (model_provider: `{}`). Context preserved.",
-                    current.model, current.model_provider
+                let mut resp = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
                 );
                 resp.push_str(&shadow_note(
                     ctx,
@@ -2658,7 +2661,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -4205,12 +4208,21 @@ async fn process_channel_message_body(
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision = ctx.model_provider.supports_vision();
-        let transcription_manager =
-            crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .ok()
-                .map(|m| {
-                    m.with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
-                });
+        // Build from legacy config; if that fails (e.g. no legacy api_key
+        // but typed providers are configured), fall back to an empty shell
+        // so with_typed_providers() can still populate the registry.
+        let transcription_manager = {
+            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let m = base
+                .with_typed_providers(&ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+            if m.available_providers().is_empty() {
+                None
+            } else {
+                Some(m)
+            }
+        };
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
@@ -5492,18 +5504,20 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let user_msg = format!("⚠️ Error: {safe_error}");
+                    // Cancel any in-progress draft (don't finalize it with the
+                    // error text, which would trigger TTS on the error message)
+                    // then deliver the error as a plain suppressed send.
                     if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(user_msg, &msg.reply_target)
+                                .suppress_voice()
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             }
         }
@@ -5540,11 +5554,12 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-request-timeout",
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, error_text.as_str())
                         .await;
                 } else {
                     let _ = channel
@@ -5721,9 +5736,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
@@ -7115,6 +7130,20 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let channel_key = format!("telegram.{alias}");
+        let agent_transcription_provider = config
+            .agents
+            .values()
+            .filter(|a| a.enabled && a.channels.iter().any(|c| c.as_str() == channel_key))
+            .find_map(|a| {
+                let s = a.transcription_provider.as_str();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            })
+            .unwrap_or_default();
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -7132,6 +7161,11 @@ fn collect_configured_channels(
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
+                    .with_agent_transcription_provider(agent_transcription_provider.clone())
+                    .with_typed_transcription_providers(
+                        &config.providers.transcription,
+                        &agent_transcription_provider,
+                    )
                     .with_tts(&config)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
@@ -18122,10 +18156,12 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let new_session_reply =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session");
         assert!(
-            sent_messages.iter().any(|message| {
-                message.contains("Conversation history cleared. Starting fresh.")
-            })
+            sent_messages
+                .iter()
+                .any(|message| message.contains(&new_session_reply))
         );
     }
 

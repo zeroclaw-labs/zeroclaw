@@ -17,7 +17,8 @@ pub use store::{
     add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job, list_jobs,
     list_jobs_by_agent, list_runs, record_last_run, record_last_run_with_status, record_run,
     release_job, remove_job, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
-    reschedule_after_run_with_status, skip_missed_run, sync_declarative_jobs, update_job,
+    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
+    sync_declarative_jobs, update_job,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
