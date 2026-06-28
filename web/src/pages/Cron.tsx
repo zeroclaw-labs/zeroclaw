@@ -822,6 +822,7 @@ export default function Cron() {
                             ', '. */}
                         <ToolPicker
                           id="cron-allowed-tools"
+                          agent={formAgent || undefined}
                           value={formAllowedTools
                             .split(',')
                             .map((s) => s.trim())

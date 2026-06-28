@@ -114,6 +114,54 @@ fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
 }
 
+/// Guard that flushes its observer on drop — the telemetry analogue of
+/// `agent::TurnGuard`. Held for the lifetime of a short-lived agent
+/// invocation (today: the CLI one-shot, `zeroclaw agent -m ...`), whose
+/// process exits before the OTLP batch exporter / metric
+/// `PeriodicReader`'s background interval fires. Without this flush all
+/// buffered telemetry — including the never-ended `gen_ai.agent.invoke`
+/// span, which is only `.end()`'d inside [`Observer::flush`] — is lost
+/// when the runtime is torn down.
+///
+/// Long-lived callers (daemon heartbeat/cron, channel `process_message`,
+/// subagent spawns) pass `interactive = false` and skip this guard: they
+/// rely on the periodic export firing on its own cadence, and a flush
+/// per turn would add a synchronous OTLP HTTP POST to every invocation.
+///
+/// Backend-agnostic: calls `Observer::flush()`, which is a no-op for
+/// synchronous backends (`Log`/`Verbose`/`Noop`) and meaningless-but-
+/// harmless for pull backends (`Prometheus` — see startup warning).
+#[must_use = "hold the guard for the lifetime of the agent invocation; dropping it flushes"]
+pub struct FlushGuard {
+    observer: Arc<dyn Observer>,
+    done: bool,
+}
+
+impl FlushGuard {
+    /// Construct a guard that will flush `observer` when dropped.
+    pub fn new(observer: Arc<dyn Observer>) -> Self {
+        Self {
+            observer,
+            done: false,
+        }
+    }
+
+    /// Flush immediately and mark the guard spent so a later `Drop` is a no-op.
+    pub fn fire(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.observer.flush();
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
 /// Wrapper that forwards every event to a primary observer plus the
 /// process-wide broadcast hook (when set). Metrics flow only to the primary.
 struct TeeObserver {
@@ -335,12 +383,14 @@ mod tests {
     use parking_lot::Mutex as PlMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test observer that counts events and metrics, used to verify the
-    /// broadcast hook fan-out and that downcasts pass through `TeeObserver`.
+    /// Test observer that counts events, metrics, and flushes, used to
+    /// verify the broadcast hook fan-out, that downcasts pass through
+    /// `TeeObserver`, and that `FlushGuard` drives `Observer::flush`.
     #[derive(Default)]
     struct CountingObserver {
         events: AtomicUsize,
         metrics: AtomicUsize,
+        flushes: AtomicUsize,
     }
 
     impl Observer for CountingObserver {
@@ -350,6 +400,10 @@ mod tests {
 
         fn record_metric(&self, _metric: &ObserverMetric) {
             self.metrics.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
         }
 
         fn name(&self) -> &str {
@@ -524,5 +578,28 @@ mod tests {
         // `as_any` must surface the primary observer so existing downcasts
         // (e.g. PrometheusObserver in /metrics) keep working through the tee.
         assert!(observer.as_any().downcast_ref::<LogObserver>().is_some());
+    }
+
+    #[test]
+    fn flush_guard_flushes_on_drop() {
+        let observer = Arc::new(CountingObserver::default());
+        let guard = FlushGuard::new(observer.clone());
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn flush_guard_fire_is_idempotent() {
+        let observer = Arc::new(CountingObserver::default());
+        let mut guard = FlushGuard::new(observer.clone());
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Second explicit fire is a no-op.
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Dropping after fire must not flush again.
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
     }
 }

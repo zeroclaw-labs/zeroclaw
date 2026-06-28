@@ -110,7 +110,7 @@ for the full procedure. In summary:
 | `arm-unknown-linux-gnueabihf` | | ✓ | ✓ |
 | `aarch64-apple-darwin` | ✓ | ✓ | ✓ |
 | `aarch64-linux-android` | | ✓ | ✓ (experimental) |
-| `x86_64-apple-darwin` | | ✓ | |
+| `x86_64-apple-darwin` | | ✓ | ✓ |
 | `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ |
 
 ---
