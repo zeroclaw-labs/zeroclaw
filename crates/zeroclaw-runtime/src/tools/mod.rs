@@ -158,6 +158,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
+use crate::security::policy::SandboxPolicy;
 use crate::security::{SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
@@ -527,7 +528,13 @@ pub fn all_tools_with_runtime(
     let persistent_writes = runtime.has_filesystem_access();
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let sandbox_policy = SandboxPolicy::from_risk_profile(risk_profile, &security.workspace_dir);
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        &sandbox_policy,
+        runtime_kind,
+        Some(&security.workspace_dir),
+    );
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
