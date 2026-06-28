@@ -13416,6 +13416,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "zeroclaw-api",
+ "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-spawn",
