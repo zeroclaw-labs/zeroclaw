@@ -176,6 +176,12 @@ pub struct TaskRecord {
 pub trait TaskRegistry: Send + Sync {
     /// Register a new unit of work. Idempotent on `rec.id`.
     async fn create(&self, rec: TaskRecord) -> anyhow::Result<()>;
+    /// Register a goal task and its goal-specific extension atomically.
+    ///
+    /// `TaskRecord` remains the canonical lifecycle/route/principal record;
+    /// `GoalTaskRecord` remains the goal-only extension. This method only owns
+    /// the transaction boundary between those two source-of-truth rows.
+    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> anyhow::Result<()>;
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;
     /// Transition `id` to `status`, optionally recording terminal output/error.

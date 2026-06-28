@@ -1009,7 +1009,7 @@ impl TelegramChannel {
             .map(|spec| {
                 serde_json::json!({
                     "command": spec.name,
-                    "description": spec.short_description,
+                    "description": zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
                 })
             })
             .collect();

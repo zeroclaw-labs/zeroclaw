@@ -340,39 +340,76 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
+fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+    // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
+    // must be a true no-op, never clobber an already-recorded output/error/terminal
+    // status back to NULL/running (review finding #11 — the documented idempotency).
+    conn.execute(
+        "INSERT INTO tasks
+            (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
+             parent_id, originator_route, delivered, idem_key, principal_id,
+             started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            rec.id,
+            kind_to_db(rec.kind),
+            rec.agent,
+            status_to_db(rec.status),
+            rec.owner_pid as i64,
+            rec.owner_boot_id,
+            rec.heartbeat_at,
+            rec.depth as i64,
+            rec.parent_id,
+            rec.originator_route,
+            rec.delivered as i64,
+            rec.idem_key,
+            rec.principal_id,
+            rec.started_at,
+            rec.finished_at,
+        ],
+    )
+    .context("insert task record")?;
+    Ok(())
+}
+
+fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO goal_tasks
+            (task_id, objective, effective_token_limit, effective_cost_limit_usd,
+             pause_reason, pause_description, blockers_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(task_id) DO NOTHING",
+        params![
+            rec.task_id,
+            rec.objective,
+            rec.effective_token_limit.map(|value| value as i64),
+            rec.effective_cost_limit_usd,
+            rec.pause_reason.map(pause_reason_to_db),
+            rec.pause_description,
+            blockers_to_db(&rec.blockers)?,
+        ],
+    )
+    .context("insert goal task record")?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
         let conn = self.conn.lock();
-        // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
-        // must be a true no-op, never clobber an already-recorded output/error/terminal
-        // status back to NULL/running (review finding #11 — the documented idempotency).
-        conn.execute(
-            "INSERT INTO tasks
-                (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-                 parent_id, originator_route, delivered, idem_key, principal_id,
-                 started_at, finished_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                rec.id,
-                kind_to_db(rec.kind),
-                rec.agent,
-                status_to_db(rec.status),
-                rec.owner_pid as i64,
-                rec.owner_boot_id,
-                rec.heartbeat_at,
-                rec.depth as i64,
-                rec.parent_id,
-                rec.originator_route,
-                rec.delivered as i64,
-                rec.idem_key,
-                rec.principal_id,
-                rec.started_at,
-                rec.finished_at,
-            ],
-        )
-        .context("insert task record")?;
+        insert_task_record(&conn, rec)?;
+        Ok(())
+    }
+
+    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start create goal transaction")?;
+        insert_task_record(&tx, task)?;
+        insert_goal_task_record(&tx, goal)?;
+        tx.commit().context("commit create goal transaction")?;
         Ok(())
     }
 
@@ -513,23 +550,7 @@ impl TaskRegistry for SqliteTaskStore {
 
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO goal_tasks
-                (task_id, objective, effective_token_limit, effective_cost_limit_usd,
-                 pause_reason, pause_description, blockers_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(task_id) DO NOTHING",
-            params![
-                rec.task_id,
-                rec.objective,
-                rec.effective_token_limit.map(|value| value as i64),
-                rec.effective_cost_limit_usd,
-                rec.pause_reason.map(pause_reason_to_db),
-                rec.pause_description,
-                blockers_to_db(&rec.blockers)?,
-            ],
-        )
-        .context("insert goal task record")?;
+        insert_goal_task_record(&conn, rec)?;
         Ok(())
     }
 
@@ -822,6 +843,35 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{err:#}").contains("FOREIGN KEY"));
+    }
+
+    #[tokio::test]
+    async fn create_goal_rolls_back_task_when_goal_extension_fails() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-task", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+
+        let err = s
+            .create_goal(
+                task,
+                GoalTaskRecord {
+                    task_id: "missing-extension-parent".into(),
+                    objective: "should roll back".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("goal extension FK failure should abort transaction");
+
+        assert!(format!("{err:#}").contains("FOREIGN KEY"));
+        assert!(
+            s.get("goal-task").await.unwrap().is_none(),
+            "task row must not survive a failed goal extension insert"
+        );
     }
 
     #[tokio::test]

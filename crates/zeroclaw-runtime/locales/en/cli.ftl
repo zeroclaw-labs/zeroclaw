@@ -29,6 +29,16 @@ cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
 cli-desktop-about = Launch the ZeroClaw companion desktop app
 
+command-help-description = Show available commands.
+command-clear-description = Clear the current conversation.
+command-new-description = Start a new conversation.
+command-stop-description = Stop the current run.
+command-model-description = Show or change the active model.
+command-models-description = List available provider models.
+command-config-description = Show runtime configuration.
+command-thinking-description = Show or change reasoning effort.
+command-goal-description = Manage a durable goal.
+
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
 cli-config-get-about = Get a config property value

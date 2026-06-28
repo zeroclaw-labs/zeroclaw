@@ -83,22 +83,12 @@ pub(crate) fn web_visible_commands() -> Vec<zeroclaw_commands::CommandSpec> {
 #[cfg(test)]
 mod command_catalogue_tests {
     use super::*;
-    use zeroclaw_commands::BuiltinCommandId;
 
     #[test]
-    fn web_visible_commands_exclude_unimplemented_goal_admission() {
+    fn web_visible_commands_are_empty_until_web_consumes_shared_discovery() {
         let commands = web_visible_commands();
 
-        assert!(
-            commands
-                .iter()
-                .any(|spec| spec.id == BuiltinCommandId::Help)
-        );
-        assert!(
-            !commands
-                .iter()
-                .any(|spec| spec.id == BuiltinCommandId::Goal)
-        );
+        assert!(commands.is_empty());
     }
 }
 

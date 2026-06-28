@@ -232,23 +232,34 @@ async fn start_goal(
     let task_id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     store
-        .create(TaskRecord {
-            id: task_id.clone(),
-            kind: TaskKind::Goal,
-            agent: ctx.agent_alias,
-            status: TaskStatus::Running,
-            owner_pid: std::process::id(),
-            owner_boot_id: boot_id.to_string(),
-            heartbeat_at: None,
-            depth: 0,
-            parent_id: None,
-            originator_route: ctx.originator_route,
-            delivered: false,
-            idem_key: None,
-            principal_id: ctx.principal_id,
-            started_at,
-            finished_at: None,
-        })
+        .create_goal(
+            TaskRecord {
+                id: task_id.clone(),
+                kind: TaskKind::Goal,
+                agent: ctx.agent_alias,
+                status: TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: boot_id.to_string(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: ctx.originator_route,
+                delivered: false,
+                idem_key: None,
+                principal_id: ctx.principal_id,
+                started_at,
+                finished_at: None,
+            },
+            GoalTaskRecord {
+                task_id: task_id.clone(),
+                objective,
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+        )
         .await
         .map_err(|error| {
             if is_active_goal_context_conflict(&error) {
@@ -257,18 +268,6 @@ async fn start_goal(
                 error.context(msg("goal-command-error-start-failed", &[]))
             }
         })?;
-    store
-        .create_goal_task(GoalTaskRecord {
-            task_id: task_id.clone(),
-            objective,
-            effective_token_limit: None,
-            effective_cost_limit_usd: None,
-            pause_reason: None,
-            pause_description: None,
-            blockers: Vec::new(),
-        })
-        .await
-        .with_context(|| msg("goal-command-error-start-failed", &[]))?;
     Ok(GoalAdmission {
         task_id: task_id.clone(),
         status: TaskStatus::Running,
