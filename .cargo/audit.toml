@@ -35,4 +35,5 @@ ignore = [
     "RUSTSEC-2026-0049",  # CRL matching bypass; tracking TBD
     "RUSTSEC-2026-0098",  # URI name constraint incorrectly accepted; tracking TBD
     "RUSTSEC-2026-0099",  # URI name constraint incorrectly accepted; tracking TBD
+    "RUSTSEC-2026-0104",  # CRL parsing panic; tracking TBD
 ]
