@@ -1219,6 +1219,10 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Tool name for tool-role messages. Some providers (Groq) require this
+    /// field on native tool-result messages; without it they reject the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2091,6 +2095,7 @@ impl OpenAiCompatibleModelProvider {
                         content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
+                        name: None,
                         reasoning_content,
                         reasoning,
                     };
@@ -2127,6 +2132,7 @@ impl OpenAiCompatibleModelProvider {
                         content,
                         tool_call_id: None,
                         tool_calls: None,
+                        name: None,
                         reasoning_content,
                         reasoning,
                     };
@@ -2162,11 +2168,17 @@ impl OpenAiCompatibleModelProvider {
                         .map(|value| MessageContent::Text(value.to_string()))
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|s| s.to_string());
+
                     return NativeMessage {
                         role: "tool".to_string(),
                         content,
                         tool_call_id,
                         tool_calls: None,
+                        name,
                         reasoning_content: None,
                         reasoning: None,
                     };
@@ -2181,6 +2193,7 @@ impl OpenAiCompatibleModelProvider {
                     )),
                     tool_call_id: None,
                     tool_calls: None,
+                    name: None,
                     reasoning_content: None,
                     reasoning: None,
                 }
@@ -3526,6 +3539,7 @@ mod tests {
                 content: Some(MessageContent::Text("hello".to_string())),
                 tool_call_id: None,
                 tool_calls: None,
+                name: None,
                 reasoning_content: None,
                 reasoning: None,
             }],
@@ -5793,6 +5807,7 @@ mod tests {
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
+            name: None,
             reasoning_content: None,
             reasoning: None,
         };
@@ -5807,6 +5822,7 @@ mod tests {
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
+            name: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
         };
