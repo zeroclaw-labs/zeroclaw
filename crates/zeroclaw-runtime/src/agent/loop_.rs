@@ -4463,6 +4463,10 @@ mod tests {
             narration_chunks: Vec<String>,
             tool_call: ToolCall,
         },
+        ToolCallThenNarration {
+            tool_call: ToolCall,
+            narration_chunks: Vec<String>,
+        },
     }
 
     struct StreamingNativeToolEventModelProvider {
@@ -4583,6 +4587,19 @@ mod tests {
                         .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
                         .collect();
                     events.push(Ok(StreamEvent::ToolCall(tool_call)));
+                    events.push(Ok(StreamEvent::Final));
+                    Box::pin(futures_util::stream::iter(events))
+                }
+                NativeStreamTurn::ToolCallThenNarration {
+                    tool_call,
+                    narration_chunks,
+                } => {
+                    let mut events: Vec<_> = vec![Ok(StreamEvent::ToolCall(tool_call))];
+                    events.extend(
+                        narration_chunks
+                            .into_iter()
+                            .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text)))),
+                    );
                     events.push(Ok(StreamEvent::Final));
                     Box::pin(futures_util::stream::iter(events))
                 }
@@ -10361,6 +10378,106 @@ This is an example, not an invocation."#;
         assert!(
             result.contains("done"),
             "final turn must not be truncated; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_forwards_native_narration_emitted_after_tool_call() {
+        let trailing = "Let me check the count.";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::ToolCallThenNarration {
+                tool_call: ToolCall {
+                    id: "call_trailing_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+                narration_chunks: vec!["Let me ".to_string(), "check the count.".to_string()],
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tool then narrate"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool-then-narration streaming should preserve tool loop semantics");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            accumulated.contains(trailing),
+            "narration emitted after the native tool call must reach the user; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert_eq!(
+            accumulated.matches(trailing).count(),
+            1,
+            "post-tool narration must be forwarded exactly once, not dropped then re-sent; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.ends_with("done"),
+            "final response should end with 'done', got: {result}"
         );
     }
 
