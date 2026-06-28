@@ -16,7 +16,9 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
-use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{GoalTaskRecord, TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 1;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -45,7 +47,8 @@ impl SqliteTaskStore {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )
         .context("set control-plane PRAGMAs")?;
         conn.execute_batch(
@@ -71,7 +74,8 @@ impl SqliteTaskStore {
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);",
         )
-        .context("create control-plane schema")?;
+        .context("create control-plane base schema")?;
+        migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -99,6 +103,36 @@ impl SqliteTaskStore {
             .context("delete tasks by agent")?;
         Ok(n as u64)
     }
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read control-plane schema version")?;
+    if version < 1 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS goal_tasks (
+                 task_id        TEXT PRIMARY KEY
+                                REFERENCES tasks(id) ON DELETE CASCADE,
+                 objective      TEXT NOT NULL
+             );
+             PRAGMA user_version = 1;",
+        )
+        .context("apply control-plane schema v1")?;
+    }
+    if version > CONTROL_PLANE_SCHEMA_VERSION {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "db_version": version,
+                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
+                })
+            ),
+            "control-plane DB was created by a newer schema version"
+        );
+    }
+    Ok(())
 }
 
 // ── serde<->TEXT helpers (reuse the snake_case derive, no hand-kept string tables) ──
@@ -156,6 +190,13 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         principal_id: row.get("principal_id")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
+    })
+}
+
+fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord> {
+    Ok(GoalTaskRecord {
+        task_id: row.get("task_id")?,
+        objective: row.get("objective")?,
     })
 }
 
@@ -297,6 +338,29 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(collect_skipping_bad_rows(rows))
     }
 
+    async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO goal_tasks (task_id, objective)
+             VALUES (?1, ?2)
+             ON CONFLICT(task_id) DO NOTHING",
+            params![rec.task_id, rec.objective],
+        )
+        .context("insert goal task record")?;
+        Ok(())
+    }
+
+    async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT task_id, objective FROM goal_tasks WHERE task_id = ?1",
+            params![task_id],
+            row_to_goal_task,
+        )
+        .optional()
+        .context("get goal task")
+    }
+
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let rec = conn
@@ -382,6 +446,43 @@ mod tests {
         assert_eq!(s.list_running().await.unwrap().len(), 2); // a + c
         assert_eq!(s.list_by_agent("main").await.unwrap().len(), 2); // a + b
         assert_eq!(s.count_by_agent("main").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn goal_task_extension_roundtrips_without_duplicating_lifecycle() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-1", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create(task).await.unwrap();
+        s.create_goal_task(GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship goal mode".into(),
+        })
+        .await
+        .unwrap();
+
+        let task = s.get("goal-1").await.unwrap().unwrap();
+        let goal = s.get_goal_task("goal-1").await.unwrap().unwrap();
+
+        assert_eq!(task.kind, TaskKind::Goal);
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(goal.task_id, task.id);
+        assert_eq!(goal.objective, "ship goal mode");
+    }
+
+    #[tokio::test]
+    async fn goal_task_requires_canonical_task_record() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let err = s
+            .create_goal_task(GoalTaskRecord {
+                task_id: "missing".into(),
+                objective: "orphan objective".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("FOREIGN KEY"));
     }
 
     #[tokio::test]

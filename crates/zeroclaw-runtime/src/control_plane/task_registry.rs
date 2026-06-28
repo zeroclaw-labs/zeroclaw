@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub enum TaskKind {
     Delegate,
     Subagent,
+    Goal,
     PeerInbox,
     // EPIC E: RemoteTurn
 }
@@ -32,6 +33,7 @@ pub enum TaskKind {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Running,
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -40,6 +42,17 @@ pub enum TaskStatus {
     Lost,
     /// Heartbeat exceeded its grace window / the task passed `max_runtime`.
     TimedOut,
+}
+
+/// Goal-specific extension record keyed by the canonical task id.
+///
+/// Lifecycle, ownership, route, principal, timestamps, and terminal state stay on
+/// [`TaskRecord`]. This record owns only goal-specific state that has no meaning
+/// for delegates/subagents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalTaskRecord {
+    pub task_id: String,
+    pub objective: String,
 }
 
 impl TaskStatus {
@@ -122,6 +135,8 @@ pub trait TaskRegistry: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>>;
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
+    async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
+    async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is
     /// authoritative for it. Returns `false` (no write) when another live daemon
     /// owns it. See [`crate::control_plane::authority::is_authoritative`].
@@ -137,6 +152,7 @@ mod tests {
         // Backward-compat: pre-EPIC-A on-disk values must deserialize unchanged.
         for (json, want) in [
             ("\"running\"", TaskStatus::Running),
+            ("\"paused\"", TaskStatus::Paused),
             ("\"completed\"", TaskStatus::Completed),
             ("\"failed\"", TaskStatus::Failed),
             ("\"cancelled\"", TaskStatus::Cancelled),
@@ -144,6 +160,14 @@ mod tests {
             let got: TaskStatus = serde_json::from_str(json).unwrap();
             assert_eq!(got, want, "legacy status {json} must parse");
         }
+    }
+
+    #[test]
+    fn goal_kind_roundtrips_snake_case() {
+        let s = serde_json::to_string(&TaskKind::Goal).unwrap();
+        assert_eq!(s, "\"goal\"");
+        let back: TaskKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, TaskKind::Goal);
     }
 
     #[test]
@@ -155,6 +179,11 @@ mod tests {
             assert_eq!(back, st);
             assert!(st.is_terminal());
         }
+    }
+
+    #[test]
+    fn paused_status_is_non_terminal() {
+        assert!(!TaskStatus::Paused.is_terminal());
     }
 
     #[test]
