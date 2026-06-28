@@ -8,7 +8,9 @@ use anyhow::{Result, bail};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
-use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
+use super::store::{
+    InMemoryRunStore, PersistedRun, RetentionPolicy, SopEventRecord, SopRunStore, StoreError,
+};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
     SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
@@ -32,6 +34,29 @@ pub struct SopEngine {
     /// Run-execution metrics collector. Per-engine fresh in `new()` (test
     /// isolation); `build_sop_engine` swaps in the process-shared collector.
     metrics: Arc<SopMetricsCollector>,
+}
+
+/// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
+/// observability. All counts are 0 on a quiet tick.
+#[derive(Debug, Default, Clone)]
+pub struct MaintenanceSummary {
+    /// Approval gates that hit their timeout this pass.
+    pub timed_out: usize,
+    /// Expired concurrency-claim leases reclaimed.
+    pub reaped_claims: usize,
+    /// Terminal runs pruned past the retention policy.
+    pub pruned_runs: usize,
+    /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
+    /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
+    /// the caller logs until EPIC A2's live executor exists.
+    pub timeout_actions: Vec<SopRunAction>,
+}
+
+impl MaintenanceSummary {
+    /// True when the pass did nothing (no timeouts, reaps, or prunes).
+    pub fn is_empty(&self) -> bool {
+        self.timed_out == 0 && self.reaped_claims == 0 && self.pruned_runs == 0
+    }
 }
 
 impl SopEngine {
@@ -906,14 +931,30 @@ impl SopEngine {
     /// explicit `AutoApprove` opt-in). Returns any actions produced (a `Cancel`
     /// terminal action, or an `AutoApprove` resumed action); `Escalate` returns none.
     pub fn check_approval_timeouts(&mut self) -> Vec<SopRunAction> {
+        let action_cfg = self.config.approval_timeout_action;
+        let mut actions = Vec::new();
+        for run_id in self.overdue_waiting_run_ids() {
+            if let Some(a) =
+                super::approval::timeout::apply_timeout_action(self, &run_id, action_cfg)
+            {
+                actions.push(a);
+            }
+        }
+        actions
+    }
+
+    /// Run ids of `WaitingApproval` gates whose approval has timed out
+    /// (`now - waiting_since >= approval_timeout_secs`). Empty when timeouts are
+    /// disabled (`approval_timeout_secs == 0`). Shared by `check_approval_timeouts`
+    /// (which applies the timeout action to each) and the maintenance tick (which
+    /// counts them), so the overdue predicate lives in exactly one place.
+    fn overdue_waiting_run_ids(&self) -> Vec<String> {
         let timeout_secs = self.config.approval_timeout_secs;
         if timeout_secs == 0 {
             return Vec::new();
         }
-
         // cooldown_elapsed(ts, secs) returns true when (now - ts) >= secs.
-        let timed_out: Vec<String> = self
-            .active_runs
+        self.active_runs
             .values()
             .filter(|r| r.status == SopRunStatus::WaitingApproval)
             .filter(|r| {
@@ -922,18 +963,89 @@ impl SopEngine {
                     .is_some_and(|ts| cooldown_elapsed(ts, timeout_secs))
             })
             .map(|r| r.run_id.clone())
-            .collect();
+            .collect()
+    }
 
-        let action_cfg = self.config.approval_timeout_action;
-        let mut actions = Vec::new();
-        for run_id in timed_out {
-            if let Some(a) =
-                super::approval::timeout::apply_timeout_action(self, &run_id, action_cfg)
-            {
-                actions.push(a);
+    /// One periodic maintenance pass (EPIC A1 daemon tick). On each tick it:
+    ///   1. fires fail-closed approval timeouts (`check_approval_timeouts`),
+    ///   2. reaps concurrency-claim leases whose holder died without releasing,
+    ///   3. prunes terminal runs past the retention policy.
+    ///
+    /// A no-op when nothing is due. Returns counts for observability. The returned
+    /// `timeout_actions` are mostly self-applied (the fail-closed `Escalate`
+    /// re-stamps the gate, `Cancel` finalizes the run); an opt-in `AutoApprove`
+    /// yields a resumed `ExecuteStep` the caller logs until the live SOP executor
+    /// (EPIC A2) exists.
+    pub fn run_maintenance_tick(&mut self) -> MaintenanceSummary {
+        // Count overdue gates BEFORE applying the action: the fail-closed Escalate
+        // default re-stamps in place and produces no action, so counting actions
+        // alone would under-report the escalations.
+        let timed_out = self.overdue_waiting_run_ids().len();
+        let timeout_actions = self.check_approval_timeouts();
+        let reaped_claims = self.reap_expired_claims();
+        let pruned_runs = self.prune_terminal_runs();
+        MaintenanceSummary {
+            timed_out,
+            reaped_claims,
+            pruned_runs,
+            timeout_actions,
+        }
+    }
+
+    /// Reclaim concurrency-claim leases past their expiry (the holder died without
+    /// releasing). Best-effort: a store error is logged and the pass continues.
+    /// Returns the number reclaimed.
+    fn reap_expired_claims(&self) -> usize {
+        let now = now_iso8601();
+        let expired = match self.store.expired_claims(&now) {
+            Ok(claims) => claims,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP maintenance: failed to read expired claims"
+                );
+                return 0;
+            }
+        };
+        let mut reclaimed = 0;
+        for token in &expired {
+            match self.store.release_claim(token) {
+                Ok(()) => reclaimed += 1,
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP maintenance: failed to release expired claim"
+                ),
             }
         }
-        actions
+        reclaimed
+    }
+
+    /// Drop terminal runs beyond the retention policy (`max_finished_runs`).
+    /// Best-effort; returns the number pruned.
+    fn prune_terminal_runs(&self) -> usize {
+        let policy = RetentionPolicy {
+            max_terminal: self.config.max_finished_runs,
+            keep_secs: None,
+        };
+        match self.store.prune(&policy) {
+            Ok(n) => n,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "SOP maintenance: failed to prune terminal runs"
+                );
+                0
+            }
+        }
     }
 
     /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
@@ -2239,6 +2351,64 @@ mod tests {
                 .any(|ev| ev.kind == "gate_escalated"),
             "escalation is recorded in the ledger"
         );
+    }
+
+    #[test]
+    fn maintenance_tick_fires_fail_closed_timeout() {
+        // EPIC A1: the daemon tick drives check_approval_timeouts. An overdue gate
+        // under the default fail-closed Escalate stays WaitingApproval (no
+        // self-approve) and the escalation is recorded; the summary counts it.
+        let mut engine = SopEngine::new(SopConfig {
+            approval_timeout_secs: 1,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        // Force the gate overdue.
+        engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
+            Some("2020-01-01T00:00:00Z".into());
+
+        let summary = engine.run_maintenance_tick();
+
+        assert!(
+            !summary.is_empty(),
+            "an overdue gate makes the pass non-empty"
+        );
+        assert_eq!(summary.timed_out, 1, "the overdue gate timed out");
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval,
+            "fail-closed escalate keeps the gate open, never self-approves"
+        );
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|ev| ev.kind == "gate_escalated"),
+            "the tick recorded the escalation in the ledger"
+        );
+    }
+
+    #[test]
+    fn maintenance_tick_is_a_noop_when_nothing_is_due() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        // No runs started -> nothing to time out, reap, or prune.
+        let summary = engine.run_maintenance_tick();
+        assert!(summary.is_empty(), "a quiet tick is a no-op");
+        assert_eq!(summary.timed_out, 0);
+        assert_eq!(summary.reaped_claims, 0);
+        assert_eq!(summary.pruned_runs, 0);
     }
 
     #[test]

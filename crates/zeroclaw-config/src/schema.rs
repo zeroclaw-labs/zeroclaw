@@ -19769,6 +19769,15 @@ pub struct SopConfig {
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
 
+    /// How often (seconds) the daemon runs the SOP maintenance tick: fire
+    /// fail-closed approval timeouts (per `approval_timeout_secs` /
+    /// `approval_timeout_action`), reap expired concurrency-claim leases, and
+    /// prune terminal runs past `max_finished_runs`. Default `60`; set to `0` to
+    /// disable the tick entirely. The tick itself self-approves nothing - timeout
+    /// handling is governed by `approval_timeout_action` (default `escalate`).
+    #[serde(default = "default_sop_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
+
     /// Persist run state durably across restarts. Default `false` keeps today's
     /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
     /// to `true`, `build_sop_engine` selects the configured backend and in-flight
@@ -19869,6 +19878,10 @@ fn default_sop_max_finished_runs() -> usize {
     100
 }
 
+fn default_sop_maintenance_interval_secs() -> u64 {
+    60
+}
+
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
@@ -19877,6 +19890,7 @@ impl Default for SopConfig {
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
+            maintenance_interval_secs: default_sop_maintenance_interval_secs(),
             persist_runs: false,
             run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
