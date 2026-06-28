@@ -38,6 +38,8 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod panel;
+mod panels;
 mod quickstart_pane;
 mod theme;
 mod turn_status;

@@ -21,6 +21,7 @@ use crate::doctor;
 use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
+use crate::panel::{self, Panel, PanelOutcome};
 use crate::quickstart_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
@@ -48,8 +49,9 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 
-/// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 7] = [
+/// Built-in mode bar entries, in display order. Registered plugin panels
+/// are appended after these at runtime (see [`all_modes`]).
+const BUILTIN_MODES: [Mode; 7] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
@@ -70,9 +72,14 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
+    /// A registered plugin panel, indexed into the session's panel list.
+    Plugin(usize),
 }
 
 impl Mode {
+    /// Fluent key for built-in panes. Plugin panels resolve their label via
+    /// [`mode_label`] instead (which has access to the panel list), so this
+    /// returns a harmless fallback for them and is never used on that path.
     fn fluent_key(self) -> &'static str {
         match self {
             Mode::Dashboard => "zc-pane-dashboard",
@@ -82,18 +89,41 @@ impl Mode {
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
             Mode::Quickstart => "zc-pane-quickstart",
+            Mode::Plugin(_) => "zc-pane-plugin",
         }
     }
+}
 
-    fn cycle(self, offset: isize) -> Mode {
-        let len = MODES.len() as isize;
-        let cur = MODES
-            .iter()
-            .position(|m| *m == self)
-            .expect("mode missing from MODES") as isize;
-        let next = ((cur + offset).rem_euclid(len)) as usize;
-        MODES[next]
+/// The full ordered mode list for this session: built-ins followed by one
+/// `Mode::Plugin(i)` per registered panel.
+fn all_modes(panels: &[Box<dyn Panel>]) -> Vec<Mode> {
+    let mut v = BUILTIN_MODES.to_vec();
+    for i in 0..panels.len() {
+        v.push(Mode::Plugin(i));
     }
+    v
+}
+
+/// Translated mode-bar label for any mode. Plugin panels use their own
+/// `title_key`; built-ins use [`Mode::fluent_key`].
+fn mode_label(mode: Mode, panels: &[Box<dyn Panel>]) -> String {
+    match mode {
+        Mode::Plugin(i) => panels
+            .get(i)
+            .map(|p| crate::i18n::t(p.title_key()))
+            .unwrap_or_default(),
+        other => crate::i18n::t(other.fluent_key()),
+    }
+}
+
+/// Cycle to the next/previous mode within the runtime mode list.
+fn cycle_mode(modes: &[Mode], cur: Mode, offset: isize) -> Mode {
+    if modes.is_empty() {
+        return cur;
+    }
+    let len = modes.len() as isize;
+    let pos = modes.iter().position(|m| *m == cur).unwrap_or(0) as isize;
+    modes[((pos + offset).rem_euclid(len)) as usize]
 }
 
 async fn switch_mode(
