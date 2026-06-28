@@ -246,7 +246,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Goal,
         name: "goal",
         aliases: &[],
-        usage: "/goal <start|status|budget|pause|resume|cancel> ...",
+        usage: "/goal <start|status|pause|resume|cancel> ...",
         description_key: "command-goal-description",
         short_description: "Manage a durable goal run",
         surfaces: WEB_TUI_CHANNEL,
