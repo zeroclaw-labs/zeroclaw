@@ -77,6 +77,7 @@
 - [Tools & Extensibility](./tools/overview.md)
   - [MCP (Model Context Protocol)](./tools/mcp.md)
   - [Browser automation](./tools/browser.md)
+  - [Relationship memory](./tools/relationship-memory.md)
   - [Skills](./tools/skills.md)
   - [Python skills](./tools/python-skills.md)
 - [Security & Autonomy](./security/overview.md)
