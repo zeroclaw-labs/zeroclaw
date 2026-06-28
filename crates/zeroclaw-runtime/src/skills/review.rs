@@ -56,6 +56,7 @@ pub async fn maybe_run_skill_review(
     max_tool_result_chars: usize,
     max_context_tokens: usize,
     cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
 ) {
     if !config.enabled {
         return;
@@ -91,6 +92,7 @@ pub async fn maybe_run_skill_review(
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let turn_id = uuid::Uuid::new_v4().to_string();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
@@ -144,6 +146,8 @@ pub async fn maybe_run_skill_review(
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
                 ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias,
+                turn_id: &turn_id,
             })
             .await
         })

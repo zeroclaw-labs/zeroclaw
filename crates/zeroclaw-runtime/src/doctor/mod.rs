@@ -682,7 +682,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+            if let Some(reason) = provider_validation_error(config, &label) {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -757,7 +757,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        if let Some(reason) = provider_validation_error(config, &route.model_provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -848,18 +848,15 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        let provider_type = agent
-            .model_provider
-            .split_once('.')
-            .map_or(agent.model_provider.as_str(), |(t, _)| t);
-        if provider_type.is_empty() {
+        let provider_ref = agent.model_provider.as_str();
+        if provider_ref.is_empty() {
             continue;
         }
-        if let Some(reason) = provider_validation_error(provider_type) {
+        if let Some(reason) = provider_validation_error(config, provider_ref) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "agent \"{name}\" uses invalid model_provider \"{provider_type}\": {reason}",
+                    "agent \"{name}\" uses invalid model_provider \"{provider_ref}\": {reason}",
                 ),
             ));
         }
@@ -919,8 +916,8 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_model_provider(name, None) {
+fn provider_validation_error(config: &Config, name: &str) -> Option<String> {
+    match create_doctor_model_provider(config, name) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -1252,6 +1249,33 @@ fn check_environment(items: &mut Vec<DiagItem>) {
 
     // Optional tools
     check_command_available("curl", &["--version"], cat, items);
+
+    if crate::service::linux_systemd_runtime_present() {
+        items.push(systemd_linger_diag_item(
+            crate::service::systemd_user_linger_status(),
+        ));
+    }
+}
+
+fn systemd_linger_diag_item(status: crate::service::SystemdUserLinger) -> DiagItem {
+    let cat = "environment";
+    match status {
+        crate::service::SystemdUserLinger::Enabled => DiagItem::ok(
+            cat,
+            crate::i18n::get_required_cli_string("cli-doctor-systemd-linger-enabled"),
+        ),
+        crate::service::SystemdUserLinger::Disabled { user } => DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-systemd-linger-disabled",
+                &[("user", user.as_str())],
+            ),
+        ),
+        crate::service::SystemdUserLinger::Unknown => DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string("cli-doctor-systemd-linger-unknown"),
+        ),
+    }
 }
 
 fn check_cli_tools(items: &mut Vec<DiagItem>) {
@@ -1394,15 +1418,47 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let config = Config::default();
+        assert!(provider_validation_error(&config, "openrouter").is_none());
+        assert!(provider_validation_error(&config, "custom:https://example.com").is_none());
+        assert!(
+            provider_validation_error(&config, "anthropic-custom:https://example.com").is_none()
+        );
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = provider_validation_error(&config, "custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown =
+            provider_validation_error(&config, "totally-fake").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown model_provider"));
+    }
+
+    #[test]
+    fn provider_validation_accepts_custom_with_uri_in_config() {
+        // Regression: the Doctor previously called create_model_provider(name, None)
+        // without config, causing custom providers with uri defined in config to
+        // fail validation with "Custom model_provider requires `uri`".
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("known model_provider type");
+        profile.uri = Some("http://10.0.0.15:8000/v1".to_string());
+        profile.model = Some("Qwen3.6-27B".to_string());
+
+        // Full label (type.alias) should validate successfully when uri is in config.
+        assert!(
+            provider_validation_error(&config, "custom.vllm").is_none(),
+            "custom.vllm should be valid when uri is defined in config"
+        );
+
+        // Bare "custom" without alias should still fail (no config entry to resolve).
+        let bare_error = provider_validation_error(&config, "custom").unwrap_or_default();
+        assert!(
+            bare_error.contains("requires `uri`"),
+            "bare 'custom' without alias should require uri"
+        );
     }
 
     #[test]
@@ -1535,7 +1591,7 @@ mod tests {
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| {
             i.message
-                .contains("agent \"broken\" uses invalid model_provider \"totally-fake\"")
+                .contains("agent \"broken\" uses invalid model_provider \"totally-fake.default\"")
         });
         assert!(
             prov_item.is_some(),
@@ -1672,6 +1728,33 @@ mod tests {
         // git should be available in any CI/dev environment
         assert!(git_item.is_some());
         assert_eq!(git_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn systemd_linger_diag_reports_disabled_user_service() {
+        let item = systemd_linger_diag_item(crate::service::SystemdUserLinger::Disabled {
+            user: "alice".to_string(),
+        });
+
+        assert_eq!(item.severity, Severity::Warn);
+        assert_eq!(item.category, "environment");
+        assert!(item.message.contains("may stop after logout"));
+        assert!(item.message.contains("loginctl enable-linger alice"));
+    }
+
+    #[test]
+    fn systemd_linger_diag_reports_enabled_and_unknown() {
+        let enabled = systemd_linger_diag_item(crate::service::SystemdUserLinger::Enabled);
+        assert_eq!(enabled.severity, Severity::Ok);
+        assert_eq!(enabled.message, "systemd user lingering enabled");
+
+        let unknown = systemd_linger_diag_item(crate::service::SystemdUserLinger::Unknown);
+        assert_eq!(unknown.severity, Severity::Warn);
+        assert!(
+            unknown
+                .message
+                .contains("could not be checked with loginctl")
+        );
     }
 
     #[test]

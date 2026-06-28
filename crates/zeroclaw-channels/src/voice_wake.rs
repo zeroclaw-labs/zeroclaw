@@ -83,6 +83,16 @@ impl ::zeroclaw_api::attribution::Attributable for VoiceWakeChannel {
 
 #[async_trait]
 impl Channel for VoiceWakeChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "voice_wake"
     }
