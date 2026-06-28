@@ -25,6 +25,9 @@ then choose a small migration candidate if code proof is needed. Do not start by
 removing tools or integrations until compatibility, config, security policy,
 operator visibility, and rollback are explicit.
 
+For the current built-in tool classification, see
+[Built-In Tool Inventory](./tool-inventory.md).
+
 ## Choose The Smallest Surface
 
 Before writing code, decide which extension surface owns the behavior.

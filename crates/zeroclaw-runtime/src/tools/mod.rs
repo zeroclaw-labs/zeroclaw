@@ -1167,18 +1167,11 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_collector(crate::sop::SopMetricsCollector::shared()),
-            ));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
@@ -1402,7 +1395,15 @@ pub fn all_tools_with_runtime(
         let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+            let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
+                &config.plugins.security.signature_mode,
+            );
+            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                &plugin_path,
+                signature_mode,
+                trusted_publisher_keys,
+            ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
