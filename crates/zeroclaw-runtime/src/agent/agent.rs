@@ -1319,6 +1319,14 @@ impl Agent {
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
+                        crate::agent::loop_::register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),

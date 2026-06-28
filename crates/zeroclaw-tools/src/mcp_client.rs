@@ -225,6 +225,11 @@ impl McpServer {
         self.inner.lock().await.config.name.clone()
     }
 
+    /// Server-advertised capabilities captured at handshake.
+    pub async fn capabilities(&self) -> McpServerCapabilities {
+        self.inner.lock().await.capabilities.clone()
+    }
+
     /// Call a tool on this server. Returns the raw JSON result.
     pub async fn call_tool(
         &self,
@@ -543,6 +548,8 @@ pub struct McpRegistry {
     servers: Vec<McpServer>,
     /// prefixed_name → (server_index, original_tool_name)
     tool_index: HashMap<String, (usize, String)>,
+    /// server name → index in `servers`.
+    server_index: HashMap<String, usize>,
 }
 
 impl McpRegistry {
@@ -550,11 +557,13 @@ impl McpRegistry {
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
+        let mut server_index = HashMap::new();
 
         for config in configs {
             match McpServer::connect(config.clone()).await {
                 Ok(server) => {
                     let server_idx = servers.len();
+                    server_index.insert(config.name.clone(), server_idx);
                     // Collect tools while holding the lock once, then release
                     let tools = server.tools().await;
                     for tool in &tools {
@@ -579,6 +588,7 @@ impl McpRegistry {
         Ok(Self {
             servers,
             tool_index,
+            server_index,
         })
     }
 
@@ -632,6 +642,94 @@ impl McpRegistry {
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
     }
+
+    /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
+    pub fn split_prefixed(prefixed: &str) -> Option<(String, String)> {
+        prefixed
+            .split_once("__")
+            .map(|(s, r)| (s.to_string(), r.to_string()))
+    }
+
+    fn server_by_name(&self, name: &str) -> Option<&McpServer> {
+        self.server_index.get(name).map(|i| &self.servers[*i])
+    }
+
+    /// Whether the named server advertised resource capability.
+    pub async fn server_supports_resources(&self, name: &str) -> bool {
+        match self.server_by_name(name) {
+            Some(srv) => srv.capabilities().await.supports_resources(),
+            None => false,
+        }
+    }
+
+    /// Whether the named server advertised prompt capability.
+    pub async fn server_supports_prompts(&self, name: &str) -> bool {
+        match self.server_by_name(name) {
+            Some(srv) => srv.capabilities().await.supports_prompts(),
+            None => false,
+        }
+    }
+
+    /// Read a resource by prefixed uri (`<server>__<uri>`).
+    pub async fn read_resource(
+        &self,
+        prefixed_uri: &str,
+    ) -> Result<crate::mcp_resource::McpResourceContents> {
+        let (server, uri) = Self::split_prefixed(prefixed_uri).ok_or_else(|| {
+            anyhow::Error::msg(format!("missing server prefix in `{prefixed_uri}`"))
+        })?;
+        let srv = self
+            .server_by_name(&server)
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown MCP server `{server}`")))?;
+        srv.read_resource(&uri).await
+    }
+
+    /// Get a prompt by prefixed name (`<server>__<name>`).
+    pub async fn get_prompt(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<crate::mcp_prompt::McpGetPromptResult> {
+        let (server, name) = Self::split_prefixed(prefixed_name).ok_or_else(|| {
+            anyhow::Error::msg(format!("missing server prefix in `{prefixed_name}`"))
+        })?;
+        let srv = self
+            .server_by_name(&server)
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown MCP server `{server}`")))?;
+        srv.get_prompt(&name, arguments).await
+    }
+
+    /// List resources across all servers that support them. Each entry's uri is
+    /// returned prefixed with `<server>__`. Per-server errors are skipped.
+    pub async fn list_all_resources(&self) -> Vec<(String, crate::mcp_resource::McpResourceDef)> {
+        let mut out = Vec::new();
+        for (name, idx) in &self.server_index {
+            let srv = &self.servers[*idx];
+            if let Ok(list) = srv.list_resources(None).await {
+                for mut def in list.resources {
+                    let prefixed_uri = format!("{name}__{}", def.uri);
+                    def.uri = prefixed_uri.clone();
+                    out.push((prefixed_uri, def));
+                }
+            }
+        }
+        out
+    }
+
+    /// List prompts across all servers that support them, prefixed by server.
+    pub async fn list_all_prompts(&self) -> Vec<(String, crate::mcp_prompt::McpPromptDef)> {
+        let mut out = Vec::new();
+        for (name, idx) in &self.server_index {
+            let srv = &self.servers[*idx];
+            if let Ok(list) = srv.list_prompts(None).await {
+                for def in list.prompts {
+                    let prefixed = format!("{name}__{}", def.name);
+                    out.push((prefixed, def));
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +741,49 @@ mod tests {
     fn tool_name_prefix_format() {
         let prefixed = format!("{}__{}", "filesystem", "read_file");
         assert_eq!(prefixed, "filesystem__read_file");
+    }
+
+    #[test]
+    fn split_prefix_separates_server_and_rest() {
+        assert_eq!(
+            McpRegistry::split_prefixed("srvA__file:///x"),
+            Some(("srvA".to_string(), "file:///x".to_string()))
+        );
+        assert_eq!(McpRegistry::split_prefixed("noprefix"), None);
+    }
+
+    #[tokio::test]
+    async fn registry_server_supports_flags_default_false() {
+        let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
+        assert!(!registry.server_supports_resources("missing").await);
+        assert!(!registry.server_supports_prompts("missing").await);
+    }
+
+    #[tokio::test]
+    async fn registry_read_resource_unknown_server_errors() {
+        let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
+        let err = registry
+            .read_resource("ghost__file:///x")
+            .await
+            .expect_err("unknown server should error");
+        assert!(err.to_string().contains("unknown MCP server"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn registry_get_prompt_unknown_server_errors() {
+        let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
+        let err = registry
+            .get_prompt("ghost__p", serde_json::json!({}))
+            .await
+            .expect_err("unknown server should error");
+        assert!(err.to_string().contains("unknown MCP server"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn registry_list_all_empty_for_empty_registry() {
+        let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
+        assert!(registry.list_all_resources().await.is_empty());
+        assert!(registry.list_all_prompts().await.is_empty());
     }
 
     #[tokio::test]
