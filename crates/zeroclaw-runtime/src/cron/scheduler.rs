@@ -35,6 +35,30 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
+/// True when an LLM-produced output is the `NO_REPLY` sentinel, signalling
+/// "nothing to report" rather than content meant to be delivered.
+///
+/// Cron jobs and heartbeat tasks routinely instruct the model to answer with
+/// `NO_REPLY` when a health/status check finds nothing worth surfacing. The
+/// delivery path must recognise this sentinel and skip sending, otherwise the
+/// literal string "NO_REPLY" is announced to the channel (the bug reported in
+/// zeroclaw-labs/zeroclaw#2128).
+///
+/// Matching is case-insensitive and trim-tolerant. The kinded and legacy
+/// `NO_REPLY[...]:` / `NO_REPLY:` prefix forms (carried over from the channel
+/// reply-intent classifier) are also treated as sentinels so a model that emits
+/// `NO_REPLY: nothing to report` does not leak that string to the channel.
+#[must_use]
+pub fn is_no_reply_sentinel(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.eq_ignore_ascii_case("NO_REPLY") {
+        return true;
+    }
+    // Kinded (`NO_REPLY[INFO]: ...`) and legacy (`NO_REPLY: ...`) forms.
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("no_reply[") || lower.starts_with("no_reply:")
+}
+
 #[derive(Clone, Copy)]
 pub enum CronDeliveryContext {
     Scheduled,
@@ -999,6 +1023,20 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    // Skip delivery when the job's agent signalled "nothing to report" via the
+    // NO_REPLY sentinel. Without this guard the literal sentinel string is
+    // announced to the channel (zeroclaw-labs/zeroclaw#2128).
+    if is_no_reply_sentinel(output) {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"job_id": job.id})),
+            "Cron job returned NO_REPLY sentinel — skipping delivery"
+        );
+        return Ok(());
+    }
+
     let channel = delivery.channel.as_deref().ok_or_else(|| {
         ::zeroclaw_log::record!(
             WARN,
@@ -1220,6 +1258,36 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     const TEST_AGENT: &str = "test-agent";
+
+    #[test]
+    fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("no_reply"));
+        assert!(is_no_reply_sentinel("No_Reply"));
+        // Trim tolerance.
+        assert!(is_no_reply_sentinel("  NO_REPLY  "));
+        assert!(is_no_reply_sentinel("\nNO_REPLY\n"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_matches_kinded_and_legacy_prefixes() {
+        assert!(is_no_reply_sentinel("NO_REPLY: nothing to report"));
+        assert!(is_no_reply_sentinel("NO_REPLY[INFO]: all healthy"));
+        assert!(is_no_reply_sentinel("no_reply[fail]: timed out"));
+        assert!(is_no_reply_sentinel("  NO_REPLY: trimmed  "));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_rejects_real_content() {
+        assert!(!is_no_reply_sentinel(""));
+        assert!(!is_no_reply_sentinel("   "));
+        assert!(!is_no_reply_sentinel("All systems nominal"));
+        // Sentinel-looking but not a sentinel: word embedded in real prose.
+        assert!(!is_no_reply_sentinel(
+            "The job returned NO_REPLY which means nothing happened"
+        ));
+        assert!(!is_no_reply_sentinel("NO_REPLYING is the status"));
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config {

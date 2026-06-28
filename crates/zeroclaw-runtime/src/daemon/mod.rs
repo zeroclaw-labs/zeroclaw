@@ -1081,7 +1081,29 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    if let Some((channel, target)) = &delivery {
+                    // Skip delivery when the heartbeat agent signalled "nothing
+                    // to report" via the NO_REPLY sentinel. Without this guard
+                    // the literal sentinel string is announced to the channel
+                    // (zeroclaw-labs/zeroclaw#2128). The empty-output branch
+                    // above never produces the sentinel, so checking the final
+                    // announcement is sufficient.
+                    let suppress_delivery =
+                        crate::cron::scheduler::is_no_reply_sentinel(&announcement);
+                    if suppress_delivery {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"task": task.text})),
+                            "Heartbeat task returned NO_REPLY sentinel — skipping delivery"
+                        );
+                    }
+                    if let Some((channel, target)) = &delivery
+                        && !suppress_delivery
+                    {
                         let delivery_result = tokio::time::timeout(
                             Duration::from_secs(30),
                             crate::cron::scheduler::deliver_announcement(
