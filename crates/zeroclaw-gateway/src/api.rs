@@ -37,7 +37,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-pub(super) fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -305,17 +305,37 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
-/// GET /api/tools — list registered tool specs
+/// Query parameters for `GET /api/tools`. Pass `?agent=<alias>` to list that
+/// agent's scoped tool set (its built-ins plus the MCP tools granted by its
+/// `mcp_bundles`); omit it for the default listing seeded from the
+/// deterministically smallest enabled agent. An unknown alias falls back to
+/// the default listing rather than erroring, so a stale UI selection still
+/// renders.
+#[derive(Debug, Deserialize)]
+pub struct ToolsQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
 pub async fn handle_api_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ToolsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let tools: Vec<serde_json::Value> = state
-        .tools_registry
+    let registry = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
+        .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
+
+    let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
             serde_json::json!({
@@ -541,73 +561,23 @@ pub async fn handle_api_cron_run(
         }
     };
 
-    let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
-    let finished_at = chrono::Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+    let event_tx = Some(state.event_tx.clone());
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
         &config,
         &job,
-        success,
-        output,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        &event_tx,
     )
     .await;
-    success = outcome.success;
-
-    if let Err(e) = zeroclaw_runtime::cron::record_run(
-        &config,
-        &job.id,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
-    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
-        &config,
-        &job.id,
-        finished_at,
-        &outcome.status,
-        &outcome.output,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to update last_run state"
-        );
-    }
-
-    // Broadcast the result so dashboard/SSE clients refresh in real time,
-    // matching the scheduler's automatic-execution behavior.
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "cron_result",
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "manual": true,
-        "timestamp": finished_at.to_rfc3339(),
-    }));
 
     Json(serde_json::json!({
-        "status": &outcome.status,
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "duration_ms": duration_ms,
-        "started_at": started_at.to_rfc3339(),
-        "finished_at": finished_at.to_rfc3339(),
+        "status": result.status,
+        "job_id": result.job_id,
+        "success": result.success,
+        "output": result.output,
+        "duration_ms": result.duration_ms,
+        "started_at": result.started_at.to_rfc3339(),
+        "finished_at": result.finished_at.to_rfc3339(),
     }))
     .into_response()
 }
@@ -1928,7 +1898,8 @@ pub async fn handle_claude_code_hook(
 }
 
 // Shared test helper: `api_config` tests reuse this AppState builder for the
-// agent rename/delete cascade handlers (#7907 regression coverage).
+// agent rename/delete cascade handlers (#7907 / #7941 regression coverage).
+
 #[cfg(test)]
 pub(crate) use tests::test_state;
 
@@ -2136,6 +2107,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
@@ -2291,6 +2263,66 @@ mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_scopes_listing_by_agent_query() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let mut state = test_state(config);
+
+        let spec = |name: &str| ToolSpec {
+            name: name.to_string(),
+            description: format!("{name} desc"),
+            parameters: serde_json::json!({}),
+        };
+        state.tools_registry = Arc::new(vec![spec("default_tool")]);
+        let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
+            std::collections::HashMap::new();
+        by_agent.insert("alpha".to_string(), Arc::new(vec![spec("alpha_tool")]));
+        by_agent.insert("beta".to_string(), Arc::new(vec![spec("beta_tool")]));
+        state.tools_registry_by_agent = Arc::new(by_agent);
+
+        async fn tool_names(state: AppState, agent: Option<&str>) -> Vec<String> {
+            let response = handle_api_tools(
+                State(state),
+                HeaderMap::new(),
+                Query(ToolsQuery {
+                    agent: agent.map(str::to_string),
+                }),
+            )
+            .await
+            .into_response();
+            response_json(response).await["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        // A known agent gets its own scoped listing.
+        assert_eq!(
+            tool_names(state.clone(), Some("beta")).await,
+            vec!["beta_tool".to_string()]
+        );
+        // Omitted agent falls back to the default seed listing.
+        assert_eq!(
+            tool_names(state.clone(), None).await,
+            vec!["default_tool".to_string()]
+        );
+        // Unknown and blank aliases fall back to the default rather than error,
+        // so a stale UI selection still renders something.
+        assert_eq!(
+            tool_names(state.clone(), Some("ghost")).await,
+            vec!["default_tool".to_string()]
+        );
+        assert_eq!(
+            tool_names(state.clone(), Some("   ")).await,
+            vec!["default_tool".to_string()]
+        );
     }
 
     #[test]
@@ -4149,5 +4181,84 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    #[cfg(feature = "a2a")]
+    mod a2a_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "a2a-test-token";
+
+        fn paired_state() -> AppState {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.a2a.server.enabled = true;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("maker".to_string(), agent);
+            let mut state = test_state(config);
+            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state
+        }
+
+        async fn status_of(
+            router: axum::Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> StatusCode {
+            router.oneshot(req).await.expect("router response").status()
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unauthenticated_request() {
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#,
+                ))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn catalog_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_with_valid_token() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
     }
 }

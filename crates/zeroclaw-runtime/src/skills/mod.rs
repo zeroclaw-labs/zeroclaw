@@ -41,7 +41,7 @@ const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
-// ─── ClawhHub / OpenClaw registry installers ───────────────────────────────
+// ─── ClawHub / OpenClaw registry installers ───────────────────────────────
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
@@ -509,15 +509,8 @@ pub fn load_skills_for_agent(
                 continue;
             }
         };
-        let include: std::collections::HashSet<&str> =
-            bundle.include.iter().map(String::as_str).collect();
-        let exclude: std::collections::HashSet<&str> =
-            bundle.exclude.iter().map(String::as_str).collect();
         for skill in load_skills_from_directory(&dir, allow_scripts) {
-            if !include.is_empty() && !include.contains(skill.name.as_str()) {
-                continue;
-            }
-            if exclude.contains(skill.name.as_str()) {
+            if !bundle.admits_skill(&skill.name) {
                 continue;
             }
             // First-write wins so workspace skills override bundle skills
@@ -1711,13 +1704,13 @@ fn clawhub_download_url(source: &str) -> Result<String> {
             .join("/");
 
         if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
         }
 
         return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
     }
 
-    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+    anyhow::bail!("unrecognised ClawHub source format: {source}")
 }
 
 fn normalize_skill_name(s: &str) -> String {
@@ -2059,7 +2052,7 @@ pub async fn install_clawhub_skill_source(
     allow_scripts: bool,
 ) -> Result<(PathBuf, usize)> {
     let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawhHub source: {source}"))?;
+        .with_context(|| format!("invalid ClawHub source: {source}"))?;
     let skill_dir_name = clawhub_skill_dir_name(source)?;
     let installed_dir = skills_path.join(&skill_dir_name);
     if installed_dir.exists() {
@@ -2080,10 +2073,10 @@ pub async fn install_clawhub_skill_source(
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawhHub rate limit reached (HTTP 429). Wait a moment and retry.");
+        anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
     }
     if !resp.status().is_success() {
-        anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
+        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
     }
 
     let bytes = resp.bytes().await?.to_vec();
@@ -2096,7 +2089,7 @@ pub async fn install_clawhub_skill_source(
         std::fs::write(
             installed_dir.join("SKILL.toml"),
             format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawhHub installed skill\"\nversion = \"0.1.0\"\n",
+                "[skill]\nname = \"{}\"\ndescription = \"ClawHub installed skill\"\nversion = \"0.1.0\"\n",
                 skill_dir_name
             ),
         )?;
@@ -2393,7 +2386,7 @@ pub fn install_extra_registry_skill_source(
             }
         })?;
 
-    if registry.kind != "git" {
+    if registry.kind != zeroclaw_config::schema::ExternalRegistryKind::Git {
         anyhow::bail!(
             "registry '{registry_name}' uses unsupported kind '{}'; only 'git' is supported",
             registry.kind
@@ -2449,7 +2442,7 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
 
     let plugins_dir = config.plugins.resolved_plugins_dir();
 
-    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();

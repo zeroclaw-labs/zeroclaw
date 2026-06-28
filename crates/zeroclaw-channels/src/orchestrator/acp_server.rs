@@ -488,32 +488,6 @@ impl AcpServer {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
-        let mut sessions = self.sessions.lock().await;
-
-        let loading_count = self.loading_sessions.lock().await.len();
-        if sessions.len() + loading_count >= self.acp_config.max_sessions {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "active": sessions.len(),
-                        "loading": loading_count,
-                        "max": self.acp_config.max_sessions,
-                    })),
-                "ACP session/new rejected: session limit reached"
-            );
-            return Err(RpcError {
-                code: SESSION_LIMIT_REACHED,
-                message: format!(
-                    "Maximum session limit reached ({})",
-                    self.acp_config.max_sessions
-                ),
-                data: None,
-            });
-        }
-
         let requested_cwd = self.requested_session_cwd(params);
 
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
@@ -568,27 +542,73 @@ impl AcpServer {
 
         let session_id = Uuid::new_v4().to_string();
 
+        // Atomically check the session limit and reserve a loading slot, then
+        // release the locks before building the agent. Agent construction can
+        // perform opt-in MCP startup (`[agents.<alias>].acp_enable_mcp`), which
+        // may block on external server timeouts; holding `self.sessions` across
+        // it would stall unrelated session ops. Mirrors `session/load`.
+        {
+            let sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "active": sessions.len(),
+                            "loading": loading.len(),
+                            "max": self.acp_config.max_sessions,
+                        })),
+                    "ACP session/new rejected: session limit reached"
+                );
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            loading.insert(session_id.clone());
+        }
+
         // Build agent from global config, with the session's cwd pinned as
         // the file/shell sandbox boundary. The agent's data directory
         // (identity, scheduled tasks) still lives under `config.data_dir`.
         // ACP sessions exclude persistent memory — context comes from the
         // persisted session history, not the agent's long-term memory store.
-        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
+        // by default to keep `session/new` prompt; on to load this agent's
+        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
+        let enable_mcp = self
+            .config
+            .agent(&agent_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
+        let agent = match Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
-            false,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
             self.canvas_store.clone(),
         )
         .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        })?;
+        {
+            Ok(agent) => agent,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to create agent: {e}"),
+                    data: None,
+                });
+            }
+        };
 
         // Wire an ACP back-channel so tools like `ask_user`,
         // `escalate_to_human`, and `reaction` can talk to the IDE/CLI client
@@ -602,27 +622,10 @@ impl AcpServer {
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
-        let now = Instant::now();
-        sessions.insert(
-            session_id.clone(),
-            Arc::new(Mutex::new(Session {
-                agent,
-                created_at: now,
-                last_active: now,
-                agent_alias: agent_alias.clone(),
-                model_provider: self
-                    .config
-                    .agent(&agent_alias)
-                    .map(|a| a.model_provider.to_string())
-                    .unwrap_or_default(),
-                model: self
-                    .config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|mp| mp.model.clone())
-                    .unwrap_or_default(),
-            })),
-        );
-
+        // Persist before publishing the session, so a failed write never
+        // leaves a live-but-unpersisted session; release the reservation on
+        // failure. The slot stays accounted for (still in `loading`) until the
+        // insert below.
         if let Some(store) = &self.store {
             let store = store.clone();
             let sid = session_id.clone();
@@ -636,14 +639,40 @@ impl AcpServer {
                 Err(join) => Some(join.to_string()),
             };
             if let Some(detail) = error {
-                // Roll back: remove the session we just inserted and surface the error.
-                sessions.remove(&session_id);
+                self.loading_sessions.lock().await.remove(&session_id);
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to persist session: {detail}"),
                     data: None,
                 });
             }
+        }
+
+        let now = Instant::now();
+        // Atomically insert and release the reservation.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
+            sessions.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(Session {
+                    agent,
+                    created_at: now,
+                    last_active: now,
+                    agent_alias: agent_alias.clone(),
+                    model_provider: self
+                        .config
+                        .agent(&agent_alias)
+                        .map(|a| a.model_provider.to_string())
+                        .unwrap_or_default(),
+                    model: self
+                        .config
+                        .model_provider_for_agent(&agent_alias)
+                        .and_then(|mp| mp.model.clone())
+                        .unwrap_or_default(),
+                })),
+            );
         }
 
         let mp = self
@@ -771,11 +800,13 @@ impl AcpServer {
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let restore_alias = self
-            .config
-            .acp
-            .default_agent
-            .clone()
+        // Restore the agent the session was created with — its alias is
+        // persisted on the session row. Fall back to the ACP default (or sole
+        // agent, or "default") only when that agent no longer exists in config,
+        // so a deleted owner degrades gracefully instead of failing the restore.
+        let restore_alias = Some(data.agent_alias.clone())
+            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
                 if self.config.agents.len() == 1 {
@@ -786,11 +817,17 @@ impl AcpServer {
             })
             .unwrap_or_else(|| "default".to_string());
 
+        // MCP init follows the restored agent's own opt-in
+        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
+        let enable_mcp = self
+            .config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
         let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            false,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -973,11 +1010,13 @@ impl AcpServer {
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let restore_alias = self
-            .config
-            .acp
-            .default_agent
-            .clone()
+        // Restore the agent the session was created with — its alias is
+        // persisted on the session row. Fall back to the ACP default (or sole
+        // agent, or "default") only when that agent no longer exists in config,
+        // so a deleted owner degrades gracefully instead of failing the restore.
+        let restore_alias = Some(data.agent_alias.clone())
+            .filter(|alias| !alias.is_empty() && self.config.agent(alias).is_some())
+            .or_else(|| self.config.acp.default_agent.clone())
             .or_else(|| {
                 let mut keys = self.config.agents.keys();
                 if self.config.agents.len() == 1 {
@@ -988,11 +1027,17 @@ impl AcpServer {
             })
             .unwrap_or_else(|| "default".to_string());
 
+        // MCP init follows the restored agent's own opt-in
+        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
+        let enable_mcp = self
+            .config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_mcp);
         let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             &restore_alias,
             Some(&workspace_dir),
-            false,
+            enable_mcp,
             true,
             self.sop_engine.clone(),
             self.sop_audit.clone(),
@@ -2040,6 +2085,23 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // WS is registered to handle them; on ACP-only sessions they should
         // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "history_trimmed",
+                    "droppedMessages": dropped_messages,
+                    "keptTurns": kept_turns,
+                    "reason": reason,
+                }
+            }),
+        },
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.
@@ -2056,27 +2118,6 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
-            if chat.is_pruned_tool_exchange_summary() {
-                return vec![JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": format!("history-pruner-{session_id}"),
-                            "name": "history-pruner",
-                            "title": "history-pruner",
-                            "kind": "think",
-                            "status": "completed",
-                            "content": [{
-                                "type": "content",
-                                "content": { "type": "text", "text": &chat.content }
-                            }]
-                        }
-                    }),
-                }];
-            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -2392,6 +2433,164 @@ mod tests {
         .expect("session/new should create a session");
 
         assert!(result["sessionId"].as_str().is_some());
+    }
+
+    /// Spin up a wiremock server speaking the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) advertising a
+    /// single tool. HTTP transport keeps the test cross-platform (no stdio
+    /// scripts). Mirrors the runtime crate's #8193 helper.
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "tools/list"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List finance records",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_test_config` plus an MCP server (`remote`, HTTP transport at
+    /// `mock_uri`) granted to `test-agent` through the `b1` mcp_bundle.
+    fn make_mcp_granting_test_config(cwd: &std::path::Path, mock_uri: String) -> Config {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut cfg = make_test_config(cwd);
+        cfg.mcp.enabled = true;
+        cfg.mcp.deferred_loading = false;
+        cfg.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        cfg.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        cfg
+    }
+
+    #[test]
+    fn agent_acp_enable_mcp_defaults_off() {
+        assert!(
+            !zeroclaw_config::schema::AliasedAgentConfig::default().acp_enable_mcp,
+            "MCP must stay opt-in per agent so session/new is prompt by default (#8193)"
+        );
+    }
+
+    /// By default (`acp_enable_mcp = false` on the agent) an ACP session must
+    /// NOT touch the servers granted by the agent's mcp_bundles — preserving
+    /// the prompt-`session/new` contract (#8193). The granted MCP server
+    /// records zero requests.
+    #[tokio::test]
+    async fn session_new_skips_mcp_by_default() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = start_mock_mcp_http_server("records.list").await;
+        let config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        let acp = AcpServer::new(config, AcpServerConfig::default());
+
+        acp.handle_session_new(&serde_json::json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "agentAlias": "test-agent"
+        }))
+        .await
+        .expect("session/new must succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.is_empty(),
+            "default ACP session must not connect to granted MCP servers; got {} request(s)",
+            requests.len()
+        );
+    }
+
+    /// With the agent's `acp_enable_mcp = true` an ACP session connects to the
+    /// servers granted by that agent's mcp_bundles (the same eager wiring used
+    /// by gateway/daemon sessions), so the agent can call those tools. The
+    /// granted MCP server receives the `tools/list` handshake during
+    /// `session/new`.
+    #[tokio::test]
+    async fn session_new_loads_mcp_bundles_when_agent_opts_in() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = start_mock_mcp_http_server("records.list").await;
+        let mut config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .acp_enable_mcp = true;
+        let acp = AcpServer::new(config, AcpServerConfig::default());
+
+        acp.handle_session_new(&serde_json::json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "agentAlias": "test-agent"
+        }))
+        .await
+        .expect("session/new must succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| {
+                std::str::from_utf8(&r.body)
+                    .map(|b| b.contains("tools/list"))
+                    .unwrap_or(false)
+            }),
+            "agent with acp_enable_mcp must list tools from granted MCP servers; \
+             got {} request(s)",
+            requests.len()
+        );
     }
 
     #[tokio::test]
@@ -3402,6 +3601,129 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
+    /// `make_mcp_granting_test_config`, reshaped so the MCP-opted-in agent is
+    /// NOT the ACP default. `finance` owns the granted `b1` bundle and sets
+    /// `acp_enable_mcp = true`; the ACP default `test-agent` has neither. A
+    /// restored session owned by `finance` therefore loads MCP only if restore
+    /// resolves the stored alias rather than `acp.default_agent`.
+    fn make_cross_agent_restore_config(cwd: &std::path::Path, mock_uri: String) -> Config {
+        let mut cfg = make_mcp_granting_test_config(cwd, mock_uri);
+        // ACP default agent: no bundle, MCP off.
+        {
+            let ta = cfg.agents.get_mut("test-agent").expect("test-agent exists");
+            ta.mcp_bundles = vec![];
+            ta.acp_enable_mcp = false;
+        }
+        // Session owner: granted the bundle and opted into ACP MCP.
+        cfg.agents.insert(
+            "finance".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                risk_profile: "default".into(),
+                mcp_bundles: vec!["b1".into()],
+                acp_enable_mcp: true,
+                ..Default::default()
+            },
+        );
+        cfg.acp.default_agent = Some("test-agent".to_string());
+        cfg
+    }
+
+    /// A restored session must rebuild under the agent it was CREATED with
+    /// (`AcpSessionData.agent_alias`), not `acp.default_agent`, and apply that
+    /// agent's `acp_enable_mcp`. Here the owner `finance` opts into MCP while
+    /// the ACP default `test-agent` does not, so a correct restore means the
+    /// granted MCP server receives the `tools/list` handshake. Regression for
+    /// the restore-path review on #8237.
+    #[tokio::test]
+    async fn session_load_restores_owning_agent_and_its_mcp_optin() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mcp = start_mock_mcp_http_server("records.list").await;
+        let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cross-agent-load";
+        store
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let requests = mcp
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| std::str::from_utf8(&r.body)
+                .map(|b| b.contains("tools/list"))
+                .unwrap_or(false)),
+            "restored session must rebuild from its owning agent `finance` (acp_enable_mcp=true) \
+             and load its MCP bundles, not the ACP default `test-agent`; got {} request(s)",
+            requests.len()
+        );
+    }
+
+    /// Same restore-alias contract as the load test, exercised through
+    /// `session/resume` (which shares the restore path). Regression for the
+    /// restore-path review on #8237.
+    #[tokio::test]
+    async fn session_resume_restores_owning_agent_and_its_mcp_optin() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mcp = start_mock_mcp_http_server("records.list").await;
+        let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cross-agent-resume";
+        store
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        let requests = mcp
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| std::str::from_utf8(&r.body)
+                .map(|b| b.contains("tools/list"))
+                .unwrap_or(false)),
+            "resumed session must rebuild from its owning agent `finance` (acp_enable_mcp=true) \
+             and load its MCP bundles, not the ACP default `test-agent`; got {} request(s)",
+            requests.len()
+        );
+    }
+
     #[test]
     fn turn_cancelled_notification_is_styled_tool_call() {
         let note = AcpServer::turn_cancelled_notification("sess-c");
@@ -3413,37 +3735,6 @@ mod tests {
             update["content"][0]["content"]["text"]
                 .as_str()
                 .is_some_and(|t| !t.is_empty())
-        );
-    }
-
-    #[test]
-    fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-        let marker = ChatMessage::pruned_tool_exchange_summary(3);
-        let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
-        let notes = history_notifications_for_message("sess-x", &msg);
-        assert_eq!(notes.len(), 1);
-        let update = &notes[0].params["update"];
-        assert_eq!(update["sessionUpdate"], "tool_call");
-        assert_eq!(update["name"], "history-pruner");
-        assert_eq!(update["content"][0]["content"]["text"], marker);
-
-        let plain = ConversationMessage::Chat(ChatMessage::assistant("normal reply"));
-        let plain_notes = history_notifications_for_message("sess-x", &plain);
-        assert_eq!(
-            plain_notes[0].params["update"]["sessionUpdate"],
-            "agent_message_chunk"
-        );
-
-        // Sessions pruned before #7684 carry the legacy marker; they must still
-        // replay as the styled tool_call, not leak the raw marker as agent text.
-        let legacy = ConversationMessage::Chat(ChatMessage::assistant(
-            "[Tool exchange: 3 tool call(s) results collapsed]",
-        ));
-        let legacy_notes = history_notifications_for_message("sess-x", &legacy);
-        assert_eq!(
-            legacy_notes[0].params["update"]["sessionUpdate"],
-            "tool_call"
         );
     }
 
@@ -3544,6 +3835,42 @@ mod tests {
             .expect_err("unknown session must fail");
 
         assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    /// `session/new` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached. Guards the reservation/limit check that moved out from
+    /// under the long-held sessions lock so MCP startup no longer blocks it.
+    #[tokio::test]
+    async fn session_new_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+        ));
+
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("first session/new must succeed under the limit");
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect_err("second session/new must fail at max_sessions");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {err:?}"
+        );
     }
 
     /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is

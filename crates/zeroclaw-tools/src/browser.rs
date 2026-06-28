@@ -1651,10 +1651,10 @@ mod native_backend {
     fn selector_for_find(by: &str, value: &str) -> String {
         let escaped = css_attr_escape(value);
         match by {
-            "role" => format!(r#"[role=\"{escaped}\"]"#),
+            "role" => format!("[role=\"{escaped}\"]"),
             "label" => format!("label={value}"),
-            "placeholder" => format!(r#"[placeholder=\"{escaped}\"]"#),
-            "testid" => format!(r#"[data-testid=\"{escaped}\"]"#),
+            "placeholder" => format!("[placeholder=\"{escaped}\"]"),
+            "testid" => format!("[data-testid=\"{escaped}\"]"),
             _ => format!("text={value}"),
         }
     }
@@ -1742,7 +1742,7 @@ mod native_backend {
 
         if trimmed.starts_with('@') {
             let escaped = css_attr_escape(trimmed);
-            return SelectorKind::Css(format!(r#"[data-zc-ref=\"{escaped}\"]"#));
+            return SelectorKind::Css(format!("[data-zc-ref=\"{escaped}\"]"));
         }
 
         SelectorKind::Css(trimmed.to_string())
@@ -1812,7 +1812,7 @@ mod native_backend {
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            r#"(() => {{
+            r#"return (() => {{
   const interactiveOnly = {interactive_only};
   const compact = {compact};
   const maxDepth = {depth_literal};
@@ -1875,6 +1875,66 @@ mod native_backend {
   }};
 }})();"#
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn snapshot_script_starts_with_return() {
+            let script = snapshot_script(true, false, None);
+            assert!(
+                script.starts_with("return (() => {"),
+                "snapshot_script must start with 'return (() => {{' for WebDriver ExecuteScript; got: {:?}",
+                &script[..60]
+            );
+        }
+
+        #[test]
+        fn selector_for_find_role_emits_normal_css_attribute() {
+            let sel = selector_for_find("role", "button");
+            assert_eq!(sel, r#"[role="button"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_placeholder_emits_normal_css_attribute() {
+            let sel = selector_for_find("placeholder", "Search");
+            assert_eq!(sel, r#"[placeholder="Search"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_testid_emits_normal_css_attribute() {
+            let sel = selector_for_find("testid", "submit-btn");
+            assert_eq!(sel, r#"[data-testid="submit-btn"]"#);
+        }
+
+        #[test]
+        fn parse_selector_at_ref_emits_normal_css_attribute() {
+            let sel = parse_selector("@elem");
+            let SelectorKind::Css(css) = sel else {
+                panic!("expected Css selector, got XPath");
+            };
+            assert_eq!(css, r#"[data-zc-ref="@elem"]"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_backslashes() {
+            let escaped = css_attr_escape(r#"path\to\file"#);
+            assert_eq!(escaped, r#"path\\to\\file"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_double_quotes() {
+            let escaped = css_attr_escape(r#"he said "hello""#);
+            assert_eq!(escaped, r#"he said \"hello\""#);
+        }
+
+        #[test]
+        fn css_attr_escape_handles_both() {
+            let escaped = css_attr_escape(r#"a\"b"#);
+            assert_eq!(escaped, r#"a\\\"b"#);
+        }
     }
 }
 

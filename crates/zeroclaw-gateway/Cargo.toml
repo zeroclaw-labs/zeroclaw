@@ -82,7 +82,12 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-default = ["schema-export"]
+default = ["schema-export", "a2a"]
+# A2A (Agent2Agent) discovery surface: well-known catalog card + per-alias
+# agent cards. Default-on; the runtime surface stays default-closed via
+# [a2a.server] enabled = false. Pure-serde cards on the existing axum stack,
+# no a2a-rs/protobuf footprint.
+a2a = []
 plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]

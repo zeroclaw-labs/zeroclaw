@@ -193,6 +193,16 @@ fn build_approval_content(
 
 #[async_trait]
 impl Channel for AcpChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing indicator in the ACP session protocol; updates stream via session/update.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing indicator in the ACP session protocol; updates stream via session/update.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

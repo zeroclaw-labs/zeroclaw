@@ -536,6 +536,7 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    bot_id: Mutex<Option<i64>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -614,6 +615,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
+            bot_id: Mutex::new(None),
             api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
@@ -754,7 +756,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "TTS disabled"
                 ),
             }
@@ -1012,7 +1014,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to register Telegram bot commands"
                 );
             }
@@ -1100,7 +1102,7 @@ impl TelegramChannel {
                                 ::zeroclaw_log::Action::Note
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                             "TTS voice reply failed"
                         );
                     }
@@ -1166,7 +1168,7 @@ impl TelegramChannel {
                                 ::zeroclaw_log::Action::Note
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                             "TTS voice reply failed"
                         );
                     }
@@ -1251,11 +1253,19 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let username = data
+        let result = data
             .get("result")
-            .and_then(|r| r.get("username"))
+            .context("missing result in getMe response")?;
+        let username = result
+            .get("username")
             .and_then(|u| u.as_str())
             .context("Bot username not found in response")?;
+
+        // Cache the bot's user ID for reply-to-self detection
+        if let Some(id) = result.get("id").and_then(|i| i.as_i64()) {
+            let mut cache = self.bot_id.lock();
+            *cache = Some(id);
+        }
 
         Ok(username.to_string())
     }
@@ -1279,7 +1289,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to fetch bot username"
                 );
                 None
@@ -1353,6 +1363,17 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    /// Check whether `message` is a reply to a message sent by the bot
+    /// itself. When true, the `mention_only` gate should be bypassed.
+    fn is_reply_to_bot(message: &serde_json::Value, bot_id: i64) -> bool {
+        message
+            .get("reply_to_message")
+            .and_then(|r| r.get("from"))
+            .and_then(|f| f.get("id"))
+            .and_then(|i| i.as_i64())
+            .is_some_and(|id| id == bot_id)
+    }
+
     /// Apply the `mention_only` gate to a non-text update (photo / document /
     /// voice) using its caption as the channel for the mention.
     ///
@@ -1382,6 +1403,16 @@ impl TelegramChannel {
         }
         let bot_username_guard = self.bot_username.lock();
         let bot_username = bot_username_guard.as_ref()?;
+
+        // If the user is replying directly to the bot's message, bypass the
+        // mention check — replies are an unambiguous signal of intent.
+        if let Some(caption) = caption
+            && let Some(bot_id) = *self.bot_id.lock()
+            && Self::is_reply_to_bot(message, bot_id)
+        {
+            return Some(Self::normalize_incoming_content(caption, bot_username));
+        }
+
         let caption = caption?;
         if !Self::contains_bot_mention(caption, bot_username) {
             return None;
@@ -1760,7 +1791,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 "Failed to create telegram_files directory"
             );
             return None;
@@ -1774,7 +1805,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to get attachment file path"
                 );
                 return None;
@@ -1788,7 +1819,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to download attachment"
                 );
                 return None;
@@ -1811,7 +1842,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 &format!("Failed to save attachment to {}", local_path.display())
             );
             return None;
@@ -1933,7 +1964,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to get voice file path"
                 );
                 return None;
@@ -1953,7 +1984,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to download voice file"
                 );
                 return None;
@@ -1967,7 +1998,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Voice transcription failed"
                 );
                 return None;
@@ -2222,8 +2253,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
+                // If the user is replying directly to the bot's message, bypass
+                // the mention check — replies are an unambiguous signal of intent.
                 if !Self::contains_bot_mention(text, bot_username) {
-                    return None;
+                    let bot_id = *self.bot_id.lock();
+                    if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                        return None;
+                    }
                 }
             } else {
                 return None;
@@ -2628,7 +2664,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"url": target, "error": format!("{}", e)})
+                            ::serde_json::json!({"url": target, "error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
                         ),
                     "Telegram send media by URL failed; falling back to text link"
                 );
@@ -3262,7 +3298,7 @@ impl Channel for TelegramChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram message_id ''"
                 );
@@ -3323,7 +3359,7 @@ impl Channel for TelegramChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram message_id ''"
                 );
@@ -3491,7 +3527,7 @@ impl Channel for TelegramChannel {
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram draft message_id ''"
                 );
@@ -3593,7 +3629,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "startup probe error; retrying in 5s"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3692,7 +3730,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "poll error"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3707,7 +3747,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "parse error"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3835,7 +3877,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                                         ::zeroclaw_log::Action::Note
                                     )
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                                     "answerCallbackQuery failed"
                                 );
                             }
@@ -3899,7 +3941,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "health check failed"
                 );
                 false
@@ -4085,6 +4127,20 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_masks_poll_error_url() {
+        let raw = "error sending request for url (https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates)";
+        let redacted = zeroclaw_runtime::security::scrub(raw);
+        assert!(!redacted.contains("123456:ABC-def_GHI"));
+        assert!(redacted.contains("[REDACTED_BOT_TOKEN]"));
+    }
+
+    #[test]
+    fn scrub_leaves_unrelated_text_untouched() {
+        let raw = "connection reset by peer";
+        assert_eq!(zeroclaw_runtime::security::scrub(raw), raw);
+    }
 
     #[test]
     fn voice_peer_resolver_resolves_live_from_config() {
@@ -5663,6 +5719,166 @@ mod tests {
             .parse_update_message(&mention_only_update)
             .expect("mention-only body admits");
         assert_eq!(parsed.content, "@mybot");
+    }
+
+    #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to the bot's own message — no mention needed.
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 55,
+                "text": "do this",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 50,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot should bypass mention_only gate");
+        // extract_reply_context prepends the quote; the gate returns the body,
+        // and the quote is re-added by the normal reply-handling path.
+        assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this");
+    }
+
+    #[test]
+    fn parse_update_reply_to_non_bot_still_dropped_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to another user (not the bot) — still needs a mention.
+        let update = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 56,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 51,
+                    "from": { "id": 99, "username": "charlie" },
+                    "text": "some message"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_bot_id_unresolved_falls_through_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        // bot_id stays None — unresolved.
+
+        // Reply to the bot's message, but bot_id is unresolved — falls through.
+        let update = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 57,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 52,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate_caption_path() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Photo with a caption, replying to the bot — caption should pass.
+        // This exercises check_media_mention_gate directly because
+        // parse_update_message requires `message.text` and photo updates
+        // carry only `message.caption`.
+        let message = serde_json::json!({
+            "message_id": 58,
+            "caption": "enhance this",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300, "type": "group" },
+            "photo": [
+                { "file_id": "abc", "width": 100, "height": 100 }
+            ],
+            "reply_to_message": {
+                "message_id": 53,
+                "from": { "id": 42, "username": "mybot", "is_bot": true },
+                "text": "original photo"
+            }
+        });
+
+        let result = ch.check_media_mention_gate(&message, Some("enhance this"));
+        assert!(
+            result.is_some(),
+            "reply-to-bot caption should bypass mention_only gate"
+        );
+        let gated = result.unwrap();
+        assert!(gated.is_some(), "gate should return the normalized caption");
+        assert_eq!(gated.unwrap(), "enhance this");
     }
 
     #[test]

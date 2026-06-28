@@ -107,6 +107,22 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn features(selection_id: &str) -> anyhow::Result<()> {
+    let menu = Sel::menu();
+    let selection = menu
+        .iter()
+        .find(|s| s.id() == selection_id)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "unknown selection `{selection_id}` (known: {})",
+                menu.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
+            ))
+        })?;
+    let list = spec::resolve_feature_list(&workspace_root(), selection)?;
+    println!("{}", list.join(","));
+    Ok(())
+}
+
 pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
     let all = registry();
     let selected: Vec<&Surface> = if targets.is_empty() {
