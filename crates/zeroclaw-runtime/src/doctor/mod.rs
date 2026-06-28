@@ -577,7 +577,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        if let Some(reason) = model_route_provider_validation_error(config, &route.model_provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -691,6 +691,26 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .into(),
         ),
     }
+}
+
+fn model_route_provider_validation_error(config: &Config, name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if let Some((family, alias)) = trimmed.split_once('.') {
+        if family.trim().is_empty() || alias.trim().is_empty() {
+            return Some(
+                "model route provider refs must be `<type>.<alias>` or a canonical provider family"
+                    .into(),
+            );
+        }
+        if config.providers.models.find(family, alias).is_some() {
+            return None;
+        }
+        return Some(format!(
+            "providers.models.{family}.{alias} is not configured"
+        ));
+    }
+
+    provider_validation_error(trimmed)
 }
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
@@ -1237,6 +1257,34 @@ mod tests {
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_accepts_dotted_model_route_provider_ref() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("anthropic", "claude")
+            .expect("known model_provider type")
+            .model = Some("claude-sonnet-4-5-20250929".to_string());
+        config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "coding".into(),
+            model_provider: "anthropic.claude".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let invalid_route_item = items.iter().find(|item| {
+            item.message
+                .contains("model route \"coding\" uses invalid model_provider")
+        });
+        assert!(
+            invalid_route_item.is_none(),
+            "doctor should accept configured dotted model route provider refs"
+        );
     }
 
     #[test]

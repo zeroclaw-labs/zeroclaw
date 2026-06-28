@@ -29,6 +29,7 @@ static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
+use crate::agent::eval::AutoClassifyExt;
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -2908,6 +2909,55 @@ fn retain_registered_tool_descriptions(
     tool_descs.retain(|(name, _)| registered_tool_names.contains(name));
 }
 
+fn model_provider_entry_for_ref<'a>(
+    config: &'a Config,
+    provider_ref: &str,
+) -> Option<&'a zeroclaw_config::schema::ModelProviderConfig> {
+    provider_ref
+        .split_once('.')
+        .and_then(|(family, alias)| config.providers.models.find(family, alias))
+}
+
+fn model_provider_api_key_for_ref<'a>(
+    config: &'a Config,
+    provider_ref: &str,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    let entry = model_provider_entry_for_ref(config, provider_ref);
+    if let Some(api_key) = entry
+        .and_then(|entry| entry.api_key.as_deref())
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+    {
+        return Some(api_key);
+    }
+    if entry.is_none() {
+        return fallback
+            .map(str::trim)
+            .filter(|api_key| !api_key.is_empty());
+    }
+    None
+}
+
+fn model_provider_uri_for_ref<'a>(
+    config: &'a Config,
+    provider_ref: &str,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    let entry = model_provider_entry_for_ref(config, provider_ref);
+    if let Some(uri) = entry
+        .and_then(|entry| entry.uri.as_deref())
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())
+    {
+        return Some(uri);
+    }
+    if entry.is_none() {
+        return fallback.map(str::trim).filter(|uri| !uri.is_empty());
+    }
+    None
+}
+
 pub fn apply_text_tool_prompt_policy(
     native_tools: bool,
     strict_tool_parsing: bool,
@@ -3270,6 +3320,65 @@ pub async fn run(
             ),
         };
 
+        if model_override.is_none()
+            && let Some(raw_message) = message.as_deref()
+        {
+            let classified_hint = super::classifier::classify_with_decision(
+                &config.query_classification,
+                raw_message,
+            )
+            .map(|decision| {
+                (
+                    decision.hint,
+                    Some(decision.priority),
+                    "rule".to_string(),
+                    None,
+                )
+            })
+            .or_else(|| {
+                agent.auto_classify.as_ref().and_then(|auto_classify| {
+                    let tier = super::eval::estimate_complexity(raw_message);
+                    auto_classify.hint_for(tier).map(|hint| {
+                        (
+                            hint.to_string(),
+                            None,
+                            "complexity".to_string(),
+                            Some(format!("{tier:?}")),
+                        )
+                    })
+                })
+            });
+
+            if let Some((hint, rule_priority, source, complexity)) = classified_hint {
+                if let Some(route) = config.model_routes.iter().find(|route| route.hint == hint) {
+                    provider_name = route.model_provider.clone();
+                    model_name = route.model.clone();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "hint": hint,
+                                "model_provider": provider_name.as_str(),
+                                "model": model_name.as_str(),
+                                "source": source,
+                                "rule_priority": rule_priority,
+                                "complexity": complexity,
+                                "message_length": raw_message.len(),
+                            })),
+                        "Classified CLI message route"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"hint": hint})),
+                        "Classified CLI message to a hint without a matching model route"
+                    );
+                }
+            }
+        }
+
         {
             let span = zeroclaw_log::Span::current();
             let mp_composite = match agent_provider_resolved.as_ref() {
@@ -3292,8 +3401,16 @@ pub async fn run(
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
                 &provider_name,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
+                model_provider_api_key_for_ref(
+                    &config,
+                    &provider_name,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                ),
+                model_provider_uri_for_ref(
+                    &config,
+                    &provider_name,
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                ),
                 &config.reliability,
                 &config.model_routes,
                 &model_name,
@@ -3663,6 +3780,7 @@ pub async fn run(
 
             #[allow(unused_assignments)]
             let mut response = String::new();
+            let mut fallback_route_used = false;
             loop {
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
@@ -3726,8 +3844,16 @@ pub async fn run(
                                 zeroclaw_providers::create_routed_model_provider_with_options(
                                     &config,
                                     &new_model_provider,
-                                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                                    model_provider_api_key_for_ref(
+                                        &config,
+                                        &new_model_provider,
+                                        agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                                    ),
+                                    model_provider_uri_for_ref(
+                                        &config,
+                                        &new_model_provider,
+                                        agent_model_provider.and_then(|e| e.uri.as_deref()),
+                                    ),
                                     &config.reliability,
                                     &config.model_routes,
                                     &new_model,
@@ -3742,6 +3868,66 @@ pub async fn run(
                             model_name = new_model;
 
                             clear_model_switch_request();
+
+                            observer.record_event(&ObserverEvent::AgentStart {
+                                model_provider: provider_name.to_string(),
+                                model: model_name.to_string(),
+                            });
+
+                            continue;
+                        }
+                        if !fallback_route_used
+                            && let Some(route) = config
+                                .model_routes
+                                .iter()
+                                .find(|route| route.hint == "fallback")
+                            && (route.model_provider != provider_name || route.model != model_name)
+                        {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "from_model_provider": provider_name.as_str(),
+                                    "from_model": model_name.as_str(),
+                                    "to_model_provider": route.model_provider.as_str(),
+                                    "to_model": route.model.as_str(),
+                                    "error": zeroclaw_providers::sanitize_api_error(&e.to_string()),
+                                })),
+                                "Primary model route failed; retrying configured fallback route"
+                            );
+
+                            model_provider =
+                                zeroclaw_providers::create_routed_model_provider_with_options(
+                                    &config,
+                                    &route.model_provider,
+                                    model_provider_api_key_for_ref(
+                                        &config,
+                                        &route.model_provider,
+                                        agent_model_provider
+                                            .and_then(|entry| entry.api_key.as_deref()),
+                                    ),
+                                    model_provider_uri_for_ref(
+                                        &config,
+                                        &route.model_provider,
+                                        agent_model_provider.and_then(|entry| entry.uri.as_deref()),
+                                    ),
+                                    &config.reliability,
+                                    &config.model_routes,
+                                    &route.model,
+                                    &zeroclaw_providers::options_for_provider_ref(
+                                        &config,
+                                        &route.model_provider,
+                                        &provider_runtime_options_base,
+                                    ),
+                                )?;
+
+                            provider_name = route.model_provider.clone();
+                            model_name = route.model.clone();
+                            fallback_route_used = true;
 
                             observer.record_event(&ObserverEvent::AgentStart {
                                 model_provider: provider_name.to_string(),

@@ -124,6 +124,7 @@ pub fn get_permissions_status() -> Vec<PermissionInfo> {
 }
 
 #[tauri::command]
+#[allow(clippy::needless_return)] // cfg-gated branches: `return` is required on non-host targets
 pub fn get_runtime_platform() -> String {
     #[cfg(target_os = "macos")]
     {
