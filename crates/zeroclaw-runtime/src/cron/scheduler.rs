@@ -1154,9 +1154,7 @@ async fn run_job_command_with_timeout(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = match output_format {
-                CronShellOutputFormat::Raw if output.status.success() => {
-                    stdout.trim().to_string()
-                }
+                CronShellOutputFormat::Raw if output.status.success() => stdout.trim().to_string(),
                 _ => format!(
                     "status={}\nstdout:\n{}\nstderr:\n{}",
                     output.status,
