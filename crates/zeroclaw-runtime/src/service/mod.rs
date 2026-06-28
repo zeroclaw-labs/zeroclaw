@@ -8,6 +8,13 @@ use zeroclaw_config::schema::Config;
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SystemdUserLinger {
+    Enabled,
+    Disabled { user: String },
+    Unknown,
+}
+
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitSystem {
@@ -67,7 +74,7 @@ impl InitSystem {
 #[cfg(target_os = "linux")]
 fn detect_init_system() -> Result<InitSystem> {
     // Check for systemd first (most common on modern Linux)
-    if Path::new("/run/systemd/system").exists() {
+    if linux_systemd_runtime_present() {
         return Ok(InitSystem::Systemd);
     }
 
@@ -83,6 +90,10 @@ fn detect_init_system() -> Result<InitSystem> {
         "Could not detect init system. Supported: systemd, OpenRC. \
          Use --service-init to specify manually."
     );
+}
+
+pub(crate) fn linux_systemd_runtime_present() -> bool {
+    cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists()
 }
 
 fn windows_task_name() -> &'static str {
@@ -252,6 +263,7 @@ fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             run_checked(
                 Command::new("systemctl").args(linux_systemd_action_args(config, "start")),
             )?;
+            warn_if_systemd_user_linger_disabled();
         }
         InitSystem::Openrc => {
             run_checked(
@@ -903,6 +915,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
         file.display().to_string()
     );
     println!("   Start with: zeroclaw service start");
+    warn_if_systemd_user_linger_disabled();
     Ok(())
 }
 
@@ -1600,6 +1613,83 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(unix)]
+fn current_loginctl_user_target() -> Option<String> {
+    // SAFETY: getuid() has no preconditions and returns the real UID of the
+    // process. loginctl accepts the numeric UID, which avoids trusting $USER.
+    Some(unsafe { libc::getuid() }.to_string())
+}
+
+#[cfg(not(unix))]
+fn current_loginctl_user_target() -> Option<String> {
+    None
+}
+
+fn parse_loginctl_linger_property(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("Linger") {
+            return None;
+        }
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("yes") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("no") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn systemd_user_linger_status() -> SystemdUserLinger {
+    let Some(user) = current_loginctl_user_target() else {
+        return SystemdUserLinger::Unknown;
+    };
+
+    let output = Command::new("loginctl")
+        .args(["show-user", user.as_str(), "--property=Linger"])
+        .output();
+
+    match output {
+        Ok(output) => systemd_user_linger_status_from_output(
+            user,
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+        ),
+        Err(_) => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_user_linger_status_from_output(
+    user: String,
+    success: bool,
+    stdout: &str,
+) -> SystemdUserLinger {
+    if !success {
+        return SystemdUserLinger::Unknown;
+    }
+
+    match parse_loginctl_linger_property(stdout) {
+        Some(true) => SystemdUserLinger::Enabled,
+        Some(false) => SystemdUserLinger::Disabled { user },
+        None => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_linger_hint(user: &str) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-service-systemd-linger-disabled-warning",
+        &[("user", user)],
+    )
+}
+
+fn warn_if_systemd_user_linger_disabled() {
+    if let SystemdUserLinger::Disabled { user } = systemd_user_linger_status() {
+        eprintln!("⚠️  {}", systemd_linger_hint(&user));
+    }
+}
+
 // Plain `#[cfg(test)]` is intentional: these pure renderer tests have no
 // integration dependencies and should run in every zeroclaw-runtime test build.
 #[cfg(test)]
@@ -1774,6 +1864,59 @@ mod linux_service_tests {
                 "-f"
             ]
         );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_reads_yes_and_no() {
+        assert_eq!(
+            parse_loginctl_linger_property("Linger=yes\nUID=1000\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_loginctl_linger_property("UID=1000\nLinger=no\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_is_case_and_whitespace_tolerant() {
+        assert_eq!(
+            parse_loginctl_linger_property("  linger = YeS  \n"),
+            Some(true)
+        );
+        assert_eq!(parse_loginctl_linger_property("LINGER = No\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_ignores_unusable_output() {
+        assert_eq!(parse_loginctl_linger_property("UID=1000\nName=dan\n"), None);
+        assert_eq!(parse_loginctl_linger_property("Linger=maybe\n"), None);
+        assert_eq!(parse_loginctl_linger_property(""), None);
+    }
+
+    #[test]
+    fn systemd_user_linger_status_requires_successful_loginctl() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), false, "Linger=no\n"),
+            SystemdUserLinger::Unknown
+        );
+    }
+
+    #[test]
+    fn systemd_user_linger_status_maps_disabled_user_target() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), true, "Linger=no\n"),
+            SystemdUserLinger::Disabled {
+                user: "1000".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn systemd_linger_hint_names_enable_command() {
+        let hint = systemd_linger_hint("1000");
+        assert!(hint.contains("may stop after logout"));
+        assert!(hint.contains("loginctl enable-linger 1000"));
     }
 
     #[cfg(not(target_os = "windows"))]

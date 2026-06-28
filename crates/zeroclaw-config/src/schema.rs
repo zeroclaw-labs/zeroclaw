@@ -130,13 +130,17 @@ pub struct Config {
     /// Model-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -3376,6 +3380,20 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
+    /// Initialize this agent's `mcp_bundles` tools when it serves an ACP
+    /// (`session/new`) session.
+    ///
+    /// Off by default: MCP servers are external processes/services that can
+    /// block startup while they connect, and ACP `session/new` is expected to
+    /// return promptly. Enable it when this agent must call its `mcp_bundles`
+    /// tools over ACP; `session/new` then pays the one-time MCP connection cost
+    /// (bounded and non-fatal per server). Set per agent so each ACP profile
+    /// opts in independently; when this agent is the ACP default
+    /// (`acp.default_agent`, or the sole configured agent), the flag is picked
+    /// up automatically for sessions that omit `agentAlias`.
+    #[tab(Bundles)]
+    #[serde(default)]
+    pub acp_enable_mcp: bool,
     /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
@@ -3514,6 +3532,7 @@ impl Default for AliasedAgentConfig {
             skill_bundles: Vec::new(),
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
+            acp_enable_mcp: false,
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
@@ -11043,17 +11062,31 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "model_routes"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -11071,20 +11104,34 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "embedding_routes"]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
+    #[serde(default)]
     pub hint: String,
     /// Dotted embedding-capable provider profile ref
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local embedding model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
+    #[serde(default)]
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -19711,8 +19758,9 @@ pub struct SopConfig {
     pub max_concurrent_total: usize,
 
     /// Approval timeout in seconds. When a run waits for approval longer than
-    /// this, Critical/High-priority SOPs auto-approve; others stay waiting.
-    /// Set to 0 to disable timeout.
+    /// this, the configured `approval_timeout_action` is applied (default
+    /// `escalate`: re-surface the gate to the out-of-band approver and never
+    /// self-approve). Set to 0 to disable the timeout sweep.
     #[serde(default = "default_sop_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
@@ -19737,6 +19785,19 @@ pub struct SopConfig {
     /// `<data_dir>/sop`. Never OS-temp.
     #[serde(default)]
     pub run_state_dir: Option<String>,
+
+    /// WHO may clear a SOP approval gate. Layered with execution_mode / priority /
+    /// requires_confirmation (those still apply). Default `both` keeps today's
+    /// behavior (the agent tool OR an out-of-band principal can clear a gate).
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+
+    /// What happens to a SOP gate that times out (after `approval_timeout_secs`).
+    /// Default `escalate` is fail-closed: re-surface to the out-of-band approver and
+    /// keep waiting, never self-approve. (The SOP-gate analog of the channel
+    /// approval-routing fail-closed default; reconcile with that model if both land.)
+    #[serde(default)]
+    pub approval_timeout_action: ApprovalTimeoutAction,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -19757,6 +19818,43 @@ pub enum SopRunStoreBackend {
     Sqlite,
     /// Ephemeral in-memory store: explicitly non-durable, for tests / degraded boot.
     Memory,
+}
+
+/// WHO may clear a SOP approval gate. Layered with execution_mode / priority /
+/// requires_confirmation (all of which still apply). Closed set => serde enum.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Agent `sop_approve` OR an out-of-band principal both clear. Backward-compat default.
+    #[default]
+    Both,
+    /// Only out-of-band principals (CLI / WS / HTTP / timeout) clear; `sop_approve`
+    /// becomes a no-op. Lets an operator require a separate approver without bricking runs.
+    OutOfBandRequired,
+    /// Only the agent tool clears; out-of-band surfaces are read-only pending lists. Niche.
+    AgentTool,
+}
+
+/// What happens to a SOP approval gate when it times out. Default is fail-closed:
+/// the gate never self-approves. Closed set => serde enum.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalTimeoutAction {
+    /// Re-surface to the out-of-band approver and keep waiting; never self-approve.
+    /// Default, fail-closed.
+    #[default]
+    Escalate,
+    /// Terminate the run (fail-safe cancel). Strict mode.
+    Cancel,
+    /// LEGACY: auto-approve on timeout. The ONLY path to the old fail-open behavior;
+    /// opt-in only.
+    AutoApprove,
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19782,6 +19880,8 @@ impl Default for SopConfig {
             persist_runs: false,
             run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
+            approval_mode: ApprovalMode::Both,
+            approval_timeout_action: ApprovalTimeoutAction::Escalate,
         }
     }
 }
@@ -25812,6 +25912,44 @@ group_policy = "disabled"
         assert_eq!(anthropic.natural_key, None);
     }
 
+    /// `model_routes` and `embedding_routes` are `#[nested]` Vec fields
+    /// with `#[natural_key = "hint"]` — they must surface in
+    /// `map_key_sections()` as `List` entries so the dashboard and the
+    /// incremental TOML writer can address individual route entries.
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_model_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "model_routes")
+            .expect("model_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::model_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_embedding_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "embedding_routes")
+            .expect("embedding_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::embedding_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
     /// A dirty path with a kebab-shaped inner field (e.g.
     /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
     /// shared `resolve_dirty_segments` helper inside the natural-key
@@ -29359,13 +29497,37 @@ allowed_users = []
             class_for("channels.matrix.default.access_token"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
+        // model_routes and embedding_routes are now #[nested] Vec fields —
+        // they are surfaced via map_key_sections(), not as flat prop_fields.
+        // After adding a route entry, its api_key sub-field appears in
+        // prop_fields with EncryptedSecret classification (from #[secret]).
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_provider: "openai.default".into(),
+            model: "gpt-4".into(),
+            api_key: None,
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openai.embeddings".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        });
+        let nested_fields = config.prop_fields();
+        let nested_class_for = |name: &str| {
+            nested_fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.credential_class)
+        };
         assert_eq!(
-            class_for("model_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("model_routes.reasoning.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert_eq!(
-            class_for("embedding_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("embedding_routes.semantic.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert!(Config::prop_is_secret(
             "providers.tts.openai.default.api_key"

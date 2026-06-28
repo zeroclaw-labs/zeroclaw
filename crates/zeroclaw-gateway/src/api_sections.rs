@@ -584,7 +584,9 @@ fn picker_items_for(
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
         Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
@@ -1065,7 +1067,9 @@ pub async fn handle_section_select(
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             // OneTierAliasMap: the URL path key IS the alias. One
             // `create_map_key_checked("<section>", &key)` call works for every
             // operator-named HashMap section; create_map_key is
