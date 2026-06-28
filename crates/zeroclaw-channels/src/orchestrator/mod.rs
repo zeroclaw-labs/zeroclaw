@@ -5147,6 +5147,10 @@ async fn process_channel_message_body(
             );
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            // This future captures the full channel turn, provider dispatch,
+            // and scoped runtime contexts. Keep it off the test thread stack so
+            // nextest/Linux does not abort in provider-error recovery tests.
+            let tool_loop = Box::pin(tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
