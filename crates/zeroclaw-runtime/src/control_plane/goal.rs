@@ -7,12 +7,17 @@
 use anyhow::{Context, Result, bail};
 
 use super::global::control_plane;
-use super::task_registry::{GoalTaskRecord, TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{
+    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind,
+    TaskRecord, TaskRegistry, TaskStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalCommandAction {
     Start,
     Status,
+    Pause,
+    Resume,
     Cancel,
 }
 
@@ -91,12 +96,24 @@ pub fn parse_goal_command(input: &str) -> Result<GoalCommand> {
             objective: None,
             task_id: nonempty(rest),
         }),
+        "pause" => Ok(GoalCommand {
+            action: GoalCommandAction::Pause,
+            objective: nonempty(rest),
+            task_id: None,
+        }),
+        "resume" => Ok(GoalCommand {
+            action: GoalCommandAction::Resume,
+            objective: None,
+            task_id: nonempty(rest),
+        }),
         "cancel" => Ok(GoalCommand {
             action: GoalCommandAction::Cancel,
             objective: None,
             task_id: nonempty(rest),
         }),
-        other => bail!("unknown goal action `{other}`; use start, status, or cancel"),
+        other => {
+            bail!("unknown goal action `{other}`; use start, status, pause, resume, or cancel")
+        }
     }
 }
 
@@ -113,6 +130,29 @@ pub async fn admit_goal_command(
             start_goal(cp.store.as_ref(), &cp.boot_id, ctx, objective).await
         }
         GoalCommandAction::Status => status_goal(cp.store.as_ref(), &ctx, command.task_id).await,
+        GoalCommandAction::Pause => {
+            let description = command.objective;
+            pause_goal_for_blocker(
+                cp.store.as_ref(),
+                &ctx,
+                command.task_id,
+                GoalPauseState {
+                    reason: GoalPauseReason::HumanEscalation,
+                    description: description.clone(),
+                    blockers: description
+                        .map(|message| {
+                            vec![GoalBlocker {
+                                kind: GoalBlockerKind::HumanEscalation,
+                                message,
+                                payload: None,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                },
+            )
+            .await
+        }
+        GoalCommandAction::Resume => resume_goal(cp.store.as_ref(), &ctx, command.task_id).await,
         GoalCommandAction::Cancel => cancel_goal(cp.store.as_ref(), &ctx, command.task_id).await,
     }
 }
@@ -150,6 +190,9 @@ async fn start_goal(
             objective,
             effective_token_limit: None,
             effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
         })
         .await?;
     Ok(GoalAdmission {
@@ -173,9 +216,61 @@ async fn status_goal(
         task_id: task.id.clone(),
         status: task.status,
         message: format!(
-            "Goal `{}` is {:?}: {}",
-            task.id, task.status, goal.objective
+            "Goal `{}` is {:?}: {}{}",
+            task.id,
+            task.status,
+            goal.objective,
+            goal.pause_reason
+                .map(|reason| format!(" (paused: {reason:?})"))
+                .unwrap_or_default()
         ),
+    })
+}
+
+async fn pause_goal_for_blocker(
+    store: &dyn TaskRegistry,
+    ctx: &GoalAdmissionContext,
+    task_id: Option<String>,
+    pause: GoalPauseState,
+) -> Result<GoalAdmission> {
+    let task = resolve_goal_task(store, ctx, task_id).await?;
+    if task.status.is_terminal() {
+        bail!("goal `{}` is already terminal ({:?})", task.id, task.status);
+    }
+    store
+        .update_goal_pause(&task.id, Some(pause))
+        .await
+        .with_context(|| format!("pause goal {}", task.id))?;
+    store
+        .update_status(&task.id, TaskStatus::Paused, None, None)
+        .await?;
+    Ok(GoalAdmission {
+        task_id: task.id.clone(),
+        status: TaskStatus::Paused,
+        message: format!("Goal `{}` paused.", task.id),
+    })
+}
+
+async fn resume_goal(
+    store: &dyn TaskRegistry,
+    ctx: &GoalAdmissionContext,
+    task_id: Option<String>,
+) -> Result<GoalAdmission> {
+    let task = resolve_goal_task(store, ctx, task_id).await?;
+    if task.status.is_terminal() {
+        bail!("goal `{}` is already terminal ({:?})", task.id, task.status);
+    }
+    store
+        .update_goal_pause(&task.id, None)
+        .await
+        .with_context(|| format!("clear goal pause {}", task.id))?;
+    store
+        .update_status(&task.id, TaskStatus::Running, None, None)
+        .await?;
+    Ok(GoalAdmission {
+        task_id: task.id.clone(),
+        status: TaskStatus::Running,
+        message: format!("Goal `{}` resumed.", task.id),
     })
 }
 
@@ -260,6 +355,10 @@ mod tests {
         let parsed = parse_goal_command("/goal@zeroclaw_bot START ship the thing").unwrap();
         assert_eq!(parsed.action, GoalCommandAction::Start);
         assert_eq!(parsed.objective.as_deref(), Some("ship the thing"));
+
+        let parsed = parse_goal_command("/goal resume goal-123").unwrap();
+        assert_eq!(parsed.action, GoalCommandAction::Resume);
+        assert_eq!(parsed.task_id.as_deref(), Some("goal-123"));
     }
 
     #[tokio::test]
@@ -298,5 +397,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already terminal"));
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_store_goal_specific_blockers_only() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let started = start_goal(&store, "boot-a", ctx.clone(), "ship it".into())
+            .await
+            .unwrap();
+
+        let paused = pause_goal_for_blocker(
+            &store,
+            &ctx,
+            Some(started.task_id.clone()),
+            GoalPauseState {
+                reason: GoalPauseReason::NeedsUserInput,
+                description: Some("need answer".into()),
+                blockers: vec![GoalBlocker {
+                    kind: GoalBlockerKind::NeedsUserInput,
+                    message: "Need operator answer".into(),
+                    payload: Some(serde_json::json!({"prompt": "continue?"})),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+        let task = store.get(&started.task_id).await.unwrap().unwrap();
+        let goal = store
+            .get_goal_task(&started.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(goal.blockers.len(), 1);
+
+        let resumed = resume_goal(&store, &ctx, Some(started.task_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resumed.status, TaskStatus::Running);
+        let task = store.get(&started.task_id).await.unwrap().unwrap();
+        let goal = store
+            .get_goal_task(&started.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(goal.pause_reason.is_none());
+        assert!(goal.blockers.is_empty());
     }
 }

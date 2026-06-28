@@ -11,6 +11,7 @@
 //! or a trait impl, never by re-opening the supervision logic.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Discriminates which producer registered a unit of work. EXTEND, don't fork:
 /// EPIC E adds `RemoteTurn`; EPIC B treats a paused task as a supervised *status*,
@@ -57,6 +58,55 @@ pub struct GoalTaskRecord {
     pub effective_token_limit: Option<u64>,
     #[serde(default)]
     pub effective_cost_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub pause_reason: Option<GoalPauseReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<GoalBlocker>,
+}
+
+/// Typed policy input for why a goal is paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPauseReason {
+    NeedsUserInput,
+    HumanEscalation,
+    ExternalDependency,
+    ProviderUnavailable,
+    VerifierBlocked,
+    DaemonRestart,
+}
+
+/// Structured blocker packet attached to a paused goal.
+///
+/// Free-form text is only explanatory. Policy branches on `kind` and payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalBlocker {
+    pub kind: GoalBlockerKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalBlockerKind {
+    NeedsUserInput,
+    HumanEscalation,
+    ExternalDependency,
+    Provider,
+    Verifier,
+    RestartRecovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPauseState {
+    pub reason: GoalPauseReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<GoalBlocker>,
 }
 
 impl TaskStatus {
@@ -141,6 +191,11 @@ pub trait TaskRegistry: Send + Sync {
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
+    async fn update_goal_pause(
+        &self,
+        task_id: &str,
+        pause: Option<GoalPauseState>,
+    ) -> anyhow::Result<()>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is
     /// authoritative for it. Returns `false` (no write) when another live daemon
     /// owns it. See [`crate::control_plane::authority::is_authoritative`].
@@ -220,5 +275,8 @@ mod tests {
         assert_eq!(rec.task_id, "goal-1");
         assert!(rec.effective_token_limit.is_none());
         assert!(rec.effective_cost_limit_usd.is_none());
+        assert!(rec.pause_reason.is_none());
+        assert!(rec.pause_description.is_none());
+        assert!(rec.blockers.is_empty());
     }
 }

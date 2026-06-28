@@ -209,6 +209,12 @@ pub struct Config {
     #[group = "Agent"]
     pub reliability: ReliabilityConfig,
 
+    /// Durable goal-mode configuration (`[goal]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: GoalConfig,
+
     /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     #[nested]
@@ -3678,6 +3684,63 @@ impl AliasedAgentConfig {
             && !self.model_provider.is_empty()
             && !self.risk_profile.trim().is_empty()
             && !self.runtime_profile.trim().is_empty()
+    }
+}
+
+/// Durable goal-mode runtime policy (`[goal]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal"]
+pub struct GoalConfig {
+    /// Completion verifier policy. The verifier is global goal-mode policy,
+    /// not an agent-local provider copy.
+    #[serde(default)]
+    #[nested]
+    pub verifier: GoalVerifierConfig,
+}
+
+impl Default for GoalConfig {
+    fn default() -> Self {
+        Self {
+            verifier: GoalVerifierConfig::default(),
+        }
+    }
+}
+
+/// Goal completion verifier policy (`[goal.verifier]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal.verifier"]
+pub struct GoalVerifierConfig {
+    /// Enable explicit verifier checks before a goal can complete.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional verifier model provider reference (`<family>.<alias>`).
+    /// Empty = reuse the goal owner's configured model provider.
+    #[serde(default)]
+    pub model_provider: crate::providers::ModelProviderRef,
+    /// Optional verifier model override. Empty = use the provider profile's
+    /// configured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional verifier temperature. `None` means provider/runtime default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Optional reasoning-effort request for providers that support it.
+    /// Uses the same normalized vocabulary as `runtime.reasoning_effort`.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for GoalVerifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_provider: crate::providers::ModelProviderRef::default(),
+            model: None,
+            temperature: None,
+            reasoning_effort: None,
+        }
     }
 }
 
@@ -16178,6 +16241,7 @@ impl Default for Config {
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
@@ -18810,6 +18874,42 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
+        }
+
+        if let Some(temperature) = self.goal.verifier.temperature {
+            validate_temperature(temperature)
+                .map_err(|msg| anyhow::anyhow!("goal.verifier.temperature: {msg}"))?;
+        }
+        if let Some(model) = self.goal.verifier.model.as_deref()
+            && model.trim().is_empty()
+        {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "goal.verifier.model",
+                "goal.verifier.model must be non-empty when set"
+            );
+        }
+        let verifier_provider = self.goal.verifier.model_provider.trim();
+        if !verifier_provider.is_empty() {
+            match verifier_provider.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            "goal.verifier.model_provider",
+                            "goal.verifier.model_provider = {verifier_provider:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    "goal.verifier.model_provider",
+                    "goal.verifier.model_provider must be dotted form `<type>.<alias>` (got {verifier_provider:?})",
+                ),
+            }
         }
 
         // Per-profile validation: the context-compression summarizer provider
@@ -22355,6 +22455,7 @@ auto_save = true
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -23089,6 +23190,7 @@ default_temperature = 0.7
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -31280,6 +31382,65 @@ allowed_users = []
                 && msg.contains("providers.models.custom.does-not-exist is not configured"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn config_validate_rejects_goal_verifier_provider_pointing_at_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+
+            [goal.verifier]
+            model_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("missing verifier alias must fail")
+        );
+        assert!(
+            msg.contains("goal.verifier.model_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for goal verifier provider, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_empty_goal_verifier_provider_as_agent_inheritance() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+
+            [goal.verifier]
+            enabled = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("empty verifier provider means inherit agent provider");
+        assert!(cfg.goal.verifier.model_provider.is_empty());
     }
 
     // #7964: agent-level summary_provider validated like classifier_provider.

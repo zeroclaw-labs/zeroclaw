@@ -16,9 +16,12 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
-use super::task_registry::{GoalTaskRecord, TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{
+    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind, TaskRecord,
+    TaskRegistry, TaskStatus,
+};
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 2;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 3;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -136,6 +139,28 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA user_version = 2;")
             .context("mark control-plane schema v2")?;
     }
+    if version < 3 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pause_reason",
+            "ALTER TABLE goal_tasks ADD COLUMN pause_reason TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pause_description",
+            "ALTER TABLE goal_tasks ADD COLUMN pause_description TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "blockers_json",
+            "ALTER TABLE goal_tasks ADD COLUMN blockers_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 3;")
+            .context("mark control-plane schema v3")?;
+    }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -197,6 +222,32 @@ fn status_from_db(s: &str) -> Result<TaskStatus> {
         .with_context(|| format!("unknown task status {s:?}"))
 }
 
+fn pause_reason_to_db(reason: GoalPauseReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "needs_user_input".into())
+}
+
+fn pause_reason_from_db(value: Option<String>) -> Result<Option<GoalPauseReason>> {
+    value
+        .map(|value| {
+            serde_json::from_value(serde_json::Value::String(value.clone()))
+                .with_context(|| format!("unknown goal pause reason {value:?}"))
+        })
+        .transpose()
+}
+
+fn blockers_to_db(blockers: &[GoalBlocker]) -> Result<String> {
+    serde_json::to_string(blockers).context("serialize goal blockers")
+}
+
+fn blockers_from_db(value: String) -> rusqlite::Result<Vec<GoalBlocker>> {
+    serde_json::from_str(&value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+    })
+}
+
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let kind_s: String = row.get("kind")?;
     let status_s: String = row.get("status")?;
@@ -230,6 +281,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
 }
 
 fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord> {
+    let pause_reason = pause_reason_from_db(row.get("pause_reason")?).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+    })?;
     Ok(GoalTaskRecord {
         task_id: row.get("task_id")?,
         objective: row.get("objective")?,
@@ -237,6 +291,9 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
             .get::<_, Option<i64>>("effective_token_limit")?
             .map(|value| value as u64),
         effective_cost_limit_usd: row.get("effective_cost_limit_usd")?,
+        pause_reason,
+        pause_description: row.get("pause_description")?,
+        blockers: blockers_from_db(row.get("blockers_json")?)?,
     })
 }
 
@@ -382,14 +439,18 @@ impl TaskRegistry for SqliteTaskStore {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO goal_tasks
-                (task_id, objective, effective_token_limit, effective_cost_limit_usd)
-             VALUES (?1, ?2, ?3, ?4)
+                (task_id, objective, effective_token_limit, effective_cost_limit_usd,
+                 pause_reason, pause_description, blockers_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(task_id) DO NOTHING",
             params![
                 rec.task_id,
                 rec.objective,
                 rec.effective_token_limit.map(|value| value as i64),
                 rec.effective_cost_limit_usd,
+                rec.pause_reason.map(pause_reason_to_db),
+                rec.pause_description,
+                blockers_to_db(&rec.blockers)?,
             ],
         )
         .context("insert goal task record")?;
@@ -399,13 +460,36 @@ impl TaskRegistry for SqliteTaskStore {
     async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd
+            "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
+                    pause_reason, pause_description, blockers_json
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
         )
         .optional()
         .context("get goal task")
+    }
+
+    async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
+        let conn = self.conn.lock();
+        let (reason, description, blockers_json) = match pause {
+            Some(pause) => (
+                Some(pause_reason_to_db(pause.reason)),
+                pause.description,
+                blockers_to_db(&pause.blockers)?,
+            ),
+            None => (None, None, blockers_to_db(&[])?),
+        };
+        conn.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = ?1,
+                    pause_description = ?2,
+                    blockers_json = ?3
+              WHERE task_id = ?4",
+            params![reason, description, blockers_json, task_id],
+        )
+        .context("update goal pause state")?;
+        Ok(())
     }
 
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
@@ -437,6 +521,7 @@ impl TaskRegistry for SqliteTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::task_registry::GoalBlockerKind;
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
         TaskRecord {
@@ -507,6 +592,13 @@ mod tests {
             objective: "ship goal mode".into(),
             effective_token_limit: Some(10_000),
             effective_cost_limit_usd: Some(1.25),
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            pause_description: Some("waiting for operator".into()),
+            blockers: vec![GoalBlocker {
+                kind: GoalBlockerKind::NeedsUserInput,
+                message: "Need operator answer".into(),
+                payload: Some(serde_json::json!({"question": "continue?"})),
+            }],
         })
         .await
         .unwrap();
@@ -520,6 +612,18 @@ mod tests {
         assert_eq!(goal.objective, "ship goal mode");
         assert_eq!(goal.effective_token_limit, Some(10_000));
         assert_eq!(goal.effective_cost_limit_usd, Some(1.25));
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(
+            goal.pause_description.as_deref(),
+            Some("waiting for operator")
+        );
+        assert_eq!(goal.blockers.len(), 1);
+
+        s.update_goal_pause("goal-1", None).await.unwrap();
+        let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();
+        assert!(resumed.pause_reason.is_none());
+        assert!(resumed.pause_description.is_none());
+        assert!(resumed.blockers.is_empty());
     }
 
     #[tokio::test]
@@ -531,6 +635,9 @@ mod tests {
                 objective: "orphan objective".into(),
                 effective_token_limit: None,
                 effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
             })
             .await
             .unwrap_err();
