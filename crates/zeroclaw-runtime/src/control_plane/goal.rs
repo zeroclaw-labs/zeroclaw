@@ -218,7 +218,8 @@ async fn start_goal(
             ctx.originator_route.as_deref(),
             ctx.principal_id.as_deref(),
         )
-        .await?
+        .await
+        .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
     {
         bail!(
             "{}",
@@ -248,7 +249,14 @@ async fn start_goal(
             started_at,
             finished_at: None,
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            if is_active_goal_context_conflict(&error) {
+                anyhow::Error::msg(msg("goal-command-error-active-goal-conflict", &[]))
+            } else {
+                error.context(msg("goal-command-error-start-failed", &[]))
+            }
+        })?;
     store
         .create_goal_task(GoalTaskRecord {
             task_id: task_id.clone(),
@@ -259,7 +267,8 @@ async fn start_goal(
             pause_description: None,
             blockers: Vec::new(),
         })
-        .await?;
+        .await
+        .with_context(|| msg("goal-command-error-start-failed", &[]))?;
     Ok(GoalAdmission {
         task_id: task_id.clone(),
         status: TaskStatus::Running,
@@ -273,12 +282,16 @@ async fn status_goal(
     task_id: Option<String>,
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
-    let goal = store.get_goal_task(&task.id).await?.with_context(|| {
-        msg(
-            "goal-command-error-extension-missing",
-            &[("task_id", &task.id)],
-        )
-    })?;
+    let goal = store
+        .get_goal_task(&task.id)
+        .await
+        .with_context(|| msg("goal-command-error-status-failed", &[]))?
+        .with_context(|| {
+            msg(
+                "goal-command-error-extension-missing",
+                &[("task_id", &task.id)],
+            )
+        })?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: task.status,
@@ -327,7 +340,8 @@ async fn pause_goal_for_blocker(
         .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task.id)]))?;
     store
         .update_status(&task.id, TaskStatus::Paused, None, None)
-        .await?;
+        .await
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Paused,
@@ -356,7 +370,8 @@ async fn resume_goal(
         .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task.id)]))?;
     store
         .update_status(&task.id, TaskStatus::Running, None, None)
-        .await?;
+        .await
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Running,
@@ -386,7 +401,8 @@ async fn cancel_goal(
             None,
             Some(msg("goal-terminal-reason-cancelled-by-controller", &[])),
         )
-        .await?;
+        .await
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: TaskStatus::Cancelled,
@@ -402,7 +418,8 @@ async fn resolve_goal_task(
     if let Some(task_id) = task_id {
         let task = store
             .get(&task_id)
-            .await?
+            .await
+            .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
             .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
         ensure_goal_visible(&task, ctx)?;
         return Ok(task);
@@ -414,10 +431,19 @@ async fn resolve_goal_task(
             ctx.originator_route.as_deref(),
             ctx.principal_id.as_deref(),
         )
-        .await?
+        .await
+        .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
         .with_context(|| msg("goal-command-error-no-active-goal", &[]))?;
     ensure_goal_visible(&task, ctx)?;
     Ok(task)
+}
+
+fn is_active_goal_context_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("idx_tasks_active_goal_context")
+            || text.contains("UNIQUE constraint failed: index 'idx_tasks_active_goal_context'")
+    })
 }
 
 fn ensure_goal_visible(task: &TaskRecord, ctx: &GoalAdmissionContext) -> Result<()> {
@@ -564,6 +590,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already active"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_goal_start_allows_one_active_context() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("telegram:chat-1".into()))
+            .with_principal_id(Some("principal-1".into()));
+
+        let (a, b) = tokio::join!(
+            start_goal(&store, "boot-a", ctx.clone(), "ship one".into()),
+            start_goal(&store, "boot-a", ctx, "ship two".into())
+        );
+        let successes = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(successes, 1);
+        let errors = [a.err(), b.err()]
+            .into_iter()
+            .flatten()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("already active"));
     }
 
     #[tokio::test]
