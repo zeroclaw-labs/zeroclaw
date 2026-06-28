@@ -15,7 +15,9 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
+use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
+use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{McpTransportConn, McpTransportError, create_transport};
 use zeroclaw_config::schema::McpServerConfig;
 
@@ -94,8 +96,8 @@ async fn handshake(
 /// (reserved for a future subscriptions spec).
 #[derive(Debug, Clone, Default)]
 pub struct McpServerCapabilities {
-    resources: bool,
-    prompts: bool,
+    pub(crate) resources: bool,
+    pub(crate) prompts: bool,
 }
 
 impl McpServerCapabilities {
@@ -377,6 +379,161 @@ impl McpServer {
 
         Ok(result)
     }
+
+    /// Generic JSON-RPC method dispatch with the same timeout, bounded
+    /// reconnect, and error surfacing as `call_tool`. Returns the raw
+    /// `result` value; callers apply any method-specific envelope handling.
+    pub(crate) async fn dispatch_method(
+        &self,
+        rpc_method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut inner = self.inner.lock().await;
+
+        let tool_timeout = inner
+            .config
+            .tool_timeout_secs
+            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
+            .min(MAX_TOOL_TIMEOUT_SECS);
+
+        let mut attempt = 0u32;
+        let resp = loop {
+            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+            let req = JsonRpcRequest::new(id, rpc_method, params.clone());
+
+            let send_result = timeout(
+                Duration::from_secs(tool_timeout),
+                inner.transport.send_and_recv(&req),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "MCP server `{}` timed out after {}s during `{rpc_method}`",
+                    inner.config.name, tool_timeout
+                ))
+            })?;
+
+            match send_result {
+                Ok(resp) => break resp,
+                Err(err) => {
+                    let recoverable_reason = err
+                        .downcast_ref::<McpTransportError>()
+                        .map(|te| te.to_string());
+                    if let Some(_reason) = recoverable_reason
+                        && attempt < MAX_RECONNECT_ATTEMPTS
+                    {
+                        attempt += 1;
+                        let server_name = inner.config.name.clone();
+                        tokio::time::sleep(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
+                        inner.transport.reset().await.with_context(|| {
+                            format!(
+                                "MCP server `{server_name}` failed to reset transport during reconnect"
+                            )
+                        })?;
+                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
+                                )
+                            })?;
+                        inner.capabilities = refreshed;
+                        continue;
+                    }
+                    return Err(err).with_context(|| {
+                        format!(
+                            "MCP server `{}` error during `{rpc_method}`",
+                            inner.config.name
+                        )
+                    });
+                }
+            }
+        };
+
+        if let Some(err) = resp.error {
+            bail!("MCP `{rpc_method}` error {}: {}", err.code, err.message);
+        }
+        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `resources/list` — capability-gated.
+    pub async fn list_resources(&self, cursor: Option<String>) -> Result<McpResourcesListResult> {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.capabilities.supports_resources() {
+                bail!(
+                    "MCP server `{}` does not support resources",
+                    inner.config.name
+                );
+            }
+        }
+        let params = match cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let raw = self.dispatch_method("resources/list", params).await?;
+        serde_json::from_value(raw).context("failed to parse resources/list result")
+    }
+
+    /// `resources/read` — capability-gated.
+    pub async fn read_resource(&self, uri: &str) -> Result<McpResourceContents> {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.capabilities.supports_resources() {
+                bail!(
+                    "MCP server `{}` does not support resources",
+                    inner.config.name
+                );
+            }
+        }
+        let raw = self
+            .dispatch_method("resources/read", json!({ "uri": uri }))
+            .await?;
+        serde_json::from_value(raw).context("failed to parse resources/read result")
+    }
+
+    /// `prompts/list` — capability-gated.
+    pub async fn list_prompts(&self, cursor: Option<String>) -> Result<McpPromptsListResult> {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.capabilities.supports_prompts() {
+                bail!(
+                    "MCP server `{}` does not support prompts",
+                    inner.config.name
+                );
+            }
+        }
+        let params = match cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let raw = self.dispatch_method("prompts/list", params).await?;
+        serde_json::from_value(raw).context("failed to parse prompts/list result")
+    }
+
+    /// `prompts/get` — capability-gated.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpGetPromptResult> {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.capabilities.supports_prompts() {
+                bail!(
+                    "MCP server `{}` does not support prompts",
+                    inner.config.name
+                );
+            }
+        }
+        let raw = self
+            .dispatch_method(
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        serde_json::from_value(raw).context("failed to parse prompts/get result")
+    }
 }
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
@@ -650,6 +807,85 @@ mod tests {
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
         }
+    }
+
+    /// Like `server_returning`, but with explicit advertised capabilities.
+    fn server_with_caps_returning(
+        capabilities: McpServerCapabilities,
+        result: serde_json::Value,
+    ) -> McpServer {
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            transport: Box::new(FakeTransport { result }),
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![],
+            capabilities,
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_resources_gated_when_unsupported() {
+        let server = server_returning(serde_json::json!({}));
+        let err = server
+            .list_resources(None)
+            .await
+            .expect_err("unsupported resources must error locally");
+        assert!(
+            err.to_string().contains("does not support resources"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_resources_parses_when_supported() {
+        let server = server_with_caps_returning(
+            McpServerCapabilities {
+                resources: true,
+                prompts: false,
+            },
+            serde_json::json!({"resources":[{"uri":"u","name":"n"}],"nextCursor":"c"}),
+        );
+        let res = server.list_resources(None).await.expect("should parse");
+        assert_eq!(res.resources.len(), 1);
+        assert_eq!(res.next_cursor.as_deref(), Some("c"));
+    }
+
+    #[tokio::test]
+    async fn get_prompt_gated_when_unsupported() {
+        let server = server_returning(serde_json::json!({}));
+        let err = server
+            .get_prompt("p", serde_json::json!({}))
+            .await
+            .expect_err("unsupported prompts must error locally");
+        assert!(
+            err.to_string().contains("does not support prompts"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_prompt_parses_when_supported() {
+        let server = server_with_caps_returning(
+            McpServerCapabilities {
+                resources: false,
+                prompts: true,
+            },
+            serde_json::json!({"messages":[{"role":"user","content":{"type":"text","text":"hi"}}]}),
+        );
+        let res = server
+            .get_prompt("p", serde_json::json!({}))
+            .await
+            .expect("parse");
+        assert_eq!(res.messages.len(), 1);
     }
 
     #[tokio::test]
@@ -1071,5 +1307,65 @@ done
         );
         // server.verify() pins the no-retry: initialize and tools/call each hit once.
         server.verify().await;
+    }
+
+    // ── dispatch_method: generic JSON-RPC dispatch ────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_method_returns_raw_result() {
+        let server = server_returning(serde_json::json!({ "ok": 1 }));
+        let out = server
+            .dispatch_method("resources/list", serde_json::json!({}))
+            .await
+            .expect("dispatch should succeed");
+        assert_eq!(out, serde_json::json!({ "ok": 1 }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_method_surfaces_jsonrpc_error() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "s")
+                    .set_body_json(
+                        json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{"resources":{}}}}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "resources/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"nope"}
+            })))
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        let err = srv
+            .dispatch_method("resources/list", json!({}))
+            .await
+            .expect_err("jsonrpc error should surface");
+        assert!(err.to_string().contains("nope"), "got: {err}");
     }
 }
