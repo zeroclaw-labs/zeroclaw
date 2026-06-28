@@ -193,6 +193,17 @@ pub trait TaskRegistry: Send + Sync {
     /// canonical task table. This is a read-only resolver, not cached state.
     async fn latest_active_goal_for_agent(&self, agent: &str)
     -> anyhow::Result<Option<TaskRecord>>;
+    /// Resolve the latest non-terminal goal for the trusted runtime context.
+    ///
+    /// Route and principal filters are matched against canonical `TaskRecord`
+    /// fields when present. Callers that have no route/principal context pass
+    /// `None` and intentionally fall back to agent-scoped resolution.
+    async fn latest_active_goal_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> anyhow::Result<Option<TaskRecord>>;
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
     async fn update_goal_pause(

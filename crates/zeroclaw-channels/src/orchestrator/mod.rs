@@ -607,6 +607,18 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
+    Some(sanitize_session_key(&format!(
+        "{}_{}",
+        channel_scope(msg),
+        sender
+    )))
+}
+
 /// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
 ///
 /// Keyspaces are kept disjoint from [`conversation_history_key`] via a
@@ -2827,7 +2839,8 @@ async fn handle_runtime_command_if_needed(
                 zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
                     ctx.agent_alias.as_ref().clone(),
                 )
-                .with_originator_route(Some(sender_key.clone())),
+                .with_originator_route(Some(sender_key.clone()))
+                .with_principal_id(goal_principal_id(msg)),
                 command,
             )
             .await
@@ -5009,12 +5022,23 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
+    let goal_admission_context = Some(
+        zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+            ctx.agent_alias.as_ref().clone(),
+        )
+        .with_originator_route(Some(history_key.clone()))
+        .with_principal_id(goal_principal_id(&msg)),
+    );
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+        let mut context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
             state.model_provider_pricing,
         )
-        .with_agent_alias(state.agent_alias.as_str())
+        .with_agent_alias(state.agent_alias.as_str());
+        if let Some(goal_ctx) = &goal_admission_context {
+            context = context.with_goal_admission_context(goal_ctx);
+        }
+        context
     });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
@@ -5041,12 +5065,6 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let goal_admission_context = Some(
-        zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
-            ctx.agent_alias.as_ref().clone(),
-        )
-        .with_originator_route(Some(history_key.clone())),
-    );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -17636,6 +17654,28 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::NewSession)
         );
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
+    #[test]
+    fn goal_principal_includes_sender_even_when_wecom_route_groups_room() {
+        let mut alice = zeroclaw_api::channel::ChannelMessage {
+            channel: "wecom_ws".into(),
+            channel_alias: Some("bot".into()),
+            reply_target: "group--room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let mut bob = alice.clone();
+        bob.sender = "bob".into();
+
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        assert_ne!(goal_principal_id(&alice), goal_principal_id(&bob));
+
+        alice.sender = " ".into();
+        assert!(goal_principal_id(&alice).is_none());
     }
 
     #[test]

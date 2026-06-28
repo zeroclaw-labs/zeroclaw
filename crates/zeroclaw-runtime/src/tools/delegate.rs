@@ -42,7 +42,11 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
     let control_plane = crate::control_plane::control_plane()?;
     control_plane
         .store
-        .latest_active_goal_for_agent(agent_alias)
+        .latest_active_goal_for_context(
+            agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
         .await
         .ok()
         .flatten()

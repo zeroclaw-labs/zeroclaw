@@ -169,7 +169,8 @@ pub async fn admit_goal_command(
     ctx: GoalAdmissionContext,
     command: GoalCommand,
 ) -> Result<GoalAdmission> {
-    let cp = control_plane().context("goal mode requires a running control plane")?;
+    let cp = control_plane()
+        .with_context(|| msg("goal-command-error-control-plane-unavailable", &[]))?;
     match command.action {
         GoalCommandAction::Start => {
             let objective = command
@@ -211,6 +212,22 @@ async fn start_goal(
     ctx: GoalAdmissionContext,
     objective: String,
 ) -> Result<GoalAdmission> {
+    if let Some(active) = store
+        .latest_active_goal_for_context(
+            &ctx.agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await?
+    {
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-active-goal-exists",
+                &[("task_id", &active.id)]
+            )
+        );
+    }
     let task_id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     store
@@ -256,10 +273,12 @@ async fn status_goal(
     task_id: Option<String>,
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
-    let goal = store
-        .get_goal_task(&task.id)
-        .await?
-        .with_context(|| format!("goal extension missing for task {}", task.id))?;
+    let goal = store.get_goal_task(&task.id).await?.with_context(|| {
+        msg(
+            "goal-command-error-extension-missing",
+            &[("task_id", &task.id)],
+        )
+    })?;
     Ok(GoalAdmission {
         task_id: task.id.clone(),
         status: task.status,
@@ -294,12 +313,18 @@ async fn pause_goal_for_blocker(
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
     if task.status.is_terminal() {
-        bail!("goal `{}` is already terminal ({:?})", task.id, task.status);
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-already-terminal",
+                &[("task_id", &task.id), ("status", status_label(task.status))]
+            )
+        );
     }
     store
         .update_goal_pause(&task.id, Some(pause))
         .await
-        .with_context(|| format!("pause goal {}", task.id))?;
+        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task.id)]))?;
     store
         .update_status(&task.id, TaskStatus::Paused, None, None)
         .await?;
@@ -317,12 +342,18 @@ async fn resume_goal(
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
     if task.status.is_terminal() {
-        bail!("goal `{}` is already terminal ({:?})", task.id, task.status);
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-already-terminal",
+                &[("task_id", &task.id), ("status", status_label(task.status))]
+            )
+        );
     }
     store
         .update_goal_pause(&task.id, None)
         .await
-        .with_context(|| format!("clear goal pause {}", task.id))?;
+        .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task.id)]))?;
     store
         .update_status(&task.id, TaskStatus::Running, None, None)
         .await?;
@@ -340,7 +371,13 @@ async fn cancel_goal(
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
     if task.status.is_terminal() {
-        bail!("goal `{}` is already terminal ({:?})", task.id, task.status);
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-already-terminal",
+                &[("task_id", &task.id), ("status", status_label(task.status))]
+            )
+        );
     }
     store
         .update_status(
@@ -366,15 +403,19 @@ async fn resolve_goal_task(
         let task = store
             .get(&task_id)
             .await?
-            .with_context(|| format!("goal `{task_id}` was not found"))?;
+            .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
         ensure_goal_visible(&task, ctx)?;
         return Ok(task);
     }
 
     let task = store
-        .latest_active_goal_for_agent(&ctx.agent_alias)
+        .latest_active_goal_for_context(
+            &ctx.agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
         .await?
-        .context("no active goal for this agent")?;
+        .with_context(|| msg("goal-command-error-no-active-goal", &[]))?;
     ensure_goal_visible(&task, ctx)?;
     Ok(task)
 }
@@ -503,10 +544,26 @@ mod tests {
         let wrong_principal = GoalAdmissionContext::new("agent-a")
             .with_originator_route(Some("telegram:chat-1".into()))
             .with_principal_id(Some("principal-2".into()));
-        let err = status_goal(&store, &wrong_principal, None)
+        let err = status_goal(&store, &wrong_principal, Some(started.task_id.clone()))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not visible to this principal"));
+    }
+
+    #[tokio::test]
+    async fn goal_start_rejects_duplicate_active_context() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("telegram:chat-1".into()))
+            .with_principal_id(Some("principal-1".into()));
+
+        start_goal(&store, "boot-a", ctx.clone(), "ship it".into())
+            .await
+            .unwrap();
+        let err = start_goal(&store, "boot-a", ctx, "ship another".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already active"));
     }
 
     #[tokio::test]

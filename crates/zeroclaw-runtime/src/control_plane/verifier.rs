@@ -194,6 +194,7 @@ mod tests {
     async fn verifier_usage_records_with_goal_attribution() {
         let temp = tempfile::tempdir().unwrap();
         let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
         let mut config = Config {
             data_dir: temp.path().to_path_buf(),
             ..Config::default()
@@ -232,7 +233,7 @@ mod tests {
             .create(crate::control_plane::TaskRecord {
                 id: goal_id.clone(),
                 kind: crate::control_plane::TaskKind::Goal,
-                agent: "main".into(),
+                agent: agent_alias.clone(),
                 status: crate::control_plane::TaskStatus::Running,
                 owner_pid: std::process::id(),
                 owner_boot_id: "test-boot".into(),
@@ -248,7 +249,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let ctx = tool_loop_cost_tracking_context_from_tracker(&config, "main", tracker.clone());
+        let ctx =
+            tool_loop_cost_tracking_context_from_tracker(&config, &agent_alias, tracker.clone());
         TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 record_tool_loop_cost_usage(

@@ -157,6 +157,12 @@ pub struct ToolLoopCostTrackingContext {
     /// Alias of the agent driving this turn. Stamped onto persisted
     /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
     pub agent_alias: Option<String>,
+    /// Trusted route for this runtime turn. Used only to resolve the active
+    /// goal from canonical `TaskRecord` fields at record time.
+    pub originator_route: Option<String>,
+    /// Trusted principal for this runtime turn. Used only to resolve the active
+    /// goal from canonical `TaskRecord` fields at record time.
+    pub principal_id: Option<String>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -169,6 +175,8 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing,
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
+            originator_route: None,
+            principal_id: None,
         }
     }
 
@@ -184,6 +192,8 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing: Arc::new(ModelProviderPricing::new()),
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
+            originator_route: None,
+            principal_id: None,
         }
     }
 
@@ -192,6 +202,18 @@ impl ToolLoopCostTrackingContext {
     #[must_use]
     pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
         self.agent_alias = Some(agent_alias.into());
+        self
+    }
+
+    /// Attach trusted goal-admission facts for this turn. These are not goal
+    /// state; they are filters used to resolve canonical task state on demand.
+    #[must_use]
+    pub fn with_goal_admission_context(
+        mut self,
+        ctx: &crate::control_plane::GoalAdmissionContext,
+    ) -> Self {
+        self.originator_route.clone_from(&ctx.originator_route);
+        self.principal_id.clone_from(&ctx.principal_id);
         self
     }
 
@@ -329,7 +351,14 @@ pub async fn record_tool_loop_cost_usage(
     }
 
     let goal_task_id = match ctx.agent_alias.as_deref() {
-        Some(agent_alias) => active_goal_task_id_for_agent(agent_alias).await,
+        Some(agent_alias) => {
+            active_goal_task_id_for_context(
+                agent_alias,
+                ctx.originator_route.as_deref(),
+                ctx.principal_id.as_deref(),
+            )
+            .await
+        }
         None => None,
     };
 
@@ -346,11 +375,15 @@ pub async fn record_tool_loop_cost_usage(
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
-async fn active_goal_task_id_for_agent(agent_alias: &str) -> Option<String> {
+async fn active_goal_task_id_for_context(
+    agent_alias: &str,
+    originator_route: Option<&str>,
+    principal_id: Option<&str>,
+) -> Option<String> {
     let control_plane = crate::control_plane::control_plane()?;
     match control_plane
         .store
-        .latest_active_goal_for_agent(agent_alias)
+        .latest_active_goal_for_context(agent_alias, originator_route, principal_id)
         .await
     {
         Ok(Some(goal)) => Some(goal.id),
@@ -810,10 +843,14 @@ mod tests {
     fn record_tool_loop_cost_usage_stamps_active_goal_task_id() {
         let workspace = tempfile::TempDir::new().unwrap();
         let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let other_goal_id = format!("goal-{}", uuid::Uuid::new_v4());
         let config = zeroclaw_config::schema::CostConfig {
             track_per_agent: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("route-a".into()))
+            .with_principal_id(Some("principal-a".into()));
         let tracker = Arc::new(CostTracker::new(config, workspace.path()).unwrap());
         let ctx = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
@@ -826,6 +863,7 @@ mod tests {
             )])),
         )
         .with_agent_alias("agent-a");
+        let ctx = ctx.with_goal_admission_context(&goal_ctx);
         let usage = zeroclaw_providers::traits::TokenUsage {
             input_tokens: Some(1_000),
             output_tokens: Some(500),
@@ -861,11 +899,31 @@ mod tests {
                     heartbeat_at: None,
                     depth: 0,
                     parent_id: None,
-                    originator_route: None,
+                    originator_route: Some("route-a".into()),
                     delivered: false,
                     idem_key: None,
-                    principal_id: None,
-                    started_at: chrono::Utc::now().to_rfc3339(),
+                    principal_id: Some("principal-a".into()),
+                    started_at: "2026-06-18T00:00:00Z".into(),
+                    finished_at: None,
+                })
+                .await
+                .unwrap();
+            store
+                .create(crate::control_plane::TaskRecord {
+                    id: other_goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("route-b".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("principal-a".into()),
+                    started_at: "2026-06-19T00:00:00Z".into(),
                     finished_at: None,
                 })
                 .await

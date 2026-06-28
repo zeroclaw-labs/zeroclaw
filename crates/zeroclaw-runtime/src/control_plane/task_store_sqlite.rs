@@ -464,6 +464,39 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(None)
     }
 
+    async fn latest_active_goal_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> Result<Option<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM tasks
+              WHERE agent = ?1
+                AND kind = 'goal'
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+                AND (?2 IS NULL OR originator_route = ?2)
+                AND (?3 IS NULL OR principal_id = ?3)
+              ORDER BY started_at DESC",
+            )
+            .context("prepare latest active goal by context")?;
+        let rows = stmt
+            .query_map(
+                params![agent, originator_route, principal_id],
+                row_to_record,
+            )
+            .context("query latest active goal by context")?;
+        for row in rows {
+            match row {
+                Ok(task) => return Ok(Some(task)),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(None)
+    }
+
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -647,6 +680,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_context_filters_route_and_principal() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut other_route_goal = rec("other-route", "main", 1, "boot-1");
+        other_route_goal.kind = TaskKind::Goal;
+        other_route_goal.originator_route = Some("route-b".into());
+        other_route_goal.principal_id = Some("principal-a".into());
+        other_route_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(other_route_goal).await.unwrap();
+
+        let mut other_principal_goal = rec("other-principal", "main", 1, "boot-1");
+        other_principal_goal.kind = TaskKind::Goal;
+        other_principal_goal.originator_route = Some("route-a".into());
+        other_principal_goal.principal_id = Some("principal-b".into());
+        other_principal_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(other_principal_goal).await.unwrap();
+
+        let mut wanted_goal = rec("wanted", "main", 1, "boot-1");
+        wanted_goal.kind = TaskKind::Goal;
+        wanted_goal.originator_route = Some("route-a".into());
+        wanted_goal.principal_id = Some("principal-a".into());
+        wanted_goal.started_at = "2026-06-18T00:00:00Z".into();
+        s.create(wanted_goal).await.unwrap();
+
+        let got = s
+            .latest_active_goal_for_context("main", Some("route-a"), Some("principal-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "wanted");
     }
 
     #[tokio::test]
