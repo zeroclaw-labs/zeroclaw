@@ -791,8 +791,10 @@ mod tests {
     #[test]
     fn record_tool_loop_cost_usage_stamps_active_goal_task_id() {
         let workspace = tempfile::TempDir::new().unwrap();
-        let mut config = zeroclaw_config::schema::CostConfig::default();
-        config.track_per_agent = true;
+        let config = zeroclaw_config::schema::CostConfig {
+            track_per_agent: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
         let tracker = Arc::new(CostTracker::new(config, workspace.path()).unwrap());
         let ctx = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),

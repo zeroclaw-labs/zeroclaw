@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-zeroclaw-commands.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
 similar = { version = "2", default-features = false, features = ["text"] }

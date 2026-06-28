@@ -3688,7 +3688,7 @@ impl AliasedAgentConfig {
 }
 
 /// Durable goal-mode runtime policy (`[goal]`).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "goal"]
 pub struct GoalConfig {
@@ -3697,14 +3697,6 @@ pub struct GoalConfig {
     #[serde(default)]
     #[nested]
     pub verifier: GoalVerifierConfig,
-}
-
-impl Default for GoalConfig {
-    fn default() -> Self {
-        Self {
-            verifier: GoalVerifierConfig::default(),
-        }
-    }
 }
 
 /// Goal completion verifier policy (`[goal.verifier]`).
@@ -18513,9 +18505,10 @@ impl Config {
             );
         }
 
-        if let Some(temperature) = self.goal.verifier.temperature {
-            validate_temperature(temperature)
-                .map_err(|msg| anyhow::anyhow!("goal.verifier.temperature: {msg}"))?;
+        if let Some(temperature) = self.goal.verifier.temperature
+            && let Err(msg) = validate_temperature(temperature)
+        {
+            anyhow::bail!("goal.verifier.temperature: {msg}");
         }
         if let Some(model) = self.goal.verifier.model.as_deref()
             && model.trim().is_empty()

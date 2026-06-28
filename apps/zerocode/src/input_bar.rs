@@ -26,12 +26,27 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
-use zeroclaw_commands::{CommandSurface, usage_for_surface};
 
 // ── Constants ────────────────────────────────────────────────────
 
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
+
+// Zerocode is an RPC-only surface and must not link ZeroClaw backend crates.
+// Until command discovery is delivered over the RPC boundary, this local list
+// only drives TUI autocomplete for commands handled locally by `parse_slash_command`.
+const LOCAL_TUI_SLASH_COMMANDS: &[&str] = &[
+    "/attach",
+    "/attachments",
+    "/clear-queue [index]",
+    "/detach",
+    "/model [model]",
+    "/model-provider [provider]",
+    "/new",
+    "/new-session",
+    "/restart-session",
+    "/toggle-thinking",
+];
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -599,8 +614,9 @@ impl InputBarState {
         if text.starts_with('/') && !text.contains(' ') {
             let prefix = text.as_str();
             self.autocomplete_target = AutocompleteTarget::Command;
-            self.autocomplete_matches = usage_for_surface(CommandSurface::Tui)
-                .into_iter()
+            self.autocomplete_matches = LOCAL_TUI_SLASH_COMMANDS
+                .iter()
+                .copied()
                 .filter(|cmd| cmd.starts_with(prefix) && *cmd != prefix)
                 .map(str::to_string)
                 .collect();
