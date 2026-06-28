@@ -3363,6 +3363,11 @@ pub struct DelegateTargetConfig {
 }
 
 impl DelegateTargetConfig {
+    /// Construct the legacy-equivalent target shape used for string entries.
+    ///
+    /// Most tests and migration paths call this instead of spelling out
+    /// `mode = Bounded`, making it explicit that a bare delegate alias never
+    /// opts into independent execution.
     #[must_use]
     pub fn bounded(agent: impl Into<String>) -> Self {
         Self {
@@ -3371,11 +3376,16 @@ impl DelegateTargetConfig {
         }
     }
 
+    /// Return the raw configured alias.
+    ///
+    /// Callers that compare aliases should trim at the comparison boundary so
+    /// diagnostics can still point at the stored value when validation fails.
     #[must_use]
     pub fn agent(&self) -> &str {
         self.agent.as_str()
     }
 
+    /// Return the configured execution mode for this explicit target.
     #[must_use]
     pub fn mode(&self) -> DelegateExecutionMode {
         self.mode
@@ -3414,6 +3424,9 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
             where
                 M: MapAccess<'de>,
             {
+                // Keep the object arm strict so misspelled mode/agent fields do
+                // not silently round-trip as bounded targets. String entries
+                // already provide the forgiving legacy shape.
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct DelegateTargetObject {
@@ -25027,6 +25040,9 @@ audit = "should-be-a-table-not-a-string"
     #[test]
     #[allow(clippy::large_futures)]
     async fn load_or_init_keeps_agents_with_object_form_delegates() {
+        // Regression for the production failure that started this PR: a current
+        // schema config containing an object-form delegate must not degrade and
+        // drop the whole `agents` section.
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
@@ -25109,6 +25125,8 @@ runtime_profile = "default"
     #[test]
     #[allow(clippy::large_futures)]
     async fn load_or_init_migrates_agents_with_object_form_delegates() {
+        // Same shape as above, but without schema_version so the migration path
+        // proves it accepts mixed string/object delegates before validation.
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
@@ -31083,6 +31101,9 @@ allowed_users = []
     }
 
     fn assert_delegate_target_modes_match_roster(cfg: &Config, caller_alias: &str) {
+        // `delegate_target_mode()` is the single-target convenience wrapper
+        // used by runtime admission. Keep it mathematically tied to the
+        // materialized roster so future resolver changes cannot split the two.
         let roster: std::collections::BTreeMap<_, _> = cfg
             .reachable_delegate_target_configs(caller_alias)
             .into_iter()
@@ -31147,6 +31168,9 @@ allowed_users = []
 
     #[test]
     async fn delegate_target_mode_matches_reachable_roster_matrix() {
+        // Matrix coverage for the roster/mode invariant: implicit peers,
+        // explicit bounded targets, explicit independent overrides,
+        // opt-out mode, disabled targets, and missing callers.
         let mut cfg = delegate_roster_config();
         assert_delegate_target_modes_match_roster(&cfg, "aaa");
         assert_delegate_target_modes_match_roster(&cfg, "nope");
@@ -31173,6 +31197,9 @@ allowed_users = []
 
     #[test]
     async fn delegate_target_mode_normalizes_target_alias_and_overrides_implicit_mode() {
+        // Direct lookup receives a user/tool argument, not a config entry, so it
+        // must trim the requested alias and still prefer explicit mode over the
+        // implicit same-profile bounded default.
         let mut cfg = delegate_roster_config();
         cfg.agents.get_mut("aaa").unwrap().delegates = vec![DelegateTargetConfig {
             agent: "aaatools".to_string(),
@@ -31253,6 +31280,9 @@ allowed_users = []
 
     #[test]
     async fn validate_rejects_duplicate_delegate_target() {
+        // Duplicate detection is by target alias, not by the full object. A
+        // bounded and independent entry for the same agent would otherwise make
+        // runtime mode selection order-dependent.
         let mut cfg = delegate_roster_config();
         cfg.agents.get_mut("aaa").unwrap().delegates = vec![
             DelegateTargetConfig::bounded("aaalore"),
@@ -31267,6 +31297,9 @@ allowed_users = []
 
     #[test]
     async fn delegate_targets_parse_strings_as_bounded() {
+        // Existing configs used bare strings. They must continue to parse as
+        // bounded targets so simply upgrading the binary does not widen any
+        // delegate's execution mode.
         let toml_src = "\
 [agents.legacy]
 risk_profile = \"shared\"
@@ -31283,6 +31316,8 @@ delegates = [\"reviewer\"]
 
     #[test]
     async fn delegate_targets_parse_objects_and_default_mode() {
+        // Object entries are the new surface. Omitted mode deliberately keeps
+        // the legacy bounded default; independent mode must be explicit.
         let toml_src = "\
 [agents.legacy]
 risk_profile = \"shared\"
@@ -31308,6 +31343,8 @@ delegates = [
 
     #[test]
     async fn delegate_targets_parse_mixed_string_and_object_entries() {
+        // Operators may migrate one target at a time. Mixed arrays are therefore
+        // part of the supported config shape, not just a permissive accident.
         let toml_src = "\
 [agents.legacy]
 risk_profile = \"shared\"
@@ -31333,6 +31370,9 @@ delegates = [
 
     #[test]
     async fn delegate_targets_object_array_round_trips_through_set_prop_and_validate() {
+        // The programmatic config-editing path must accept the same mixed shape
+        // as TOML loading, then serialize back without dropping the agents
+        // table. This is the CLI/config-tool version of the original failure.
         let mut cfg = delegate_roster_config();
         let value = serde_json::json!([
             "aaatools",
@@ -31379,6 +31419,9 @@ delegates = [
 
     #[test]
     async fn delegate_targets_serialize_as_object_array_with_explicit_mode() {
+        // Saving always emits explicit objects, including bounded mode. That
+        // makes future diffs unambiguous and avoids a lossy string/object mix on
+        // writeback.
         let mut cfg = delegate_roster_config();
         cfg.agents.get_mut("aaa").unwrap().delegates = vec![
             DelegateTargetConfig::bounded("aaatools"),

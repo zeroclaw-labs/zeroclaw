@@ -120,7 +120,15 @@ pub struct DelegateTool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelegateAdmission {
+    /// This call entered through the user-visible `delegate` tool and must run
+    /// caller-side tool authorization plus target reachability checks.
     Required,
+    /// The parent path already admitted the request before spawning work.
+    ///
+    /// Background workers use this after the parent has returned a task id with
+    /// a resolved target policy. Re-running the full admission inside that
+    /// worker would ask whether the child target can delegate to itself, which
+    /// is not the authorization question being answered.
     Prevalidated,
 }
 
@@ -433,6 +441,11 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
+    /// Build the user-facing refusal for a target outside the caller's roster.
+    ///
+    /// The reachability resolver intentionally returns only `None` for "not
+    /// reachable"; this helper re-reads canonical config to explain which
+    /// branch failed without duplicating the admission decision itself.
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
         let Some(caller) = config.agents.get(&self.caller_alias) else {
             return format!(
@@ -498,6 +511,11 @@ impl DelegateTool {
         )
     }
 
+    /// Resolve the target mode for execution paths that already admitted it.
+    ///
+    /// Legacy unit-test constructors have no root config, so they keep the old
+    /// bounded behavior. Production instances always carry `root_config` and
+    /// therefore resolve through the canonical roster.
     fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
         self.root_config
             .as_ref()
@@ -635,6 +653,15 @@ impl DelegateTool {
         ]
     }
 
+    /// Build the full target-owned registry for an independent agentic child.
+    ///
+    /// Bounded agentic delegation starts from the caller's already-filtered
+    /// `parent_tools`. Independent delegation is intentionally different: it is
+    /// equivalent to starting a fresh target-agent turn, so the registry comes
+    /// from `all_tools_with_runtime()` using the target risk profile, target
+    /// workspace, target memory, and target provider credentials. The only
+    /// cross-cutting restriction retained here is stripping `delegate` itself,
+    /// because recursive agentic delegation is still not supported.
     async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
@@ -1121,6 +1148,12 @@ impl DelegateTool {
             .await
     }
 
+    /// Execute one foreground delegate call after selecting the admission mode.
+    ///
+    /// `Required` is the public tool entry path. `Prevalidated` is reserved for
+    /// detached background workers that already performed caller-side admission
+    /// before returning a task id. Keeping the switch at this boundary prevents
+    /// sync/background/agentic variants from each inventing a different bypass.
     async fn execute_sync_with_admission(
         &self,
         agent_name: &str,
@@ -1677,6 +1710,10 @@ impl DelegateTool {
         }
 
         for name in &agent_names {
+            // Validate the whole fan-out before any spawn. A single blocked
+            // target should fail the entire parallel request rather than
+            // launching a partial set of child agents and then reporting mixed
+            // results.
             if let Err(e) = self.policy_for_target(name) {
                 return Ok(ToolResult {
                     success: false,
@@ -1759,6 +1796,12 @@ impl DelegateTool {
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
+                                // Parallel workers still carry the caller's
+                                // security policy, not a pre-resolved target
+                                // policy. Let each worker run normal admission
+                                // so the target policy is rebuilt for its own
+                                // agentic loop; the preflight above only
+                                // prevents partial fan-out.
                                 Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
                                     .await
                             })
@@ -3409,6 +3452,9 @@ mod tests {
     }
 
     async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
+        // Minimal OpenAI-compatible responder for tests that only need to prove
+        // which delegate path ran. Each expected child turn consumes one final
+        // assistant response in order.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let responses: Vec<_> = contents
@@ -3436,6 +3482,9 @@ mod tests {
     }
 
     async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
+        // The memory backend can store the same key under multiple agent UUIDs.
+        // Scope bugs are therefore silent unless the test checks both the target
+        // positive case and the caller negative case.
         let target_entry = fixture
             .inner_memory
             .get_for_agent(key, &fixture.target_uuid)
@@ -3964,6 +4013,9 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_empty_allowed_tools_empty_registry_runs_without_tools() {
+        // Empty allowed_tools means "inherit", but an empty inherited registry is
+        // still a valid agentic run. The fallback is a tool-less loop, not a
+        // configuration error.
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -3987,6 +4039,9 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_empty_allowed_tools_respects_excluded_tools_without_aborting() {
+        // `excluded_tools` still applies to the inherited parent registry. If it
+        // filters every candidate out, agentic execution should continue without
+        // tools rather than failing admission.
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -4021,6 +4076,9 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_padded_allowed_tool_name_remains_exact_and_runs_without_match() {
+        // Tool identifiers are exact names, not forgiving user input. Padding an
+        // allowed_tools entry must not accidentally admit a real tool after
+        // trimming; the result is a valid no-tool child loop.
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -4052,6 +4110,9 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_unmatched_allowed_tools_runs_without_tools() {
+        // A configured allowlist can name tools absent from the parent registry.
+        // That should produce an empty child registry, not an error, because the
+        // target may still complete without tool calls.
         let config = agentic_agent_config();
         let allowed = vec!["missing_tool".to_string()];
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -4114,6 +4175,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
+        // Memory tools are stateful even when they come from the parent registry.
+        // Agentic delegation must rebind them to the target alias so a child
+        // cannot write into the caller's memory namespace.
         let fixture = delegate_memory_fixture(None).await;
         let model_provider = MemoryStoreRecallThenFinalModelProvider {
             key: "sync-key",
@@ -4141,6 +4205,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        // Same memory-scope invariant as the sync path, but through the detached
+        // task worker that runs after a task id is returned to the caller.
         let server =
             start_memory_tool_chat_server("background-key", "background target memory").await;
         let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
@@ -4177,6 +4243,8 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        // Parallel fan-out gets its own coverage because each spawned worker
+        // rebuilds a delegate tool instance before entering the agentic loop.
         let server = start_memory_tool_chat_server("parallel-key", "parallel target memory").await;
         let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
 
@@ -4196,6 +4264,10 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_delegate_runs_with_caller_authorization_not_child_authorization() {
+        // Parallel independent fan-out starts with caller admission for the
+        // delegate tool, then each child runs with its own target policy. This
+        // guards the earlier bug where child-side policy blocked valid targets
+        // before the independent mode switch could take effect.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let server = start_final_chat_server(vec!["reviewer-ok", "sysadmin-ok"]).await;
@@ -4304,6 +4376,9 @@ mod tests {
 
     #[tokio::test]
     async fn background_agentic_delegate_runs_with_caller_authorization_not_child_authorization() {
+        // Background bounded admission happens before the task id is returned;
+        // the detached worker must not reinterpret that request as a child-side
+        // self-delegation decision after it starts.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let server = start_final_chat_server(vec!["background-ok"]).await;
@@ -4423,6 +4498,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
+        // Strict parsing is target runtime policy. If the parent path leaked its
+        // own prompt/tool settings, text fallback tool calls could execute in a
+        // child that intentionally disabled them.
         let config = agentic_agent_config();
         let mut runtime_profiles = agentic_runtime_profiles(10);
         runtime_profiles
@@ -4483,6 +4561,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
+        // Recursive agentic delegation is still unsupported. Even if the target
+        // profile allowlists `delegate`, the child registry must strip it before
+        // the tool loop starts.
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -5908,6 +5989,10 @@ mod tests {
     }
 
     fn config_with_always_ask_delegate(mode: DelegateExecutionMode) -> Arc<Config> {
+        // Shared fixture for the temporary `always_ask` block: caller can
+        // delegate to both targets, but only `target` carries a trimmed
+        // always_ask entry. `peer` lets parallel tests prove fan-out fails
+        // before spawning any sibling when one target is blocked.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -5996,6 +6081,9 @@ mod tests {
 
     #[tokio::test]
     async fn independent_delegate_rejects_target_always_ask() {
+        // Synchronous path: the runtime must refuse an independent child before
+        // the target turn starts, and the refusal must name the operator-facing
+        // cause instead of a generic reachability failure.
         let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
         let tool = delegate_tool_for_config(config);
 
@@ -6027,6 +6115,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_does_not_trigger_target_always_ask_guard() {
+        // The blocker is scoped to independent mode only. Bounded delegates
+        // still use the normal parent-mediated tool path, so this helper must
+        // stay silent for the same target/profile pair.
         let config = config_with_always_ask_delegate(DelegateExecutionMode::Bounded);
         let tool = delegate_tool_for_config(config);
 
@@ -6040,6 +6131,9 @@ mod tests {
 
     #[tokio::test]
     async fn background_independent_delegate_rejects_always_ask_before_task_id() {
+        // Background admission is observable: returning a task id would imply a
+        // child was accepted and may now ask for approval. Refuse before the
+        // result file/task-id surface exists.
         let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
         let tool = delegate_tool_for_config(config);
 
@@ -6067,6 +6161,9 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_independent_delegate_rejects_always_ask_before_spawning() {
+        // Parallel fan-out must be all-or-nothing for admission. If any target
+        // is independently blocked by always_ask, do not start the other
+        // otherwise-valid child.
         let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
         let tool = delegate_tool_for_config(config);
 
@@ -6095,6 +6192,9 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_rejects_cross_profile_target_not_in_roster() {
+        // This covers the diagnostic branch where delegate_same_risk_profile is
+        // true, but the target differs by profile and lacks an explicit roster
+        // entry. The error must tell operators it is a profile mismatch.
         let config = config_with_two_agents("caller", 5, "target", 50);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -6126,6 +6226,9 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_forbidden_policy_reports_caller_and_profile() {
+        // Top-level delegation_policy remains the first gate. Its diagnostic
+        // should point at the exact risk profile key to edit, before any target
+        // reachability details are considered.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let mut config = (*config_with_two_agents("caller", 5, "target", 5)).clone();
@@ -6286,6 +6389,9 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_target_inherits_caller_action_tracker() {
+        // Baseline bounded behavior: even when caller and target have matching
+        // profiles, delegation must not mint a fresh action budget. Independent
+        // mode has its own test that intentionally differs from this.
         let config = config_with_two_agents("caller", 5, "target", 5);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -6410,6 +6516,9 @@ mod tests {
 
     #[tokio::test]
     async fn independent_delegate_target_uses_target_risk_profile_restrictions() {
+        // Independent mode should not be confused with unrestricted mode. It
+        // removes the caller ceiling, then applies the target's own policy
+        // fields exactly as a fresh target-agent run would.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
@@ -6493,6 +6602,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_cross_profile_agentic_tools_are_capped_by_parent_registry() {
+        // Target asks for `shell`, caller can delegate but only has EchoTool in
+        // its registry. Bounded mode must not synthesize target-owned tools
+        // just because the target risk profile names them.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
@@ -6579,6 +6691,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_agentic_tools_are_capped_by_caller_policy() {
+        // Stronger ceiling case: EchoTool is present in the parent registry but
+        // the caller policy only admits `delegate`, so bounded child tools are
+        // empty even though the target profile would allow EchoTool.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,

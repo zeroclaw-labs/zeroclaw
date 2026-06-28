@@ -120,6 +120,10 @@ impl ModelRoutingConfigTool {
         raw: &Value,
         field: &str,
     ) -> anyhow::Result<Vec<DelegateTargetConfig>> {
+        // Keep the config-editing tool as permissive as the schema loader:
+        // operators may pass a comma-separated legacy string, a string array,
+        // or object entries with explicit mode. The stored config still uses
+        // `DelegateTargetConfig`, so mode semantics are not reimplemented here.
         if let Some(raw_string) = raw.as_str() {
             return Ok(raw_string
                 .split(',')
