@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::metrics::SopMetricsCollector;
 use super::types::{SopRun, SopRunAction, SopStepResult};
 
 /// Live SOP action captured by SOP tools while they run inside an agent turn.
@@ -92,9 +91,6 @@ pub(crate) fn advance_sop_step(
         }
         _ => None,
     };
-    if let Some(ref run) = finished_run {
-        SopMetricsCollector::shared().record_run_complete(run);
-    }
     Ok((action, finished_run))
 }
 
@@ -125,6 +121,94 @@ pub(crate) async fn audit_sop_step(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"error": e.to_string()})),
             "SOP executor: audit log_run_complete failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sop::metrics::SopMetricsCollector;
+    use crate::sop::types::{
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopStepResult,
+        SopStepStatus, SopTrigger, SopTriggerSource,
+    };
+    use serde_json::json;
+    use zeroclaw_config::schema::SopConfig;
+
+    fn test_sop(name: &str) -> Sop {
+        Sop {
+            name: name.to_string(),
+            description: "Test SOP".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".to_string(),
+                body: "Complete the step".to_string(),
+                suggested_tools: Vec::new(),
+                requires_confirmation: false,
+                kind: SopStepKind::Execute,
+                schema: None,
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    fn manual_event() -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-06-28T00:00:00Z".to_string(),
+        }
+    }
+
+    fn extract_run_id(action: &SopRunAction) -> String {
+        match action {
+            SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_executor_records_terminal_metrics_once() {
+        let collector = SopMetricsCollector::shared();
+        collector.reset_for_test();
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_metrics(collector.clone());
+        engine.set_sops_for_test(vec![test_sop("live-once")]);
+        let action = engine.start_run("live-once", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+        assert!(finished_run.is_some());
+        assert_eq!(
+            collector.get_metric_value("sop.runs_completed"),
+            Some(json!(1u64))
+        );
+        assert_eq!(
+            collector.get_metric_value("sop.live-once.runs_completed"),
+            Some(json!(1u64))
         );
     }
 }
