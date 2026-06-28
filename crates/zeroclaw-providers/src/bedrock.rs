@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use zeroclaw_api::tool::ToolSpec;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -349,16 +351,7 @@ impl AwsCredentials {
 
 #[cfg(windows)]
 fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut command = std::process::Command::new("cmd.exe");
-    command
-        .raw_arg("/C")
-        .raw_arg(format!("\"{cmd}\""))
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    windows_std_cmd_shell_command(cmd).output()
 }
 
 #[cfg(not(windows))]
@@ -1053,6 +1046,57 @@ impl BedrockModelProvider {
         }
     }
 
+    /// Strip `toolUse` blocks that have no matching `toolResult` anywhere in
+    /// the request.
+    ///
+    /// Belt-and-suspenders defence: the runtime's history pruner is the first
+    /// line (it strips unpaired tool_calls before the request is built), but if
+    /// an orphaned tool_use ever reaches the converter — e.g. a max-iteration
+    /// graceful-shutdown path that wasn't sanitised — Bedrock rejects the whole
+    /// request with: "Expected toolResult blocks at messages.N.content for the
+    /// following Ids: tooluse_*". Here we drop the unpaired `toolUse` blocks so
+    /// the request still succeeds; an assistant message left empty gets a
+    /// placeholder so Bedrock's non-empty-content invariant holds.
+    fn strip_orphaned_tool_uses(messages: &mut [ConverseMessage]) {
+        use std::collections::HashSet;
+
+        let answered_ids: HashSet<String> = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(w) => Some(w.tool_result.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for msg in messages.iter_mut() {
+            if msg.role != "assistant" {
+                continue;
+            }
+            let before = msg.content.len();
+            msg.content.retain(|block| match block {
+                ContentBlock::ToolUse(w) => answered_ids.contains(&w.tool_use.tool_use_id),
+                _ => true,
+            });
+            let removed = before - msg.content.len();
+            if removed > 0 {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "removed": removed })),
+                    "bedrock: converter stripped orphaned toolUse block(s) from an assistant \
+                     message — upstream history pruning likely missed a case"
+                );
+                if msg.content.is_empty() {
+                    msg.content.push(ContentBlock::Text(TextBlock {
+                        text: "(tool call omitted — no matching result)".to_string(),
+                    }));
+                }
+            }
+        }
+    }
+
     /// Try to extract a tool_call_id from partially-valid JSON content.
     fn extract_tool_call_id(content: &str) -> Option<String> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
@@ -1579,6 +1623,12 @@ impl ModelProvider for BedrockModelProvider {
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
 
+        // Strip orphaned toolUse blocks (no matching toolResult) that would
+        // otherwise trigger "Expected toolResult blocks at messages.N.content
+        // for the following Ids: tooluse_*". The runtime history pruner is the
+        // primary defence; this is the converter-side backstop.
+        Self::strip_orphaned_tool_uses(&mut converse_messages);
+
         // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
         // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
         // insertion on model support (see issue #7312).
@@ -2004,6 +2054,55 @@ mod tests {
         assert_eq!(msgs[0].content.len(), 2);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
         assert!(matches!(msgs[0].content[1], ContentBlock::ToolUse(_)));
+    }
+
+    #[test]
+    fn strip_orphaned_tool_uses_removes_unanswered_tool_use() {
+        // Belt-and-suspenders: if an orphaned tool_use slips past the runtime
+        // history pruner, the Bedrock converter must strip it so AWS doesn't
+        // reject with "Expected toolResult blocks at messages.N.content".
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        // Pre-condition: the converter produced an (orphaned) ToolUse block.
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_)))
+        );
+
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "orphaned ToolUse must be stripped"
+        );
+        // Content must not be empty (Bedrock rejects blank content).
+        assert!(!msgs[0].content.is_empty());
+    }
+
+    #[test]
+    fn strip_orphaned_tool_uses_retains_answered_tool_use() {
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_OK", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let tool_result_json = r#"{"content":"ls output","tool_call_id":"call_OK"}"#;
+        let messages = vec![
+            ChatMessage::assistant(tool_call_json),
+            ChatMessage::tool(tool_result_json),
+        ];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "a tool_use with a matching tool_result must be retained"
+        );
     }
 
     #[test]

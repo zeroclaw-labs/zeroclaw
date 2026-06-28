@@ -68,6 +68,10 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          # Platforms are resolved per tag from the generated matrix: Dockerfile
+          # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
+          # native amd64 builder), Containerfile tags stay amd64-only.
+          platforms: ${{ matrix.platforms }}
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
           tags: |

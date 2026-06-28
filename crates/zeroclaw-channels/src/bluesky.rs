@@ -479,6 +479,15 @@ impl Channel for BlueskyChannel {
     async fn health_check(&self) -> bool {
         self.get_access_jwt().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator event in the AT Protocol.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

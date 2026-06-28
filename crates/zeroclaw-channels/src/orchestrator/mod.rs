@@ -2630,14 +2630,17 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-model-empty")
             } else {
                 apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                let mut resp = format!(
-                    "Model switched to `{}` (model_provider: `{}`). Context preserved.",
-                    current.model, current.model_provider
+                let mut resp = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
                 );
                 resp.push_str(&shadow_note(
                     ctx,
@@ -2685,7 +2688,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -4051,6 +4054,42 @@ fn resolve_channel_ack_reactions(
     }
 }
 
+/// Reconcile the early processing ack (👀) on an early-return path that bails
+/// before the normal 👀 → ✅/⚠️ swap. The early ack is posted unconditionally
+/// right after the self-loop guard, so every path that returns before the swap
+/// would otherwise strand a permanent 👀 that signals "processing" forever. Pass
+/// the emoji that should replace it (✅ for a handled outcome, ⚠️ for a failure),
+/// or `None` to simply clear the ack with no replacement (the caller surfaces its
+/// own signal, e.g. a no_reply kind emoji). No-op when ack reactions are
+/// disabled or no target channel is present, so it mirrors the ack post exactly.
+async fn reconcile_early_ack(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    early_ack_task: Option<tokio::task::JoinHandle<()>>,
+    done_emoji: Option<&str>,
+) {
+    if !resolve_channel_ack_reactions(ctx, msg) {
+        return;
+    }
+    let Some(channel) = target_channel else {
+        return;
+    };
+    // Wait for the spawned 👀 add to land first; otherwise a fast early-return
+    // path could remove before the add runs and strand the ack.
+    if let Some(task) = early_ack_task {
+        let _ = task.await;
+    }
+    let _ = channel
+        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+        .await;
+    if let Some(emoji) = done_emoji {
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, emoji)
+            .await;
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4090,66 +4129,6 @@ async fn process_channel_message_body(
         msg
     };
 
-    let history_key = conversation_history_key(&msg);
-    let thinking_override = ctx
-        .thinking_overrides
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .copied();
-    let thinking = resolve_channel_thinking(
-        &msg.content,
-        thinking_override,
-        &ctx.agent_cfg.resolved.thinking,
-        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
-    );
-    if thinking.effective_content != msg.content {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"thinking_level": thinking.level})),
-            "Thinking directive parsed from channel message"
-        );
-        msg.content = thinking.effective_content.clone();
-    }
-
-    // ── Media pipeline: enrich inbound message with media annotations ──
-    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = ctx.model_provider.supports_vision();
-        let transcription_manager =
-            crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .ok()
-                .map(|m| {
-                    m.with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
-                });
-        let pipeline = media_pipeline::MediaPipeline::new(
-            &ctx.media_pipeline,
-            transcription_manager.as_ref(),
-            vision,
-        );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
-    }
-
-    // ── Link enricher: prepend URL summaries before agent sees the message ──
-    let le_config = &ctx.prompt_config.link_enricher;
-    if le_config.enabled {
-        let enricher_cfg = link_enricher::LinkEnricherConfig {
-            enabled: le_config.enabled,
-            max_links: le_config.max_links,
-            timeout_secs: le_config.timeout_secs,
-        };
-        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
-        if enriched != msg.content {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "Link enricher: prepended URL summaries to message"
-            );
-            msg.content = enriched;
-        }
-    }
-
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
     // Self-loop guard, two-layer.
@@ -4188,6 +4167,117 @@ async fn process_channel_message_body(
         }
     }
 
+    // The early ack is spawned (fire-and-forget) so it lands before the
+    // enrichment/model pipeline without blocking it. The join handle is kept so
+    // any early-return reconciliation can await the add before removing the 👀,
+    // making the swap deterministic instead of racing the spawned add.
+    let early_ack_task: Option<tokio::task::JoinHandle<()>> =
+        if resolve_channel_ack_reactions(&ctx, &msg)
+            && let Some(channel) = target_channel.clone()
+        {
+            let reply_target = msg.reply_target.clone();
+            let message_id = msg.id.clone();
+            let message_id_label = message_id.clone();
+            let agent_alias = Arc::clone(&ctx.agent_alias);
+            let sender = msg.sender.clone();
+            let channel_label = channel.name().to_string();
+            let span = ::zeroclaw_log::attribution_span!(&*channel);
+            Some(zeroclaw_spawn::spawn!(
+            ::zeroclaw_log::scope!(
+                category: "channel",
+                agent_alias: agent_alias.as_str(),
+                channel: channel_label.as_str(),
+                sender: sender.as_str(),
+                message_id: message_id_label.as_str(),
+                => async move {
+                    if let Err(e) = channel
+                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to add ack reaction"
+                        );
+                    }
+                }
+            )
+            .instrument(span)
+        ))
+        } else {
+            None
+        };
+
+    let history_key = conversation_history_key(&msg);
+    let thinking_override = ctx
+        .thinking_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .copied();
+    let thinking = resolve_channel_thinking(
+        &msg.content,
+        thinking_override,
+        &ctx.agent_cfg.resolved.thinking,
+        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
+    );
+    if thinking.effective_content != msg.content {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"thinking_level": thinking.level})),
+            "Thinking directive parsed from channel message"
+        );
+        msg.content = thinking.effective_content.clone();
+    }
+
+    // ── Media pipeline: enrich inbound message with media annotations ──
+    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
+        let vision = ctx.model_provider.supports_vision();
+        // Build from legacy config; if that fails (e.g. no legacy api_key
+        // but typed providers are configured), fall back to an empty shell
+        // so with_typed_providers() can still populate the registry.
+        let transcription_manager = {
+            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let m = base
+                .with_typed_providers(&ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+            if m.available_providers().is_empty() {
+                None
+            } else {
+                Some(m)
+            }
+        };
+        let pipeline = media_pipeline::MediaPipeline::new(
+            &ctx.media_pipeline,
+            transcription_manager.as_ref(),
+            vision,
+        );
+        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+    }
+
+    // ── Link enricher: prepend URL summaries before agent sees the message ──
+    let le_config = &ctx.prompt_config.link_enricher;
+    if le_config.enabled {
+        let enricher_cfg = link_enricher::LinkEnricherConfig {
+            enabled: le_config.enabled,
+            max_links: le_config.max_links,
+            timeout_secs: le_config.timeout_secs,
+        };
+        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
+        if enriched != msg.content {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "Link enricher: prepended URL summaries to message"
+            );
+            msg.content = enriched;
+        }
+    }
+
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -4198,6 +4288,14 @@ async fn process_channel_message_body(
         );
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            Some("\u{2705}"),
+        )
+        .await;
         return;
     }
 
@@ -4277,6 +4375,14 @@ async fn process_channel_message_body(
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
             }
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
             return;
         }
     };
@@ -4538,16 +4644,22 @@ async fn process_channel_message_body(
             &history_key,
             ChatMessage::assistant(&history_response),
         );
-        // Surface the no-reply decision in chat with an emoji on the user's
-        // message so the chatter isn't left wondering whether the bot saw
-        // the message. Same `ack_reactions` gate as the 👀 → ✅/⚠️ ack/done
-        // pattern so operators with reactions disabled don't suddenly see
-        // them. Best-effort: log on failure, never propagate. Channels that
-        // don't implement add_reaction get the trait's no-op default.
+        // Clear the early processing ack first (awaiting the spawned add so it
+        // is never stranded): the agent deliberately chose silence, so a left
+        // 👀 would falsely read as "still working." The message ends carrying
+        // only the no-reply kind emoji.
         //
         // Resolve per-channel overrides: channels like Lark, Telegram,
         // and Matrix allow `<channel>.ack_reactions` to take precedence
         // over the global `[channels].ack_reactions`.
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            None,
+        )
+        .await;
         if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
         {
@@ -4684,21 +4796,6 @@ async fn process_channel_message_body(
     } else {
         None
     };
-
-    // React with 👀 to acknowledge the incoming message
-    if resolve_channel_ack_reactions(&ctx, &msg)
-        && let Some(channel) = target_channel.as_ref()
-        && let Err(e) = channel
-            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await
-    {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to add reaction"
-        );
-    }
 
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
@@ -5437,18 +5534,20 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let user_msg = format!("⚠️ Error: {safe_error}");
+                    // Cancel any in-progress draft (don't finalize it with the
+                    // error text, which would trigger TTS on the error message)
+                    // then deliver the error as a plain suppressed send.
                     if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(user_msg, &msg.reply_target)
+                                .suppress_voice()
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             }
         }
@@ -5485,11 +5584,12 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-request-timeout",
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, error_text.as_str())
                         .await;
                 } else {
                     let _ = channel
@@ -5503,10 +5603,14 @@ async fn process_channel_message_body(
         }
     }
 
-    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
+    // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
+        if let Some(task) = early_ack_task {
+            let _ = task.await;
+        }
         let _ = channel
             .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
             .await;
@@ -5662,9 +5766,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
@@ -7056,6 +7160,20 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let channel_key = format!("telegram.{alias}");
+        let agent_transcription_provider = config
+            .agents
+            .values()
+            .filter(|a| a.enabled && a.channels.iter().any(|c| c.as_str() == channel_key))
+            .find_map(|a| {
+                let s = a.transcription_provider.as_str();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            })
+            .unwrap_or_default();
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -7073,6 +7191,11 @@ fn collect_configured_channels(
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
+                    .with_agent_transcription_provider(agent_transcription_provider.clone())
+                    .with_typed_transcription_providers(
+                        &config.providers.transcription,
+                        &agent_transcription_provider,
+                    )
                     .with_tts(&config)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
@@ -12480,6 +12603,33 @@ api_key = "anthropic-key"
         }
     }
 
+    struct NoReplyModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoReplyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("NO_REPLY[INFO]: nothing to add".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NoReplyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NoReplyModelProvider"
+        }
+    }
+
     struct ToolCallingModelProvider;
 
     fn tool_call_payload() -> String {
@@ -16104,6 +16254,292 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(removed[0].2, "\u{1F440}");
     }
 
+    // Pins the no_reply reconciliation: when the agent deliberately chooses
+    // silence, the early 👀 ack must be removed (not left dangling) and the
+    // message must end carrying only the no-reply kind emoji. A regression that
+    // strands the 👀 on this path falsely signals "still processing" forever.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_clears_early_ack() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NoReplyModelProvider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "noreply-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-noreply".to_string(),
+                content: "fyi".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.iter().any(|r| r.2 == "\u{1F44D}"),
+            "the informational no-reply emoji must be added, got {added:?}"
+        );
+        assert!(
+            !added.iter().any(|r| r.2 == "\u{2705}"),
+            "no_reply must not produce a completion checkmark, got {added:?}"
+        );
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert!(
+            removed.iter().any(|r| r.2 == "\u{1F440}"),
+            "the early eyes ack must be reconciled (removed) on the no_reply path, got {removed:?}"
+        );
+    }
+
+    struct AckTimingChannel {
+        start: Instant,
+        ack_elapsed_ms: tokio::sync::Mutex<Option<u128>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for AckTimingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "ack-timing"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for AckTimingChannel {
+        fn name(&self) -> &str {
+            "ack-timing-channel"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn add_reaction(
+            &self,
+            _channel_id: &str,
+            _message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            if emoji == "\u{1F440}" {
+                let mut slot = self.ack_elapsed_ms.lock().await;
+                if slot.is_none() {
+                    *slot = Some(self.start.elapsed().as_millis());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // Pins the early-ack ordering: with a slow model_provider, the 👀 ack must
+    // land well before the model completes. Fails on the old order where the
+    // ack was awaited after enrichment / the model call. A regression back to
+    // the late position would record the ack at >= the model delay.
+    #[tokio::test]
+    async fn process_channel_message_acks_before_slow_model_completes() {
+        let model_delay = Duration::from_millis(400);
+        let channel_impl = Arc::new(AckTimingChannel {
+            start: Instant::now(),
+            ack_elapsed_ms: tokio::sync::Mutex::new(None),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(SlowModelProvider { delay: model_delay }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "ack-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-ack".to_string(),
+                content: "hello".to_string(),
+                channel: "ack-timing-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let ack_elapsed = channel_impl
+            .ack_elapsed_ms
+            .lock()
+            .await
+            .expect("eyes ack must have been attempted");
+        assert!(
+            ack_elapsed < model_delay.as_millis(),
+            "ack fired at {ack_elapsed}ms, must precede the {}ms model delay (early-ack ordering)",
+            model_delay.as_millis()
+        );
+    }
+
     #[test]
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
@@ -17963,10 +18399,12 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let new_session_reply =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session");
         assert!(
-            sent_messages.iter().any(|message| {
-                message.contains("Conversation history cleared. Starting fresh.")
-            })
+            sent_messages
+                .iter()
+                .any(|message| message.contains(&new_session_reply))
         );
     }
 
