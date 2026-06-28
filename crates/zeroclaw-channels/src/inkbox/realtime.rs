@@ -1200,14 +1200,14 @@ mod tests {
         let m = CallMeta {
             agent_handle: "zero-claw".into(),
             agent_email: Some("zero@inkbox.ai".into()),
-            contact_name: Some("Dima Vremenko".into()),
-            contact_card: Some("- Name: Dima Vremenko\n- Emails: dima@inkbox.ai".into()),
+            contact_name: Some("Ada Lovelace".into()),
+            contact_card: Some("- Name: Ada Lovelace\n- Emails: ada@inkbox.ai".into()),
             direction: "inbound".into(),
             ..Default::default()
         };
         let s = build_instructions(&m);
         assert!(s.contains("speak in the first person"));
-        assert!(s.contains("Caller name: Dima Vremenko."));
+        assert!(s.contains("Caller name: Ada Lovelace."));
         assert!(s.contains("Their full contact card:"));
         assert!(s.contains("Your email identity: zero@inkbox.ai."));
         assert!(!s.contains("No matching contact record"));
@@ -1239,10 +1239,10 @@ mod tests {
     #[test]
     fn greeting_uses_first_name_inbound_else_there() {
         let m = CallMeta {
-            contact_name: Some("Dima Vremenko".into()),
+            contact_name: Some("Ada Lovelace".into()),
             ..inbound()
         };
-        assert!(build_greeting(&m).contains("Hi Dima,"));
+        assert!(build_greeting(&m).contains("Hi Ada,"));
         assert!(build_greeting(&inbound()).contains("Hi there,"));
     }
 
@@ -1265,12 +1265,12 @@ mod tests {
     fn sample_contact() -> inkbox::contacts::types::Contact {
         serde_json::from_value(json!({
             "id": "00000000-0000-0000-0000-000000000001",
-            "preferred_name": "Dima",
-            "given_name": "Dima",
-            "family_name": "Vremenko",
-            "company_name": "Inkbox",
-            "job_title": "Cofounder",
-            "emails": [{ "value": "dima@inkbox.ai", "is_primary": true, "label": "work" }],
+            "preferred_name": "Ada",
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "company_name": "Globex",
+            "job_title": "Engineer",
+            "emails": [{ "value": "ada@inkbox.ai", "is_primary": true, "label": "work" }],
             "phones": [{ "value_e164": "+15551230000", "is_primary": true, "label": "mobile" }],
             "notes": "VIP",
             "created_at": "2026-01-01T00:00:00Z",
@@ -1283,16 +1283,16 @@ mod tests {
     fn contact_display_name_prefers_preferred_name() {
         assert_eq!(
             contact_display_name(&sample_contact()).as_deref(),
-            Some("Dima")
+            Some("Ada")
         );
     }
 
     #[test]
     fn render_contact_card_includes_all_populated_fields() {
         let card = render_contact_card(&sample_contact());
-        assert!(card.contains("- Name: Dima Vremenko"));
-        assert!(card.contains("- Company: Inkbox (Cofounder)"));
-        assert!(card.contains("dima@inkbox.ai"));
+        assert!(card.contains("- Name: Ada Lovelace"));
+        assert!(card.contains("- Company: Globex (Engineer)"));
+        assert!(card.contains("ada@inkbox.ai"));
         assert!(card.contains("+15551230000"));
         assert!(card.contains("- Notes: VIP"));
     }
