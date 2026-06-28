@@ -2,7 +2,7 @@
 id: ADR-008
 title: Anchor goal mode in the durable task control plane
 date: 2026-06-25
-status: proposed
+status: accepted
 relates-to:
   - https://github.com/zeroclaw-labs/zeroclaw/issues/8303
   - https://github.com/zeroclaw-labs/zeroclaw/issues/7929
