@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_config::schema::Config;
+use zeroclaw_providers::ProviderDispatch;
 
 use crate::agent::agent::build_session_model_provider;
 use crate::agent::cost::{
@@ -55,7 +56,8 @@ pub async fn verify_goal_completion(
     let messages = [ChatMessage::system(system), ChatMessage::user(user)];
 
     let verifier_call = async {
-        let response = model_provider
+        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let response = dispatcher
             .chat(
                 ChatRequest {
                     messages: &messages,
