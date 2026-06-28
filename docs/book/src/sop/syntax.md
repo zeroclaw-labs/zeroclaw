@@ -67,9 +67,8 @@ The `[sop]` config controls enforcement:
 Schema enforcement fails closed: invalid step input prevents the step from
 starting, and invalid step output is routed through the step's `on_failure`
 policy. Routing enforcement replaces linear `current_step + 1` advancement in
-LLM and deterministic runs. Tool-scope enforcement is available as config, but
-the current runtime still treats scopes as advisory until the turn-loop filter
-is wired.
+LLM and deterministic runs. Tool-scope enforcement narrows the live step turn's
+available tools and blocks scoped-out calls at dispatch.
 
 ## 4. Trigger Types
 

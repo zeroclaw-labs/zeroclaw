@@ -109,7 +109,8 @@ pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
 use crate::agent::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
+    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -843,10 +844,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
-                    execute_tools_parallel(
-                        &executable_calls,
+                    let dispatch = ToolDispatchContext {
                         tools_registry,
                         activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_parallel(
+                        &executable_calls,
+                        dispatch,
                         &meta,
                         observer,
                         cancellation_token.as_ref(),
@@ -856,10 +861,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     .await
                 } else {
                     let meta = ctx.meta();
-                    execute_tools_sequential(
-                        &executable_calls,
+                    let dispatch = ToolDispatchContext {
                         tools_registry,
                         activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_sequential(
+                        &executable_calls,
+                        dispatch,
                         &meta,
                         observer,
                         cancellation_token.as_ref(),
@@ -1056,6 +1065,91 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     .await
 }
 
+fn collect_callable_tool_names(
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Vec<String> {
+    let mut names = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    if let Some(activated) = activated_tools {
+        let activated = match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "activated-tool lock poisoned while resolving SOP step scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        names.extend(activated.tool_names().into_iter().map(String::from));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn push_excluded_tool(excluded_tools: &mut Vec<String>, tool: impl Into<String>) {
+    let tool = tool.into();
+    if !excluded_tools
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&tool))
+    {
+        excluded_tools.push(tool);
+    }
+}
+
+fn sop_step_excluded_tools(
+    queued: &crate::sop::executor::QueuedSopAction,
+    run_id: &str,
+    step: &crate::sop::SopStep,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
+) -> Vec<String> {
+    let mut scoped = excluded_tools.to_vec();
+    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+        push_excluded_tool(&mut scoped, tool);
+    }
+
+    let registry_names = collect_callable_tool_names(tools_registry, activated_tools);
+    let active_scope = {
+        let engine = match queued.engine.lock() {
+            Ok(engine) => engine,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+                    "SOP engine lock poisoned while resolving step tool scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        crate::sop::active_scope::resolve_active_step_scope(
+            run_id,
+            step,
+            engine.config(),
+            &registry_names,
+        )
+    };
+
+    if let Some(active_scope) = active_scope {
+        for tool in active_scope.excluded {
+            push_excluded_tool(&mut scoped, tool);
+        }
+    }
+    scoped.sort();
+    scoped
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
@@ -1096,7 +1190,7 @@ async fn drive_live_sop_actions(
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
-        let mut action = queued.action;
+        let mut action = queued.action.clone();
         loop {
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
@@ -1111,12 +1205,14 @@ async fn drive_live_sop_actions(
                         out.push(user_message);
                     }
 
-                    let mut sop_excluded_tools = excluded_tools.to_vec();
-                    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
-                        if !sop_excluded_tools.iter().any(|existing| existing == tool) {
-                            sop_excluded_tools.push(tool.to_string());
-                        }
-                    }
+                    let sop_excluded_tools = sop_step_excluded_tools(
+                        &queued,
+                        &run_id,
+                        &step,
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    );
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_output = Box::pin(run_tool_call_loop(ToolLoop {
