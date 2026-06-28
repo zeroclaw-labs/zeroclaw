@@ -12581,6 +12581,14 @@ pub struct CronJobDecl {
     #[serde(default)]
     #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Output format for shell jobs: `"wrapped"` (default) or `"raw"`.
+    ///
+    /// - `"wrapped"` (default): returns stdout and stderr wrapped in a
+    ///   `status=... / stdout: / stderr:` envelope.
+    /// - `"raw"`: returns trimmed stdout on success; failures still include
+    ///   status and error context.
+    #[serde(default)]
+    pub shell_output_format: CronShellOutputFormat,
 }
 
 impl Default for CronJobDecl {
@@ -12597,8 +12605,21 @@ impl Default for CronJobDecl {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         }
     }
+}
+
+/// Output format for shell cron job stdout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CronShellOutputFormat {
+    /// Wrapped format: `status=...\nstdout:\n...\nstderr:\n...` (default).
+    #[default]
+    Wrapped,
+    /// Raw stdout on success; failure context on error.
+    Raw,
 }
 
 /// Schedule variant for declarative cron jobs.

@@ -17,7 +17,7 @@ use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
+use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
@@ -276,6 +276,7 @@ pub async fn run(
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1132,6 +1133,14 @@ async fn run_job_command_with_timeout(
         );
     }
 
+    // Resolve the shell output format from config. Imperative jobs (created
+    // via CLI/API) are not in config.cron and default to Wrapped.
+    let output_format = config
+        .cron
+        .get(&job.id)
+        .map(|decl| &decl.shell_output_format)
+        .unwrap_or(&CronShellOutputFormat::Wrapped);
+
     let child = match build_cron_shell_command(&job.command, &config.data_dir) {
         Ok(mut cmd) => match cmd.spawn() {
             Ok(child) => child,
@@ -1144,12 +1153,17 @@ async fn run_job_command_with_timeout(
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!(
-                "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            );
+            let combined = match output_format {
+                CronShellOutputFormat::Raw if output.status.success() => {
+                    stdout.trim().to_string()
+                }
+                _ => format!(
+                    "status={}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+            };
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
@@ -1441,6 +1455,59 @@ mod tests {
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // Insert a config-declared job with raw output format.
+        config.cron.insert(
+            "test-raw-job".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("echo raw-format-ok".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        // The job id must match the config key for the format to be resolved.
+        let mut job = test_job("echo raw-format-ok");
+        job.id = "test-raw-job".into();
+        job.source = "declarative".into();
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Raw output should be just the command's trimmed stdout, no wrapper.
+        assert_eq!(output, "raw-format-ok");
+        assert!(!output.contains("status="));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_failure_still_uses_wrapped() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.cron.insert(
+            "test-raw-fail".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("ls definitely_missing_file_raw_test".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        let mut job = test_job("ls definitely_missing_file_raw_test");
+        job.id = "test-raw-fail".into();
+        job.source = "declarative".into();
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        // On failure, raw mode should still include the wrapped format
+        // so operators can diagnose the failure.
+        assert!(output.contains("status=exit status:"));
+        assert!(output.contains("definitely_missing_file_raw_test"));
     }
 
     #[tokio::test]
