@@ -3,8 +3,9 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
+const gatewayHost = process.env.ZEROCLAW_GATEWAY_HOST ?? "127.0.0.1";
 const gatewayPort = process.env.ZEROCLAW_GATEWAY_PORT ?? "42617";
-const gatewayTarget = `http://127.0.0.1:${gatewayPort}`;
+const gatewayTarget = `http://${gatewayHost}:${gatewayPort}`;
 
 // Extra Host header values the dev server will accept, comma-separated, e.g.
 // ZEROCLAW_WEB_ALLOWED_HOSTS=my-box.internal,dev.example.com. Unset → Vite default.
