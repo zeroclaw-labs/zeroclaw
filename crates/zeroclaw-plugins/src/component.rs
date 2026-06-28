@@ -91,12 +91,12 @@ pub fn load_component(wasm_path: &Path) -> Result<Component> {
     wt(load_inner(wasm_path), "failed to load WASM component")
 }
 
-#[cfg(any(feature = "plugins-wasm-cranelift", feature = "plugins-wasm-pulley"))]
+#[cfg(feature = "plugins-wasm-cranelift")]
 fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     Component::from_file(engine(), wasm_path)
 }
 
-#[cfg(not(any(feature = "plugins-wasm-cranelift", feature = "plugins-wasm-pulley")))]
+#[cfg(not(feature = "plugins-wasm-cranelift"))]
 fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
