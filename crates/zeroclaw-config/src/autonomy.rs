@@ -98,8 +98,9 @@ fn default_approval_timeout_secs() -> u64 {
 /// actions can be approved by a separate ops channel / a different principal).
 ///
 /// `Option<ApprovalRoute>` on a risk profile: ABSENT ⇒ today's behavior (the originating
-/// channel approves). Present ⇒ the gate asks `approver_channel` (a registered channel
-/// name, NOT the originator), bounded by `timeout_secs`, fail-closed by default.
+/// channel approves). Present ⇒ the gate asks `approver_channel` (a channel registry key,
+/// platform-qualified `<channel>.<alias>` such as `matrix.ops`, NOT the originator),
+/// bounded by `timeout_secs`, fail-closed by default.
 ///
 /// Consulted on both the interactive channel-driven path and the non-interactive turn path
 /// (gateway chat/webhook dispatch and agent-to-agent peer messages, which run without an

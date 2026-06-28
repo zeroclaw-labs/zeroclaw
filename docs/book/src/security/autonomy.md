@@ -50,12 +50,12 @@ By default an approval prompt is delivered through whichever channel initiated t
 
 ```toml
 [risk_profiles.frontline.approval_route]
-approver_channel = "ops"            # a registered channel name, NOT the originator
+approver_channel = "matrix.ops"     # a channel registry key, NOT the originator
 on_no_approver   = "deny"           # default; or "inherit-originator"
 timeout_secs     = 120              # default; bounds the approver's response window
 ```
 
-- `approver_channel` is the registered channel that receives the approval request. When the route is set, the approval gate asks **only** that channel, not the originating one.
+- `approver_channel` is the channel registry key that receives the approval request. Keys are platform-qualified, `<channel>.<alias>` (for example `matrix.ops` or `telegram.default`); a bare platform name (e.g. `matrix`) resolves only when it is the single channel of that platform. An alias on its own is not a registry key and will fail closed. When the route is set, the approval gate asks **only** that channel, not the originating one.
 - `on_no_approver` decides what happens when the approver does not answer decisively, is unreachable, is not a registered channel, or times out:
   - `deny` (the default) fails closed and denies the tool call.
   - `inherit-originator` falls back to the originating-channel prompt (today's behavior).
