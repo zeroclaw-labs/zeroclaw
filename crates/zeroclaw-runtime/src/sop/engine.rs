@@ -10,9 +10,9 @@ use super::load_sops;
 use super::metrics::SopMetricsCollector;
 use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
 use super::types::{
-    DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
-    SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
-    SopTrigger, SopTriggerSource,
+    DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
+    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use zeroclaw_config::schema::SopConfig;
 
@@ -1156,6 +1156,30 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             event.topic.as_deref().is_some_and(|t| t == expression)
         }
 
+        (
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            },
+            SopTriggerSource::Filesystem,
+        ) => {
+            let path_match = event
+                .topic
+                .as_deref()
+                .is_some_and(|t| filesystem_path_matches(path, t));
+            if !path_match {
+                return false;
+            }
+            if !events.is_empty() && !filesystem_event_listed(events, event.payload.as_deref()) {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
 
         _ => false,
@@ -1190,6 +1214,33 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
 
     // Both must be fully consumed (unless pattern ended with #)
     pi == pat_parts.len() && ti == top_parts.len()
+}
+
+/// Glob match a filesystem trigger `pattern` against a normalized `path`,
+/// supporting `*` (single segment) and `**` (recursive) wildcards via the
+/// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
+    if let Ok(compiled) = glob::Pattern::new(pattern)
+        && compiled.matches(path)
+    {
+        return true;
+    }
+    let prefix = pattern.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Whether the payload's `event` field names one of the trigger's listed kinds.
+fn filesystem_event_listed(events: &[FilesystemEventKind], payload: Option<&str>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(kind) = value.get("event").and_then(|e| e.as_str()) else {
+        return false;
+    };
+    events.iter().any(|e| e.to_string() == kind)
 }
 
 // ── Execution mode resolution ───────────────────────────────────

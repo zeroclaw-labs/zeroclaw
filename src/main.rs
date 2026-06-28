@@ -4264,6 +4264,36 @@ async fn main() -> Result<()> {
                     }
                 }));
 
+                #[cfg(feature = "channel-filesystem")]
+                registry.register_filesystem(Box::new({
+                    let engine = sop_engine.clone();
+                    let audit = sop_audit.clone();
+                    move |filesystem_config| {
+                        let engine = engine.clone();
+                        let audit = audit.clone();
+                        Box::pin(async move {
+                            if let (Some(engine), Some(audit)) = (engine, audit) {
+                                zeroclaw_channels::orchestrator::filesystem::run_filesystem_sop_listener(
+                                    &filesystem_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            } else {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Skip
+                                    ),
+                                    "Filesystem SOP listener skipped — no SOPs directory configured"
+                                );
+                                Ok(())
+                            }
+                        })
+                    }
+                }));
+
                 registry.register_socket(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
                         zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)

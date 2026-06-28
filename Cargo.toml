@@ -304,6 +304,7 @@ agent-runtime = [
 default-channels = [
     "channel-acp-server", "channel-webhook",
     "channel-email", "channel-telegram", "channel-discord",
+    "channel-filesystem",
 ]
 
 # Historical broad channel bundle. Use this for builds that should preserve the
@@ -314,6 +315,7 @@ channels-full = [
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
+    "channel-filesystem",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
@@ -348,6 +350,7 @@ channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
 channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
+channel-filesystem = ["zeroclaw-channels/channel-filesystem"]
 channel-amqp = ["zeroclaw-channels/channel-amqp"]
 channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]

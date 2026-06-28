@@ -19,6 +19,8 @@
 
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+#[cfg(feature = "channel-filesystem")]
+pub mod filesystem;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;

@@ -696,6 +696,41 @@ pub async fn run(
         crate::health::mark_component_ok("mqtt");
     }
 
+    // Wire up filesystem SOP listener if configured and referenced by an enabled agent
+    if let Some(filesystem_start) = registry.take_filesystem_start() {
+        let active_filesystem: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect();
+        let mut filesystem_started = false;
+        for (alias, filesystem_config) in &config.channels.filesystem {
+            if !active_filesystem.contains(&format!("filesystem.{alias}")) {
+                continue;
+            }
+            let filesystem_cfg = filesystem_config.clone();
+            let filesystem_start = std::sync::Arc::new(filesystem_start);
+            handles.push(spawn_component_supervisor(
+                "filesystem",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = filesystem_cfg.clone();
+                    let start = filesystem_start.clone();
+                    async move { start(cfg).await }
+                },
+            ));
+            filesystem_started = true;
+            break;
+        }
+        if !filesystem_started {
+            crate::health::mark_component_ok("filesystem");
+        }
+    } else {
+        crate::health::mark_component_ok("filesystem");
+    }
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
