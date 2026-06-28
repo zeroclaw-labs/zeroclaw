@@ -189,6 +189,10 @@ pub trait TaskRegistry: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>>;
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
+    /// Resolve the latest non-terminal goal task for `agent` directly from the
+    /// canonical task table. This is a read-only resolver, not cached state.
+    async fn latest_active_goal_for_agent(&self, agent: &str)
+    -> anyhow::Result<Option<TaskRecord>>;
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
     async fn update_goal_pause(

@@ -350,16 +350,9 @@ async fn resolve_goal_task(
         return Ok(task);
     }
 
-    let mut goals = store
-        .list_by_agent(&ctx.agent_alias)
+    store
+        .latest_active_goal_for_agent(&ctx.agent_alias)
         .await?
-        .into_iter()
-        .filter(|task| task.kind == TaskKind::Goal)
-        .collect::<Vec<_>>();
-    goals.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    goals
-        .into_iter()
-        .find(|task| !task.status.is_terminal())
         .context("no active goal for this agent")
 }
 

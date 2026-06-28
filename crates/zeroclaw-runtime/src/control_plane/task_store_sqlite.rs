@@ -75,7 +75,9 @@ impl SqliteTaskStore {
                  error           TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);",
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
+                ON tasks(agent, kind, started_at DESC);",
         )
         .context("create control-plane base schema")?;
         migrate_schema(&conn).context("migrate control-plane schema")?;
@@ -308,16 +310,20 @@ where
     for r in rows {
         match r {
             Ok(rec) => out.push(rec),
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
-                "control-plane: skipping unreadable task row"
-            ),
+            Err(e) => log_unreadable_task_row(e),
         }
     }
     out
+}
+
+fn log_unreadable_task_row(error: rusqlite::Error) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+        "control-plane: skipping unreadable task row"
+    );
 }
 
 #[async_trait::async_trait]
@@ -433,6 +439,29 @@ impl TaskRegistry for SqliteTaskStore {
             .query_map(params![agent], row_to_record)
             .context("query list_by_agent")?;
         Ok(collect_skipping_bad_rows(rows))
+    }
+
+    async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM tasks
+              WHERE agent = ?1
+                AND kind = 'goal'
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+              ORDER BY started_at DESC",
+            )
+            .context("prepare latest active goal by agent")?;
+        let rows = stmt
+            .query_map(params![agent], row_to_record)
+            .context("query latest active goal by agent")?;
+        for row in rows {
+            match row {
+                Ok(task) => return Ok(Some(task)),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(None)
     }
 
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
@@ -578,6 +607,76 @@ mod tests {
         assert_eq!(s.list_running().await.unwrap().len(), 2); // a + c
         assert_eq!(s.list_by_agent("main").await.unwrap().len(), 2); // a + b
         assert_eq!(s.count_by_agent("main").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_agent_resolves_in_sql() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut old_goal = rec("old-goal", "main", 1, "boot-1");
+        old_goal.kind = TaskKind::Goal;
+        old_goal.started_at = "2026-06-18T00:00:00Z".into();
+        s.create(old_goal).await.unwrap();
+
+        let mut newer_terminal_goal = rec("done-goal", "main", 1, "boot-1");
+        newer_terminal_goal.kind = TaskKind::Goal;
+        newer_terminal_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(newer_terminal_goal).await.unwrap();
+        s.update_status("done-goal", TaskStatus::Completed, None, None)
+            .await
+            .unwrap();
+
+        let mut newest_delegate = rec("newest-delegate", "main", 1, "boot-1");
+        newest_delegate.started_at = "2026-06-21T00:00:00Z".into();
+        s.create(newest_delegate).await.unwrap();
+
+        let mut latest_active_goal = rec("latest-goal", "main", 1, "boot-1");
+        latest_active_goal.kind = TaskKind::Goal;
+        latest_active_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(latest_active_goal).await.unwrap();
+
+        let got = s
+            .latest_active_goal_for_agent("main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "latest-goal");
+        assert!(
+            s.latest_active_goal_for_agent("other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_agent_skips_unreadable_latest_candidate() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut older_valid_goal = rec("older-valid-goal", "main", 1, "boot-1");
+        older_valid_goal.kind = TaskKind::Goal;
+        older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(older_valid_goal).await.unwrap();
+
+        let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
+        unreadable_newer_goal.kind = TaskKind::Goal;
+        unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(unreadable_newer_goal).await.unwrap();
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET status = 'future_paused' WHERE id = ?1",
+                params!["unreadable-newer-goal"],
+            )
+            .unwrap();
+        }
+
+        let got = s
+            .latest_active_goal_for_agent("main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "older-valid-goal");
     }
 
     #[tokio::test]
