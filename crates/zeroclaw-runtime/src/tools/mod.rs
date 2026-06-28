@@ -90,6 +90,8 @@ pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
     build_deferred_tools_section_filtered,
 };
+pub use zeroclaw_tools::mcp_prompts_tool::McpPromptsTool;
+pub use zeroclaw_tools::mcp_resources_tool::McpResourcesTool;
 pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
 pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
@@ -409,6 +411,25 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
         }
     }
     arcs
+}
+
+/// Build the two generic MCP capability tools (`mcp_resources`, `mcp_prompts`),
+/// including each only when the access `policy` admits its name. A `None` policy
+/// admits both. Returned as `Arc<dyn Tool>` ready to register and/or expose to
+/// delegates.
+pub fn build_mcp_capability_tools(
+    registry: &Arc<McpRegistry>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> Vec<Arc<dyn Tool>> {
+    let admit = |name: &str| policy.is_none_or(|p| p.is_tool_allowed(name));
+    let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+    if admit("mcp_resources") {
+        out.push(Arc::new(McpResourcesTool::new(Arc::clone(registry))));
+    }
+    if admit("mcp_prompts") {
+        out.push(Arc::new(McpPromptsTool::new(Arc::clone(registry))));
+    }
+    out
 }
 
 /// Always-on built-in tools that surface in the integrations panel as
@@ -1495,6 +1516,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+
+    #[tokio::test]
+    async fn mcp_capability_tools_respect_policy() {
+        use zeroclaw_tools::tool_search::ToolAccessPolicy;
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+
+        // No policy → both tools present.
+        let both = build_mcp_capability_tools(&registry, None);
+        let names: Vec<_> = both.iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains(&"mcp_resources".to_string()));
+        assert!(names.contains(&"mcp_prompts".to_string()));
+
+        // Deny mcp_prompts → only mcp_resources present.
+        let policy =
+            ToolAccessPolicy::from_security(None, Some(&["mcp_prompts".to_string()]), None);
+        let one = build_mcp_capability_tools(&registry, policy.as_ref());
+        let names: Vec<_> = one.iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains(&"mcp_resources".to_string()));
+        assert!(!names.contains(&"mcp_prompts".to_string()));
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {

@@ -1308,6 +1308,18 @@ pub async fn run(
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
+                    // Register the generic MCP resource/prompt capability tools
+                    // (policy-gated, both deferred and eager modes).
+                    for tool in
+                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
+                    {
+                        register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools_registry,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -2920,6 +2932,16 @@ pub async fn process_message(
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
+                    for tool in
+                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy_pm.as_ref())
+                    {
+                        register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools_registry,
+                            delegate_handle_pm.as_ref(),
+                            mcp_policy_pm.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
