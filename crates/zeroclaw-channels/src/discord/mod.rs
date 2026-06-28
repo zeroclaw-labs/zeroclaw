@@ -3755,7 +3755,24 @@ impl Channel for DiscordChannel {
         // streaming/draft reply renders embeds the same as a normal send.
         let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
             prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text_without_embeds);
+        // Interactive components next (same ordering as `send()`): the
+        // `[COMPONENTS:{json}]` body also contains `[`/`]`, so strip it before the
+        // attachment scanner runs. A streamed/draft reply must render components
+        // identically to a normal send. `send()` parsed them but `finalize_draft`
+        // did not, so any reply that streamed (stream_mode != Off) leaked the raw
+        // marker as plain text. Each interactive component carrying a `prompt` is
+        // registered in `pending_components` via `build_marker_components`, so a
+        // click dispatches the same as on the non-streaming path. The action rows
+        // ride the first finalized message below, mirroring embeds.
+        let (text_without_components, component_rows) =
+            parse_component_markers(&text_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&text_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
@@ -3776,10 +3793,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds + files ride the first message.
+                    // Embeds + components + files ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload_with_files(
@@ -3813,10 +3831,11 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    // Embeds ride the first message.
+                    // Embeds + components ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
                         embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
                         ..Default::default()
                     };
                     send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
@@ -3836,13 +3855,16 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
 
-        // Path 3: simple case — edit in-place (with any embeds); fall back to
-        // delete + POST on failure. The reaction target is the draft message_id
-        // when the edit lands; when the fallback fires it's the freshly posted
-        // message instead.
+        // Path 3: simple case, edit in-place (with any embeds + components); fall
+        // back to delete + POST on failure. The reaction target is the draft
+        // message_id when the edit lands; when the fallback fires it's the freshly
+        // posted message instead. Editing the draft to carry the action rows is
+        // what makes a streamed reply's components render (Discord accepts
+        // `components` on a message edit just as on a create).
         let payload = DiscordOutgoing {
             content: Some(content.clone()),
             embeds: embeds.clone(),
+            components: component_action_rows.clone(),
             ..Default::default()
         };
         let reaction_target = match edit_discord_message_payload(
@@ -4091,6 +4113,33 @@ mod tests {
         assert_eq!(
             payload.to_rest_json(),
             serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
+    }
+
+    #[test]
+    fn finalize_draft_payload_carries_components() {
+        // finalize_draft must lift `[COMPONENTS:...]` out of the final streamed text
+        // and attach the action rows to the first message, the same transformation
+        // send() does. Before this fix only send() parsed components, so any reply
+        // that streamed (stream_mode != Off) leaked the raw marker as plain text.
+        // Pin the transformation so the streaming path can't regress to
+        // content-only.
+        let raw = "Pick one [COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"style\":\"primary\",\"prompt\":\"go\"}]]}]";
+        let (content, rows) = parse_component_markers(raw);
+        assert_eq!(content.trim(), "Pick one");
+        assert_eq!(rows.len(), 1, "one action row parsed");
+        let mut reg = pending::PendingComponents::default();
+        let component_action_rows = build_component_rows("n", &rows, &mut reg);
+        assert_eq!(component_action_rows.len(), 1, "row rendered");
+        let payload = DiscordOutgoing {
+            content: Some(content.trim().to_string()),
+            components: component_action_rows,
+            ..Default::default()
+        };
+        let json = payload.to_rest_json();
+        assert!(
+            json.get("components").is_some(),
+            "finalize payload must carry the action rows; got {json}"
         );
     }
 
