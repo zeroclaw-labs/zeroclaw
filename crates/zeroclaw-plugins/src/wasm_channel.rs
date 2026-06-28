@@ -47,7 +47,8 @@ impl Attributable for WasmChannel {
 fn linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
-    let options = crate::component::bindings::channel::LinkOptions::default();
+    let mut options = crate::component::bindings::channel::LinkOptions::default();
+    options.plugins_wit_v0(true);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
