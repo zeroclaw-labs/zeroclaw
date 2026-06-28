@@ -45,26 +45,27 @@ Parser behavior:
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>`.
 - `- mode:` overrides the SOP execution mode for that step.
 
-### Step Contract Metadata
+### Step Contract Enforcement
 
 Step contracts are optional. When present, `input` and `output` accept a compact
 JSON object with `type`, `required`, `properties`, and `items` fields. The
 supported primitive types are `object`, `array`, `string`, `number`, `integer`,
 `boolean`, and `null`.
 
-The `[sop]` config reserves the enforcement knobs for this contract surface:
+The `[sop]` config controls enforcement:
 
 | Field | Default | Effect |
 |---|---:|---|
-| `step_schema_enforce` | `true` | Enables fail-closed schema validation once the engine enforcement slice is active. |
-| `step_scope_enforce` | `false` | Enables per-step tool-scope filtering once the turn-loop filter slice is active. |
-| `step_mandatory_tools` | `["sop_advance", "sop_approve", "sop_status"]` | Keeps lifecycle tools available while scope enforcement is enabled. |
-| `max_step_visits` | `256` | Bounds routed runs that revisit one step. |
-| `max_step_retries` | `2` | Bounds retries requested by a step failure policy. |
+| `step_schema_enforce` | `true` | Validate declared step input/output schemas at engine boundaries. |
+| `step_scope_enforce` | `false` | Treat per-step tool scopes as enforced filters instead of advisory hints. |
+| `step_mandatory_tools` | `["sop_advance", "sop_approve", "sop_status"]` | Keep lifecycle tools available while scope enforcement is enabled. |
+| `max_step_visits` | `256` | Stop routed runs that revisit one step too many times. |
+| `max_step_retries` | `2` | Limit retries requested by a step failure policy. |
 
-This metadata is parsed and preserved by the SOP loader. Route replacement,
-schema enforcement, and turn-loop tool-scope filtering are activated by later
-runtime slices.
+Schema enforcement fails closed: invalid step input prevents the step from
+starting, and invalid step output prevents the run from advancing. Tool-scope
+enforcement is available as config, but the current runtime still treats scopes
+as advisory until the turn-loop filter is wired.
 
 ## 4. Trigger Types
 
