@@ -4,6 +4,14 @@ use serde_json::Value;
 
 use super::types::{SchemaError, SchemaNode};
 
+const TYPE_OBJECT: &str = "object";
+const TYPE_ARRAY: &str = "array";
+const TYPE_STRING: &str = "string";
+const TYPE_NUMBER: &str = "number";
+const TYPE_INTEGER: &str = "integer";
+const TYPE_BOOLEAN: &str = "boolean";
+const TYPE_NULL: &str = "null";
+
 pub(crate) fn compile_schema(schema: &Value) -> Result<SchemaNode, SchemaError> {
     let object = schema
         .as_object()
@@ -35,16 +43,16 @@ pub(crate) fn compile_schema(schema: &Value) -> Result<SchemaNode, SchemaError> 
         .ok_or_else(|| SchemaError::Malformed("type must be a string".into()))?;
 
     match schema_type {
-        "object" => Ok(SchemaNode::Object {
+        TYPE_OBJECT => Ok(SchemaNode::Object {
             required,
             properties,
         }),
-        "array" => Ok(SchemaNode::Array { items }),
-        "string" => Ok(SchemaNode::String),
-        "number" => Ok(SchemaNode::Number),
-        "integer" => Ok(SchemaNode::Integer),
-        "boolean" => Ok(SchemaNode::Boolean),
-        "null" => Ok(SchemaNode::Null),
+        TYPE_ARRAY => Ok(SchemaNode::Array { items }),
+        TYPE_STRING => Ok(SchemaNode::String),
+        TYPE_NUMBER => Ok(SchemaNode::Number),
+        TYPE_INTEGER => Ok(SchemaNode::Integer),
+        TYPE_BOOLEAN => Ok(SchemaNode::Boolean),
+        TYPE_NULL => Ok(SchemaNode::Null),
         other => Err(SchemaError::Malformed(format!(
             "unsupported type `{other}`"
         ))),

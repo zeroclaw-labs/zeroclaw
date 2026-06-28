@@ -28,6 +28,9 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
+   - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
+   - next: 3
 ```
 
 Parser behavior:
@@ -36,6 +39,32 @@ Parser behavior:
 - Leading bold text (`**Title**`) becomes step title.
 - `- tools:` maps to `suggested_tools`.
 - `- requires_confirmation: true` enforces approval for that step.
+- `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
+- `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
+- `- next:` and `- depends_on:` declare route metadata for non-linear runs.
+- `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>`.
+- `- mode:` overrides the SOP execution mode for that step.
+
+### Step Contract Metadata
+
+Step contracts are optional. When present, `input` and `output` accept a compact
+JSON object with `type`, `required`, `properties`, and `items` fields. The
+supported primitive types are `object`, `array`, `string`, `number`, `integer`,
+`boolean`, and `null`.
+
+The `[sop]` config reserves the enforcement knobs for this contract surface:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `step_schema_enforce` | `true` | Enables fail-closed schema validation once the engine enforcement slice is active. |
+| `step_scope_enforce` | `false` | Enables per-step tool-scope filtering once the turn-loop filter slice is active. |
+| `step_mandatory_tools` | `["sop_advance", "sop_approve", "sop_status"]` | Keeps lifecycle tools available while scope enforcement is enabled. |
+| `max_step_visits` | `256` | Bounds routed runs that revisit one step. |
+| `max_step_retries` | `2` | Bounds retries requested by a step failure policy. |
+
+This metadata is parsed and preserved by the SOP loader. Route replacement,
+schema enforcement, and turn-loop tool-scope filtering are activated by later
+runtime slices.
 
 ## 4. Trigger Types
 
