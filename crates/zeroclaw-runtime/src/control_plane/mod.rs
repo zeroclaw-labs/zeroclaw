@@ -23,6 +23,7 @@ pub mod goal;
 pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;
+pub mod verifier;
 
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
@@ -32,3 +33,7 @@ pub use goal::{
 };
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;
+pub use verifier::{
+    GoalVerifierDecision, ensure_verifier_allows_completion, verifier_outage_pause,
+    verify_goal_completion,
+};
