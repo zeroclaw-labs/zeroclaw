@@ -1014,6 +1014,12 @@ async fn process_chat_message(
         ))
     });
 
+    // Resolve context window (max input tokens) for this agent.
+    let max_context_tokens = {
+        let cfg = state.config.read();
+        cfg.effective_model_context_window(&turn_alias) as u64
+    };
+
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
@@ -1476,6 +1482,7 @@ async fn process_chat_message(
                 "cost_usd": cost_usd,
                 "model": turn_model,
                 "provider": provider_label,
+                "max_context_tokens": max_context_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 

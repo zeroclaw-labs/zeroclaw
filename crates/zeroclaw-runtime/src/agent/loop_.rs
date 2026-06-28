@@ -1,5 +1,18 @@
 use crate::approval::ApprovalManager;
 
+/// Format token count with thousands separators.
+fn format_tokens(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
     Box<dyn Fn() -> Box<dyn zeroclaw_api::channel::Channel> + Send + Sync>,
@@ -1076,9 +1089,9 @@ pub async fn run(
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_max_history_messages = agent.resolved.max_history_messages;
-        let eff_max_context_tokens = agent.resolved.max_context_tokens;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
+        let eff_max_context_tokens = agent.resolved.model_context_window;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1526,13 +1539,12 @@ pub async fn run(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         // ── Build system prompt from workspace MD files (OpenClaw framework) ──
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
@@ -2658,6 +2670,44 @@ pub async fn run(
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
 
+                // Display context usage for this turn.
+                if let Some(ref ctx) = cost_tracking_context {
+                    let usage = ctx.snapshot_turn_usage();
+                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                        let max_ctx = eff_max_context_tokens as u64;
+                        let pct = if max_ctx > 0 {
+                            (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        let bar_width: usize = 16;
+                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                        let empty = bar_width.saturating_sub(filled);
+                        let bar = format!(
+                            "[{}{}]",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(empty)
+                        );
+                        let msg = if usage.input_tokens > 0 {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar",
+                                &[
+                                    ("used", format_tokens(usage.input_tokens).as_str()),
+                                    ("max", format_tokens(max_ctx).as_str()),
+                                    ("bar", &bar),
+                                    ("pct", format!("{:.0}", pct).as_str()),
+                                ],
+                            )
+                        } else {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar-unknown",
+                                &[("max", format_tokens(max_ctx).as_str())],
+                            )
+                        };
+                        eprintln!("\x1b[2m{}\x1b[0m", msg);
+                    }
+                }
+
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
 
@@ -3077,13 +3127,12 @@ pub async fn process_message(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
 
