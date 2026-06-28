@@ -210,6 +210,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -219,6 +220,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,

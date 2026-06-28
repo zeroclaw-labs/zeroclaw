@@ -463,6 +463,7 @@ mod tests {
                 requires_confirmation: false,
                 kind: crate::sop::SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 2,

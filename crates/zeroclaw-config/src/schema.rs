@@ -19783,6 +19783,26 @@ pub struct SopConfig {
     /// approval-routing fail-closed default; reconcile with that model if both land.)
     #[serde(default)]
     pub approval_timeout_action: ApprovalTimeoutAction,
+
+    /// Enforce per-step tool scope. Default false keeps `tools:` advisory.
+    #[serde(default)]
+    pub step_scope_enforce: bool,
+
+    /// Tool names that remain available while step scope is enforced.
+    #[serde(default = "default_sop_step_mandatory_tools")]
+    pub step_mandatory_tools: Vec<String>,
+
+    /// Enforce per-step input/output schemas when a step declares them.
+    #[serde(default = "default_sop_step_schema_enforce")]
+    pub step_schema_enforce: bool,
+
+    /// Maximum times a routed SOP run can visit one step.
+    #[serde(default = "default_sop_max_step_visits")]
+    pub max_step_visits: u32,
+
+    /// Maximum retries allowed by a step failure policy.
+    #[serde(default = "default_sop_max_step_retries")]
+    pub max_step_retries: u32,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -19854,6 +19874,25 @@ fn default_sop_max_finished_runs() -> usize {
     100
 }
 
+fn default_sop_step_mandatory_tools() -> Vec<String> {
+    ["sop_advance", "sop_approve", "sop_status"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_sop_step_schema_enforce() -> bool {
+    true
+}
+
+fn default_sop_max_step_visits() -> u32 {
+    256
+}
+
+fn default_sop_max_step_retries() -> u32 {
+    2
+}
+
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
@@ -19867,6 +19906,11 @@ impl Default for SopConfig {
             run_state_dir: None,
             approval_mode: ApprovalMode::Both,
             approval_timeout_action: ApprovalTimeoutAction::Escalate,
+            step_scope_enforce: false,
+            step_mandatory_tools: default_sop_step_mandatory_tools(),
+            step_schema_enforce: default_sop_step_schema_enforce(),
+            max_step_visits: default_sop_max_step_visits(),
+            max_step_retries: default_sop_max_step_retries(),
         }
     }
 }

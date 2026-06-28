@@ -107,7 +107,9 @@ impl Tool for SopApproveTool {
                         Some(SopRunStatus::PausedCheckpoint)
                     );
                     if is_checkpoint {
-                        engine.approve_step(run_id).map(ResolveOutcome::Resumed)
+                        engine
+                            .approve_step(run_id)
+                            .map(|action| ResolveOutcome::Resumed(Box::new(action)))
                     } else {
                         Ok(ResolveOutcome::NotWaiting)
                     }
@@ -123,7 +125,7 @@ impl Tool for SopApproveTool {
                     self.audit.clone(),
                     &action,
                 );
-                let output = match action {
+                let output = match *action {
                     SopRunAction::ExecuteStep {
                         run_id, context, ..
                     } => {
@@ -196,6 +198,7 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
