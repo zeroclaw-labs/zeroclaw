@@ -58,7 +58,7 @@ impl Tool for McpPromptsTool {
             "properties": {
                 "action": { "type": "string", "enum": ["list", "get"] },
                 "server": { "type": "string", "description": "Filter list to one server." },
-                "cursor": { "type": "string", "description": "Pagination cursor for list." },
+                "cursor": { "type": "string", "description": "Pagination cursor for list; requires `server` (per-server opaque token)." },
                 "name": { "type": "string", "description": "Prefixed prompt name for get." },
                 "arguments": { "type": "object", "description": "Prompt arguments for get." }
             },
@@ -81,21 +81,41 @@ impl Tool for McpPromptsTool {
         match action.as_str() {
             "list" => {
                 let server_filter = map.get("server").and_then(|v| v.as_str());
-                let all = self.registry.list_all_prompts().await;
-                let filtered: Vec<_> = all
-                    .into_iter()
-                    .filter(|(prefixed, _)| {
-                        server_filter.is_none_or(|s| {
-                            McpRegistry::split_prefixed(prefixed)
-                                .map(|(srv, _)| srv == s)
-                                .unwrap_or(false)
-                        })
-                    })
-                    .map(|(_, def)| def)
-                    .collect();
-                match serde_json::to_string_pretty(&filtered) {
-                    Ok(s) => Ok(Self::ok(s)),
-                    Err(e) => Ok(Self::fail(format!("failed to serialize prompts: {e}"))),
+                let cursor = map
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                match (server_filter, cursor) {
+                    // Single-server pagination: cursor is an opaque per-server
+                    // token, so it is only meaningful with an explicit `server`.
+                    (Some(server), cursor) => {
+                        match self.registry.list_server_prompts(server, cursor).await {
+                            Ok((defs, next_cursor)) => {
+                                let body = json!({ "prompts": defs, "next_cursor": next_cursor });
+                                match serde_json::to_string_pretty(&body) {
+                                    Ok(s) => Ok(Self::ok(s)),
+                                    Err(e) => {
+                                        Ok(Self::fail(format!("failed to serialize prompts: {e}")))
+                                    }
+                                }
+                            }
+                            Err(e) => Ok(Self::fail(e.to_string())),
+                        }
+                    }
+                    // Cross-server aggregate has no well-defined single cursor.
+                    (None, Some(_)) => Ok(Self::fail(
+                        "`cursor` requires a `server` (pagination is per-server); \
+                         omit `cursor` for an all-server list",
+                    )),
+                    (None, None) => {
+                        let all = self.registry.list_all_prompts().await;
+                        let defs: Vec<_> = all.into_iter().map(|(_, def)| def).collect();
+                        match serde_json::to_string_pretty(&defs) {
+                            Ok(s) => Ok(Self::ok(s)),
+                            Err(e) => Ok(Self::fail(format!("failed to serialize prompts: {e}"))),
+                        }
+                    }
                 }
             }
             "get" => {
@@ -154,6 +174,33 @@ mod tests {
             .unwrap();
         assert!(!res.success);
         assert!(!res.error.unwrap().to_lowercase().contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn list_cursor_without_server_is_rejected() {
+        let tool = McpPromptsTool::new(empty_registry().await);
+        let res = tool
+            .execute(json!({ "action": "list", "cursor": "abc" }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        let err = res.error.unwrap();
+        assert!(err.contains("cursor"), "got: {err}");
+        assert!(err.contains("server"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_cursor_with_unknown_server_reaches_server_path() {
+        let tool = McpPromptsTool::new(empty_registry().await);
+        let res = tool
+            .execute(json!({ "action": "list", "server": "ghost", "cursor": "abc" }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert!(
+            res.error.unwrap().contains("unknown MCP server"),
+            "cursor+server must take the per-server path"
+        );
     }
 
     #[tokio::test]

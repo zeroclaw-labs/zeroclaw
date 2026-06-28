@@ -121,6 +121,44 @@ impl McpServerCapabilities {
     }
 }
 
+/// Inspect an MCP method `result` for an `isError: true` envelope (HTTP 200 +
+/// error detail in `content[].text`, per the MCP spec) and convert it to an
+/// `Err`. The server-controlled detail is scrubbed for secrets and
+/// length-bounded via `sanitize_api_error` before it reaches logs or the
+/// returned error. Shared by `call_tool` and `dispatch_method`.
+///
+/// `op` is the human-readable operation label (tool name or RPC method) used in
+/// the log line and error message.
+fn check_result_is_error(result: &serde_json::Value, op: &str, server_name: &str) -> Result<()> {
+    if result.get("isError").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let detail = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(|| "(no error detail returned by server)".to_string());
+    let detail = zeroclaw_providers::sanitize_api_error(&detail);
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "mcp_server": server_name,
+                "op": op,
+                "detail": &detail,
+            })),
+        "mcp_client: MCP result returned isError:true"
+    );
+    bail!("MCP `{op}` (server `{server_name}`) returned isError: {detail}");
+}
+
 // ── Internal server state ──────────────────────────────────────────────────
 
 struct McpServerInner {
@@ -345,42 +383,9 @@ impl McpServer {
 
         // MCP servers signal *tool-execution* failures (as opposed to JSON-RPC
         // protocol errors) with HTTP 200 + `result.isError: true` and the detail
-        // in `result.content[].text`, per the MCP spec. Without surfacing this,
-        // the error envelope is returned as a normal success — so the failure is
-        // invisible to the model and the daemon log, and callers only ever see a
-        // generic "error during tool call" with no detail.
-        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
-            let detail = result
-                .get("content")
-                .and_then(|c| c.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .filter(|s: &String| !s.is_empty())
-                .unwrap_or_else(|| "(no error detail returned by server)".to_string());
-            // Server-controlled text: scrub secrets (sk-/ghp_/…) and bound length
-            // (`sanitize_api_error` truncates to MAX_API_ERROR_CHARS) before it
-            // reaches the daemon log or the returned error.
-            let detail = zeroclaw_providers::sanitize_api_error(&detail);
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "mcp_server": &inner.config.name,
-                        "tool": tool_name,
-                        "detail": &detail,
-                    })),
-                "mcp_client: tool returned isError:true"
-            );
-            bail!(
-                "MCP tool `{tool_name}` (server `{}`) returned isError: {detail}",
-                inner.config.name
-            );
-        }
+        // in `result.content[].text`, per the MCP spec. Surface it (scrubbed and
+        // length-bounded) so the failure is visible to the model and the log.
+        check_result_is_error(&result, tool_name, &inner.config.name)?;
 
         Ok(result)
     }
@@ -458,7 +463,14 @@ impl McpServer {
         if let Some(err) = resp.error {
             bail!("MCP `{rpc_method}` error {}: {}", err.code, err.message);
         }
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+        let result = resp.result.unwrap_or(serde_json::Value::Null);
+        // Surface MCP `result.isError: true` envelopes (HTTP 200 + error detail
+        // in `content[].text`) the same way `call_tool` does, with the detail
+        // scrubbed and length-bounded. resources/* and prompts/* can return
+        // these envelopes per the MCP spec, so the dispatch path must honor them
+        // instead of handing the model an error envelope dressed as success.
+        check_result_is_error(&result, rpc_method, &inner.config.name)?;
+        Ok(result)
     }
 
     /// `resources/list` — capability-gated.
@@ -699,6 +711,53 @@ impl McpRegistry {
         srv.get_prompt(&name, arguments).await
     }
 
+    /// List one server's resources with optional pagination cursor. Returns the
+    /// prefixed defs and the server's `next_cursor` (if any). The `cursor` is the
+    /// opaque token from a prior page's `next_cursor` for this same server.
+    pub async fn list_server_resources(
+        &self,
+        server: &str,
+        cursor: Option<String>,
+    ) -> Result<(Vec<crate::mcp_resource::McpResourceDef>, Option<String>)> {
+        let srv = self
+            .server_by_name(server)
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown MCP server `{server}`")))?;
+        let list = srv.list_resources(cursor).await?;
+        let next = list.next_cursor.clone();
+        let defs = list
+            .resources
+            .into_iter()
+            .map(|mut def| {
+                def.uri = format!("{server}__{}", def.uri);
+                def
+            })
+            .collect();
+        Ok((defs, next))
+    }
+
+    /// List one server's prompts with optional pagination cursor. Returns the
+    /// prefixed defs and the server's `next_cursor` (if any).
+    pub async fn list_server_prompts(
+        &self,
+        server: &str,
+        cursor: Option<String>,
+    ) -> Result<(Vec<crate::mcp_prompt::McpPromptDef>, Option<String>)> {
+        let srv = self
+            .server_by_name(server)
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown MCP server `{server}`")))?;
+        let list = srv.list_prompts(cursor).await?;
+        let next = list.next_cursor.clone();
+        let defs = list
+            .prompts
+            .into_iter()
+            .map(|mut def| {
+                def.name = format!("{server}__{}", def.name);
+                def
+            })
+            .collect();
+        Ok((defs, next))
+    }
+
     /// List resources across all servers that support them. Each entry's uri is
     /// returned prefixed with `<server>__`. Per-server errors are skipped.
     pub async fn list_all_resources(&self) -> Vec<(String, crate::mcp_resource::McpResourceDef)> {
@@ -722,8 +781,12 @@ impl McpRegistry {
         for (name, idx) in &self.server_index {
             let srv = &self.servers[*idx];
             if let Ok(list) = srv.list_prompts(None).await {
-                for def in list.prompts {
+                for mut def in list.prompts {
+                    // Rewrite the def's name to the prefixed form so the value
+                    // emitted by `mcp_prompts list` can be passed straight back
+                    // to `mcp_prompts get` (mirrors `list_all_resources`).
                     let prefixed = format!("{name}__{}", def.name);
+                    def.name = prefixed.clone();
                     out.push((prefixed, def));
                 }
             }
@@ -784,6 +847,70 @@ mod tests {
         let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
         assert!(registry.list_all_resources().await.is_empty());
         assert!(registry.list_all_prompts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_server_prompts_prefixes_name_and_returns_cursor() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // initialize advertises prompts capability so the method is not gated.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "s")
+                    .set_body_json(json!({
+                        "jsonrpc":"2.0","id":1,
+                        "result":{"capabilities":{"prompts":{}}}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[]}
+            })))
+            .mount(&server)
+            .await;
+        // prompts/list returns a bare name plus a nextCursor.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"prompts/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":3,
+                "result":{"prompts":[{"name":"summarize"}],"nextCursor":"page2"}
+            })))
+            .mount(&server)
+            .await;
+
+        let registry = McpRegistry::connect_all(&[http_server_config(server.uri())])
+            .await
+            .expect("connect_all");
+
+        // The configured server name is "remote" (see http_server_config).
+        let (defs, next) = registry
+            .list_server_prompts("remote", None)
+            .await
+            .expect("list_server_prompts should succeed");
+        assert_eq!(defs.len(), 1);
+        // Regression: the listed name must be the prefixed form that `get` needs.
+        assert_eq!(defs[0].name, "remote__summarize");
+        // Regression: the server's nextCursor must be surfaced to the caller.
+        assert_eq!(next.as_deref(), Some("page2"));
+
+        // And list_all_prompts must also carry the prefixed name in the def.
+        let all = registry.list_all_prompts().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.name, "remote__summarize");
     }
 
     #[tokio::test]
@@ -1460,6 +1587,28 @@ done
             .await
             .expect("dispatch should succeed");
         assert_eq!(out, serde_json::json!({ "ok": 1 }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_method_surfaces_is_error_envelope_scrubbed() {
+        // An `isError: true` envelope on a resources/prompts result must map to
+        // Err (not be returned as success), with the server-controlled detail
+        // secret-scrubbed and length-bounded — same contract as `call_tool`.
+        let server = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "boom using sk-supersecrettoken12345abcdef" }],
+        }));
+        let err = server
+            .dispatch_method("resources/read", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err");
+        let msg = err.to_string();
+        assert!(msg.contains("returned isError"), "got: {msg}");
+        assert!(msg.contains("[REDACTED]"), "secret not scrubbed: {msg}");
+        assert!(
+            !msg.contains("supersecrettoken"),
+            "raw secret leaked: {msg}"
+        );
     }
 
     #[tokio::test]

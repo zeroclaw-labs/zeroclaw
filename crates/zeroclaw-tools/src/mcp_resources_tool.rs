@@ -58,7 +58,7 @@ impl Tool for McpResourcesTool {
             "properties": {
                 "action": { "type": "string", "enum": ["list", "read"] },
                 "server": { "type": "string", "description": "Filter list to one server." },
-                "cursor": { "type": "string", "description": "Pagination cursor for list." },
+                "cursor": { "type": "string", "description": "Pagination cursor for list; requires `server` (per-server opaque token)." },
                 "uri": { "type": "string", "description": "Prefixed resource uri for read." }
             },
             "required": ["action"]
@@ -80,21 +80,41 @@ impl Tool for McpResourcesTool {
         match action.as_str() {
             "list" => {
                 let server_filter = map.get("server").and_then(|v| v.as_str());
-                let all = self.registry.list_all_resources().await;
-                let filtered: Vec<_> = all
-                    .into_iter()
-                    .filter(|(prefixed, _)| {
-                        server_filter.is_none_or(|s| {
-                            McpRegistry::split_prefixed(prefixed)
-                                .map(|(srv, _)| srv == s)
-                                .unwrap_or(false)
-                        })
-                    })
-                    .map(|(_, def)| def)
-                    .collect();
-                match serde_json::to_string_pretty(&filtered) {
-                    Ok(s) => Ok(Self::ok(s)),
-                    Err(e) => Ok(Self::fail(format!("failed to serialize resources: {e}"))),
+                let cursor = map
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                match (server_filter, cursor) {
+                    // Single-server pagination: cursor is an opaque per-server
+                    // token, so it is only meaningful with an explicit `server`.
+                    (Some(server), cursor) => {
+                        match self.registry.list_server_resources(server, cursor).await {
+                            Ok((defs, next_cursor)) => {
+                                let body = json!({ "resources": defs, "next_cursor": next_cursor });
+                                match serde_json::to_string_pretty(&body) {
+                                    Ok(s) => Ok(Self::ok(s)),
+                                    Err(e) => Ok(Self::fail(format!(
+                                        "failed to serialize resources: {e}"
+                                    ))),
+                                }
+                            }
+                            Err(e) => Ok(Self::fail(e.to_string())),
+                        }
+                    }
+                    // Cross-server aggregate has no well-defined single cursor.
+                    (None, Some(_)) => Ok(Self::fail(
+                        "`cursor` requires a `server` (pagination is per-server); \
+                         omit `cursor` for an all-server list",
+                    )),
+                    (None, None) => {
+                        let all = self.registry.list_all_resources().await;
+                        let defs: Vec<_> = all.into_iter().map(|(_, def)| def).collect();
+                        match serde_json::to_string_pretty(&defs) {
+                            Ok(s) => Ok(Self::ok(s)),
+                            Err(e) => Ok(Self::fail(format!("failed to serialize resources: {e}"))),
+                        }
+                    }
                 }
             }
             "read" => {
@@ -153,6 +173,40 @@ mod tests {
             .unwrap();
         assert!(!res.success);
         assert!(!res.error.unwrap().to_lowercase().contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn list_cursor_without_server_is_rejected() {
+        // A cursor is a per-server opaque token; supplying it without a `server`
+        // for the all-server aggregate must fail with a clear, non-fatal error
+        // (regression: cursor was previously advertised but silently ignored).
+        let tool = McpResourcesTool::new(empty_registry().await);
+        let res = tool
+            .execute(json!({ "action": "list", "cursor": "abc" }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        let err = res.error.unwrap();
+        assert!(err.contains("cursor"), "got: {err}");
+        assert!(err.contains("server"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_cursor_with_unknown_server_reaches_server_path() {
+        // With a `server`, the cursor is threaded to the per-server path. An
+        // empty registry has no such server, so this surfaces the server-path
+        // error ("unknown MCP server") — proving the cursor branch is taken
+        // rather than the all-server branch (which would ignore the cursor).
+        let tool = McpResourcesTool::new(empty_registry().await);
+        let res = tool
+            .execute(json!({ "action": "list", "server": "ghost", "cursor": "abc" }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert!(
+            res.error.unwrap().contains("unknown MCP server"),
+            "cursor+server must take the per-server path"
+        );
     }
 
     #[tokio::test]
