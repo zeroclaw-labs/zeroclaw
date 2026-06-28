@@ -70,7 +70,7 @@ for pkg in data.get("package", []):
         continue
     url, rev = m.groups()
     entries.append({
-        "key": f"{pkg["name"]}-{pkg["version"]}",
+        "key": "%s-%s" % (pkg["name"], pkg["version"]),
         "url": url,
         "rev": rev,
     })
