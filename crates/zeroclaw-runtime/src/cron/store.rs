@@ -2340,6 +2340,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                shell_output_format: Default::default(),
             },
         )
     }
@@ -2366,6 +2367,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                shell_output_format: Default::default(),
             },
         )
     }
@@ -2553,6 +2555,7 @@ mod tests {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: Default::default(),
         };
 
         let mut decls = std::collections::HashMap::new();
