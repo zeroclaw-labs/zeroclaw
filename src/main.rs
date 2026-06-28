@@ -73,6 +73,183 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// Replaces `dialoguer::Password::interact()` for `agent-runtime` builds.
+/// Uses `crossterm` raw mode to read keystrokes one at a time. When the
+/// input buffer transitions from empty to non-empty, a fixed-length
+/// indicator line ("● Value captured — press Enter to save") appears
+/// immediately — giving the user visible feedback *before* pressing Enter.
+/// The indicator is removed if the buffer becomes empty again (e.g. after
+/// backspace). No secret length is disclosed at any point.
+///
+/// When `allow_empty` is false, submitting an empty/whitespace-only value
+/// re-prompts (matching `dialoguer::Password` interactive behavior) instead
+/// of bailing. Ctrl+C and Esc remain the explicit cancellation paths.
+///
+/// Returns the raw buffer — callers that historically trimmed (e.g.
+/// `config set secret`, `read_auth_input`) must trim themselves. This
+/// avoids silently rewriting secrets/tokens/OTP codes that may contain
+/// significant leading or trailing whitespace.
+///
+/// For non-`agent-runtime` builds, callers fall through to `dialoguer::Password`,
+/// which provides no pre-submit feedback (the pre-existing behavior).
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        execute,
+        style::Print,
+        terminal::{disable_raw_mode, enable_raw_mode},
+    };
+    use std::io::{self, Write as IoWrite};
+
+    enable_raw_mode()?;
+
+    // RAII guard ensures raw mode is disabled even if the closure panics.
+    // Without this, a panic would leave the terminal in raw mode (no echo),
+    // requiring the user to manually run `stty sane` or `reset`.
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let _raw_guard = RawModeGuard;
+
+    let result: Result<String> = (|| {
+        // Outer loop: re-prompts on empty submit when allow_empty is false,
+        // matching dialoguer::Password's interactive behavior.
+        loop {
+            eprintln!("{prompt_text}");
+            io::stderr().flush()?;
+
+            let mut buffer = String::new();
+            let mut feedback_shown = false;
+
+            // Inner loop: raw-mode keystroke reading.
+            loop {
+                if event::poll(std::time::Duration::from_millis(200))? {
+                    if let Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind,
+                        ..
+                    }) = event::read()?
+                    {
+                        // Only respond to key press / repeat; ignore release events
+                        // (crossterm sends Press, Repeat, Release under kitty keyboard protocol).
+                        if kind != crossterm::event::KeyEventKind::Press
+                            && kind != crossterm::event::KeyEventKind::Repeat
+                        {
+                            continue;
+                        }
+
+                        match code {
+                            KeyCode::Enter => {
+                                // Clear the feedback line before submitting so it doesn't
+                                // linger in the terminal scrollback.
+                                if feedback_shown {
+                                    // Move cursor up one line, clear it, then move back down
+                                    // so the cursor ends up on the correct line for any
+                                    // subsequent output from the caller.
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0),
+                                        crossterm::cursor::MoveDown(1)
+                                    )?;
+                                }
+                                break;
+                            }
+                            KeyCode::Char(c) => {
+                                if c == 'c' && modifiers.contains(KeyModifiers::CONTROL) {
+                                    // Ctrl+C — clear feedback, then return an Interrupted-style
+                                    // error so callers that map Interrupted → Ok(None) / bail
+                                    // continue to work.
+                                    if feedback_shown {
+                                        execute!(
+                                            io::stderr(),
+                                            crossterm::cursor::MoveUp(1),
+                                            crossterm::terminal::Clear(
+                                                crossterm::terminal::ClearType::CurrentLine
+                                            ),
+                                            crossterm::cursor::MoveToColumn(0)
+                                        )?;
+                                    }
+                                    bail!("Interrupted");
+                                }
+                                buffer.push(c);
+                                if !feedback_shown && !buffer.is_empty() {
+                                    feedback_shown = true;
+                                    // Show fixed-length indicator — no {$count} to avoid
+                                    // disclosing secret length (issue #7808 requirement).
+                                    let indicator = ta(
+                                        "cli-secret-captured",
+                                        &[], // i18n-exempt: no args; length not disclosed
+                                        "  ● Value captured — press Enter to save",
+                                    );
+                                    execute!(io::stderr(), Print(format!("{indicator}\r\n")))?;
+                                    io::stderr().flush()?;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                buffer.pop();
+                                if buffer.is_empty() && feedback_shown {
+                                    feedback_shown = false;
+                                    // Remove the indicator line: move up, clear, return cursor.
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0)
+                                    )?;
+                                    io::stderr().flush()?;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                // Treat Esc the same as Ctrl+C for consistency with
+                                // the existing Password Ctrl+C-as-back-out mapping.
+                                if feedback_shown {
+                                    execute!(
+                                        io::stderr(),
+                                        crossterm::cursor::MoveUp(1),
+                                        crossterm::terminal::Clear(
+                                            crossterm::terminal::ClearType::CurrentLine
+                                        ),
+                                        crossterm::cursor::MoveToColumn(0)
+                                    )?;
+                                }
+                                bail!("Interrupted");
+                            }
+                            _ => {} // Ignore other keys (arrows, Home, etc.)
+                        }
+                    }
+                    // Ignore mouse / resize events
+                }
+            }
+
+            if !allow_empty && buffer.trim().is_empty() {
+                // Re-prompt on empty submit for required fields,
+                // preserving dialoguer::Password interactive behavior.
+                continue;
+            }
+
+            // Return raw buffer — callers trim if they need to (matching the
+            // pre-PR behavior at each call site individually).
+            return Ok(buffer);
+        }
+    })();
+
+    // RawModeGuard's Drop impl calls disable_raw_mode() here (or on panic).
+    result
+}
+
 #[cfg(feature = "agent-runtime")]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
@@ -2441,22 +2618,52 @@ fn prompt_for_field(
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
+        // Use crossterm-based secret_prompt for pre-submit feedback
+        // when agent-runtime is available; otherwise fall through to
+        // dialoguer::Password (no pre-submit feedback).
+        #[cfg(feature = "agent-runtime")]
         {
-            Ok(pw) => return Ok(Some(pw)),
-            Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
-                    return Ok(None);
+            match secret_prompt(&prompt, true) {
+                Ok(pw) => {
+                    if !pw.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    return Ok(Some(pw));
                 }
-                return Err(io.into());
+                Err(e) => {
+                    // secret_prompt returns "Interrupted" for Ctrl+C / Esc,
+                    // matching the existing Password Ctrl+C-as-back-out mapping.
+                    if e.to_string() == "Interrupted" {
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "agent-runtime"))]
+        {
+            // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
+            // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
+            // Map that to `Ok(None)` so the caller treats it as "user backed
+            // out" instead of bubbling a confusing IO-error message.
+            match Password::new()
+                .with_prompt(prompt.clone())
+                .allow_empty_password(true)
+                .interact()
+            {
+                Ok(pw) => {
+                    if !pw.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    return Ok(Some(pw));
+                }
+                Err(e) => {
+                    let io: std::io::Error = e.into();
+                    if io.kind() == std::io::ErrorKind::Interrupted {
+                        return Ok(None);
+                    }
+                    return Err(io.into());
+                }
             }
         }
     }
@@ -5165,10 +5372,25 @@ async fn main() -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    #[cfg(feature = "agent-runtime")]
+                    let secret_value = {
+                        let raw = secret_prompt(&format!("Enter value for {path}"), false)?;
+                        raw.trim().to_string()
+                    };
+                    #[cfg(not(feature = "agent-runtime"))]
+                    let secret_value = {
+                        let raw = dialoguer::Password::new()
+                            .with_prompt(format!("Enter value for {path}"))
+                            .interact()?;
+                        raw.trim().to_string()
+                    };
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
+                    // Safety net for the `not(agent-runtime)` dialoguer fallback path,
+                    // which does not enforce non-empty input at the prompt level.
+                    // Under agent-runtime, secret_prompt(_, false) re-prompts on empty
+                    // input, making this check unreachable for that path.
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -6019,10 +6241,16 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
+                    #[cfg(feature = "agent-runtime")]
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    #[cfg(not(feature = "agent-runtime"))]
                     let entered = Password::new()
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -6861,11 +7089,11 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
-    Ok(input.trim().to_string())
+    let raw = secret_prompt(prompt, false)?;
+    if !raw.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
+    Ok(raw.trim().to_string())
 }
 
 #[cfg(feature = "agent-runtime")]
