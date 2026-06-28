@@ -350,10 +350,12 @@ async fn resolve_goal_task(
         return Ok(task);
     }
 
-    store
+    let task = store
         .latest_active_goal_for_agent(&ctx.agent_alias)
         .await?
-        .context("no active goal for this agent")
+        .context("no active goal for this agent")?;
+    ensure_goal_visible(&task, ctx)?;
+    Ok(task)
 }
 
 fn ensure_goal_visible(task: &TaskRecord, ctx: &GoalAdmissionContext) -> Result<()> {
@@ -362,6 +364,16 @@ fn ensure_goal_visible(task: &TaskRecord, ctx: &GoalAdmissionContext) -> Result<
     }
     if task.agent != ctx.agent_alias {
         bail!("goal `{}` is not owned by this agent", task.id);
+    }
+    if let Some(route) = task.originator_route.as_deref()
+        && ctx.originator_route.as_deref() != Some(route)
+    {
+        bail!("goal `{}` is not visible from this route", task.id);
+    }
+    if let Some(principal_id) = task.principal_id.as_deref()
+        && ctx.principal_id.as_deref() != Some(principal_id)
+    {
+        bail!("goal `{}` is not visible to this principal", task.id);
     }
     Ok(())
 }
@@ -428,6 +440,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already terminal"));
+    }
+
+    #[tokio::test]
+    async fn goal_visibility_enforces_route_and_principal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let owner = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("telegram:chat-1".into()))
+            .with_principal_id(Some("principal-1".into()));
+        let started = start_goal(&store, "boot-a", owner.clone(), "ship it".into())
+            .await
+            .unwrap();
+
+        status_goal(&store, &owner, Some(started.task_id.clone()))
+            .await
+            .unwrap();
+
+        let wrong_route = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("telegram:chat-2".into()))
+            .with_principal_id(Some("principal-1".into()));
+        let err = status_goal(&store, &wrong_route, Some(started.task_id.clone()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not visible from this route"));
+
+        let wrong_principal = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("telegram:chat-1".into()))
+            .with_principal_id(Some("principal-2".into()));
+        let err = status_goal(&store, &wrong_principal, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not visible to this principal"));
     }
 
     #[tokio::test]
