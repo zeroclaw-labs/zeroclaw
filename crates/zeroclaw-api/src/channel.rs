@@ -269,10 +269,11 @@ impl SendMessage {
     }
 }
 
-/// Core channel trait — implement for any messaging platform.
-///
+/// Default interval for refreshing a channel's typing indicator, in seconds.
 const DEFAULT_TYPING_REFRESH_SECS: u64 = 4;
 
+/// Core channel trait — implement for any messaging platform.
+///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
 /// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
 /// inherit `channel = <type>.<alias>` from the trait object's role + alias.
