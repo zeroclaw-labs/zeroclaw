@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod host;
+pub mod registry;
 pub mod runtime;
 pub mod signature;
 pub mod wasm_channel;
