@@ -9232,6 +9232,7 @@ pub async fn start_channels(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            tools::GoalAdmissionToolPolicy::Include,
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;

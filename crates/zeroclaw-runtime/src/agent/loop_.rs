@@ -1296,6 +1296,7 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -2955,6 +2956,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;

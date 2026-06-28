@@ -468,6 +468,14 @@ pub struct AllToolsResult {
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
 }
 
+/// Controls whether tools that require a scoped `GoalAdmissionContext` are
+/// registered for the current tool loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalAdmissionToolPolicy {
+    Omit,
+    Include,
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -514,6 +522,7 @@ pub fn all_tools(
         tui_env,
         None,
         None,
+        GoalAdmissionToolPolicy::Omit,
     )
 }
 
@@ -544,6 +553,7 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
+    goal_admission_tools: GoalAdmissionToolPolicy,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -651,8 +661,11 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
-        Arc::new(GoalStartTool::new(agent_alias)),
     ];
+
+    if matches!(goal_admission_tools, GoalAdmissionToolPolicy::Include) {
+        tool_arcs.push(Arc::new(GoalStartTool::new(agent_alias)));
+    }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
@@ -1627,6 +1640,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn goal_start_tool_requires_goal_admission_registry_scope() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let general_tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        assert!(
+            general_tools.iter().all(|tool| tool.name() != "goal.start"),
+            "general registries must not expose goal.start without trusted admission context"
+        );
+
+        let scoped_tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            GoalAdmissionToolPolicy::Include,
+        )
+        .tools;
+        assert!(
+            scoped_tools.iter().any(|tool| tool.name() == "goal.start"),
+            "goal.start should be exposed only when the caller scopes trusted admission context"
+        );
+    }
+
     /// SOP tools MUST appear in the tool registry when an engine handle is
     /// provided, regardless of config. Proves the parameter-passing path
     /// works end-to-end.
@@ -1676,6 +1764,7 @@ mod tests {
             None,
             Some(engine),
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1745,6 +1834,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            GoalAdmissionToolPolicy::Omit,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -1767,6 +1857,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            GoalAdmissionToolPolicy::Omit,
         );
 
         for tools in [&session_a.tools, &session_b.tools] {
@@ -1847,6 +1938,7 @@ mod tests {
             None,
             None,
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
 
@@ -2180,6 +2272,7 @@ mod tests {
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                GoalAdmissionToolPolicy::Omit,
             )
             .tools
         };
