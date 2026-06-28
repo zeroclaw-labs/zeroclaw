@@ -19,9 +19,10 @@ permissions:
   contents: write
   packages: write
   # OIDC (`id-token: write`) is granted at the job level only — see
-  # `slsa-provenance` and `sign-and-sbom` — so non-signing jobs cannot mint
-  # OIDC tokens. Workflow-level grants would also propagate to validate/build/
-  # publish/redeploy/package-sync, which never need keyless signing.
+  # `slsa-provenance`, `sign-and-sbom`, and `docker` — so non-signing jobs
+  # cannot mint OIDC tokens. Workflow-level grants would also propagate to
+  # validate/build/publish/redeploy/package-sync, which never need keyless
+  # signing.
 
 env:
   CARGO_TERM_COLOR: always
@@ -539,6 +540,10 @@ jobs:
     needs: [validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
     environment:
       name: docker
       url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
@@ -566,7 +571,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - name: Build and push
+        id: build-push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: docker-ctx
@@ -576,7 +585,20 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           platforms: linux/amd64,linux/arm64
 
+      - name: Sign container image (keyless / Rekor)
+        # Signs by digest so the signature is immutable regardless of tag mutations.
+        # Consumers verify with:
+        #   cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
+        #     ghcr.io/zeroclaw-labs/zeroclaw@<digest>
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
       - name: Build and push Debian compatibility image
+        id: build-push-debian
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: docker-ctx
@@ -586,6 +608,13 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}-debian
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:debian
           platforms: linux/amd64,linux/arm64
+
+      - name: Sign Debian container image (keyless / Rekor)
+        env:
+          DIGEST: ${{ steps.build-push-debian.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
   # ── Post-publish: signing, SBOM, and SLSA provenance ─────────────────
   hash-artifacts:
