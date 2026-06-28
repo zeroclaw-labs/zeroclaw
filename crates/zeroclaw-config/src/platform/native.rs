@@ -369,13 +369,52 @@ mod tests {
             .build_shell_command("echo test_command", &cwd)
             .unwrap();
         let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("-c"),
-            "shell command must use -c flag, got: {debug}"
-        );
+
+        // The command string is preserved verbatim on every platform.
         assert!(
             debug.contains("echo test_command"),
             "command should contain the passed string, got: {debug}"
         );
+
+        // On Unix the shell is invoked as `<shell> -c "<command>"`. Android
+        // ignores the configured shell and pins `/system/bin/sh` (it is not on
+        // PATH for spawned processes), so mirror that runtime branch here.
+        #[cfg(unix)]
+        {
+            assert!(
+                debug.contains("-c"),
+                "shell command must use -c flag, got: {debug}"
+            );
+            if is_android() {
+                assert!(
+                    debug.contains("/system/bin/sh"),
+                    "Android should pin /system/bin/sh, got: {debug}"
+                );
+                assert!(
+                    !debug.contains("bash"),
+                    "Android must ignore the configured shell, got: {debug}"
+                );
+            } else {
+                assert!(
+                    debug.contains("bash"),
+                    "configured shell should be used, got: {debug}"
+                );
+            }
+        }
+
+        // On Windows the configured shell is ignored: commands run via
+        // `cmd.exe /C` (see the [runtime].shell docs), so there is no `-c`
+        // boundary and `bash` never appears.
+        #[cfg(windows)]
+        {
+            assert!(
+                debug.contains("cmd.exe") && debug.contains("/C"),
+                "Windows should use the cmd.exe /C boundary, got: {debug}"
+            );
+            assert!(
+                !debug.contains("bash"),
+                "Windows must ignore the configured shell, got: {debug}"
+            );
+        }
     }
 }
