@@ -7896,6 +7896,10 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+    /// Per-call WASM execution limits
+    #[serde(default)]
+    #[nested]
+    pub limits: PluginLimitsConfig,
     #[serde(default)]
     #[nested]
     #[natural_key = "name"]
@@ -7956,6 +7960,57 @@ impl Default for PluginSecurityConfig {
     }
 }
 
+/// Per-call WASM execution limits (`[plugins.limits]`).
+///
+/// Bounds a single plugin call so a runaway or malicious component traps
+/// instead of hanging the host or exhausting memory. `call_fuel` caps
+/// instructions per call; the memory, table, and instance ceilings bound a
+/// store's growth. Every value is operator-tunable and validated as non-zero.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plugins.limits"]
+pub struct PluginLimitsConfig {
+    /// Fuel budget per plugin call (wasmtime instruction units).
+    #[serde(default = "default_plugin_call_fuel")]
+    pub call_fuel: u64,
+    /// Maximum linear memory a plugin store may grow to, in megabytes.
+    #[serde(default = "default_plugin_max_memory_mb")]
+    pub max_memory_mb: usize,
+    /// Maximum table elements a plugin store may allocate.
+    #[serde(default = "default_plugin_max_table_elements")]
+    pub max_table_elements: usize,
+    /// Maximum component instances a plugin store may create.
+    #[serde(default = "default_plugin_max_instances")]
+    pub max_instances: usize,
+}
+
+fn default_plugin_call_fuel() -> u64 {
+    1_000_000_000
+}
+
+fn default_plugin_max_memory_mb() -> usize {
+    256
+}
+
+fn default_plugin_max_table_elements() -> usize {
+    100_000
+}
+
+fn default_plugin_max_instances() -> usize {
+    64
+}
+
+impl Default for PluginLimitsConfig {
+    fn default() -> Self {
+        Self {
+            call_fuel: default_plugin_call_fuel(),
+            max_memory_mb: default_plugin_max_memory_mb(),
+            max_table_elements: default_plugin_max_table_elements(),
+            max_instances: default_plugin_max_instances(),
+        }
+    }
+}
+
 fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
@@ -7972,6 +8027,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
         }
     }
@@ -18851,6 +18907,21 @@ impl Config {
             }
         }
 
+        if self.plugins.limits.call_fuel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.call_fuel",
+                "plugins.limits.call_fuel must be greater than 0; a zero budget traps every plugin call before it runs"
+            );
+        }
+        if self.plugins.limits.max_memory_mb == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_memory_mb",
+                "plugins.limits.max_memory_mb must be greater than 0; a zero cap rejects every plugin at instantiation"
+            );
+        }
+
         Ok(())
     }
 
@@ -20961,6 +21032,32 @@ enabled = true
         assert!(
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_call_fuel() {
+        let mut config = Config::default();
+        config.plugins.limits.call_fuel = 0;
+        let err = config
+            .validate()
+            .expect_err("zero call_fuel must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_memory() {
+        let mut config = Config::default();
+        config.plugins.limits.max_memory_mb = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_memory_mb must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.max_memory_mb"),
+            "error must name the offending path; got: {err}"
         );
     }
 

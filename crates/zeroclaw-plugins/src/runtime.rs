@@ -50,9 +50,13 @@ fn tool_linker() -> &'static Linker<PluginState> {
 }
 
 /// Compile and instantiate a tool plugin. Permissions gate config at call time.
-pub async fn create_plugin(wasm_path: &Path, _permissions: &[PluginPermission]) -> Result<Plugin> {
+pub async fn create_plugin(
+    wasm_path: &Path,
+    _permissions: &[PluginPermission],
+    limits: crate::component::PluginLimits,
+) -> Result<Plugin> {
     let component = load_component(wasm_path)?;
-    let mut store = Store::new(engine(), PluginState::default());
+    let mut store = crate::component::new_store(limits);
     let bindings = wt(
         ToolPlugin::instantiate_async(&mut store, &component, tool_linker()).await,
         "failed to instantiate tool plugin",
