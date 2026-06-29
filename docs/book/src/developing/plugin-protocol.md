@@ -497,7 +497,7 @@ The schema mirror is what makes this work: the plugin config types in
 and writes. Secret fields (a plugin entry's `config` map is marked `#[secret]`)
 encrypt at rest under the adjacent `.secret_key`. The canonical fields,
 defaults, and the `signature_mode` values live in the
-[Config reference](../reference/config.md); that schema is the source of truth,
+[Config reference](../reference/index.md); that schema is the source of truth,
 not this page.
 
 ### Build features
