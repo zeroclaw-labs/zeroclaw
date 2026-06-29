@@ -1476,6 +1476,22 @@ impl Agent {
             );
         }
 
+        // ── Wire per-agent policy into PipelineTool (from_config /
+        //    daemon path) ─────────────────────────────────────────────
+        // PipelineTool construction is deferred so the per-agent
+        // ToolAccessPolicy is baked in immutably at construction time.
+        // The daemon path has no caller allowlist, matching the
+        // process_message contract.
+        if let Some(ref raw) = all_tools_result.pipeline_raw
+            && security.is_tool_allowed("execute_pipeline")
+        {
+            let policy =
+                crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
+                tools.push(pipe);
+            }
+        }
+
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI

@@ -1039,6 +1039,20 @@ pub async fn run_gateway(
             }
             let mut gw_tools = all_tools_result.tools;
             let gw_delegate = all_tools_result.delegate_handle;
+
+            // ── Wire per-agent policy into PipelineTool (dashboard /
+            //    gateway path) ────────────────────────────────────────
+            // The gateway path has no caller allowlist, matching the
+            // process_message / daemon contract.
+            if let Some(ref raw) = all_tools_result.pipeline_raw
+                && security.is_tool_allowed("execute_pipeline")
+            {
+                let policy = mcp_tool_access_policy(&security, None);
+                if let Some(pipe) = tools::build_pipeline_tool(raw, policy) {
+                    gw_tools.push(pipe);
+                }
+            }
+
             // MCP tools, scoped to this agent's `mcp_bundles` and gated by its
             // tool policy (parity with the orchestrator + runtime paths;
             // omission is not a grant). Factored into `append_scoped_mcp_tools`
