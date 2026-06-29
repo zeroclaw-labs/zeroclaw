@@ -47,6 +47,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate Scoop publish access
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SCOOP_BUCKET_REPO:-}" ]]; then
+            echo "::error::Repository variable SCOOP_BUCKET_REPO is required when dry_run=false."
+            exit 1
+          fi
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Repository secret SCOOP_BUCKET_TOKEN is required when dry_run=false."
+            exit 1
+          fi
+          if [[ "$SCOOP_BUCKET_REPO" != */* ]]; then
+            echo "::error::SCOOP_BUCKET_REPO must be in owner/repo format."
+            exit 1
+          fi
+          if ! gh api "repos/${SCOOP_BUCKET_REPO}" >/dev/null 2>&1; then
+            echo "::error::SCOOP_BUCKET_TOKEN cannot access ${SCOOP_BUCKET_REPO}."
+            exit 1
+          fi
+          if ! gh api "repos/${SCOOP_BUCKET_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
+            echo "::error::SCOOP_BUCKET_TOKEN cannot prove push access to ${SCOOP_BUCKET_REPO}. Update the token or SCOOP_BUCKET_REPO before running a non-dry-run release."
+            exit 1
+          fi
+
       - name: Validate and compute metadata
         id: meta
         shell: bash
@@ -128,10 +157,12 @@ jobs:
 
           echo "manifest_file=$manifest_file" >> "$GITHUB_OUTPUT"
 
-          echo "### Generated Manifest" >> "$GITHUB_STEP_SUMMARY"
-          echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat "$manifest_file" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Generated Manifest"
+            echo '```json'
+            cat "$manifest_file"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Push to Scoop bucket
         if: inputs.dry_run == false

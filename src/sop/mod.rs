@@ -191,6 +191,14 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             println!();
             Ok(())
         }
+        // Approve/Deny/Pending talk to the running daemon and are dispatched over
+        // the gateway in main.rs; they never reach this local handler.
+        crate::SopCommands::Approve { .. }
+        | crate::SopCommands::Deny { .. }
+        | crate::SopCommands::Pending => anyhow::bail!(
+            "This command talks to the running daemon over the gateway; \
+             it is not handled by the local SOP CLI."
+        ),
     }
 }
 
@@ -427,6 +435,7 @@ type = "manual"
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,

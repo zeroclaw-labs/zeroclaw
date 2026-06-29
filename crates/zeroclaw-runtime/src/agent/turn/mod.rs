@@ -596,6 +596,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let interpreted = interpret_chat_response(
                     &ctx,
                     resp,
+                    &prepared_messages.messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -837,33 +838,38 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
-            let meta = ctx.meta();
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                &meta,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        } else {
-            let meta = ctx.meta();
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                &meta,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        };
+        let live_sop_queue = crate::sop::executor::new_live_action_queue();
+        let execution_result =
+            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+                if allow_parallel_execution && executable_calls.len() > 1 {
+                    let meta = ctx.meta();
+                    execute_tools_parallel(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                } else {
+                    let meta = ctx.meta();
+                    execute_tools_sequential(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                }
+            })
+            .await;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -989,6 +995,48 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
+
+        let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
+        if !queued_sop_actions.is_empty() {
+            drive_live_sop_actions(
+                queued_sop_actions,
+                history,
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+                tools_registry,
+                observer,
+                silent,
+                approval,
+                multimodal_config,
+                max_tool_iterations,
+                hooks,
+                excluded_tools,
+                dedup_exempt_tools,
+                activated_tools,
+                model_switch_callback.clone(),
+                pacing,
+                strict_tool_parsing,
+                parallel_tools,
+                max_tool_result_chars,
+                context_token_budget,
+                receipt_generator,
+                knobs,
+                channel_name,
+                channel_reply_target,
+                cancellation_token.clone(),
+                on_delta.clone(),
+                shared_budget.clone(),
+                channel,
+                collected_receipts,
+                event_tx.clone(),
+                new_messages_out.as_deref_mut(),
+                image_cache.as_deref_mut(),
+                agent_alias,
+            )
+            .await?;
+        }
     }
 
     finish_after_max_iterations(
@@ -1006,4 +1054,238 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         new_messages_out,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_live_sop_actions(
+    queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
+    history: &mut Vec<ChatMessage>,
+    model_provider: &dyn ModelProvider,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    observer: &dyn crate::observability::Observer,
+    silent: bool,
+    approval: Option<&crate::approval::ApprovalManager>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    pacing: &zeroclaw_config::schema::PacingConfig,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    knobs: &LoopKnobs,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
+    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    channel: Option<&dyn Channel>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    agent_alias: Option<&str>,
+) -> Result<()> {
+    let mut pending = std::collections::VecDeque::from(queued_actions);
+    while let Some(queued) = pending.pop_front() {
+        let mut action = queued.action;
+        loop {
+            match action {
+                crate::sop::SopRunAction::ExecuteStep {
+                    run_id,
+                    step,
+                    context,
+                } => {
+                    let started_at = crate::sop::engine::now_iso8601();
+                    let user_message = ChatMessage::user(context.clone());
+                    history.push(user_message.clone());
+                    if let Some(out) = new_messages_out.as_deref_mut() {
+                        out.push(user_message);
+                    }
+
+                    let mut sop_excluded_tools = excluded_tools.to_vec();
+                    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+                        if !sop_excluded_tools.iter().any(|existing| existing == tool) {
+                            sop_excluded_tools.push(tool.to_string());
+                        }
+                    }
+
+                    let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
+                    let step_output = Box::pin(run_tool_call_loop(ToolLoop {
+                        exec: ResolvedAgentExecution::resolve(
+                            ResolvedModelAccess {
+                                model_provider,
+                                provider_name,
+                                model,
+                                temperature,
+                            },
+                            ResolvedIo {
+                                tools_registry,
+                                observer,
+                                silent,
+                                approval,
+                                multimodal_config,
+                                hooks,
+                                activated_tools,
+                                model_switch_callback: model_switch_callback.clone(),
+                                receipt_generator,
+                            },
+                            ResolvedRuntimeKnobs {
+                                max_tool_iterations,
+                                excluded_tools: &sop_excluded_tools,
+                                dedup_exempt_tools,
+                                pacing,
+                                strict_tool_parsing,
+                                parallel_tools,
+                                max_tool_result_chars,
+                                context_token_budget,
+                                knobs,
+                            },
+                        ),
+                        history,
+                        channel_name,
+                        channel_reply_target,
+                        cancellation_token: cancellation_token.clone(),
+                        on_delta: on_delta.clone(),
+                        shared_budget: shared_budget.clone(),
+                        channel,
+                        collected_receipts,
+                        event_tx: event_tx.clone(),
+                        steering: None,
+                        new_messages_out: new_messages_out.as_deref_mut(),
+                        image_cache: image_cache.as_deref_mut(),
+                        ingress: IngressContext::internal(),
+                        agent_alias,
+                        turn_id: &nested_turn_id,
+                    }))
+                    .await;
+
+                    let completed_at = crate::sop::engine::now_iso8601();
+                    let step_result = match step_output {
+                        Ok(output) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Completed,
+                            output,
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                        Err(e) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Failed,
+                            output: e.to_string(),
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                    };
+
+                    let (next_action, finished_run) = crate::sop::executor::advance_sop_step(
+                        &queued.engine,
+                        &run_id,
+                        step_result.clone(),
+                    )?;
+                    crate::sop::executor::audit_sop_step(
+                        queued.audit.as_deref(),
+                        &run_id,
+                        &step_result,
+                        finished_run.as_ref(),
+                    )
+                    .await;
+                    action = next_action;
+                }
+                crate::sop::SopRunAction::WaitApproval { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused for approval"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor yielded deterministic step"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused at checkpoint"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Pending {
+                    run_id,
+                    step,
+                    reason,
+                    ..
+                } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step,
+                                "reason": reason,
+                            })),
+                        "SOP live executor pending on step dependencies"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Completed { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Failed {
+                    run_id,
+                    sop_name,
+                    reason,
+                } => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                                "reason": reason,
+                            })),
+                        "SOP live executor failed run"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

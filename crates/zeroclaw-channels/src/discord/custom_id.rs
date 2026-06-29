@@ -156,4 +156,13 @@ mod tests {
         // A 101-char raw input is rejected before parsing.
         assert_eq!(CustomId::parse(&"z".repeat(101)), None);
     }
+
+    #[test]
+    fn round_trips_kind_with_separators() {
+        let id = CustomId::new(r"ap|pr\ove", "interaction-123");
+        let wire = id.encode().unwrap();
+
+        assert_eq!(CustomId::parse(&wire), Some(id));
+        assert!(wire.contains(r"ap\|pr\\ove"));
+    }
 }

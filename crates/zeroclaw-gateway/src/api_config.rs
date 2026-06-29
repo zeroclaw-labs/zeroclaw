@@ -896,6 +896,15 @@ pub struct MapKeyResponse {
     pub path: String,
     pub key: String,
     pub created: bool,
+    /// Owned-state cascade warnings (agent delete only): a non-empty list means
+    /// the config delete succeeded but one or more side-effects (archive dir
+    /// creation, workspace archive `fs::rename`, memory / cron / acp / session
+    /// purge) did NOT complete. The operator must inspect the archive directory
+    /// and the agent-owned stores before reusing the alias. Omitted from the
+    /// JSON when empty (back-compat for the generic create-map-key path, which
+    /// has no owned state). See #7941.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1042,6 +1051,7 @@ pub async fn handle_delete_map_key(
         path: q.path,
         key: q.key,
         created: false,
+        warnings: None,
     })
     .into_response()
 }
@@ -1130,18 +1140,44 @@ async fn delete_agent_cascade(
         }
     };
 
+    // Persist FIRST (so a persist failure leaves config naming the agent and
+    // its workspace / owned stores fully intact — the inverse of #7907's
+    // rename-direction split-brain). Mark EVERY entry the cascade touched
+    // dirty — the removed agent entry AND each other entry whose soft-ref was
+    // scrubbed. `save_dirty` writes only marked paths, so marking just
+    // `agents.<alias>` would leave a scrubbed referrer (another agent's
+    // `delegates`, a peer group's `agents`) correct in memory but STALE on
+    // disk, reappearing as a dangling reference on the next config reload
+    // (which `validate()` then rejects). Mirrors rename's
+    // `RenameReport.dirty_paths`.
+    for path in cascade.dirty_paths() {
+        working.mark_dirty(&path);
+    }
+    if let Err(e) = persist_and_swap(state, working).await {
+        return error_response(e);
+    }
+    // Config is durably committed: the agent is GONE from the persisted config.
+    // Read it back from the (now-swapped) AppState for the side-effects below.
+    let committed = state.config.read().clone();
+
     // Archive into the shared graveyard `<data_dir>/agents/_deleted/<alias>-<ts>/`
     // (not inside the deleted agent's own dir), and give the owned-state exports
-    // a home there even if the agent had no workspace dir. (`workspace` was
-    // resolved above, before the cascade removed the entry.)
+    // a home there even if the agent had no workspace dir. `workspace` was
+    // resolved above, before the cascade removed the entry; `data_dir` comes
+    // from the post-swap in-memory config (the persisted one).
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = working
+    let archive_dir = committed
         .data_dir
         .join("agents")
         .join("_deleted")
         .join(format!("{alias}-{ts}"));
+    let mut warnings: Vec<String> = Vec::new();
     if let Err(err) = tokio::fs::create_dir_all(&archive_dir).await {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": alias, "archive": archive_dir.display().to_string(), "err": err.to_string()})), "agent delete: archive dir creation failed");
+        warnings.push(format!(
+            "archive dir creation failed ({}): {err}",
+            archive_dir.display()
+        ));
     }
     if workspace.exists() {
         let dest = archive_dir.join("workspace");
@@ -1150,40 +1186,42 @@ async fn delete_agent_cascade(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent": alias, "err": err.to_string()})),
+                    .with_attrs(::serde_json::json!({"agent": alias, "from": workspace.display().to_string(), "to": dest.display().to_string(), "err": err.to_string()})),
                 "agent delete: workspace archive failed"
             );
+            warnings.push(format!(
+                "workspace archive failed ({} -> {}): {err}",
+                workspace.display(),
+                dest.display()
+            ));
         }
     }
 
     // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
     let owned = crate::agent_owned_state::cascade_owned_state(
-        &working,
+        &committed,
         &state.mem,
         state.session_backend.as_ref(),
         alias,
         &archive_dir,
     )
     .await;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string()})), "agent deleted with owned-state cascade");
+    // Combine per-side-effect failures (archive dir / workspace rename) with
+    // the per-store failures surfaced by `cascade_owned_state`, so the operator
+    // sees the FULL partial-failure picture in the response, not just the
+    // server log.
+    warnings.extend(owned.warnings.iter().cloned());
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string(), "warnings": warnings.len()})), "agent deleted with owned-state cascade");
 
-    // Persist: mark EVERY entry the cascade touched dirty — the removed agent
-    // entry AND each other entry whose soft-ref was scrubbed. `save_dirty` writes
-    // only marked paths, so marking just `agents.<alias>` would leave a scrubbed
-    // referrer (another agent's `delegates`, a peer group's `agents`) correct in
-    // memory but STALE on disk, reappearing as a dangling reference on the next
-    // config reload (which `validate()` then rejects). Mirrors rename's
-    // `RenameReport.dirty_paths`.
-    for path in cascade.dirty_paths() {
-        working.mark_dirty(&path);
-    }
-    if let Err(e) = persist_and_swap(state, working).await {
-        return error_response(e);
-    }
     axum::Json(MapKeyResponse {
         path: "agents".to_string(),
         key: alias.to_string(),
         created: false,
+        warnings: if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings)
+        },
     })
     .into_response()
 }
@@ -1224,6 +1262,7 @@ async fn delete_config_cascade(
         path: path.to_string(),
         key: key.to_string(),
         created: false,
+        warnings: None,
     })
     .into_response()
 }
@@ -1302,7 +1341,13 @@ pub async fn handle_map_key(
         }
     }
 
-    axum::Json(MapKeyResponse { path, key, created }).into_response()
+    axum::Json(MapKeyResponse {
+        path,
+        key,
+        created,
+        warnings: None,
+    })
+    .into_response()
 }
 
 /// A single config reference site to an aliased entry, for the delete preview.
@@ -2598,6 +2643,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
@@ -3770,6 +3816,262 @@ mod tests {
         assert!(
             !raw.contains("first reason"),
             "expected the prior comment to be cleared, got:\n{raw}"
+        );
+    }
+
+    /// #7941: when config persistence FAILS, the agent delete must not have
+    /// archived the workspace or purged any owned state. Pre-fix the archive
+    /// and the owned-state cascade ran *before* `persist_and_swap`, so a
+    /// persist failure left config naming the agent while its workspace had
+    /// been archived and its owned stores had been purged — the inverse
+    /// split-brain of #7907 (in the delete direction). Persist-first means an
+    /// early failure returns before any side-effect runs; the agent's
+    /// workspace, cron jobs, and other owned stores all stay on the original
+    /// alias.
+    #[tokio::test]
+    async fn agent_delete_leaves_owned_state_intact_when_persist_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Force config persistence to FAIL by making `config_path` itself a
+        // directory — save_dirty's atomic write can't replace a dir. Its
+        // parent (the install root) stays a real dir, so the agent-workspace
+        // creation and the cron seed below still work. data_dir is separate
+        // + writable.
+        let cfg_dir = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: cfg_dir,
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // Real default-workspace dir for the agent so the archive step has
+        // something to act on (and so a buggy pre-fix run would visibly move
+        // it under `agents/_deleted/`).
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        };
+        config.agents.insert("victim".to_string(), agent);
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+        let old_ws = config.agent_workspace_dir("victim");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        // Seed an owned-state row (a cron job) under `victim` — the delete probe.
+        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
+            .expect("seed cron job");
+        assert_eq!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let state = crate::api::test_state(config.clone());
+        let resp = delete_agent_cascade(&state, config.clone(), "victim").await;
+
+        // Persist failed -> error response, not a clean delete.
+        assert!(
+            !resp.status().is_success(),
+            "a failed config persist must surface an error"
+        );
+        // Owned state did NOT move: the cron job stays under `victim`.
+        assert_eq!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+                .unwrap()
+                .len(),
+            1,
+            "cron must stay under `victim` when persist fails (no premature purge)"
+        );
+        // Workspace was NOT archived: still on disk at the original path.
+        assert!(
+            old_ws.exists(),
+            "workspace must NOT have been archived when persist fails"
+        );
+        let archive_root = config.data_dir.join("agents").join("_deleted");
+        assert!(
+            !archive_root.exists(),
+            "no archive directory must be created when persist fails"
+        );
+        // In-memory config was never swapped: still names `victim`.
+        assert!(state.config.read().agents.contains_key("victim"));
+    }
+
+    /// #7941: when persist SUCCEEDS, the agent is gone from the persisted
+    /// config AND the workspace + owned state have been archived / purged.
+    /// This is the happy path that proves the reorder didn't accidentally
+    /// skip the side-effects (or return success without doing them).
+    #[tokio::test]
+    async fn agent_delete_purges_owned_state_after_successful_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"), // writable -> persist OK
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        };
+        config.agents.insert("victim".to_string(), agent);
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+        let old_ws = config.agent_workspace_dir("victim");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
+            .expect("seed cron job");
+
+        let state = crate::api::test_state(config.clone());
+        let resp = delete_agent_cascade(&state, config.clone(), "victim").await;
+        assert!(resp.status().is_success(), "a clean delete returns success");
+
+        // Config swapped: `victim` is GONE.
+        assert!(
+            !state.config.read().agents.contains_key("victim"),
+            "agent removed from persisted config"
+        );
+        // Cron job purged: the cascade ran after a successful persist.
+        assert!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+                .unwrap()
+                .is_empty(),
+            "cron purged once persist succeeds"
+        );
+        // Workspace archived: source dir gone, archive dir populated.
+        assert!(
+            !old_ws.exists(),
+            "old workspace no longer at the original path"
+        );
+        let archive_root = config.data_dir.join("agents").join("_deleted");
+        assert!(archive_root.exists(), "archive directory was created");
+        let archived_ws = std::fs::read_dir(&archive_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().join("workspace").exists())
+            .expect("an archive entry for `victim` with a workspace/ subdir");
+        assert!(
+            archived_ws
+                .file_name()
+                .to_string_lossy()
+                .starts_with("victim-"),
+            "archive entry name must start with `victim-`"
+        );
+    }
+
+    /// #7941 partial-failure surface: the response body must carry a
+    /// `warnings` array that aggregates (a) archive dir creation failures,
+    /// (b) workspace archive `fs::rename` failures, and (c) per-store failures
+    /// from the owned-state cascade. Pre-fix, `MapKeyResponse` had no
+    /// `warnings` field at all and every side-effect failure was WARN-logged
+    /// only — the operator got a clean 200 OK and had to scrape server logs
+    /// to learn that part of the cascade had silently failed.
+    #[tokio::test]
+    async fn agent_delete_response_carries_partial_failure_warnings() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        };
+        config.agents.insert("victim".to_string(), agent);
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+        // Force the workspace archive `fs::rename` to fail: place a FILE at
+        // the archive-destination path, so the move into `<archive>/workspace`
+        // can't complete. (Archive-dir creation itself succeeds — the partial
+        // failure is at the rename step, which is exactly the case #7941
+        // calls out as currently invisible to the caller.)
+        let archive_root = config.data_dir.join("agents").join("_deleted");
+        std::fs::create_dir_all(&archive_root).unwrap();
+        // We don't know the exact timestamped subdir in advance, so we block
+        // the rename by making the agent's workspace itself unrenamable:
+        // put a file where the workspace dir is supposed to be created, so
+        // `agent_workspace_dir(victim)` points to a path that exists AS A
+        // FILE (not a dir) — `fs::rename` of a file onto a non-existent path
+        // is fine, but the cascade test also exercises the case where the
+        // archive-dir creation has already happened. The simplest reliable
+        // block: replace the workspace dir with a FILE so that when the
+        // handler later does `if workspace.exists()` then
+        // `tokio::fs::rename(&workspace, &dest)`, the source exists but the
+        // rename can still succeed. We need a different tactic — see below.
+        //
+        // Robust tactic: pre-create a FILE at the exact path the timestamped
+        // archive dir WOULD use, so `create_dir_all` for that path fails
+        // (because a non-dir entry already exists at that location). We
+        // can't know the timestamp up front, so instead we block the rename
+        // by making the parent-of-archive non-writable: chown the archive
+        // root to a read-only mode. Cross-platform: just remove write perms
+        // on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+        }
+        let old_ws = config.agent_workspace_dir("victim");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        // Drop a real file inside the workspace so the cascade has something
+        // to archive (and so we can detect a successful archive).
+        std::fs::write(old_ws.join("marker.txt"), b"hi").unwrap();
+        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
+            .expect("seed cron job");
+
+        let state = crate::api::test_state(config.clone());
+        let resp = delete_agent_cascade(&state, config.clone(), "victim").await;
+
+        // Restore archive-root writability so the test cleans up.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        // The HTTP call is still 200 OK — partial failure is not an error
+        // response, it is a successful response with `warnings` populated.
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Parse the response body and assert the `warnings` field is present
+        // and non-empty. We assert the SPECIFIC shape the operator sees:
+        // an array of strings, one per failed side-effect.
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let warnings = json
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .expect("response must carry a `warnings` array");
+        assert!(
+            !warnings.is_empty(),
+            "partial-failure response must surface at least one warning, got: {warnings:?}"
+        );
+        // At least one warning should mention the archive dir (creation or rename).
+        let joined = warnings
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("archive"),
+            "warnings should mention archive-side failures, got: {joined}"
         );
     }
 }

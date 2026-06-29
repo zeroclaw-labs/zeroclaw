@@ -140,8 +140,10 @@ keyactions! {
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::CONTROL), Chord::ctrl('k')] => "enter browse mode",
-        BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::CONTROL)] => "exit browse mode",
+        // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
+        // and queue navigation conflict (alt+up/down). See issue #8075.
+        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
+        BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",
         BrowseUpVim             [Chord::char('k')] => "browse prev (vim)",
@@ -306,6 +308,7 @@ keyactions! {
         Cancel  [Chord::key(KeyCode::Esc), Chord::char('n'), Chord::char('N')] => "cancel",
         Up      [Chord::key(KeyCode::Up)] => "prev",
         Down    [Chord::key(KeyCode::Down)] => "next",
+        Toggle  [Chord::char(' ')] => "toggle selection",
     }
 }
 
