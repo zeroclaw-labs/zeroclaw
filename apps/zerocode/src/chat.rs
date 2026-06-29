@@ -88,8 +88,10 @@ pub(crate) struct Chat {
     /// Receiver for server-initiated JSON-RPC requests that expect a
     /// response (today: `elicitation/create`). Drained per draw alongside
     /// `notif_rx` so an ACP-style multiple-choice prompt routed over the
-    /// Code tab's RPC channel can be surfaced — or, today, auto-cancelled
-    /// — without blocking the daemon's tool call indefinitely.
+    /// Code tab's RPC channel is surfaced as an interactive modal — or
+    /// auto-cancelled when it can't be matched to the active session or
+    /// its schema won't parse — without blocking the daemon's tool call
+    /// indefinitely.
     ///
     /// See `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` for the
     /// emitter side and the ACP elicitation RFD
@@ -509,18 +511,18 @@ impl Chat {
     }
 
     /// Drain server-initiated JSON-RPC requests (today: only
-    /// `elicitation/create`) and answer them so the daemon's tool call
+    /// `elicitation/create`) and dispatch them so the daemon's tool call
     /// doesn't stall.
     ///
-    /// **Phase 1 behaviour:** the Code tab does not yet render an
-    /// interactive picker for elicitation requests. Instead we log the
-    /// inbound prompt into the transcript and auto-respond with
+    /// An `elicitation/create` targeting the active session with a schema
+    /// we understand is installed as an interactive picker modal
+    /// (`handle_inbound_elicitation`); the user's selection is sent back as
+    /// the JSON-RPC response. A request we can't match to the active
+    /// session, or whose schema won't parse, is auto-answered with
     /// `{"action": "cancel"}`, which the daemon's
-    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so
-    /// the calling tool can fall back to its non-channel path. This
-    /// satisfies the "wire path is complete" contract — the protocol
-    /// roundtrip exists and is observable — without blocking on the
-    /// modal UI work tracked as a follow-up to the ACP elicitation RFD
+    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
+    /// calling tool can fall back to its non-channel path. See the ACP
+    /// elicitation RFD
     /// (https://agentclientprotocol.com/rfds/elicitation).
     ///
     /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
@@ -2222,7 +2224,7 @@ impl Chat {
                 // handler owns every key while the daemon waits on the
                 // `elicitation/create` response. Returning `false` here would
                 // let those globals fire *over* an in-flight prompt, breaking
-                // modality (regression caught in review).
+                // modality.
                 if s.pending_elicitation().is_some() {
                     return true;
                 }
@@ -5963,8 +5965,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_elicitation_makes_chat_claim_text_input() {
-        // Regression (review: Audacity88): while an `elicitation/create`
-        // prompt is pending the pane MUST be modal — it has to claim
+        // Regression: while an `elicitation/create` prompt is pending the
+        // pane MUST be modal — it has to claim
         // text-input so `app.rs` suppresses global chords (`?` help,
         // `Ctrl+R` reload) and routes every key to the modal handler. If
         // this returns `false`, those globals fire over an in-flight

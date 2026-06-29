@@ -161,8 +161,8 @@ pub fn multi_select_schema(choices: &[String], min_items: usize, max_items: usiz
 }
 
 /// Internal — mirrors `single_select_schema_with_property_name` so the
-/// `SENSITIVE_PROPERTY_NAMES` trip-wire guards the multi-select path too
-/// (keeps the invariant uniform for future callers; review: Nillth).
+/// `SENSITIVE_PROPERTY_NAMES` trip-wire guards the multi-select path too,
+/// keeping the invariant uniform for future callers.
 pub fn multi_select_schema_with_property_name(
     property: &str,
     choices: &[String],
@@ -392,7 +392,7 @@ mod tests {
     #[should_panic(expected = "sensitive")]
     fn multi_select_schema_rejects_sensitive_property_names_in_debug() {
         // The multi-select path must enforce the same sensitive-name guard
-        // as single-select (review: Nillth — keep the invariant uniform).
+        // as single-select — keep the invariant uniform.
         let _ = multi_select_schema_with_property_name("token", &["x".to_string()], 1, 1);
     }
 
