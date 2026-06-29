@@ -13843,11 +13843,18 @@ pub struct FilesystemConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub follow_symlinks: bool,
-    /// Maximum file content bytes admitted into a payload when `read_content`.
-    /// Unset means unlimited.
+    /// Maximum file content bytes admitted into a payload when `read_content`,
+    /// and the size ceiling for hashing. Defaults to 65536 (64 KiB). Only
+    /// enforced when `enforce_max_content_bytes` is on; otherwise unlimited.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_max_content_bytes")]
+    pub max_content_bytes: Option<usize>,
+    /// Enforce `max_content_bytes` as a hard ceiling for hashing and content
+    /// reads. Off by default: the cap value is carried but not applied, so the
+    /// listener reads/hashes regardless of size until an operator opts in.
     #[tab(Advanced)]
     #[serde(default)]
-    pub max_content_bytes: Option<usize>,
+    pub enforce_max_content_bytes: bool,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
     /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
     /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
@@ -13875,7 +13882,8 @@ impl Default for FilesystemConfig {
             settle_ms: default_filesystem_settle_ms(),
             read_content: false,
             follow_symlinks: false,
-            max_content_bytes: None,
+            max_content_bytes: default_filesystem_max_content_bytes(),
+            enforce_max_content_bytes: false,
             allow_broad_roots: false,
             excluded_tools: Vec::new(),
         }
@@ -13939,6 +13947,10 @@ fn default_filesystem_debounce_ms() -> u64 {
 
 fn default_filesystem_settle_ms() -> u64 {
     250
+}
+
+fn default_filesystem_max_content_bytes() -> Option<usize> {
+    Some(65536)
 }
 
 /// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
@@ -20322,7 +20334,8 @@ mod tests {
         assert!(!cfg.allow_broad_roots);
         assert_eq!(cfg.debounce_ms, 500);
         assert_eq!(cfg.settle_ms, 250);
-        assert_eq!(cfg.max_content_bytes, None);
+        assert_eq!(cfg.max_content_bytes, Some(65536));
+        assert!(!cfg.enforce_max_content_bytes);
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;

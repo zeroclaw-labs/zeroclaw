@@ -428,7 +428,11 @@ fn build_payload(
                         ::serde_json::json!(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
                     );
                 }
-                let content_cap = config.max_content_bytes.unwrap_or(usize::MAX);
+                let content_cap = if config.enforce_max_content_bytes {
+                    config.max_content_bytes.unwrap_or(usize::MAX)
+                } else {
+                    usize::MAX
+                };
                 if let Some(hash) = hash_file(path, content_cap) {
                     obj.insert("hash".into(), ::serde_json::json!(hash));
                 }
