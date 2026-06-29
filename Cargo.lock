@@ -13825,6 +13825,9 @@ dependencies = [
 name = "zeroclaw-onboarding"
 version = "0.8.2"
 dependencies = [
+ "async-trait",
+ "thiserror 2.0.18",
+ "tokio",
  "zeroclaw-config",
  "zeroclaw-runtime",
 ]

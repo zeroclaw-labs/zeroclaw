@@ -10,3 +10,8 @@ publish = false
 [dependencies]
 zeroclaw-config.workspace = true
 zeroclaw-runtime.workspace = true
+async-trait = "0.1"
+thiserror = "2.0"
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt", "macros", "sync"] }
