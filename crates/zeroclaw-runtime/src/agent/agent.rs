@@ -318,6 +318,10 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
+    /// Tool specs sent to the LLM. Populated from `tools` at build time;
+    /// may be overridden per-request (e.g. by the OpenAI chat completions
+    /// endpoint to honour `tools` / `tool_choice` request parameters).
+    tool_specs: Vec<zeroclaw_api::tool::ToolSpec>,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -820,6 +824,7 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("model_provider is required")
             })?,
+            tool_specs: tools.iter().map(|t| t.spec()).collect::<Vec<_>>(),
             tools,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
@@ -1116,6 +1121,24 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Replace the tool specs sent to the LLM with the given set.
+    /// Used by the OpenAI-compatible HTTP endpoint to honour the `tools`
+    /// and `tool_choice` request parameters.
+    pub fn set_tool_specs(&mut self, specs: Vec<zeroclaw_api::tool::ToolSpec>) {
+        self.tool_specs = specs;
+    }
+
+    /// Clear all tool specs so the LLM sees no available tools.
+    /// Corresponds to `tool_choice: "none"`.
+    pub fn disable_tools(&mut self) {
+        self.tool_specs.clear();
+    }
+
+    /// Return the names of all registered tools.
+    pub fn get_configured_tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {

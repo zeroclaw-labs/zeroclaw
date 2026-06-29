@@ -13668,6 +13668,7 @@ name = "zeroclaw-gateway"
 version = "0.8.2"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
