@@ -14034,17 +14034,14 @@ pub struct FilesystemConfig {
     #[serde(default)]
     pub follow_symlinks: bool,
     /// Maximum file content bytes admitted into a payload when `read_content`,
-    /// and the size ceiling for hashing. Defaults to 65536 (64 KiB). Only
-    /// enforced when `enforce_max_content_bytes` is on; otherwise unlimited.
+    /// and the size ceiling for hashing. `Some(n)` caps reads and hashing at
+    /// `n` bytes; oversize files are skipped rather than truncated. `None`
+    /// removes the ceiling entirely (unbounded reads). Defaults to
+    /// `Some(65536)` (64 KiB), so the cap applies by default whenever
+    /// `read_content` or hashing runs.
     #[tab(Advanced)]
     #[serde(default = "default_filesystem_max_content_bytes")]
     pub max_content_bytes: Option<usize>,
-    /// Enforce `max_content_bytes` as a hard ceiling for hashing and content
-    /// reads. Off by default: the cap value is carried but not applied, so the
-    /// listener reads/hashes regardless of size until an operator opts in.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub enforce_max_content_bytes: bool,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
     /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
     /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
@@ -14073,7 +14070,6 @@ impl Default for FilesystemConfig {
             read_content: false,
             follow_symlinks: false,
             max_content_bytes: default_filesystem_max_content_bytes(),
-            enforce_max_content_bytes: false,
             allow_broad_roots: false,
             excluded_tools: Vec::new(),
         }
@@ -20660,7 +20656,6 @@ mod tests {
         assert_eq!(cfg.debounce_ms, 500);
         assert_eq!(cfg.settle_ms, 250);
         assert_eq!(cfg.max_content_bytes, Some(65536));
-        assert!(!cfg.enforce_max_content_bytes);
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;

@@ -140,6 +140,7 @@ impl FilesystemChannel {
                 last_seen.insert(dedup_key, now);
                 continue;
             }
+            last_seen.retain(|_, seen| now.duration_since(*seen) < debounce);
             last_seen.insert(dedup_key, now);
 
             if !settle.is_zero() {
@@ -428,11 +429,7 @@ fn build_payload(
                         ::serde_json::json!(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
                     );
                 }
-                let content_cap = if config.enforce_max_content_bytes {
-                    config.max_content_bytes.unwrap_or(usize::MAX)
-                } else {
-                    usize::MAX
-                };
+                let content_cap = config.max_content_bytes.unwrap_or(usize::MAX);
                 if let Some(hash) = hash_file(path, content_cap) {
                     obj.insert("hash".into(), ::serde_json::json!(hash));
                 }
@@ -749,6 +746,50 @@ mod tests {
         std::fs::write(&file, vec![0u8; 100]).unwrap();
         assert!(read_capped(&file, 10).is_none());
         assert!(read_capped(&file, 1000).is_some());
+    }
+
+    #[test]
+    fn build_payload_default_cap_skips_oversize_content_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.json");
+        std::fs::write(&file, vec![b'x'; 65537]).unwrap();
+        let cfg = FilesystemConfig {
+            read_content: true,
+            ..FilesystemConfig::default()
+        };
+        let payload = build_payload(FilesystemEventKind::Created, &file, None, &cfg);
+        assert_eq!(payload["size"], 65537);
+        assert!(
+            payload.get("content").is_none(),
+            "default 64 KiB cap must skip oversize content"
+        );
+        assert!(
+            payload.get("hash").is_none(),
+            "default 64 KiB cap must skip hashing oversize files"
+        );
+    }
+
+    #[test]
+    fn build_payload_none_cap_reads_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.json");
+        std::fs::write(&file, vec![b'y'; 65537]).unwrap();
+        let cfg = FilesystemConfig {
+            read_content: true,
+            max_content_bytes: None,
+            ..FilesystemConfig::default()
+        };
+        let payload = build_payload(FilesystemEventKind::Created, &file, None, &cfg);
+        assert_eq!(
+            payload["content"].as_str().map(|c| c.len()),
+            Some(65537),
+            "None cap reads the whole file"
+        );
+        assert!(
+            payload["hash"]
+                .as_str()
+                .is_some_and(|h| h.starts_with("sha256:"))
+        );
     }
 
     #[cfg(unix)]
