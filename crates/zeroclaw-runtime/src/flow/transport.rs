@@ -33,6 +33,8 @@ pub enum TransportError {
     Closed,
     #[error("response type mismatch: expected {expected:?}")]
     ResponseTypeMismatch { expected: ResponseType },
+    #[error("agent turn failed: {reason}")]
+    Agent { reason: String },
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
