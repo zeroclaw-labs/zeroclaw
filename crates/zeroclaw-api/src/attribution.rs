@@ -114,6 +114,7 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
+    Plugin,
 }
 
 /// Built-in tool implementations. Closed set — plugins that need their

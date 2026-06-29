@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use super::scope::StepToolScope;
+use super::step_contract::{StepFailure, StepRouting};
+
 // ── Priority ────────────────────────────────────────────────────
 
 /// SOP priority level, used for execution mode resolution and scheduling.
@@ -122,6 +125,11 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
+    Calendar {
+        calendar_source: String,
+        #[serde(default)]
+        calendar_ids: Vec<String>,
+    },
     Manual,
 }
 
@@ -133,6 +141,9 @@ impl fmt::Display for SopTrigger {
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
             Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
+            Self::Calendar {
+                calendar_source, ..
+            } => write!(f, "calendar:{calendar_source}"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -194,6 +205,49 @@ pub struct SopStep {
     /// Typed input/output schemas for deterministic data flow validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<StepSchema>,
+    /// Tool scope for this step. `suggested_tools` remains the legacy alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<StepToolScope>,
+    /// Conditional routing metadata. Default preserves linear execution.
+    #[serde(default, skip_serializing_if = "StepRouting::is_default")]
+    pub routing: StepRouting,
+    /// Failure handling metadata. Default preserves fail-the-run behavior.
+    #[serde(default, skip_serializing_if = "StepFailure::is_fail")]
+    pub on_failure: StepFailure,
+    /// Optional per-step execution mode override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SopExecutionMode>,
+}
+
+impl Default for SopStep {
+    fn default() -> Self {
+        Self {
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            suggested_tools: Vec::new(),
+            requires_confirmation: false,
+            kind: SopStepKind::Execute,
+            schema: None,
+            scope: None,
+            routing: StepRouting::default(),
+            on_failure: StepFailure::default(),
+            mode: None,
+        }
+    }
+}
+
+impl SopStep {
+    pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
+        let mut scope = self.scope.clone();
+        if !self.suggested_tools.is_empty() {
+            let scope = scope.get_or_insert_with(StepToolScope::default);
+            if scope.allow.is_none() {
+                scope.allow = Some(self.suggested_tools.clone());
+            }
+        }
+        scope
+    }
 }
 
 // ── SOP ─────────────────────────────────────────────────────────
@@ -273,6 +327,7 @@ pub enum SopTriggerSource {
     Cron,
     Peripheral,
     Filesystem,
+    Calendar,
     Manual,
 }
 
@@ -284,6 +339,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
             Self::Filesystem => write!(f, "filesystem"),
+            Self::Calendar => write!(f, "calendar"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -368,6 +424,9 @@ pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
     pub trigger_event: SopEvent,
+    /// Stable per-run boundary marker for untrusted trigger framing.
+    #[serde(default)]
+    pub frame_marker_id: String,
     pub status: SopRunStatus,
     pub current_step: u32,
     pub total_steps: u32,
@@ -455,6 +514,13 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
+    /// Routing selected a step whose dependencies are not yet satisfied.
+    Pending {
+        run_id: String,
+        sop_name: String,
+        step: u32,
+        reason: String,
+    },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
     /// The SOP run failed.
@@ -492,6 +558,12 @@ mod tests {
         };
         assert_eq!(mqtt.to_string(), "mqtt:sensors/temp");
 
+        let calendar = SopTrigger::Calendar {
+            calendar_source: "microsoft365".into(),
+            calendar_ids: vec!["primary".into()],
+        };
+        assert_eq!(calendar.to_string(), "calendar:microsoft365");
+
         let manual = SopTrigger::Manual;
         assert_eq!(manual.to_string(), "manual");
     }
@@ -510,6 +582,40 @@ mod tests {
         assert_eq!(json, "\"priority_based\"");
         let parsed: SopExecutionMode = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, SopExecutionMode::PriorityBased);
+    }
+
+    #[test]
+    fn calendar_trigger_serde_roundtrip() {
+        let trigger = SopTrigger::Calendar {
+            calendar_source: "microsoft365".into(),
+            calendar_ids: vec!["primary".into()],
+        };
+
+        let json = serde_json::to_string(&trigger).unwrap();
+        let parsed: SopTrigger = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, trigger);
+        assert_eq!(SopTriggerSource::Calendar.to_string(), "calendar");
+        assert_eq!(
+            serde_json::to_string(&SopTriggerSource::Calendar).unwrap(),
+            "\"calendar\""
+        );
+    }
+
+    #[test]
+    fn calendar_trigger_toml_roundtrip() {
+        let toml_str = r#"
+type = "calendar"
+calendar_source = "microsoft365"
+calendar_ids = ["primary", "team"]
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+
+        assert!(
+            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids }
+                if calendar_source == "microsoft365"
+                    && calendar_ids.as_slice() == ["primary", "team"])
+        );
     }
 
     #[test]
@@ -669,6 +775,22 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn default_step_contract_fields_do_not_serialize() {
+        let step = SopStep {
+            number: 1,
+            title: "Check".into(),
+            body: "Verify readings".into(),
+            ..SopStep::default()
+        };
+        let value = serde_json::to_value(step).unwrap();
+
+        assert!(value.get("scope").is_none());
+        assert!(value.get("routing").is_none());
+        assert!(value.get("on_failure").is_none());
+        assert!(value.get("mode").is_none());
+    }
+
+    #[test]
     fn manifest_parse() {
         let toml_str = r#"
 [sop]
@@ -727,6 +849,7 @@ path = "/sop/test"
                 payload: None,
                 timestamp: "2026-02-19T12:00:00Z".into(),
             },
+            frame_marker_id: "marker-run-001".into(),
             status: SopRunStatus::Running,
             current_step: 2,
             total_steps: 5,

@@ -32,7 +32,7 @@ Configure broker access with `zeroclaw config set channels.mqtt.<field> <value>`
 
 ### 2.2 Trigger Definition
 
-The SOP's trigger is defined in its `SOP.toml` (see [Syntax](./syntax.md)). Topic patterns support `+` (single-level) and `#` (multi-level) wildcards. The MQTT payload is forwarded into the SOP event payload (`event.payload`) and is available to an optional trigger `condition`, then shown in step context.
+The SOP's trigger is defined in its `SOP.toml` (see [Syntax](./syntax.md)). Topic patterns support `+` (single-level) and `#` (multi-level) wildcards. The MQTT payload is forwarded into the SOP event payload (`event.payload`) and is available to an optional trigger `condition`; step context receives the capped, sanitized, framed form.
 
 ## 3. Filesystem Integration
 
@@ -65,6 +65,8 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 | **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
 | **Filesystem roots** | The broad roots `/`, `/home`, `/etc`, `/var` rejected at config validation (override with `allow_broad_roots`); include/exclude globs scope events |
 | **Filesystem symlinks** | Symlink event paths are rejected before any metadata/hash/content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |
+| **Untrusted trigger input** | Topic and payload text are capped, normalized, prompt-guard screened, and framed before model context. |
+| **Unsafe trigger block** | `untrusted_input_guard = "block"` refuses unsafe untrusted events with `BlockedUnsafe`; default `warn` audits and allows. |
 | **Cron validation** | Invalid cron expressions fail closed during parsing/cache build |
 | **Headless dispatch** | Headless callers log run progression instead of auto-executing `ExecuteStep` |
 

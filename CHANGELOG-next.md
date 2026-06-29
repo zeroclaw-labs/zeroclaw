@@ -99,6 +99,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Per-sender `/thinking` overrides restored (#8011).
 - Re-loadable media refs preserved in cached history (#8153).
 - `refreshed_new_session_system_prompt` loads bundled skills (#8203).
+- **ACP elicitation (multiple-choice)**: agent-driven `ask_user` and `poll` calls now use the ACP [`elicitation/create`](https://agentclientprotocol.com/protocol/schema) method (form mode, enum schema) when the client advertises `elicitation.form` in `initialize.clientCapabilities`. Clients that don't yet advertise the capability keep using the existing `session/request_permission` path with no behaviour change. The Zerocode TUI advertises the capability, and its Code tab renders an interactive single-/multi-select modal (↑/↓ to move, Space to toggle for multi-select, Enter to confirm, Esc to cancel) that answers the daemon over the same `elicitation/create` wire format — making the Code tab a strict superset of the external ACP channel. Note that multiple-choice elicitation is currently a draft in the ACP spec and no external editor (Zed included) implements the client half yet, so the external-channel path is exercised today only by the Zerocode Code tab. Free-form text and URL mode are not implemented and remain follow-up work.
 
 ## Web and Dashboard
 
