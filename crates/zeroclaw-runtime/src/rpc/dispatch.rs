@@ -4082,6 +4082,138 @@ mod tests {
         );
     }
 
+    /// Regression test for #7733. An agent whose `mcp_bundles` is empty
+    /// must receive ZERO MCP tools at session/new time, even when the
+    /// global `[mcp.servers]` list is non-empty and another agent (here
+    /// `test-agent`) has been granted that same server through a bundle.
+    /// In deferred mode the visible signal is the absence of
+    /// `tool_search`.
+    ///
+    /// If a future change reverts any production call site from
+    /// `config.mcp_servers_for_agent(agent_alias)` back to
+    /// `&config.mcp.servers`, this test fails.
+    #[tokio::test]
+    async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_deferred() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
+
+        // Add a SECOND agent with no `mcp_bundles`. Reuse `test-agent`'s
+        // model_provider/risk_profile so the agent is fully constructible
+        // without touching providers/risk_profiles.
+        let template = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("test-agent must exist in make_mcp_granting_config");
+        config.agents.insert(
+            "unscoped-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: template.model_provider.clone(),
+                risk_profile: template.risk_profile.clone(),
+                mcp_bundles: Vec::new(), // explicit: no grant
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "unscoped-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-unscoped-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for an unscoped agent should still succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-unscoped-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search"),
+            "Unscoped agent must NOT expose `tool_search` in deferred mode \
+             (mcp_bundles is empty -> no MCP connection -> no deferred \
+             registry -> no tool_search). Tools were: {names:?}"
+        );
+        // And, defensively, no prefixed MCP tool either.
+        assert!(
+            !names.iter().any(|n| n.contains("__")),
+            "Unscoped agent must expose zero `<server>__<tool>` MCP tools; \
+             tools were: {names:?}"
+        );
+    }
+
+    /// Eager-mode counterpart to
+    /// `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_deferred`.
+    /// In eager mode the visible signal is the absence of any prefixed
+    /// `<server>__<tool>` name (here: `remote__domains.list`).
+    #[tokio::test]
+    async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_eager() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), false);
+
+        let template = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("test-agent must exist in make_mcp_granting_config");
+        config.agents.insert(
+            "unscoped-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: template.model_provider.clone(),
+                risk_profile: template.risk_profile.clone(),
+                mcp_bundles: Vec::new(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "unscoped-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-unscoped-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for an unscoped agent should still succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-unscoped-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"remote__domains.list"),
+            "Unscoped agent must NOT expose `remote__domains.list` in \
+             eager mode (mcp_bundles is empty -> no MCP connection -> \
+             no eager registration). Tools were: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("remote__")),
+            "No `remote__*` tool may leak to an unscoped agent; tools \
+             were: {names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn acp_session_new_skips_mcp_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4941,7 +5073,7 @@ mod tests {
 
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
-        use zeroclaw_config::schema::AliasedAgentConfig;
+        use zeroclaw_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
 
         let mut config = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -4953,7 +5085,7 @@ mod tests {
         config.acp.default_agent = Some("alpha".to_string());
 
         let mut alpha = AliasedAgentConfig {
-            delegates: vec!["alpha".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
             ..Default::default()
         };
         alpha
@@ -4963,7 +5095,7 @@ mod tests {
         config.agents.insert("alpha".to_string(), alpha);
 
         let mut reviewer = AliasedAgentConfig {
-            delegates: vec!["alpha".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
             ..Default::default()
         };
         reviewer
@@ -5010,7 +5142,12 @@ mod tests {
         assert!(config.agents.contains_key("beta"));
         assert_eq!(config.heartbeat.agent, "beta");
         assert_eq!(config.acp.default_agent.as_deref(), Some("beta"));
-        assert_eq!(config.agents["beta"].delegates, vec!["beta".to_string()]);
+        assert_eq!(
+            config.agents["beta"].delegates,
+            vec![zeroclaw_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
+        );
         assert!(
             config.agents["beta"]
                 .workspace
@@ -5019,7 +5156,9 @@ mod tests {
         );
         assert_eq!(
             config.agents["reviewer"].delegates,
-            vec!["beta".to_string()]
+            vec![zeroclaw_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
         );
         assert_eq!(
             config.agents["reviewer"].workspace.read_memory_from,
