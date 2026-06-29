@@ -57,9 +57,26 @@ impl FilesystemChannel {
         self.watch_and_dispatch_inner().instrument(span).await
     }
 
+    fn compile_globs_or_log(
+        &self,
+        patterns: &[String],
+        list: &str,
+    ) -> anyhow::Result<Vec<glob::Pattern>> {
+        compile_globs(patterns).inspect_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "list": list, "error": e.to_string() })),
+                "Filesystem channel: invalid glob pattern, refusing to start listener"
+            );
+        })
+    }
+
     async fn watch_and_dispatch_inner(&self) -> anyhow::Result<()> {
         let config = &self.config;
         config.validate()?;
+        let include = self.compile_globs_or_log(&config.include, "include")?;
+        let exclude = self.compile_globs_or_log(&config.exclude, "exclude")?;
 
         let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Event>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
@@ -86,8 +103,6 @@ impl FilesystemChannel {
         zeroclaw_runtime::health::mark_component_ok("filesystem");
 
         let enabled_events = parse_event_kinds(&config.events);
-        let include = compile_globs(&config.include);
-        let exclude = compile_globs(&config.exclude);
         let debounce = Duration::from_millis(config.debounce_ms);
         let settle = Duration::from_millis(config.settle_ms);
         let mut last_seen: HashMap<(String, FilesystemEventKind), Instant> = HashMap::new();
@@ -294,10 +309,13 @@ fn classify_rename(
     }
 }
 
-fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
+fn compile_globs(patterns: &[String]) -> anyhow::Result<Vec<glob::Pattern>> {
     patterns
         .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
+        .map(|p| {
+            glob::Pattern::new(p)
+                .map_err(|e| anyhow::Error::msg(format!("invalid glob pattern '{p}': {e}")))
+        })
         .collect()
 }
 
@@ -436,9 +454,21 @@ fn build_payload(
 }
 
 fn hash_file(path: &Path, max_bytes: usize) -> Option<String> {
-    let bytes = read_capped_bytes(path, max_bytes)?;
+    use std::io::Read;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() as usize > max_bytes {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Some(format!("sha256:{:x}", hasher.finalize()))
 }
 
@@ -470,8 +500,8 @@ mod tests {
 
     #[test]
     fn matches_globs_respects_include_and_exclude() {
-        let include = compile_globs(&["**/*.json".into()]);
-        let exclude = compile_globs(&["**/*.tmp.json".into()]);
+        let include = compile_globs(&["**/*.json".into()]).unwrap();
+        let exclude = compile_globs(&["**/*.tmp.json".into()]).unwrap();
         assert!(matches_globs("/var/inbox/order.json", &include, &exclude));
         assert!(!matches_globs(
             "/var/inbox/order.tmp.json",
@@ -483,9 +513,18 @@ mod tests {
 
     #[test]
     fn matches_globs_empty_include_matches_all_but_excludes() {
-        let exclude = compile_globs(&["**/*.swp".into()]);
+        let exclude = compile_globs(&["**/*.swp".into()]).unwrap();
         assert!(matches_globs("/var/inbox/a.json", &[], &exclude));
         assert!(!matches_globs("/var/inbox/.a.swp", &[], &exclude));
+    }
+
+    #[test]
+    fn compile_globs_rejects_invalid_pattern() {
+        let err = compile_globs(&["**/[broken".into()]).expect_err("invalid glob must fail closed");
+        assert!(
+            err.to_string().contains("**/[broken"),
+            "error must name the offending pattern; got: {err}"
+        );
     }
 
     #[test]
@@ -779,5 +818,83 @@ mod tests {
         };
         let payload = build_payload(FilesystemEventKind::Created, &link, None, &cfg);
         assert_eq!(payload["content"], "{\"id\":1}");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn invalid_glob_rejection_is_span_attributed() {
+        use std::sync::Arc;
+        use zeroclaw_runtime::sop::engine::SopEngine;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let watched = tempfile::tempdir().unwrap();
+        let config = FilesystemConfig {
+            paths: vec![watched.path().to_string_lossy().to_string()],
+            include: vec!["**/[broken".into()],
+            ..FilesystemConfig::default()
+        };
+        let memory = Arc::new(zeroclaw_memory::NoneMemory::new("fs-proof"));
+        let channel = FilesystemChannel::new(FilesystemChannelConfig {
+            config,
+            alias: "fs-proof".into(),
+            engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),
+            audit: Arc::new(SopAuditLogger::new(memory)),
+        });
+
+        let err = channel
+            .watch_and_dispatch()
+            .await
+            .expect_err("invalid include glob must fail the listener closed");
+        assert!(
+            err.to_string().contains("**/[broken"),
+            "error must name the bad pattern; got: {err}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = None;
+        while found.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("invalid glob pattern, refusing to start listener"))
+                        .unwrap_or(false)
+                    {
+                        found = Some(value);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+
+        let value = found.expect("expected the invalid-glob rejection event on the broadcast hook");
+        assert_eq!(value["severity_text"], "ERROR");
+        let zc = value
+            .get("zeroclaw")
+            .expect("zeroclaw attribution block present");
+        assert_eq!(
+            zc.get("channel").and_then(|v| v.as_str()),
+            Some("filesystem.fs-proof"),
+            "rejection must be span-attributed to the filesystem channel; got: {zc:?}"
+        );
+        assert_eq!(
+            zc.get("channel_type").and_then(|v| v.as_str()),
+            Some("filesystem")
+        );
+        assert_eq!(
+            zc.get("channel_alias").and_then(|v| v.as_str()),
+            Some("fs-proof")
+        );
+        assert_eq!(value["attributes"]["list"], "include");
     }
 }
