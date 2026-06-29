@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::CronShellOutputFormat;
 
 /// Try to deserialize a `serde_json::Value` as `T`.  If the value is a JSON
 /// string that looks like an object (i.e. the LLM double-serialized it), parse
@@ -174,6 +175,11 @@ pub struct CronJob {
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
+    /// Output format for shell jobs. `"wrapped"` (default) or `"raw"`.
+    /// Declarative jobs read this from `CronJobDecl.shell_output_format` in
+    /// the config; imperative jobs read it from the stored field in the DB.
+    #[serde(default)]
+    pub shell_output_format: CronShellOutputFormat,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
@@ -205,6 +211,7 @@ pub struct CronJobPatch {
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
+    pub shell_output_format: Option<CronShellOutputFormat>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for CronJob {
