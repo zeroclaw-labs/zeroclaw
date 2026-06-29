@@ -1348,6 +1348,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             )
         );
 
+        // Stay silent in group/supergroup chats: never post the operator-approval
+        // pairing prompt into a shared room. Unauthorized senders there are simply
+        // ignored (the DM path below still offers pairing for 1:1 access requests).
+        if Self::is_group_message(message) {
+            return;
+        }
+
         let suggested_identity = normalized_sender_id
             .clone()
             .or_else(|| {
