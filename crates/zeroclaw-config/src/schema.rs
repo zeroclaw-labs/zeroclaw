@@ -20106,6 +20106,29 @@ pub struct SopConfig {
     /// Maximum retries allowed by a step failure policy.
     #[serde(default = "default_sop_max_step_retries")]
     pub max_step_retries: u32,
+
+    /// Maximum bytes accepted from untrusted SOP trigger payload/topic content
+    /// before char-boundary truncation. 0 disables the cap.
+    #[serde(default = "default_sop_untrusted_payload_max_bytes")]
+    pub untrusted_payload_max_bytes: usize,
+
+    /// Prompt-guard action for untrusted SOP trigger input: warn, block, or sanitize.
+    #[serde(default = "default_sop_untrusted_input_guard")]
+    pub untrusted_input_guard: String,
+
+    /// Prompt-guard and outbound-redaction sensitivity for untrusted SOP content.
+    #[serde(default = "default_sop_untrusted_guard_sensitivity")]
+    pub untrusted_guard_sensitivity: f64,
+
+    /// Include the explanatory warning text inside untrusted-content frames.
+    /// Boundary framing itself is always on once wired.
+    #[serde(default = "default_sop_untrusted_frame_warning")]
+    pub untrusted_frame_warning: bool,
+
+    /// Redact outbound SOP content before persistence/audit consumers write it.
+    /// Intended to converge with the shared B/F redaction switch once those consumers land.
+    #[serde(default = "default_sop_untrusted_outbound_redact")]
+    pub untrusted_outbound_redact: bool,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -20196,6 +20219,26 @@ fn default_sop_max_step_retries() -> u32 {
     2
 }
 
+fn default_sop_untrusted_payload_max_bytes() -> usize {
+    8192
+}
+
+fn default_sop_untrusted_input_guard() -> String {
+    "warn".to_string()
+}
+
+fn default_sop_untrusted_guard_sensitivity() -> f64 {
+    0.7
+}
+
+fn default_sop_untrusted_frame_warning() -> bool {
+    true
+}
+
+fn default_sop_untrusted_outbound_redact() -> bool {
+    true
+}
+
 fn default_sop_maintenance_interval_secs() -> u64 {
     60
 }
@@ -20219,6 +20262,11 @@ impl Default for SopConfig {
             step_schema_enforce: default_sop_step_schema_enforce(),
             max_step_visits: default_sop_max_step_visits(),
             max_step_retries: default_sop_max_step_retries(),
+            untrusted_payload_max_bytes: default_sop_untrusted_payload_max_bytes(),
+            untrusted_input_guard: default_sop_untrusted_input_guard(),
+            untrusted_guard_sensitivity: default_sop_untrusted_guard_sensitivity(),
+            untrusted_frame_warning: default_sop_untrusted_frame_warning(),
+            untrusted_outbound_redact: default_sop_untrusted_outbound_redact(),
         }
     }
 }
@@ -20585,6 +20633,37 @@ mod tests {
             config.mcp_bundles.insert(alias.to_string(), bundle);
         }
         config
+    }
+
+    #[test]
+    async fn sop_untrusted_payload_defaults_are_back_compat() {
+        let config: SopConfig = toml::from_str("").expect("empty SOP config should deserialize");
+
+        assert_eq!(config.untrusted_payload_max_bytes, 8192);
+        assert_eq!(config.untrusted_input_guard, "warn");
+        assert_eq!(config.untrusted_guard_sensitivity, 0.7);
+        assert!(config.untrusted_frame_warning);
+        assert!(config.untrusted_outbound_redact);
+    }
+
+    #[test]
+    async fn sop_untrusted_payload_config_overrides_deserialize() {
+        let config: SopConfig = toml::from_str(
+            r#"
+untrusted_payload_max_bytes = 4096
+untrusted_input_guard = "block"
+untrusted_guard_sensitivity = 0.9
+untrusted_frame_warning = false
+untrusted_outbound_redact = false
+"#,
+        )
+        .expect("SOP untrusted payload overrides should deserialize");
+
+        assert_eq!(config.untrusted_payload_max_bytes, 4096);
+        assert_eq!(config.untrusted_input_guard, "block");
+        assert_eq!(config.untrusted_guard_sensitivity, 0.9);
+        assert!(!config.untrusted_frame_warning);
+        assert!(!config.untrusted_outbound_redact);
     }
 
     #[test]

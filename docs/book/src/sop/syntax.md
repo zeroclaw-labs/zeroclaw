@@ -63,6 +63,11 @@ The `[sop]` config controls enforcement:
 | `step_mandatory_tools` | `["sop_advance", "sop_approve", "sop_status"]` | Keep lifecycle tools available while scope enforcement is enabled. |
 | `max_step_visits` | `256` | Stop routed runs that revisit one step too many times. |
 | `max_step_retries` | `2` | Limit retries requested by a step failure policy. |
+| `untrusted_payload_max_bytes` | `8192` | Cap untrusted trigger topic/payload text at a UTF-8 character boundary; `0` disables the cap. |
+| `untrusted_input_guard` | `"warn"` | Prompt-guard action for untrusted trigger input: `warn`, `block`, or `sanitize`. |
+| `untrusted_guard_sensitivity` | `0.7` | Sensitivity used by prompt-guard screening and outbound redaction. |
+| `untrusted_frame_warning` | `true` | Include explanatory warning text in the untrusted-content frame. Frame boundaries remain enabled. |
+| `untrusted_outbound_redact` | `true` | Enable shared outbound redaction for SOP content-safety consumers. |
 
 Schema enforcement fails closed: invalid step input prevents the step from
 starting, and invalid step output is routed through the step's `on_failure`
@@ -70,6 +75,11 @@ policy. Routing enforcement replaces linear `current_step + 1` advancement in
 LLM and deterministic runs. Tool-scope enforcement is available as config, but
 the current runtime still treats scopes as advisory until the turn-loop filter
 is wired.
+
+Untrusted trigger topic and payload text is capped, normalized, screened, and
+framed before it reaches step context. Framing is always on; the warning text can
+be hidden, but raw external trigger text is not interpolated into the model
+context.
 
 ## 4. Trigger Types
 

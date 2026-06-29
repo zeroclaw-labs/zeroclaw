@@ -383,6 +383,9 @@ pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
     pub trigger_event: SopEvent,
+    /// Stable per-run boundary marker for untrusted trigger framing.
+    #[serde(default)]
+    pub frame_marker_id: String,
     pub status: SopRunStatus,
     pub current_step: u32,
     pub total_steps: u32,
@@ -742,6 +745,7 @@ path = "/sop/test"
                 payload: None,
                 timestamp: "2026-02-19T12:00:00Z".into(),
             },
+            frame_marker_id: "marker-run-001".into(),
             status: SopRunStatus::Running,
             current_step: 2,
             total_steps: 5,

@@ -7234,6 +7234,7 @@ struct SopMaintenanceTickReport {
     maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
     cron_started: usize,
     cron_skipped: usize,
+    cron_blocked_unsafe: usize,
     cron_no_match: usize,
 }
 
@@ -7243,6 +7244,7 @@ impl SopMaintenanceTickReport {
         self.maintenance.is_empty()
             && self.cron_started == 0
             && self.cron_skipped == 0
+            && self.cron_blocked_unsafe == 0
             && self.cron_no_match == 0
     }
 }
@@ -7287,6 +7289,9 @@ async fn run_sop_maintenance_tick(
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
                     report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
+                    report.cron_blocked_unsafe += 1;
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
                     report.cron_no_match += 1;

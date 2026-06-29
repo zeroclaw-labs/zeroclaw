@@ -487,6 +487,7 @@ mod tests {
                 payload: None,
                 timestamp: started_at.clone(),
             },
+            frame_marker_id: format!("marker-{id}"),
             status: SopRunStatus::Running,
             current_step: 0,
             total_steps: 1,

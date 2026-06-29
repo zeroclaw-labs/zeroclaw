@@ -6,7 +6,6 @@ pub mod dispatch;
 pub mod engine;
 pub mod executor;
 pub mod metrics;
-pub mod payload_safety;
 pub mod route;
 pub mod rundata;
 pub mod schema;

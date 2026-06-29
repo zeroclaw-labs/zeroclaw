@@ -121,6 +121,7 @@ mod tests {
                 payload: None,
                 timestamp: "now".into(),
             },
+            frame_marker_id: "marker-run".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 2,
