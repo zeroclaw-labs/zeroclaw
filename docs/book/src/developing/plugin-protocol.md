@@ -449,11 +449,12 @@ Copy it alongside your `manifest.toml`. For a runtime-only host build with no JI
 backend, precompile the component to a `.cwasm` with a matching wasmtime and ship
 that instead, since such a host deserializes rather than compiles on load.
 
-The committed reference fixture
-(`crates/zeroclaw-plugins/tests/fixtures/reference-plugin.wasm`) is
-byte-identical to a clean `cargo build --target wasm32-wasip2` of the published
-reference plugin, and `reference_plugin_e2e.rs` loads it through the same
-`PluginHost` and config-resolution paths the daemon runs.
+The reference fixture is not committed to the tree (it is a build artifact, not
+source). When `crates/zeroclaw-plugins/tests/fixtures/reference-plugin.wasm` is
+provisioned by a clean `cargo build --target wasm32-wasip2` of the published
+reference plugin, `reference_plugin.rs` and `reference_plugin_e2e.rs` load it
+through the same `PluginHost` and config-resolution paths the daemon runs. When
+the artifact is absent, those tests skip.
 
 ### Installing
 
