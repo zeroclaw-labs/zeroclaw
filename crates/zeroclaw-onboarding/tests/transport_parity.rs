@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use zeroclaw_config::schema::{Config, MatrixConfig};
 use zeroclaw_onboarding::{
-    CliTransport, LlmResponder, LlmTransport, SecretReader, build_spec, section_fields,
+    CliSecretSource, CliTransport, LlmResponder, LlmTransport, SecretReader, build_spec,
+    section_fields,
 };
 use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
 
@@ -65,20 +66,41 @@ impl SecretReader for ScriptedSecretReader {
     }
 }
 
+struct ScriptedCliSecretSource {
+    replies: VecDeque<String>,
+}
+
+#[async_trait]
+impl CliSecretSource for ScriptedCliSecretSource {
+    async fn read_secret(
+        &mut self,
+        _prompt_text: &str,
+    ) -> zeroclaw_runtime::flow::TransportResult<String> {
+        self.replies
+            .pop_front()
+            .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
+    }
+}
+
 fn ordered_fields(config: &Config) -> Vec<zeroclaw_config::traits::PropFieldInfo> {
     let mut fields = section_fields(config.prop_fields(), SECTION);
     fields.sort_by(|a, b| a.name.cmp(&b.name));
     fields
 }
 
-fn cli_script(config: &Config) -> String {
+fn cli_scripts(config: &Config) -> (String, Vec<String>) {
     let mut script = String::new();
+    let mut secrets = Vec::new();
     for field in ordered_fields(config) {
-        let line = answer_for(&field);
-        script.push_str(&line);
-        script.push('\n');
+        let answer = answer_for(&field);
+        if field.is_secret {
+            secrets.push(answer);
+        } else {
+            script.push_str(&answer);
+            script.push('\n');
+        }
     }
-    script
+    (script, secrets)
 }
 
 fn llm_scripts(config: &Config) -> (Vec<String>, Vec<String>) {
@@ -110,7 +132,7 @@ fn answer_for(field: &zeroclaw_config::traits::PropFieldInfo) -> String {
     }
 }
 
-async fn walk_cli(config: &mut Config, script: &str) -> Outcome {
+async fn walk_cli(config: &mut Config, script: &str, secrets: Vec<String>) -> Outcome {
     let spec = build_spec(
         config.prop_fields(),
         SECTION,
@@ -120,7 +142,14 @@ async fn walk_cli(config: &mut Config, script: &str) -> Outcome {
     )
     .expect("matrix section yields a spec");
     let mut output: Vec<u8> = Vec::new();
-    let mut transport = CliTransport::new(Cursor::new(script.as_bytes().to_vec()), &mut output);
+    let secret_source = ScriptedCliSecretSource {
+        replies: secrets.into(),
+    };
+    let mut transport = CliTransport::with_secret_source(
+        Cursor::new(script.as_bytes().to_vec()),
+        &mut output,
+        secret_source,
+    );
     spec.walk(&mut transport, config).await.unwrap()
 }
 
@@ -147,8 +176,8 @@ async fn walk_llm(config: &mut Config, llm: Vec<String>, secrets: Vec<String>) -
 async fn cli_and_llm_build_identical_config_from_registry_spec() {
     let (_cli_tmp, mut cli_config) = fresh_config();
     let cli_outcome = {
-        let script = cli_script(&cli_config);
-        walk_cli(&mut cli_config, &script).await
+        let (script, secrets) = cli_scripts(&cli_config);
+        walk_cli(&mut cli_config, &script, secrets).await
     };
 
     let (_llm_tmp, mut llm_config) = fresh_config();

@@ -12,6 +12,8 @@ zeroclaw-config.workspace = true
 zeroclaw-runtime.workspace = true
 async-trait = "0.1"
 thiserror = "2.0"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+tokio = { version = "1.50", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt", "macros", "sync"] }

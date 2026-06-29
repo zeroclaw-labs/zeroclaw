@@ -31,6 +31,10 @@ impl<L: LlmResponder, S: SecretReader> LlmTransport<L, S> {
         &self.emitted
     }
 
+    pub fn into_responder(self) -> L {
+        self.responder
+    }
+
     fn parse_non_secret(prompt: &Prompt, raw: &str) -> Option<ResponseValue> {
         let trimmed = raw.trim();
         match &prompt.response_type {
@@ -168,6 +172,27 @@ mod tests {
             ResponseValue::Secret(secret) => assert_eq!(secret.expose(), "sk-live"),
             other => panic!("expected secret, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_secret_value_never_appears_in_any_text_sent_to_the_llm() {
+        const SECRET: &str = "sk-live-must-not-leak";
+        let mut responder = ScriptedResponder::new(vec!["scout"]);
+        let secret_reader = RecordingSecretReader::new(vec![SECRET]);
+        let mut transport = LlmTransport::new(responder, secret_reader);
+        transport
+            .ask(&Prompt::new("API key", ResponseType::Secret))
+            .await
+            .unwrap();
+        transport
+            .ask(&Prompt::new("Agent name", ResponseType::FreeformText))
+            .await
+            .unwrap();
+        responder = transport.into_responder();
+        assert!(
+            responder.calls.iter().all(|call| !call.contains(SECRET)),
+            "the secret value reached the LLM responder"
+        );
     }
 
     #[tokio::test]

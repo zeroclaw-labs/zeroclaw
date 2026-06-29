@@ -3,14 +3,50 @@ use std::io::{BufRead, Write};
 use zeroclaw_runtime::flow::{FlowTransport, Outcome, Prompt, TransportError, TransportResult};
 use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
 
-pub struct CliTransport<R: BufRead + Send, W: Write + Send> {
-    reader: R,
-    writer: W,
+#[async_trait]
+pub trait CliSecretSource: Send {
+    async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String>;
 }
 
-impl<R: BufRead + Send, W: Write + Send> CliTransport<R, W> {
-    pub fn new(reader: R, writer: W) -> Self {
-        Self { reader, writer }
+pub struct NoSecretSource;
+
+#[async_trait]
+impl CliSecretSource for NoSecretSource {
+    async fn read_secret(&mut self, _prompt_text: &str) -> TransportResult<String> {
+        Err(TransportError::Closed)
+    }
+}
+
+pub struct TtyPasswordSource;
+
+#[async_trait]
+impl CliSecretSource for TtyPasswordSource {
+    async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String> {
+        let prompt = prompt_text.to_string();
+        tokio::task::spawn_blocking(move || {
+            dialoguer::Password::new()
+                .with_prompt(prompt)
+                .interact()
+                .map_err(|_| TransportError::Closed)
+        })
+        .await
+        .map_err(|_| TransportError::Closed)?
+    }
+}
+
+pub struct CliTransport<R: BufRead + Send, W: Write + Send, S: CliSecretSource> {
+    reader: R,
+    writer: W,
+    secret_source: S,
+}
+
+impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, S> {
+    pub fn with_secret_source(reader: R, writer: W, secret_source: S) -> Self {
+        Self {
+            reader,
+            writer,
+            secret_source,
+        }
     }
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
@@ -68,7 +104,9 @@ fn parse_yes_no(raw: &str) -> Option<bool> {
 }
 
 #[async_trait]
-impl<R: BufRead + Send, W: Write + Send> FlowTransport for CliTransport<R, W> {
+impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
+    for CliTransport<R, W, S>
+{
     async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
         loop {
             let line = self.prompt_line(prompt);
@@ -76,6 +114,17 @@ impl<R: BufRead + Send, W: Write + Send> FlowTransport for CliTransport<R, W> {
                 .write_all(line.as_bytes())
                 .map_err(|_| TransportError::Closed)?;
             self.writer.flush().map_err(|_| TransportError::Closed)?;
+            if prompt.routes_secret() {
+                let raw = self.secret_source.read_secret(&prompt.text).await?;
+                self.writer
+                    .write_all(b"\n")
+                    .map_err(|_| TransportError::Closed)?;
+                self.writer.flush().map_err(|_| TransportError::Closed)?;
+                if let Some(value) = Self::parse(prompt, &raw) {
+                    return Ok(value);
+                }
+                continue;
+            }
             let raw = self.read_line()?;
             if let Some(value) = Self::parse(prompt, &raw) {
                 return Ok(value);
@@ -96,14 +145,44 @@ impl<R: BufRead + Send, W: Write + Send> FlowTransport for CliTransport<R, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
     use zeroclaw_runtime::flow::ConfiguredItem;
     use zeroclaw_runtime::response_type::ChoiceOption;
 
+    struct ScriptedSecretSource {
+        secrets: VecDeque<String>,
+        prompts_seen: Vec<String>,
+    }
+
+    impl ScriptedSecretSource {
+        fn new(secrets: Vec<&str>) -> Self {
+            Self {
+                secrets: secrets.into_iter().map(String::from).collect(),
+                prompts_seen: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CliSecretSource for ScriptedSecretSource {
+        async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String> {
+            self.prompts_seen.push(prompt_text.to_string());
+            self.secrets.pop_front().ok_or(TransportError::Closed)
+        }
+    }
+
+    fn visible_only(
+        reader: Cursor<Vec<u8>>,
+        writer: &mut Vec<u8>,
+    ) -> CliTransport<Cursor<Vec<u8>>, &mut Vec<u8>, ScriptedSecretSource> {
+        CliTransport::with_secret_source(reader, writer, ScriptedSecretSource::new(Vec::new()))
+    }
+
     #[tokio::test]
     async fn yes_no_prompt_uses_angle_sigil_and_parses_affirmative() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(b"yes\n".to_vec()), &mut output);
+        let mut transport = visible_only(Cursor::new(b"yes\n".to_vec()), &mut output);
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(true));
@@ -111,9 +190,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secret_prompt_uses_hash_sigil_and_never_echoes_value() {
+    async fn secret_prompt_reads_from_secret_source_and_never_echoes_value() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(b"sk-secret\n".to_vec()), &mut output);
+        let mut transport = CliTransport::with_secret_source(
+            Cursor::new(Vec::new()),
+            &mut output,
+            ScriptedSecretSource::new(vec!["sk-secret"]),
+        );
         let prompt = Prompt::new("Token", ResponseType::Secret);
         let value = transport.ask(&prompt).await.unwrap();
         match value {
@@ -121,14 +204,14 @@ mod tests {
             other => panic!("expected secret, got {other:?}"),
         }
         let rendered = String::from_utf8(output).unwrap();
-        assert_eq!(rendered, "Token # ");
+        assert_eq!(rendered, "Token # \n");
         assert!(!rendered.contains("sk-secret"));
     }
 
     #[tokio::test]
     async fn invalid_yes_no_reprompts() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(b"maybe\nno\n".to_vec()), &mut output);
+        let mut transport = visible_only(Cursor::new(b"maybe\nno\n".to_vec()), &mut output);
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(false));
@@ -138,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn choice_parses_matching_option_value() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(b"partial\n".to_vec()), &mut output);
+        let mut transport = visible_only(Cursor::new(b"partial\n".to_vec()), &mut output);
         let prompt = Prompt::new(
             "Mode",
             ResponseType::Choice {
@@ -159,9 +242,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_input_errors() {
+    async fn closed_secret_source_errors() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(Vec::new()), &mut output);
+        let mut transport = visible_only(Cursor::new(Vec::new()), &mut output);
         let prompt = Prompt::new("Token", ResponseType::Secret);
         let result = transport.ask(&prompt).await;
         assert!(matches!(result, Err(TransportError::Closed)));
@@ -170,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn emit_renders_outcome_label() {
         let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::new(Cursor::new(Vec::new()), &mut output);
+        let mut transport = visible_only(Cursor::new(Vec::new()), &mut output);
         let outcome = Outcome::Completed {
             configured: vec![ConfiguredItem {
                 layer: "channel".into(),
