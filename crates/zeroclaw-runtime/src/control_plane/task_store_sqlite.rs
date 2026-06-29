@@ -567,6 +567,28 @@ impl TaskRegistry for SqliteTaskStore {
         .context("get goal task")
     }
 
+    async fn update_goal_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE goal_tasks
+                SET effective_token_limit = ?1,
+                    effective_cost_limit_usd = ?2
+              WHERE task_id = ?3",
+            params![
+                token_limit.map(|value| value as i64),
+                cost_limit_usd,
+                task_id
+            ],
+        )
+        .context("update goal effective limits")?;
+        Ok(())
+    }
+
     async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
         let conn = self.conn.lock();
         let (reason, description, blockers_json) = match pause {
@@ -818,6 +840,13 @@ mod tests {
             Some("waiting for operator")
         );
         assert_eq!(goal.blockers.len(), 1);
+
+        s.update_goal_limits("goal-1", Some(20_000), None)
+            .await
+            .unwrap();
+        let limited = s.get_goal_task("goal-1").await.unwrap().unwrap();
+        assert_eq!(limited.effective_token_limit, Some(20_000));
+        assert_eq!(limited.effective_cost_limit_usd, None);
 
         s.update_goal_pause("goal-1", None).await.unwrap();
         let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();

@@ -842,23 +842,39 @@ channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the
 
 # ── Goal mode runtime surfaces (#8303 / ADR-008) ─────────────────────
 goal-command-started = Goal `{$task_id}` started.
+goal-command-help = /goal start [--tokens=N|unlimited] [--cost=N|unlimited] <objective>
+    /goal status [task_id]
+    /goal budget --tokens=N|unlimited --cost=N|unlimited
+    /goal pause [reason]
+    /goal resume [task_id]
+    /goal cancel [task_id]
 goal-command-paused = Goal `{$task_id}` paused.
 goal-command-resumed = Goal `{$task_id}` resumed.
 goal-command-cancelled = Goal `{$task_id}` cancelled.
+goal-command-budget-updated = Goal `{$task_id}` budget updated.
 goal-command-status = Goal `{$task_id}` is {$status}: {$objective}
 goal-command-status-paused = Goal `{$task_id}` is {$status}: {$objective} (paused: {$reason})
 goal-terminal-reason-cancelled-by-controller = cancelled by goal controller
 goal-command-error-control-plane-unavailable = Goal mode requires a running control plane.
+goal-command-error-disabled = Goal mode is disabled by `goal.enabled = false`.
+goal-command-error-agent-disabled = Goal mode is disabled for this agent.
+goal-command-error-surface-disabled = Goal mode is not allowed on command surface `{$surface}`.
+goal-command-error-channel-disabled = Goal mode is not allowed on channel type `{$channel_type}`.
 goal-command-error-active-goal-exists = Goal `{$task_id}` is already active for this route and principal.
 goal-command-error-active-goal-conflict = A goal is already active for this route and principal.
 goal-command-error-active-goal-lookup-failed = Failed to check active goal state.
 goal-command-error-start-failed = Failed to start goal.
+goal-command-error-budget-failed = Failed to update goal `{$task_id}` budget.
 goal-command-error-status-failed = Failed to read goal status.
 goal-command-error-update-failed = Failed to update goal `{$task_id}`.
 goal-command-error-lookup-failed = Failed to read goal state.
-goal-command-error-missing-action = Goal command requires an action: start, status, pause, resume, or cancel.
+goal-command-error-missing-action = Goal command requires an action: start, status, budget, pause, resume, cancel, or help.
 goal-command-error-missing-objective = Goal start requires an objective.
-goal-command-error-unknown-action = Unknown goal action `{$action}`; use start, status, pause, resume, or cancel.
+goal-command-error-missing-budget = Goal budget requires `--tokens=N|unlimited`, `--cost=N|unlimited`, or both.
+goal-command-error-invalid-budget-flag = Invalid goal budget flag `{$flag}`; use `--tokens=N|unlimited` or `--cost=N|unlimited`.
+goal-command-error-invalid-token-budget = Invalid goal token budget `{$value}`; use a positive integer or `unlimited`.
+goal-command-error-invalid-cost-budget = Invalid goal cost budget `{$value}`; use a positive number or `unlimited`.
+goal-command-error-unknown-action = Unknown goal action `{$action}`; use start, status, budget, pause, resume, cancel, or help.
 goal-command-error-extension-missing = Goal extension missing for task `{$task_id}`.
 goal-command-error-already-terminal = Goal `{$task_id}` is already terminal ({$status}).
 goal-command-error-pause-failed = Failed to pause goal `{$task_id}`.
@@ -871,6 +887,11 @@ goal-command-error-wrong-route = Goal `{$task_id}` is not visible from this rout
 goal-command-error-wrong-principal = Goal `{$task_id}` is not visible to this principal.
 channel-goal-command-failed = Goal command failed: {$error}
 channel-goal-command-invalid = Invalid goal command: {$raw}
+channel-goal-start-work-prompt =
+    Durable goal {$task_id} has been admitted. Continue working on this active goal.
+
+    Objective:
+    {$objective}
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})

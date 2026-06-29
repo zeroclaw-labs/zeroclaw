@@ -64,6 +64,17 @@ impl CommandSpec {
     }
 }
 
+impl CommandSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Web => "web",
+            Self::Tui => "tui",
+            Self::Channel => "channel",
+        }
+    }
+}
+
 /// Parsed command token before surface-specific argument handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedCommandToken {
@@ -149,7 +160,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Goal,
         name: "goal",
         aliases: &[],
-        usage: "/goal <start|status|pause|resume|cancel> ...",
+        usage: "/goal <start|status|budget|pause|resume|cancel|help> ...",
         description_key: "command-goal-description",
         surfaces: CHANNEL_ONLY,
         execution: CommandExecution::GoalAdmission,

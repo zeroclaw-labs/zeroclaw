@@ -212,6 +212,16 @@ pub trait TaskRegistry: Send + Sync {
     ) -> anyhow::Result<Option<TaskRecord>>;
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
+    /// Replace the persisted effective budget limits for a goal.
+    ///
+    /// These are creation/update-time policy limits only. Consumed and
+    /// remaining usage stay derived from canonical usage ledger rows.
+    async fn update_goal_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<()>;
     async fn update_goal_pause(
         &self,
         task_id: &str,
