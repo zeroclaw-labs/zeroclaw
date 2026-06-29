@@ -18921,6 +18921,20 @@ impl Config {
                 "plugins.limits.max_memory_mb must be greater than 0; a zero cap rejects every plugin at instantiation"
             );
         }
+        if self.plugins.limits.max_table_elements == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_table_elements",
+                "plugins.limits.max_table_elements must be greater than 0; a zero ceiling rejects every plugin that allocates a table"
+            );
+        }
+        if self.plugins.limits.max_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_instances",
+                "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
+            );
+        }
 
         Ok(())
     }
@@ -21057,6 +21071,33 @@ enabled = true
             .expect_err("zero max_memory_mb must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.max_memory_mb"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_table_elements() {
+        let mut config = Config::default();
+        config.plugins.limits.max_table_elements = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_table_elements must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.limits.max_table_elements"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_instances() {
+        let mut config = Config::default();
+        config.plugins.limits.max_instances = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_instances must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.max_instances"),
             "error must name the offending path; got: {err}"
         );
     }
