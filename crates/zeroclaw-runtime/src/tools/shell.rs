@@ -412,40 +412,25 @@ impl Tool for ShellTool {
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
 
-        let drain_stdout = drain_capped(stdout_handle, MAX_OUTPUT_BYTES);
-        let drain_stderr = drain_capped(stderr_handle, MAX_OUTPUT_BYTES);
-        let wait_fut = async {
-            let status = child.wait().await?;
-            #[cfg(unix)]
-            group_guard.disarm();
-            let (out, err) = tokio::join!(
-                tokio::time::timeout(POST_EXIT_DRAIN, drain_stdout),
-                tokio::time::timeout(POST_EXIT_DRAIN, drain_stderr),
-            );
-            Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
-        };
+        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
+        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
 
         let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
-                Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
-                    let mut stdout = decode_output(&stdout_bytes);
-                    let mut stderr = decode_output(&stderr_bytes);
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                Ok(Ok(status)) => {
+                    #[cfg(unix)]
+                    group_guard.disarm();
+                    let (stdout_capture, stderr_capture) =
+                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    if stdout.len() > MAX_OUTPUT_BYTES {
-                        let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                        while b > 0 && !stdout.is_char_boundary(b) {
-                            b -= 1;
-                        }
-                        stdout.truncate(b);
-                        stdout.push_str("\n... [output truncated at 1MB]");
+                    let mut stdout = decode_output(&stdout_capture.bytes);
+                    let mut stderr = decode_output(&stderr_capture.bytes);
+
+                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
                     }
-                    if stderr.len() > MAX_OUTPUT_BYTES {
-                        let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                        while b > 0 && !stderr.is_char_boundary(b) {
-                            b -= 1;
-                        }
-                        stderr.truncate(b);
-                        stderr.push_str("\n... [stderr truncated at 1MB]");
+                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                     }
 
                     ToolResult {
@@ -458,18 +443,25 @@ impl Tool for ShellTool {
                         },
                     }
                 }
-                Ok(Err(e)) => ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute command: {e}")),
-                },
-                Err(_) => ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Command timed out after {timeout_secs}s and was killed"
-                    )),
-                },
+                Ok(Err(e)) => {
+                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to execute command: {e}")),
+                    }
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Command timed out after {timeout_secs}s and was killed"
+                        )),
+                    }
+                }
             };
 
         // The command ran inside an ephemeral workspace: any files it wrote are
@@ -487,30 +479,90 @@ impl Tool for ShellTool {
     }
 }
 
-async fn drain_capped<R>(reader: Option<R>, cap: usize) -> Vec<u8>
+struct DrainHandle {
+    task: tokio::task::JoinHandle<()>,
+    output: Arc<std::sync::Mutex<DrainOutput>>,
+}
+
+#[derive(Clone, Default)]
+struct DrainOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
 where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+    let shared = Arc::clone(&output);
+    let task = zeroclaw_spawn::spawn!(async move {
+        drain_capped_into(reader, cap, shared).await;
+    });
+    DrainHandle { task, output }
+}
+
+async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
+    if tokio::time::timeout(POST_EXIT_DRAIN, &mut drain.task)
+        .await
+        .is_err()
+    {
+        drain.task.abort();
+        let _ = drain.task.await;
+    }
+
+    drain
+        .output
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or_default()
+}
+
+async fn abort_drain(drain: DrainHandle) {
+    drain.task.abort();
+    let _ = drain.task.await;
+}
+
+async fn drain_capped_into<R>(
+    reader: Option<R>,
+    cap: usize,
+    output: Arc<std::sync::Mutex<DrainOutput>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
-        return Vec::new();
+        return;
     };
-    let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                let take = n.min(cap.saturating_sub(buf.len()).max(1));
-                buf.extend_from_slice(&chunk[..take]);
-                if buf.len() >= cap {
+                let Ok(mut capture) = output.lock() else {
                     break;
+                };
+                let remaining = cap.saturating_sub(capture.bytes.len());
+                if remaining > 0 {
+                    let take = n.min(remaining);
+                    capture.bytes.extend_from_slice(&chunk[..take]);
+                    capture.truncated |= take < n;
+                } else {
+                    capture.truncated = true;
                 }
             }
             Err(_) => break,
         }
     }
-    buf
+}
+
+fn append_truncation_marker(output: &mut String, marker: &str) {
+    let mut boundary = MAX_OUTPUT_BYTES.min(output.len());
+    while boundary > 0 && !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str(marker);
 }
 
 /// Compose the child `PATH` for an Android shell: the platform tool dirs
@@ -580,6 +632,16 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         })
     }
@@ -1184,6 +1246,101 @@ mod tests {
         assert_eq!(
             MAX_OUTPUT_BYTES, 1_048_576,
             "max output must be 1 MB to prevent OOM"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_drains_large_stdout_while_child_runs() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"x\" }'"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stdout command should not time out: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.output.len(),
+            200_000,
+            "stdout should be drained while the child is still running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_stdout_truncated_after_limit() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stdout command should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.ends_with("\n... [output truncated at 1MB]"),
+            "stdout should retain the truncation marker after the drain cap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_stderr_truncated_after_limit() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }' 1>&2"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stderr command should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .ends_with("\n... [stderr truncated at 1MB]"),
+            "stderr should retain the truncation marker after the drain cap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_output_when_grandchild_holds_pipe_open() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({"command": "printf done; (sleep 1) &"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "main shell process should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "output drained before EOF should be preserved when a grandchild holds the pipe open"
         );
     }
 

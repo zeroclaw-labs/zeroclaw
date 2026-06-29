@@ -306,6 +306,30 @@ mod tests {
         assert!(required.contains(&serde_json::Value::String("message".to_string())));
     }
 
+    #[test]
+    fn pushover_schema_overlaps_standard_notify_shape() {
+        let tool = PushoverTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+        );
+        let pushover_schema = tool.parameters_schema();
+        let pushover_props = pushover_schema["properties"].as_object().unwrap();
+        let notify_capability = crate::node_capabilities::notification_capabilities()
+            .into_iter()
+            .find(|cap| cap.name == "system.notify")
+            .unwrap();
+        let notify_props = notify_capability.parameters["properties"]
+            .as_object()
+            .unwrap();
+
+        assert!(pushover_props.contains_key("title"));
+        assert!(pushover_props.contains_key("message"));
+        assert!(pushover_props.contains_key("priority"));
+        assert!(notify_props.contains_key("title"));
+        assert!(notify_props.contains_key("body"));
+        assert!(notify_props.contains_key("priority"));
+    }
+
     #[tokio::test]
     async fn credentials_parsed_from_env_file() {
         let tmp = TempDir::new().unwrap();

@@ -727,6 +727,35 @@ export interface SkillDocument {
 export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
 
 /**
+ * A lower-precedence same-name skill that a winning skill shadowed (it did
+ * not load). `origin` is the loser's origin tag (e.g. `"bundle"`).
+ */
+export interface ShadowedSkillEntry {
+  name: string;
+  origin: string;
+}
+
+/**
+ * A candidate skill the audited resolver dropped (failed its security audit,
+ * was unauditable, or its manifest failed to parse). Surfaced so operators
+ * can tell "no skills configured" apart from "all skills failed audit".
+ */
+export interface DroppedSkillEntry {
+  name: string;
+  origin: string;
+  /** Stable machine-readable reason tag. */
+  reason_kind:
+    | "audit_findings"
+    | "audit_error"
+    | "manifest_parse_error"
+    | string;
+  /** Human-readable detail (the audit summary / error text). */
+  reason: string;
+  /** On-disk directory of the dropped skill, when known. */
+  directory?: string | null;
+}
+
+/**
  * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
  * (not just the configured bundles). Returned by {@link listAgentSkills}.
  */
@@ -743,6 +772,8 @@ export interface AgentSkillEntry {
   /** True only when `origin === 'bundle'` — i.e. the skill is editable via
    *  the bundle endpoints and can be expanded for detail. */
   editable: boolean;
+  /** Lower-precedence same-name skills this one shadows. Empty normally. */
+  shadowed?: ShadowedSkillEntry[];
 }
 
 export interface SkillCreateRequest {
@@ -770,7 +801,11 @@ export function listSkillsInBundle(
  */
 export function listAgentSkills(
   alias: string,
-): Promise<{ agent: string; skills: AgentSkillEntry[] }> {
+): Promise<{
+  agent: string;
+  skills: AgentSkillEntry[];
+  dropped?: DroppedSkillEntry[];
+}> {
   return apiFetch(`/api/agents/${encodeURIComponent(alias)}/skills`);
 }
 
@@ -1660,8 +1695,9 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+export function getTools(agent?: string): Promise<ToolSpec[]> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
     (data) => {
       const result = unwrapField(data, "tools");
       return Array.isArray(result) ? result : [];

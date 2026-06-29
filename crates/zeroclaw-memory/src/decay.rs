@@ -150,4 +150,17 @@ mod tests {
         apply_time_decay(&mut entries, 7.0);
         assert_eq!(entries[0].score, Some(0.9));
     }
+
+    #[test]
+    fn future_timestamp_does_not_boost_or_decay_score() {
+        let mut entries = vec![make_entry(
+            MemoryCategory::Conversation,
+            Some(0.75),
+            "9999-12-31T00:00:00Z",
+        )];
+
+        apply_time_decay(&mut entries, 7.0);
+
+        assert_eq!(entries[0].score, Some(0.75));
+    }
 }

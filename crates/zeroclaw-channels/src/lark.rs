@@ -2755,6 +2755,15 @@ impl Channel for LarkChannel {
         self.get_tenant_access_token().await.is_ok()
     }
 
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the Lark/Feishu Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn add_reaction(
         &self,
         _channel_id: &str,
