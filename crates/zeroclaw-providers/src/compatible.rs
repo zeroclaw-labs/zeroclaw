@@ -1951,7 +1951,13 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+        // Omit tool_choice when there are no tool entries. vLLM 0.19+ and
+        // spec-compliant validators reject `tool_choice` without a non-empty
+        // `tools` field ("When using `tool_choice`, `tools` must be set."),
+        // which breaks bots running with max_tool_iterations = 0 or no MCP
+        // servers. Gate on `has_tool_entries` (Some AND non-empty), not on
+        // `tools.is_some()`.
+        let tool_choice = has_tool_entries.then(|| "auto".to_string());
 
         NativeChatRequest {
             model: model.to_string(),
@@ -3056,7 +3062,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         include_usage: true,
                     }),
                     tools: tools.clone(),
-                    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                    // Guard on the converted tools being non-empty (not just
+                    // `has_tools`): convert_tool_specs_for_model can sanitize a
+                    // non-empty input down to None, and tool_choice without a
+                    // tools field is an HTTP 400 on vLLM 0.19+.
+                    tool_choice: tools
+                        .as_ref()
+                        .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
                     max_tokens: provider.max_tokens,
                     extra_body: provider.extra_body.clone(),
                 })
@@ -3468,6 +3480,56 @@ mod tests {
     fn creates_without_key() {
         let p = make_model_provider("test", "https://example.com", None);
         assert!(p.credential.is_none());
+    }
+
+    // Regression: vLLM 0.19+ and spec-compliant validators reject
+    // `tool_choice` when `tools` is absent or empty (HTTP 400:
+    // "When using `tool_choice`, `tools` must be set."). The request builders
+    // must omit `tool_choice` whenever the converted tool list is empty.
+    #[test]
+    fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+
+        // Assert on the structured value rather than substring-matching the
+        // serialized string: a JSON-shape or escaping change could otherwise
+        // flip these assertions silently. Inspect the `tool_choice` key
+        // directly.
+
+        // None tools → no tool_choice key.
+        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is None; got: {value}"
+        );
+
+        // Empty tools vec → still no tool_choice key.
+        let req_empty =
+            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let value_empty = serde_json::to_value(&req_empty).unwrap();
+        assert!(
+            value_empty.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value_empty}"
+        );
+    }
+
+    #[test]
+    fn build_native_tool_chat_request_sets_tool_choice_when_tools_present() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "description": "", "parameters": {} }
+        })];
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "tool_choice must be 'auto' when tools are present; got: {value}"
+        );
     }
 
     #[test]
