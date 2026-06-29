@@ -13848,8 +13848,11 @@ pub struct FilesystemConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub max_content_bytes: Option<usize>,
-    /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`) despite the
-    /// deny-broad-roots default. Off unless explicitly enabled.
+    /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
+    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
+    /// paths in SOP payloads and flood the watcher with events. Off unless
+    /// explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -13879,7 +13882,9 @@ impl Default for FilesystemConfig {
     }
 }
 
-const FILESYSTEM_BROAD_ROOTS: [&str; 4] = ["/", "/home", "/etc", "/var"];
+const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
+    "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
+];
 
 impl FilesystemConfig {
     /// Validate the filesystem listener configuration.
@@ -20260,13 +20265,18 @@ mod tests {
 
     #[test]
     async fn filesystem_validate_rejects_broad_root_by_default() {
-        let cfg = FilesystemConfig {
-            enabled: true,
-            paths: vec!["/etc".into()],
-            ..FilesystemConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("broad system root"));
+        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+        }
     }
 
     #[test]
