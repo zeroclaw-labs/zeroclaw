@@ -72,7 +72,7 @@ impl SerialTransport {
             send_request(&mut port, cmd, args),
         )
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
@@ -80,6 +80,7 @@ impl SerialTransport {
                     .with_attrs(::serde_json::json!({
                         "command": cmd,
                         "timeout_secs": SERIAL_TIMEOUT_SECS,
+                        "error": format!("{e}"),
                     })),
                 "serial peripheral request timed out"
             );
