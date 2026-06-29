@@ -343,6 +343,10 @@ You do not need to manually verify Docker or the distribution channels
 unless a job in the workflow run shows red. Check the workflow run summary; if
 all jobs are green, you are done.
 
+Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
+published artifacts can follow
+[Release artifact verification](./release-verification.md).
+
 ---
 
 ## Step 7: Versioned documentation deployment

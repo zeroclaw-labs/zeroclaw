@@ -170,6 +170,126 @@ fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
     if ids.is_empty() { None } else { Some(ids) }
 }
 
+/// Strip `tool_calls` entries from assistant messages when no following
+/// `tool` message pairs with the call's id.
+///
+/// This complements [`remove_orphaned_tool_messages`], which only handles the
+/// inverse case (tool messages without a matching assistant). Unpaired
+/// `tool_use` blocks in assistant messages cause Bedrock/Anthropic to reject
+/// the next request with: "Expected toolResult blocks at messages.N.content
+/// for the following Ids: tooluse_*". The usual trigger is the agent loop
+/// hitting `max_tool_iterations` immediately after emitting a tool_use but
+/// before the runner recorded the tool_result.
+///
+/// Behaviour:
+/// * If SOME of an assistant's `tool_calls` ids pair with later `tool`
+///   messages and some do not, the unpaired entries are removed and the
+///   retained ones stay inside the JSON envelope.
+/// * If NONE of the `tool_calls` pair, the orphaned dispatch is reduced to a
+///   plain *text* turn carrying whatever assistant text it had. When there is
+///   no such text (the canonical `{"content":null,"tool_calls":[...]}`
+///   early-exit shape), the assistant message is dropped entirely — letting
+///   [`remove_orphaned_tool_messages`] and the provider converters backfill
+///   any role gap. Removing only the `tool_calls` key would leave a degenerate
+///   `{"content":null}` envelope that the provider converters (anthropic.rs /
+///   openai.rs) re-emit verbatim as literal assistant text, corrupting the
+///   exact graceful-shutdown request this sweep is meant to clean.
+///
+/// Returns the number of assistant messages that were rewritten or dropped
+/// because at least one of their `tool_calls` was unpaired.
+pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatMessage>) -> usize {
+    // Single reverse scan. `seen_tool_ids` accumulates the `tool_call_id`s of
+    // tool-role messages encountered *after* the current index (in original
+    // order), which is exactly the "answered later" relation an assistant's
+    // tool_calls must satisfy. Walking in reverse keeps this O(n) — no
+    // per-index HashSet clone — and makes an in-place `Vec::remove` safe for a
+    // fully-orphaned assistant, since every index past the current one has
+    // already been processed.
+    let mut seen_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stripped = 0usize;
+
+    let mut idx = messages.len();
+    while idx > 0 {
+        idx -= 1;
+
+        if messages[idx].role == "tool" {
+            if let Some(id) = extract_tool_call_id(&messages[idx].content) {
+                seen_tool_ids.insert(id);
+            }
+            continue;
+        }
+        if messages[idx].role != "assistant" || !messages[idx].content.contains("tool_calls") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&messages[idx].content)
+        else {
+            continue;
+        };
+        let Some(calls) = value.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+
+        let paired_calls: Vec<serde_json::Value> = calls
+            .iter()
+            .filter(|call| {
+                call.get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| seen_tool_ids.contains(id))
+            })
+            .cloned()
+            .collect();
+
+        if paired_calls.len() == calls.len() {
+            continue; // every tool_call is paired — nothing to do
+        }
+
+        let orphan_ids: Vec<String> = calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .filter(|id| !seen_tool_ids.contains(id))
+            .collect();
+
+        if paired_calls.is_empty() {
+            // Every tool_call is orphaned. Salvage any real assistant text into
+            // a bare text turn; otherwise drop the message so no degenerate
+            // envelope survives. A *bare* string (not a re-serialised
+            // `{"content":...}` object) is required — the converters only treat
+            // the un-enveloped string as plain assistant text.
+            let salvaged_text = value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string);
+            match salvaged_text {
+                Some(text) => messages[idx].content = text,
+                None => {
+                    messages.remove(idx);
+                }
+            }
+        } else {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert(
+                    "tool_calls".to_string(),
+                    serde_json::Value::Array(paired_calls),
+                );
+            }
+            messages[idx].content = value.to_string();
+        }
+        stripped += 1;
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "orphan_ids": orphan_ids })),
+            "Stripped unpaired tool_calls from assistant history message — likely a \
+             max_tool_iterations early exit"
+        );
+    }
+    stripped
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -183,6 +303,134 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_orphaned_tool_calls_from_assistants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_orphan_tool_calls_drops_tool_calls_when_no_result_follows() {
+        // Canonical case: loop hit max_tool_iterations after the assistant
+        // emitted a tool_use but before any tool_result landed. The Bedrock
+        // converter would then receive an orphaned tool_use and AWS returns:
+        // "Expected toolResult blocks at messages.N.content".
+        //
+        // With assistant text present, the orphaned dispatch is salvaged to a
+        // *bare* text turn — not a re-serialised `{"content":...}` envelope,
+        // which the provider converters would emit verbatim as literal text.
+        let tool_calls_assistant = r#"{"content":"looking it up","tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("user", "search for X"),
+            msg("assistant", tool_calls_assistant),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        assert_eq!(
+            messages.len(),
+            2,
+            "message with salvageable text is retained"
+        );
+        assert_eq!(
+            messages[1].content, "looking it up",
+            "survivor must be bare assistant text, not a JSON envelope; got: {}",
+            messages[1].content
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&messages[1].content).is_err(),
+            "salvaged text must not parse back as a JSON object"
+        );
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_drops_message_when_content_null_all_orphan() {
+        // The exact max_tool_iterations early-exit shape: a canonical tool-call
+        // assistant `{"content":null,"tool_calls":[...]}` where every call is
+        // orphaned. Removing only the `tool_calls` key would leave a degenerate
+        // `{"content":null}` envelope, which anthropic.rs / openai.rs re-emit
+        // verbatim as literal assistant text (corrupting the graceful-shutdown
+        // request). The whole assistant message must be dropped instead.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("user", "search for X"),
+            msg("assistant", tool_calls_assistant),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user"],
+            "the content-null all-orphan assistant must be dropped, leaving no \
+             {{\"content\":null}} survivor"
+        );
+        assert!(
+            !messages.iter().any(|m| m.content.contains("content")),
+            "no degenerate envelope may survive: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_drops_message_when_content_empty_all_orphan() {
+        // Same as above but with empty-string content rather than null — also
+        // degenerate, also dropped.
+        let tool_calls_assistant = r#"{"content":"","tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
+        let mut messages = vec![msg("user", "go"), msg("assistant", tool_calls_assistant)];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user"]
+        );
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_retains_paired_calls() {
+        let tool_calls_assistant =
+            r#"{"content":null,"tool_calls":[{"id":"toolu_OK","name":"search","arguments":"{}"}]}"#;
+        let tool_result = r#"{"content":"result","tool_call_id":"toolu_OK"}"#;
+        let mut messages = vec![
+            msg("user", "q"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", tool_result),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 0, "paired tool_call must not be stripped");
+        assert!(messages[1].content.contains("toolu_OK"));
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_partial_keeps_paired_drops_orphans() {
+        // One paired, one orphaned — the paired entry survives, orphan goes.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_OK","name":"a","arguments":"{}"},{"id":"toolu_ORPHAN","name":"b","arguments":"{}"}]}"#;
+        let tool_result = r#"{"content":"result","tool_call_id":"toolu_OK"}"#;
+        let mut messages = vec![
+            msg("user", "q"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", tool_result),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+        let calls = parsed.get("tool_calls").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].get("id").and_then(|v| v.as_str()),
+            Some("toolu_OK")
+        );
+        assert!(!messages[1].content.contains("toolu_ORPHAN"));
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_no_op_on_plain_assistants() {
+        let mut messages = vec![
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "how are you"),
+            msg("assistant", "great"),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 0);
+        assert_eq!(messages.len(), 4);
     }
 
     // -----------------------------------------------------------------------

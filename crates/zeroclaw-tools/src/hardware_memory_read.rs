@@ -205,3 +205,63 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn execute_with_empty_boards_returns_error() {
+        let tool = HardwareMemoryReadTool::new(Vec::new());
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("No peripherals configured"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_unsupported_board_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["arduino-uno".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Memory read only supports"))
+        );
+    }
+
+    #[cfg(not(feature = "probe"))]
+    #[tokio::test]
+    async fn execute_without_probe_feature_returns_build_hint() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("requires probe feature"))
+        );
+    }
+
+    #[cfg(feature = "probe")]
+    #[tokio::test]
+    async fn execute_probe_attach_failure_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("probe-rs read failed"))
+        );
+    }
+}
