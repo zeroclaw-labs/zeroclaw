@@ -3666,9 +3666,7 @@ async fn main() -> Result<()> {
                         // is held for the duration of the REPL loop and
                         // dropped at scope exit, restoring the original
                         // behavior of stdin.
-                        let mut stdin = std::io::stdin()
-                            .lock()
-                            .take((STDIN_LINE_CAP + 1) as u64);
+                        let mut stdin = std::io::stdin().lock().take((STDIN_LINE_CAP + 1) as u64);
                         let mut line = String::new();
                         loop {
                             eprint!("> ");
