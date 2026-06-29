@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
+use zeroclaw_api::elicitation::ElicitationCapabilities;
 pub use zeroclaw_api::jsonrpc::RpcOutbound;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -112,6 +113,13 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Most-recently-seen `clientCapabilities.elicitation` block from
+    /// `initialize`. ACP `initialize` happens once per connection,
+    /// before any `session/new`, but some clients legally re-send
+    /// `initialize`; `RwLock` honours "1 writer (initialize), N readers
+    /// (session/new)" with last-write-wins, and matches the
+    /// `std::sync::*` family used elsewhere in this file.
+    client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
 
 impl AcpServer {
@@ -165,6 +173,7 @@ impl AcpServer {
             canvas_store: None,
             sop_engine: None,
             sop_audit: None,
+            client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
     }
 
@@ -438,7 +447,13 @@ impl AcpServer {
 
     // ── Method handlers ──────────────────────────────────────────
 
-    fn handle_initialize(&self, _params: &Value) -> RpcResult {
+    fn handle_initialize(&self, params: &Value) -> RpcResult {
+        let elicitation = params
+            .get("clientCapabilities")
+            .and_then(|c| c.get("elicitation"));
+        *self.client_elicitation_caps.write().unwrap() =
+            ElicitationCapabilities::from_value(elicitation);
+
         let default_model = self
             .config
             .providers
@@ -619,6 +634,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
+            *self.client_elicitation_caps.read().unwrap(),
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
@@ -855,6 +871,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
+            *self.client_elicitation_caps.read().unwrap(),
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
@@ -1065,6 +1082,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
+            *self.client_elicitation_caps.read().unwrap(),
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
@@ -2325,6 +2343,36 @@ mod tests {
         );
         assert!(result.get("serverInfo").is_none());
         assert!(result.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn initialize_caches_client_elicitation_capabilities() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let _ = server
+            .handle_initialize(&serde_json::json!({
+                "protocolVersion": "1.0",
+                "clientCapabilities": {
+                    "elicitation": { "form": {} }
+                }
+            }))
+            .unwrap();
+        let caps = *server.client_elicitation_caps.read().unwrap();
+        assert!(caps.form);
+        assert!(!caps.url);
+    }
+
+    #[test]
+    fn initialize_without_elicitation_leaves_default_caps() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let _ = server
+            .handle_initialize(&serde_json::json!({
+                "protocolVersion": "1.0",
+                "clientCapabilities": {}
+            }))
+            .unwrap();
+        let caps = *server.client_elicitation_caps.read().unwrap();
+        assert!(!caps.form);
+        assert!(!caps.url);
     }
 
     #[test]

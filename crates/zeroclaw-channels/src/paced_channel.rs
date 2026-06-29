@@ -495,6 +495,19 @@ impl Channel for PacedChannel {
         self.inner.request_choice(question, choices, timeout).await
     }
 
+    async fn request_multi_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        min_items: usize,
+        max_items: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<String>>> {
+        self.inner
+            .request_multi_choice(question, choices, min_items, max_items, timeout)
+            .await
+    }
+
     fn supports_free_form_ask(&self) -> bool {
         self.inner.supports_free_form_ask()
     }
