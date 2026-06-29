@@ -4466,7 +4466,6 @@ mod tests {
             !json.contains("\"name\""),
             "name should be omitted for non-tool messages"
         );
->>>>>>> 28df294ac (fix(providers): add tests for native tool-result name lookup)
     }
 
     #[test]
