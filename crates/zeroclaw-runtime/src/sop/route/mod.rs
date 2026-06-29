@@ -11,7 +11,7 @@ pub enum NextStep {
     Retry,
     Complete,
     Fail(String),
-    Wait,
+    Wait(u32),
 }
 
 pub struct RouteCtx<'a> {
@@ -43,27 +43,23 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     }
 
-    let next_step = current
-        .routing
-        .next
-        .unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
-    if next_step > ctx.run.total_steps {
-        return NextStep::Complete;
-    }
-    if ctx.sop.steps.iter().all(|step| step.number != next_step) {
-        return NextStep::Fail(format!("step {next_step} does not exist"));
-    }
+    let explicit_next = current.routing.next;
+    let next_step = explicit_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
+    let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
+        return if explicit_next.is_none() && next_step > ctx.run.total_steps {
+            NextStep::Complete
+        } else {
+            NextStep::Fail(format!("step {next_step} does not exist"))
+        };
+    };
     if !guard::within_visit_bound(ctx.run, next_step, ctx.max_step_visits) {
         return NextStep::Fail(format!("step {next_step} visit limit reached"));
     }
 
-    let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
-        return NextStep::Fail(format!("step {next_step} does not exist"));
-    };
     if eligible(step, ctx.run_data) {
         NextStep::Step(next_step)
     } else {
-        NextStep::Wait
+        NextStep::Wait(next_step)
     }
 }
 
@@ -167,6 +163,6 @@ mod tests {
             max_step_visits: 256,
         };
 
-        assert_eq!(resolve_next(&ctx), NextStep::Wait);
+        assert_eq!(resolve_next(&ctx), NextStep::Wait(2));
     }
 }

@@ -460,6 +460,13 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
+    /// Routing selected a step whose dependencies are not yet satisfied.
+    Pending {
+        run_id: String,
+        sop_name: String,
+        step: u32,
+        reason: String,
+    },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
     /// The SOP run failed.
