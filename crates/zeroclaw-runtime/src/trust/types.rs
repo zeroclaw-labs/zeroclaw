@@ -267,9 +267,13 @@ mod tests {
             t.record_correction("d", CorrectionType::UserOverride, "x");
         }
         let score = t.get_score("d");
-        if score < 0.5 {
-            assert!(t.check_regression("d").is_some());
-        }
+        // Precondition: if this fires, config defaults changed and the test needs updating.
+        assert!(
+            score < t.config().regression_threshold,
+            "expected score {score} to be below regression_threshold {}",
+            t.config().regression_threshold
+        );
+        assert!(t.check_regression("d").is_some());
     }
 
     #[test]
@@ -278,11 +282,14 @@ mod tests {
         for _ in 0..20 {
             t.record_correction("d", CorrectionType::SopDeviation, "x");
         }
-        // If score dropped below threshold, autonomy should be reduced
-        if t.check_regression("d").is_some() {
-            assert_eq!(t.get_effective_autonomy("d", "full"), "supervised");
-            assert_eq!(t.get_effective_autonomy("d", "supervised"), "read_only");
-            assert_eq!(t.get_effective_autonomy("d", "read_only"), "read_only");
-        }
+        // Precondition: score must be below threshold; if not, config defaults changed.
+        assert!(
+            t.get_score("d") < t.config().regression_threshold,
+            "expected score to be below regression_threshold after 20 corrections"
+        );
+        assert!(t.check_regression("d").is_some());
+        assert_eq!(t.get_effective_autonomy("d", "full"), "supervised");
+        assert_eq!(t.get_effective_autonomy("d", "supervised"), "read_only");
+        assert_eq!(t.get_effective_autonomy("d", "read_only"), "read_only");
     }
 }
