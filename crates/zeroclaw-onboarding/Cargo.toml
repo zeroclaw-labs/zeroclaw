@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Chat onboarding flow for ZeroClaw"
+publish = false
+
+[dependencies]
+zeroclaw-config.workspace = true
+zeroclaw-runtime.workspace = true
