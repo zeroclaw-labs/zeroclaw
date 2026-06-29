@@ -24793,6 +24793,8 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
             },
             CancellationToken::new(),
         )
