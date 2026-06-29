@@ -135,9 +135,10 @@ pub fn global_pricing_rates(model: &str) -> Option<(f64, f64, f64)> {
 }
 
 /// Load `<data_dir>/pricing.json` into the process-global catalog. Returns the
-/// number of priced models loaded. Network/IO tolerant: a missing or corrupt
-/// file leaves the existing catalog in place and returns its current size
-/// (never fatal — an unpriced run simply reports `$0`).
+/// number of priced models loaded. A MISSING file clears the global catalog
+/// (so removing `pricing.json` reverts unmatched models to `$0` on the next
+/// reload, even same-PID); a corrupt or otherwise unreadable file keeps the
+/// previous catalog (never fatal — an unpriced run simply reports `$0`).
 pub fn load_global_pricing_catalog(data_dir: &Path) -> usize {
     let path = data_dir.join("pricing.json");
     match std::fs::read_to_string(&path) {
@@ -172,13 +173,59 @@ pub fn load_global_pricing_catalog(data_dir: &Path) -> usize {
                 global_pricing_catalog().priced_len()
             }
         },
-        Err(_) => global_pricing_catalog().priced_len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No catalog file: clear any previously-loaded global catalog so removing
+            // <data_dir>/pricing.json reverts unmatched models to $0 on the next reload
+            // (same PID), honoring the documented rollback contract.
+            set_global_pricing_catalog(GlobalPricingCatalog::default());
+            0
+        }
+        Err(error) => {
+            // Present but unreadable (permissions, a directory, transient I/O): keep the
+            // previous catalog rather than silently dropping configured rates.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": format!("{error}")
+                    })),
+                "Pricing catalog unreadable; keeping previous rates"
+            );
+            global_pricing_catalog().priced_len()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_file_clears_global_catalog_on_same_process_reload() {
+        // Rollback contract: deleting <data_dir>/pricing.json must revert unmatched
+        // models to $0 on the next reload, even in the same PID (the global catalog is
+        // process-global across config reloads).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("pricing.json");
+        std::fs::write(
+            &path,
+            r#"{"models":{"acme/rollback-probe":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":2.0}}}"#,
+        )
+        .unwrap();
+        load_global_pricing_catalog(tmp.path());
+        assert!(
+            global_pricing_rates("acme/rollback-probe").is_some(),
+            "valid catalog should load"
+        );
+        std::fs::remove_file(&path).unwrap();
+        load_global_pricing_catalog(tmp.path());
+        assert!(
+            global_pricing_rates("acme/rollback-probe").is_none(),
+            "removing pricing.json must clear stale rates on same-process reload"
+        );
+    }
 
     fn catalog_from(json: &str) -> GlobalPricingCatalog {
         let mut c: GlobalPricingCatalog = serde_json::from_str(json).unwrap();
