@@ -3,6 +3,7 @@
 pub mod agent_responder;
 pub mod cli_transport;
 pub mod driver;
+pub mod i18n;
 pub mod llm_transport;
 pub mod phrasing;
 pub mod spec_builder;
