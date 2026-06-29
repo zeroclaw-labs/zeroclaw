@@ -410,11 +410,12 @@ fn build_payload(
                         ::serde_json::json!(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
                     );
                 }
-                if let Some(hash) = hash_file(path, config.max_content_bytes) {
+                let content_cap = config.max_content_bytes.unwrap_or(usize::MAX);
+                if let Some(hash) = hash_file(path, content_cap) {
                     obj.insert("hash".into(), ::serde_json::json!(hash));
                 }
                 if config.read_content
-                    && let Some(content) = read_capped(path, config.max_content_bytes)
+                    && let Some(content) = read_capped(path, content_cap)
                 {
                     obj.insert("content".into(), ::serde_json::json!(content));
                 }
@@ -653,7 +654,7 @@ mod tests {
         std::fs::write(&file, b"{\"id\":1}").unwrap();
         let cfg = FilesystemConfig {
             read_content: true,
-            max_content_bytes: 1024,
+            max_content_bytes: Some(1024),
             ..FilesystemConfig::default()
         };
         let payload = build_payload(FilesystemEventKind::Created, &file, None, &cfg);
@@ -720,7 +721,7 @@ mod tests {
 
         let cfg = FilesystemConfig {
             read_content: true,
-            max_content_bytes: 1024,
+            max_content_bytes: Some(1024),
             follow_symlinks: false,
             paths: vec![watched.path().to_string_lossy().to_string()],
             ..FilesystemConfig::default()
@@ -748,7 +749,7 @@ mod tests {
 
         let cfg = FilesystemConfig {
             read_content: true,
-            max_content_bytes: 1024,
+            max_content_bytes: Some(1024),
             follow_symlinks: true,
             paths: vec![watched.path().to_string_lossy().to_string()],
             ..FilesystemConfig::default()
@@ -771,7 +772,7 @@ mod tests {
 
         let cfg = FilesystemConfig {
             read_content: true,
-            max_content_bytes: 1024,
+            max_content_bytes: Some(1024),
             follow_symlinks: true,
             paths: vec![watched.path().to_string_lossy().to_string()],
             ..FilesystemConfig::default()
