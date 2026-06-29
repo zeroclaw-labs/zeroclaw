@@ -1,15 +1,5 @@
+use crate::response_type::{PromptSigil, ResponseType, ResponseValue};
 use async_trait::async_trait;
-use zeroclaw_runtime::response_type::{PromptSigil, ResponseType, ResponseValue};
-
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    #[error("transport closed before the prompt was answered")]
-    Closed,
-    #[error("response type mismatch: expected {expected:?}")]
-    ResponseTypeMismatch { expected: ResponseType },
-}
-
-pub type TransportResult<T> = Result<T, TransportError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
@@ -37,33 +27,75 @@ impl Prompt {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TransportError {
+    #[error("transport closed before the prompt was answered")]
+    Closed,
+    #[error("response type mismatch: expected {expected:?}")]
+    ResponseTypeMismatch { expected: ResponseType },
+}
+
+pub type TransportResult<T> = Result<T, TransportError>;
+
 #[async_trait]
-pub trait OnboardingTransport: Send {
+pub trait FlowTransport: Send {
     async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue>;
     async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredItem {
+    pub layer: String,
+    pub instance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    ValidationError { field: String, message: String },
-    AgentCreated { alias: String },
+    Completed { configured: Vec<ConfiguredItem> },
     Cancelled,
+    Failed {
+        layer: String,
+        instance: String,
+        reason: String,
+    },
+}
+
+impl Outcome {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Outcome::Cancelled => "cancelled".to_string(),
+            Outcome::Completed { configured } => {
+                let summary = configured
+                    .iter()
+                    .map(|item| format!("{}:{}", item.layer, item.instance))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("completed: {summary}")
+            }
+            Outcome::Failed {
+                layer,
+                instance,
+                reason,
+            } => format!("failed: {layer}:{instance}: {reason}"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_type::{ResponseType, SecretValue};
     use std::collections::VecDeque;
-    use zeroclaw_runtime::response_type::SecretValue;
 
-    struct ScriptedTransport {
+    struct RoutingTransport {
         scripted: VecDeque<ResponseValue>,
         seen_secret_via_secret_channel: bool,
         seen_secret_in_visible_text: bool,
         emitted: Vec<Outcome>,
     }
 
-    impl ScriptedTransport {
+    impl RoutingTransport {
         fn new(scripted: Vec<ResponseValue>) -> Self {
             Self {
                 scripted: scripted.into(),
@@ -75,12 +107,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl OnboardingTransport for ScriptedTransport {
+    impl FlowTransport for RoutingTransport {
         async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
-            let answer = self
-                .scripted
-                .pop_front()
-                .ok_or(TransportError::Closed)?;
+            let answer = self.scripted.pop_front().ok_or(TransportError::Closed)?;
             if prompt.routes_secret() {
                 if let ResponseValue::Secret(_) = &answer {
                     self.seen_secret_via_secret_channel = true;
@@ -97,7 +126,7 @@ mod tests {
         }
     }
 
-    async fn drive(transport: &mut dyn OnboardingTransport) -> Vec<ResponseValue> {
+    async fn drive(transport: &mut dyn FlowTransport) -> Vec<ResponseValue> {
         let sequence = [
             Prompt::new("Enable telemetry?", ResponseType::YesNo),
             Prompt::new("API key", ResponseType::Secret),
@@ -107,12 +136,6 @@ mod tests {
         for prompt in sequence {
             answers.push(transport.ask(&prompt).await.unwrap());
         }
-        transport
-            .emit(&Outcome::AgentCreated {
-                alias: "scout".into(),
-            })
-            .await
-            .unwrap();
         answers
     }
 
@@ -125,26 +148,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_transports_drive_identical_flow() {
-        let mut first = ScriptedTransport::new(scripted_answers());
-        let mut second = ScriptedTransport::new(scripted_answers());
-
-        let first_answers = drive(&mut first).await;
-        let second_answers = drive(&mut second).await;
-
-        assert_eq!(first_answers, second_answers);
-        assert_eq!(first.emitted, second.emitted);
-        assert_eq!(
-            first.emitted,
-            vec![Outcome::AgentCreated {
-                alias: "scout".into()
-            }]
-        );
+    async fn both_transports_drive_identical_answers() {
+        let mut first = RoutingTransport::new(scripted_answers());
+        let mut second = RoutingTransport::new(scripted_answers());
+        assert_eq!(drive(&mut first).await, drive(&mut second).await);
     }
 
     #[tokio::test]
     async fn secret_prompt_routes_through_secret_channel() {
-        let mut transport = ScriptedTransport::new(scripted_answers());
+        let mut transport = RoutingTransport::new(scripted_answers());
         drive(&mut transport).await;
         assert!(transport.seen_secret_via_secret_channel);
         assert!(!transport.seen_secret_in_visible_text);
@@ -153,14 +165,14 @@ mod tests {
     #[test]
     fn secret_prompt_uses_hash_sigil() {
         let prompt = Prompt::new("API key", ResponseType::Secret);
-        assert_eq!(prompt.sigil(), PromptSigil::Secret);
+        assert_eq!(prompt.sigil().as_str(), "#");
         assert!(prompt.routes_secret());
     }
 
     #[test]
     fn visible_prompt_uses_angle_sigil() {
         let prompt = Prompt::new("Agent name", ResponseType::FreeformText);
-        assert_eq!(prompt.sigil(), PromptSigil::Visible);
+        assert_eq!(prompt.sigil().as_str(), ">");
         assert!(!prompt.routes_secret());
     }
 }

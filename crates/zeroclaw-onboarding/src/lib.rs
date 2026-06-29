@@ -1,5 +1,5 @@
 #![doc = "Chat onboarding flow for ZeroClaw."]
 
-pub mod transport;
-
-pub use transport::{OnboardingTransport, Outcome, Prompt};
+pub use zeroclaw_runtime::flow::{
+    ConfiguredItem, FlowTransport, Node, NodeId, Outcome, Prompt, Spec, Step,
+};

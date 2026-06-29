@@ -36,6 +36,37 @@ impl ResponseType {
             ResponseType::Choice { .. } => ResponseExpectation::Selection,
         }
     }
+
+    #[must_use]
+    pub fn ask_kind(&self) -> AskKind {
+        match self {
+            ResponseType::YesNo => AskKind::YesNo,
+            ResponseType::Secret => AskKind::Secret,
+            ResponseType::FreeformText => AskKind::FreeformText,
+            ResponseType::Choice { .. } => AskKind::Choice,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    YesNo,
+    Secret,
+    FreeformText,
+    Choice,
+}
+
+impl std::fmt::Display for AskKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            AskKind::YesNo => "YesNo",
+            AskKind::Secret => "Secret",
+            AskKind::FreeformText => "FreeformText",
+            AskKind::Choice => "Choice",
+        };
+        formatter.write_str(label)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +200,17 @@ mod tests {
         assert_eq!(
             ResponseType::Choice { options: Vec::new() }.expectation(),
             ResponseExpectation::Selection
+        );
+    }
+
+    #[test]
+    fn ask_kind_display_renders_variant_name_verbatim() {
+        assert_eq!(ResponseType::Secret.ask_kind().to_string(), "Secret");
+        assert_eq!(ResponseType::YesNo.ask_kind().to_string(), "YesNo");
+        assert_eq!(ResponseType::FreeformText.ask_kind().to_string(), "FreeformText");
+        assert_eq!(
+            ResponseType::Choice { options: Vec::new() }.ask_kind().to_string(),
+            "Choice"
         );
     }
 }
