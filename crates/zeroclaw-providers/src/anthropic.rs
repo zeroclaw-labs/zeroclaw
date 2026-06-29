@@ -844,9 +844,7 @@ impl AnthropicModelProvider {
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(
-        request: &NativeChatRequest,
-    ) -> anyhow::Result<serde_json::Value> {
+    fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
         let mut body = serde_json::to_value(request)
             .context("Failed to serialize NativeChatRequest to JSON")?;
         body["stream"] = serde_json::Value::Bool(true);
