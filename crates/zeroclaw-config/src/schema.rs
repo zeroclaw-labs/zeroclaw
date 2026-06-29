@@ -13836,6 +13836,13 @@ pub struct FilesystemConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub read_content: bool,
+    /// Follow symlinks when reading event-path metadata, hash, and content.
+    /// Off by default: a symlink under a watched root is rejected before any
+    /// metadata/hash/content handling so its target cannot escape the root. When
+    /// on, the canonical target must still resolve inside a configured root.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub follow_symlinks: bool,
     /// Maximum file content bytes admitted into a payload when `read_content`.
     #[tab(Advanced)]
     #[serde(default = "default_filesystem_max_content_bytes")]
@@ -13863,6 +13870,7 @@ impl Default for FilesystemConfig {
             debounce_ms: default_filesystem_debounce_ms(),
             settle_ms: default_filesystem_settle_ms(),
             read_content: false,
+            follow_symlinks: false,
             max_content_bytes: default_filesystem_max_content_bytes(),
             allow_broad_roots: false,
             excluded_tools: Vec::new(),
@@ -20303,6 +20311,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert!(cfg.recursive);
         assert!(!cfg.read_content);
+        assert!(!cfg.follow_symlinks);
         assert!(!cfg.allow_broad_roots);
         assert_eq!(cfg.debounce_ms, 500);
         assert_eq!(cfg.settle_ms, 250);

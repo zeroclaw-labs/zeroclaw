@@ -64,6 +64,7 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 |---|---|
 | **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
 | **Filesystem roots** | The broad roots `/`, `/home`, `/etc`, `/var` rejected at config validation (override with `allow_broad_roots`); include/exclude globs scope events |
+| **Filesystem symlinks** | Symlink event paths are rejected before any metadata/hash/content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |
 | **Cron validation** | Invalid cron expressions fail closed during parsing/cache build |
 | **Headless dispatch** | Headless callers log run progression instead of auto-executing `ExecuteStep` |
 

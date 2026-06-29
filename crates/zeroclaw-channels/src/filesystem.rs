@@ -337,6 +337,49 @@ fn file_name_of(path: &Path) -> String {
         .to_string()
 }
 
+fn symlink_path_admitted(path: &Path, config: &FilesystemConfig) -> bool {
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return true;
+    }
+    if !config.follow_symlinks {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "path": path.to_string_lossy() })),
+            "Filesystem channel: rejecting symlink event path (follow_symlinks is off)"
+        );
+        return false;
+    }
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if canonical_target_within_roots(&target, &config.paths) {
+        return true;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "path": path.to_string_lossy(),
+                "target": target.to_string_lossy(),
+            })
+        ),
+        "Filesystem channel: rejecting symlink whose target escapes the watched roots"
+    );
+    false
+}
+
+fn canonical_target_within_roots(target: &Path, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|canonical_root| target.starts_with(&canonical_root))
+            .unwrap_or(false)
+    })
+}
+
 fn build_payload(
     kind: FilesystemEventKind,
     path: &Path,
@@ -355,6 +398,9 @@ fn build_payload(
 
     match kind {
         FilesystemEventKind::Created | FilesystemEventKind::Modified => {
+            if !symlink_path_admitted(path, config) {
+                return payload;
+            }
             if let Ok(meta) = std::fs::metadata(path) {
                 obj.insert("size".into(), ::serde_json::json!(meta.len()));
                 if let Ok(modified) = meta.modified() {
@@ -659,5 +705,78 @@ mod tests {
         std::fs::write(&file, vec![0u8; 100]).unwrap();
         assert!(read_capped(&file, 10).is_none());
         assert!(read_capped(&file, 1000).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_payload_rejects_symlink_escaping_watched_root_by_default() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+
+        let watched = tempfile::tempdir().unwrap();
+        let link = watched.path().join("order-123.json");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let cfg = FilesystemConfig {
+            read_content: true,
+            max_content_bytes: 1024,
+            follow_symlinks: false,
+            paths: vec![watched.path().to_string_lossy().to_string()],
+            ..FilesystemConfig::default()
+        };
+        let payload = build_payload(FilesystemEventKind::Created, &link, None, &cfg);
+        assert_eq!(payload["event"], "created");
+        assert!(payload.get("size").is_none(), "symlink target size leaked");
+        assert!(payload.get("hash").is_none(), "symlink target hashed");
+        assert!(
+            payload.get("content").is_none(),
+            "symlink target content leaked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_payload_follow_symlinks_rejects_target_outside_roots() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+
+        let watched = tempfile::tempdir().unwrap();
+        let link = watched.path().join("order-123.json");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let cfg = FilesystemConfig {
+            read_content: true,
+            max_content_bytes: 1024,
+            follow_symlinks: true,
+            paths: vec![watched.path().to_string_lossy().to_string()],
+            ..FilesystemConfig::default()
+        };
+        let payload = build_payload(FilesystemEventKind::Created, &link, None, &cfg);
+        assert!(
+            payload.get("content").is_none(),
+            "escaping symlink target read under follow_symlinks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_payload_follow_symlinks_admits_target_inside_roots() {
+        let watched = tempfile::tempdir().unwrap();
+        let real = watched.path().join("real-order.json");
+        std::fs::write(&real, b"{\"id\":1}").unwrap();
+        let link = watched.path().join("order-123.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let cfg = FilesystemConfig {
+            read_content: true,
+            max_content_bytes: 1024,
+            follow_symlinks: true,
+            paths: vec![watched.path().to_string_lossy().to_string()],
+            ..FilesystemConfig::default()
+        };
+        let payload = build_payload(FilesystemEventKind::Created, &link, None, &cfg);
+        assert_eq!(payload["content"], "{\"id\":1}");
     }
 }
