@@ -594,4 +594,209 @@ mod tests {
             "recovered activated tool should have been invoked exactly once"
         );
     }
+
+    // Pinned regression for the `tool_search` branch of
+    // `should_execute_tools_in_parallel` (issue #7686, parent tracker #7685).
+    //
+    // `tool_search` activates deferred MCP tools into `ActivatedToolSet`. The
+    // production comment on lines 345–348 explains why this branch exists:
+    // running `tool_search` in parallel with the tools it activates can race
+    // the lookup before activation completes. This branch forces serial
+    // execution.
+    //
+    // PR #8040 covered the `tool_search` serial branch (3 tests below).
+    // PR #8222 — rebased onto #8040 — adds the approval-required branch
+    // (3 tests) and the parallel-when-allowed control (3 tests), sharing
+    // these imports and the `parsed_tool_call` helper so the two PRs can
+    // land in either order without E0252 duplicate-import collisions.
+    //
+    // Pre-existing tests in `loop_.rs` cover the single-call,
+    // approval-required, and parallel control paths but leave the
+    // `tool_search` branch untested. A future refactor that removes the
+    // branch as "seems redundant because we hold a mutex" would silently
+    // regress this contract — these tests pin it.
+    use super::should_execute_tools_in_parallel;
+    use crate::agent::loop_::ParsedToolCall;
+    use crate::approval::ApprovalManager;
+    use zeroclaw_config::autonomy::AutonomyLevel;
+    use zeroclaw_config::schema::RiskProfileConfig;
+
+    fn parsed_tool_call(name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        }
+    }
+
+    fn supervised_risk_profile() -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: vec!["file_read".into()],
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    // --- tool_search branch (#8040) ---
+
+    #[test]
+    fn tool_search_in_batch_forces_serial() {
+        // Two non-approval-gated tools in a batch where one is `tool_search`
+        // must run sequentially. Without the `tool_search` branch the default
+        // path would return `true` and the runtime would dispatch them in
+        // parallel, racing the lookup against the activation.
+        let calls = vec![
+            parsed_tool_call("tool_search"),
+            parsed_tool_call("file_read"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "batch containing tool_search must force sequential execution (line 349-351)"
+        );
+    }
+
+    #[test]
+    fn tool_search_with_approval_required_in_batch_still_forces_serial() {
+        // When both branches would trigger, the test only needs to confirm
+        // the call still returns `false` — the ordering between the
+        // `tool_search` branch and the approval branch is an implementation
+        // detail. The important invariant is: `tool_search` present ⇒ serial.
+        let calls = vec![parsed_tool_call("tool_search"), parsed_tool_call("shell")];
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, Some(&approval_mgr)),
+            "tool_search in a mixed approval batch must still force sequential execution"
+        );
+    }
+
+    #[test]
+    fn non_search_non_approval_batch_remains_parallel_eligible() {
+        // Control case (issue #7686 acceptance criterion #4): a batch that
+        // contains neither `tool_search` nor any approval-gated tool must
+        // remain parallel-eligible. This pins the default-true return so a
+        // future refactor that turns the policy helper into a defensive
+        // always-serial function is caught here, not at a much later
+        // integration test. Issue #7686 only requires the inverse direction
+        // (tool_search ⇒ serial); this test makes the "default still works"
+        // half of the contract explicit in `tool_execution.rs` itself rather
+        // than relying solely on the pre-existing control test in `loop_.rs`.
+        let calls = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("memory_recall"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    // --- approval-required + control branches (#8222) ---
+
+    #[test]
+    fn approval_required_batch_forces_sequential() {
+        // A batch containing `shell` (always_ask in supervised) must stay
+        // sequential so the caller can enforce the prompt/deny policy
+        // uniformly. Without this, an approval-gated call could race with a
+        // non-approval sibling and produce inconsistent state.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
+        let batch = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("shell"),
+            parsed_tool_call("file_read"),
+        ];
+        assert!(
+            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "batch with approval-required tool must execute sequentially"
+        );
+    }
+
+    #[test]
+    fn approval_required_alone_in_batch_still_sequential() {
+        // A two-element batch where one tool requires approval must still
+        // take the serial branch (length check above already returns false
+        // for len <= 1; this asserts the approval branch is the actual gate).
+        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
+        let batch = vec![parsed_tool_call("file_read"), parsed_tool_call("shell")];
+        assert!(
+            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "approval branch must trigger regardless of approval tool position"
+        );
+    }
+
+    #[test]
+    fn mixed_batch_with_approval_forces_serial_even_with_parallel_candidates() {
+        // Mixed batch: two file_read (parallel candidates) plus one shell
+        // (approval-required). The presence of `shell` must force serial
+        // execution, even though the other two could otherwise run in
+        // parallel.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
+        let batch = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("shell"),
+            parsed_tool_call("file_read"),
+        ];
+        assert!(
+            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "mixed batch must serialize when any approval-required tool is present"
+        );
+    }
+
+    #[test]
+    fn parallel_when_no_approval_and_no_tool_search() {
+        // Control case: a batch of three non-approval, non-tool_search
+        // calls under `Supervised` (where `file_read` is auto-approved and
+        // `shell` is approval-required) may run in parallel.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
+        let batch = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("file_read"),
+            parsed_tool_call("file_read"),
+        ];
+        assert!(
+            should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "non-approval, non-tool_search batch must run in parallel when allowed"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_batch_with_unknown_tool_runs_in_parallel() {
+        // Under `Full` autonomy, no tool requires approval — `needs_approval`
+        // returns false for every name. The control case extends to a batch
+        // whose names would otherwise be unknown to supervised profile.
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let mgr = ApprovalManager::for_non_interactive(&full);
+        let batch = vec![
+            parsed_tool_call("file_write"),
+            parsed_tool_call("shell"),
+            parsed_tool_call("anything"),
+        ];
+        assert!(
+            should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "full autonomy never prompts, so parallel execution is allowed"
+        );
+    }
+
+    #[test]
+    fn no_approval_manager_with_multi_call_batch_runs_in_parallel() {
+        // When the caller passes `None` for `approval` and no tool in the
+        // batch is `tool_search`, the function takes the parallel branch
+        // unconditionally — useful for the tests / harnesses that exercise
+        // the tool loop without an approval manager.
+        let batch = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("memory_recall"),
+        ];
+        assert!(
+            should_execute_tools_in_parallel(&batch, None),
+            "no approval manager + non-tool_search batch must run in parallel"
+        );
+    }
 }

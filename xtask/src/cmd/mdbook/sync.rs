@@ -20,6 +20,8 @@ pub fn run(
     require_tool("msgattrib", "apt install gettext / brew install gettext")?;
     require_tool("msgcat", "apt install gettext / brew install gettext")?;
 
+    ensure_po_submodule(&root)?;
+
     let book = book_dir(&root);
     let po_dir = po_dir(&root);
     let pot = pot_file(&root);

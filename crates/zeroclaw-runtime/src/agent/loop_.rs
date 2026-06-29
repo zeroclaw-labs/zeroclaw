@@ -107,6 +107,21 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
+
+/// Snapshot the live `channel_key → Arc<dyn Channel>` map from the injected
+/// channel-map factory as a [`tools::PerToolChannelHandle`], for channel-less
+/// turn paths (`process_message`) that must reach a live approver channel to
+/// honor a risk profile's cross-channel `approval_route`. Returns `None` when no
+/// factory is registered (e.g. CLI/tests) or no channels are live — callers then
+/// keep today's channel-less behavior (the gate auto-denies gated tools).
+pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
+    let factory = CHANNEL_MAP_FN.get()?;
+    let map = factory();
+    if map.is_empty() {
+        return None;
+    }
+    Some(Arc::new(parking_lot::RwLock::new(map)))
+}
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -1083,6 +1098,27 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
+        // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
+        // exporter's background interval fires. Hold a FlushGuard for the rest of
+        // this body so every return path — including `?` errors — pushes buffered
+        // telemetry before the runtime is torn down. Daemon/cron/subagent callers
+        // pass `interactive = false` and skip this; they rely on periodic export.
+        let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
+        if interactive
+            && matches!(
+                config.observability.backend,
+                zeroclaw_config::schema::ObservabilityBackend::Prometheus
+            )
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Observability backend is Prometheus (pull/scrape model): a one-shot CLI process \
+                 exits before any scraper can pull, so its telemetry will not be collected. \
+                 Prometheus is intended for long-running (daemon) deployments."
+            );
+        }
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -1287,6 +1323,18 @@ pub async fn run(
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
+                    // Register the generic MCP resource/prompt capability tools
+                    // (policy-gated, both deferred and eager modes).
+                    for tool in
+                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
+                    {
+                        register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools_registry,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -2655,11 +2703,27 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
+        // Populate aggregate token usage from the cost-tracking context that
+        // scoped every `run_tool_call_loop` call above — mirroring the streamed
+        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
+        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
+        // reads the context's own accumulator, which holds the session-wide
+        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
+        // even though usage was tracked.
+        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+            let usage = ctx.snapshot_turn_usage();
+            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+        });
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used: None,
+            tokens_used,
             cost_usd: None,
             channel: Some(channel_name.to_string()),
             agent_alias: Some(agent_alias.to_string()),
@@ -2883,6 +2947,16 @@ pub async fn process_message(
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
+                    for tool in
+                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy_pm.as_ref())
+                    {
+                        register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools_registry,
+                            delegate_handle_pm.as_ref(),
+                            mcp_policy_pm.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -3133,14 +3207,19 @@ pub async fn process_message(
         // tools (and their target identifiers) that the execution denylist
         // would block — a control boundary violation.
         //
-        // Note: compute_excluded_mcp_tools uses the raw message here (before
-        // thinking directive stripping). This is safe — dynamic tool filter
-        // keyword matching works the same, and risk-profile excluded_tools
-        // are message-independent.
+        // We strip the leading `/think:<level>` directive before filtering
+        // so the prompt-construction and request-execution paths see the
+        // same user-message shape. Otherwise a `tool_filter_groups` dynamic
+        // keyword that happens to appear inside `/think:high` (or the
+        // directive token itself — `"think"`, `"high"`, `"max"`, …) would
+        // make the prompt advertise tools the request then excludes, or
+        // vice versa. Issue #8054 Surface 4.
+        let effective_message_for_filter =
+            crate::agent::thinking::strip_thinking_directive(message);
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
-            message,
+            effective_message_for_filter.as_ref(),
         );
         {
             let active_profile = &risk_profile;
@@ -3301,6 +3380,24 @@ pub async fn process_message(
             }
         }
 
+        // ── Cross-channel HITL on the channel-less path ───────────────────
+        // process_message (gateway chat/webhook dispatch, agent-to-agent peer
+        // messages) runs with no originating channel, so a gated tool can only
+        // reach a human through the profile's `approval_route`. When one is set
+        // and a live channel registry is available, hand the turn a route-only
+        // approval bridge: it asks the named approver alone, bounded by
+        // `timeout_secs` and fail-closed by default. Absent a route (or with no
+        // live channels) this stays `None` and the gate keeps today's
+        // non-interactive auto-deny.
+        let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
+            live_channel_registry().map(|handles| {
+                crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
+            })
+        });
+        let routed_approval_channel_ref = routed_approval_channel
+            .as_ref()
+            .map(|c| c as &dyn zeroclaw_api::channel::Channel);
+
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
@@ -3326,7 +3423,10 @@ pub async fn process_message(
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.max_context_tokens,
-                    None, // channel: process_message path has no channel ref
+                    // Cross-channel HITL: a route-only approval bridge when the
+                    // profile sets `approval_route` and channels are live, else
+                    // `None` (today's channel-less auto-deny). See above.
+                    routed_approval_channel_ref,
                 ),
             )
             .await
@@ -4421,6 +4521,10 @@ mod tests {
             narration_chunks: Vec<String>,
             tool_call: ToolCall,
         },
+        ToolCallThenNarration {
+            tool_call: ToolCall,
+            narration_chunks: Vec<String>,
+        },
     }
 
     struct StreamingNativeToolEventModelProvider {
@@ -4541,6 +4645,19 @@ mod tests {
                         .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
                         .collect();
                     events.push(Ok(StreamEvent::ToolCall(tool_call)));
+                    events.push(Ok(StreamEvent::Final));
+                    Box::pin(futures_util::stream::iter(events))
+                }
+                NativeStreamTurn::ToolCallThenNarration {
+                    tool_call,
+                    narration_chunks,
+                } => {
+                    let mut events: Vec<_> = vec![Ok(StreamEvent::ToolCall(tool_call))];
+                    events.extend(
+                        narration_chunks
+                            .into_iter()
+                            .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text)))),
+                    );
                     events.push(Ok(StreamEvent::Final));
                     Box::pin(futures_util::stream::iter(events))
                 }
@@ -10319,6 +10436,106 @@ This is an example, not an invocation."#;
         assert!(
             result.contains("done"),
             "final turn must not be truncated; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_forwards_native_narration_emitted_after_tool_call() {
+        let trailing = "Let me check the count.";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::ToolCallThenNarration {
+                tool_call: ToolCall {
+                    id: "call_trailing_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+                narration_chunks: vec!["Let me ".to_string(), "check the count.".to_string()],
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tool then narrate"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool-then-narration streaming should preserve tool loop semantics");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            accumulated.contains(trailing),
+            "narration emitted after the native tool call must reach the user; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert_eq!(
+            accumulated.matches(trailing).count(),
+            1,
+            "post-tool narration must be forwarded exactly once, not dropped then re-sent; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.ends_with("done"),
+            "final response should end with 'done', got: {result}"
         );
     }
 

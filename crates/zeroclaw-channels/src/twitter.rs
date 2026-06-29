@@ -418,9 +418,18 @@ impl Channel for TwitterChannel {
     async fn health_check(&self) -> bool {
         self.get_authenticated_user_id().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the Twitter/X v2 API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-/// Split text into tweet-sized chunks, breaking at word boundaries.
+/// Split tweet text into tweet-sized chunks, breaking at word boundaries.
 fn split_tweet_text(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
