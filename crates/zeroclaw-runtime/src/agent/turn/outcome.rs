@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn is_tool_loop_cancelled_unrelated_error_returns_false() {
-        let err = anyhow::anyhow!("some other error");
+        let err = anyhow::Error::msg("some other error");
         assert!(!is_tool_loop_cancelled(&err));
     }
 
