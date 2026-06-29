@@ -313,7 +313,7 @@ impl OverrideScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ChannelRuntimeCommand {
     ShowProviders,
     SetProvider(String),
@@ -327,6 +327,13 @@ enum ChannelRuntimeCommand {
     InvalidThinking(String),
     Goal(zeroclaw_runtime::control_plane::GoalCommand),
     InvalidGoal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeCommandOutcome {
+    NotCommand,
+    Handled,
+    ContinueGoalStart { task_id: String, objective: String },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1302,6 +1309,13 @@ fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) ->
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
+}
+
+fn goal_channel_type(channel_name: &str) -> String {
+    channel_name
+        .split_once(':')
+        .map_or(channel_name, |(channel_type, _)| channel_type)
+        .to_string()
 }
 
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
@@ -2641,19 +2655,20 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> bool {
+) -> RuntimeCommandOutcome {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
-        return false;
+        return RuntimeCommandOutcome::NotCommand;
     };
 
     let Some(channel) = target_channel else {
-        return true;
+        return RuntimeCommandOutcome::Handled;
     };
 
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
+    let mut outcome = RuntimeCommandOutcome::Handled;
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
@@ -2835,17 +2850,35 @@ async fn handle_runtime_command_if_needed(
             "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
         ),
         ChannelRuntimeCommand::Goal(command) => {
+            let start_objective = matches!(
+                command.action,
+                zeroclaw_runtime::control_plane::GoalCommandAction::Start
+            )
+            .then(|| command.objective.clone())
+            .flatten();
+            let defaults_snapshot = runtime_defaults_snapshot(ctx);
             match zeroclaw_runtime::control_plane::admit_goal_command(
                 zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
                     ctx.agent_alias.as_ref().clone(),
                 )
+                .with_command_surface(CommandSurface::Channel)
+                .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
                 .with_originator_route(Some(sender_key.clone()))
                 .with_principal_id(goal_principal_id(msg)),
                 command,
+                defaults_snapshot.config.as_ref(),
+                Some(ctx.agent_cfg.as_ref()),
             )
             .await
             {
-                Ok(admission) => admission.message,
+                Ok(admission) => {
+                    if let (Some(task_id), Some(objective)) =
+                        (admission.task_id.clone(), start_objective)
+                    {
+                        outcome = RuntimeCommandOutcome::ContinueGoalStart { task_id, objective };
+                    }
+                    admission.message
+                }
                 Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-command-failed",
                     &[("error", &error.to_string())],
@@ -2888,7 +2921,7 @@ async fn handle_runtime_command_if_needed(
         );
     }
 
-    true
+    outcome
 }
 
 async fn build_memory_context(
@@ -4422,16 +4455,25 @@ async fn process_channel_message_body(
             "Failed to apply runtime config update"
         );
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
-        reconcile_early_ack(
-            ctx.as_ref(),
-            &msg,
-            target_channel.as_ref(),
-            early_ack_task,
-            Some("\u{2705}"),
-        )
-        .await;
-        return;
+    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        RuntimeCommandOutcome::NotCommand => {}
+        RuntimeCommandOutcome::Handled => {
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{2705}"),
+            )
+            .await;
+            return;
+        }
+        RuntimeCommandOutcome::ContinueGoalStart { task_id, objective } => {
+            msg.content = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-start-work-prompt",
+                &[("task_id", &task_id), ("objective", &objective)],
+            );
+        }
     }
 
     if let Some(ref store) = ctx.session_store {
@@ -5026,6 +5068,8 @@ async fn process_channel_message_body(
         zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
             ctx.agent_alias.as_ref().clone(),
         )
+        .with_command_surface(CommandSurface::Channel)
+        .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
         .with_originator_route(Some(history_key.clone()))
         .with_principal_id(goal_principal_id(&msg)),
     );
@@ -17692,6 +17736,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     action: zeroclaw_runtime::control_plane::GoalCommandAction::Start,
                     objective: Some("ship goal mode".into()),
                     task_id: None,
+                    budgets: Default::default(),
                 }
             ))
         );

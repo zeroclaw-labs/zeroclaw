@@ -664,7 +664,7 @@ pub fn all_tools_with_runtime(
     ];
 
     if matches!(goal_admission_tools, GoalAdmissionToolPolicy::Include) {
-        tool_arcs.push(Arc::new(GoalStartTool::new(agent_alias)));
+        tool_arcs.push(Arc::new(GoalStartTool::new(agent_alias, config.clone())));
     }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the

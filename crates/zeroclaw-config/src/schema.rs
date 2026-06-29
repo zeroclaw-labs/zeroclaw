@@ -3634,6 +3634,13 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub identity: IdentityConfig,
 
+    /// Per-agent goal-mode policy (`[agents.<alias>.goal]`).
+    /// This is the canonical agent-level gate for accepting durable goals.
+    #[tab(General)]
+    #[serde(default)]
+    #[nested]
+    pub goal: AgentGoalConfig,
+
     /// Per-agent A2A publication block (`[agents.<alias>.a2a]`). Gates
     /// whether this alias is discoverable as a spec-conforming A2A agent
     /// and which resolved skills appear on its card. Default-closed
@@ -3668,6 +3675,7 @@ impl Default for AliasedAgentConfig {
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            goal: AgentGoalConfig::default(),
             a2a: crate::multi_agent::AgentA2aConfig::default(),
         }
     }
@@ -3687,16 +3695,128 @@ impl AliasedAgentConfig {
     }
 }
 
+/// Per-agent goal-mode policy (`[agents.<alias>.goal]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agents.goal"]
+pub struct AgentGoalConfig {
+    /// Enable durable goal mode for this agent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AgentGoalConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Durable goal-mode runtime policy (`[goal]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "goal"]
 pub struct GoalConfig {
+    /// Enable durable goal mode.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Command surfaces allowed to start or manage durable goals.
+    #[serde(default = "default_goal_allowed_command_surfaces")]
+    pub allowed_command_surfaces: Vec<String>,
+    /// Channel types allowed to accept goal commands or model-initiated starts.
+    #[serde(default = "default_goal_allowed_channel_types")]
+    pub allowed_channel_types: Vec<String>,
+    /// Default token budget for newly created goals. Omit for unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// Default cost budget in USD for newly created goals. Omit for unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_usd: Option<f64>,
     /// Completion verifier policy. The verifier is global goal-mode policy,
     /// not an agent-local provider copy.
     #[serde(default)]
     #[nested]
     pub verifier: GoalVerifierConfig,
+}
+
+impl Default for GoalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_command_surfaces: default_goal_allowed_command_surfaces(),
+            allowed_channel_types: default_goal_allowed_channel_types(),
+            token_budget: None,
+            cost_budget_usd: None,
+            verifier: GoalVerifierConfig::default(),
+        }
+    }
+}
+
+fn default_goal_allowed_command_surfaces() -> Vec<String> {
+    ["web", "tui", "channel"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_goal_allowed_channel_types() -> Vec<String> {
+    ["matrix", "telegram"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_goal_config(goal: &GoalConfig) -> Result<()> {
+    for (idx, surface) in goal.allowed_command_surfaces.iter().enumerate() {
+        let trimmed = surface.trim();
+        if trimmed.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("goal.allowed_command_surfaces[{idx}]"),
+                "goal.allowed_command_surfaces[{idx}] must not be empty"
+            );
+        }
+        if !matches!(trimmed, "web" | "tui" | "channel") {
+            validation_bail!(
+                InvalidFormat,
+                format!("goal.allowed_command_surfaces[{idx}]"),
+                "goal.allowed_command_surfaces[{idx}] = {surface:?} must be one of: web, tui, channel"
+            );
+        }
+    }
+    for (idx, channel_type) in goal.allowed_channel_types.iter().enumerate() {
+        let trimmed = channel_type.trim();
+        if trimmed.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("goal.allowed_channel_types[{idx}]"),
+                "goal.allowed_channel_types[{idx}] must not be empty"
+            );
+        }
+        if trimmed.contains('.') || trimmed.contains(char::is_whitespace) {
+            validation_bail!(
+                InvalidFormat,
+                format!("goal.allowed_channel_types[{idx}]"),
+                "goal.allowed_channel_types[{idx}] = {channel_type:?} must be a bare channel type such as matrix or telegram"
+            );
+        }
+    }
+    if matches!(goal.token_budget, Some(0)) {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.token_budget",
+            "goal.token_budget must be greater than 0 when set"
+        );
+    }
+    if let Some(cost) = goal.cost_budget_usd
+        && (!cost.is_finite() || cost <= 0.0)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.cost_budget_usd",
+            "goal.cost_budget_usd must be a finite positive value when set"
+        );
+    }
+    Ok(())
 }
 
 /// Goal completion verifier policy (`[goal.verifier]`).
@@ -18505,6 +18625,8 @@ impl Config {
             );
         }
 
+        validate_goal_config(&self.goal)?;
+
         if let Some(temperature) = self.goal.verifier.temperature
             && let Err(msg) = validate_temperature(temperature)
         {
@@ -20996,6 +21118,69 @@ enabled = true
         );
 
         assert!(c.skills.install_suggestions.enabled);
+    }
+
+    #[test]
+    async fn goal_config_deserializes_rfc_policy_shape() {
+        let c = parse_test_config(
+            r#"
+[goal]
+enabled = true
+allowed_command_surfaces = ["web", "tui", "channel"]
+allowed_channel_types = ["matrix", "telegram"]
+token_budget = 50000
+cost_budget_usd = 2.50
+
+[agents.researcher]
+
+[agents.researcher.goal]
+enabled = false
+"#,
+        );
+
+        assert!(c.goal.enabled);
+        assert_eq!(
+            c.goal.allowed_command_surfaces,
+            vec!["web".to_string(), "tui".to_string(), "channel".to_string()]
+        );
+        assert_eq!(
+            c.goal.allowed_channel_types,
+            vec!["matrix".to_string(), "telegram".to_string()]
+        );
+        assert_eq!(c.goal.token_budget, Some(50_000));
+        assert_eq!(c.goal.cost_budget_usd, Some(2.50));
+        assert!(!c.agents["researcher"].goal.enabled);
+        assert!(validate_goal_config(&c.goal).is_ok());
+    }
+
+    #[test]
+    async fn goal_config_rejects_invalid_policy_values() {
+        let mut c = Config::default();
+        c.goal.allowed_command_surfaces = vec!["chanenl".into()];
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.allowed_command_surfaces")
+        );
+
+        let mut c = Config::default();
+        c.goal.allowed_channel_types = vec!["matrix.default".into()];
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.allowed_channel_types")
+        );
+
+        let mut c = Config::default();
+        c.goal.token_budget = Some(0);
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.token_budget")
+        );
     }
 
     fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {

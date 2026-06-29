@@ -9,12 +9,17 @@ use crate::control_plane::{
 
 pub struct GoalStartTool {
     agent_alias: String,
+    config: std::sync::Arc<zeroclaw_config::schema::Config>,
 }
 
 impl GoalStartTool {
-    pub fn new(agent_alias: impl Into<String>) -> Self {
+    pub fn new(
+        agent_alias: impl Into<String>,
+        config: std::sync::Arc<zeroclaw_config::schema::Config>,
+    ) -> Self {
         Self {
             agent_alias: agent_alias.into(),
+            config,
         }
     }
 }
@@ -88,7 +93,10 @@ impl Tool for GoalStartTool {
                 action: GoalCommandAction::Start,
                 objective: Some(objective.to_string()),
                 task_id: None,
+                budgets: Default::default(),
             },
+            self.config.as_ref(),
+            self.config.agent(&self.agent_alias),
         )
         .await?;
 
@@ -111,7 +119,7 @@ mod tests {
 
     #[test]
     fn tool_schema_requires_only_untrusted_objective() {
-        let tool = GoalStartTool::new("agent-a");
+        let tool = GoalStartTool::new("agent-a", std::sync::Arc::new(Default::default()));
         let schema = tool.parameters_schema();
         assert_eq!(schema["required"][0], "objective");
         assert!(schema["properties"].get("agent_alias").is_none());
@@ -134,7 +142,9 @@ mod tests {
                 Arc::clone(&control_plane().unwrap().store)
             }
         };
-        let tool = GoalStartTool::new(agent.clone());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.allowed_channel_types.push("channel".into());
+        let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config.clone()));
         let owner = GoalAdmissionContext::new(agent.clone())
             .with_originator_route(Some("channel:route-a".into()))
             .with_principal_id(Some("principal-a".into()));
@@ -164,7 +174,10 @@ mod tests {
                 action: GoalCommandAction::Status,
                 objective: None,
                 task_id: Some(task.id),
+                budgets: Default::default(),
             },
+            &config,
+            None,
         )
         .await
         .unwrap_err();

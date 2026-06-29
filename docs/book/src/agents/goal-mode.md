@@ -16,16 +16,57 @@ In this release, goal admission is available on channel runtimes that supply a
 trusted route and principal context. Use the channel slash command:
 
 ```text
-/goal start <objective>
+/goal start [--tokens=N|unlimited] [--cost=N|unlimited] <objective>
 /goal status [task_id]
+/goal budget --tokens=N|unlimited --cost=N|unlimited
 /goal pause [reason]
 /goal resume [task_id]
 /goal cancel [task_id]
+/goal help
 ```
 
-`status`, `pause`, `resume`, and `cancel` use the active goal for the same
-agent, route, and principal when no `task_id` is provided. Passing a task id is
-allowed only when that goal is visible to the same trusted context.
+`/goal` without a subcommand is an error. `/goal help`, `/goal --help`, and
+`/goal -h` print the supported command shape. `status`, `pause`, `resume`, and
+`cancel` use the active goal for the same agent, route, and principal when no
+`task_id` is provided. Passing a task id is allowed only when that goal is
+visible to the same trusted context.
+
+`/goal start` first admits the durable goal, then the same channel turn
+continues with the admitted objective under goal context. The admission
+acknowledgement is therefore not the goal's first worker response.
+
+## Configuration
+
+Goal mode is enabled by default. The global policy lives under `[goal]`; the
+per-agent opt-out lives under `[agents.<alias>.goal]`.
+
+```toml
+[goal]
+enabled = true
+allowed_command_surfaces = ["web", "tui", "channel"]
+allowed_channel_types = ["matrix", "telegram"]
+token_budget = 50000
+cost_budget_usd = 2.50
+
+[goal.verifier]
+enabled = false
+model_provider = ""
+model = ""
+temperature = 0.0
+
+[agents.researcher.goal]
+enabled = true
+```
+
+`allowed_command_surfaces` currently gates admission by runtime surface.
+`allowed_channel_types` applies when the surface is `channel`; values are bare
+channel types such as `matrix` or `telegram`, not aliases like
+`matrix.default`.
+
+Budget resolution is per dimension: explicit command value, then `[goal]`
+default, then unlimited. Configured budget defaults apply only when a goal is
+created. `/goal budget` mutates the active goal's persisted effective limits.
+Consumed and remaining usage are still derived from the usage ledger.
 
 The model-facing `goal_start` tool is registered only for tool loops that have
 trusted goal admission context. General CLI, gateway, and tool-listing
