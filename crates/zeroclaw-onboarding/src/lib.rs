@@ -5,6 +5,7 @@ pub mod cli_transport;
 pub mod driver;
 pub mod i18n;
 pub mod llm_transport;
+pub mod outcome_message;
 pub mod phrasing;
 pub mod spec_builder;
 

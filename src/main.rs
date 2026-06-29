@@ -1383,6 +1383,21 @@ async fn run_onboard_flow(
     };
     use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
 
+    let emit_outcome = |outcome: &Outcome| {
+        let descriptor = zeroclaw_onboarding::outcome_message::outcome_message(outcome);
+        let args: Vec<(&str, &str)> = descriptor
+            .args
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let localized = zeroclaw_onboarding::i18n::get_required_onboard_string_with_args(
+            &descriptor.message_id,
+            &args,
+        );
+        println!("{localized}");
+        println!("[{}]", outcome.label());
+    };
+
     let scope = if required_only {
         FieldScope::RequiredOnly
     } else {
@@ -1434,7 +1449,7 @@ async fn run_onboard_flow(
         let mut transport = LlmTransport::new(responder, TtySecretReader);
         let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;
         Box::pin(config.save()).await?;
-        println!("[{}]", outcome.label());
+        emit_outcome(&outcome);
         return Ok(());
     }
 
@@ -1450,7 +1465,7 @@ async fn run_onboard_flow(
     };
     let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
     Box::pin(config.save()).await?;
-    println!("[{}]", outcome.label());
+    emit_outcome(&outcome);
     Ok(())
 }
 

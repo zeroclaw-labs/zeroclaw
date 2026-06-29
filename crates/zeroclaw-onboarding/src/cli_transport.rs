@@ -127,7 +127,15 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
     }
 
     async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()> {
-        let rendered = format!("[{}]\n", outcome.label());
+        let descriptor = crate::outcome_message::outcome_message(outcome);
+        let args: Vec<(&str, &str)> = descriptor
+            .args
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let localized =
+            crate::i18n::get_required_onboard_string_with_args(&descriptor.message_id, &args);
+        let rendered = format!("{localized}\n[{}]\n", outcome.label());
         self.writer
             .write_all(rendered.as_bytes())
             .map_err(|_| TransportError::Closed)?;
@@ -248,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_renders_outcome_label() {
+    async fn emit_renders_localized_message_and_structural_token() {
         let mut output: Vec<u8> = Vec::new();
         let mut transport = visible_only(Cursor::new(Vec::new()), &mut output);
         let outcome = Outcome::Completed {
@@ -258,9 +266,14 @@ mod tests {
             }],
         };
         transport.emit(&outcome).await.unwrap();
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "[completed: channel:matrix]\n"
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(
+            rendered.contains("[completed: channel:matrix]"),
+            "structural token must survive for transcript matching, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("channel:matrix"),
+            "localized message must carry the items arg, got:\n{rendered}"
         );
     }
 }
