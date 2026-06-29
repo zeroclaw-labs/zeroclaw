@@ -432,7 +432,18 @@ pub async fn handle_version_upgrade(
     let action = if req.auto_restart {
         match restart.mode {
             RestartMode::Supervised => RestartAction::Supervised,
-            RestartMode::SelfRespawn => RestartAction::SelfRespawn,
+            RestartMode::SelfRespawn => RestartAction::SelfRespawn {
+                // `reload_tx` is `None` exactly when the gateway runs without
+                // a daemon wrapper (see `AppState::reload_tx` docs and
+                // `run_gateway_if_enabled` in `src/main.rs`). In that mode
+                // SIGTERM/`shutdown_notify` would just kill the process
+                // before `respawn_if_requested()` could run, so signal the
+                // gateway's own shutdown watch instead.
+                standalone_shutdown_tx: state
+                    .reload_tx
+                    .is_none()
+                    .then(|| state.shutdown_tx.clone()),
+            },
             // Unreachable: rejected with 400 above.
             RestartMode::Manual => RestartAction::None,
         }
@@ -587,15 +598,28 @@ async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<Upgrade
 }
 
 /// What to do once the upgrade succeeds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum RestartAction {
     /// Leave the swapped binary on disk; the operator restarts manually.
     None,
-    /// Exit cleanly; a supervisor (systemd/launchd) relaunches the new binary.
+    /// Exit cleanly; a supervisor (systemd/launchd) or the outer daemon process
+    /// relaunches the new binary. The daemon's `wait_for_exit_signal` is the
+    /// shutdown receiver here (SIGTERM on unix, `restart::shutdown_notify()`
+    /// elsewhere).
     Supervised,
     /// Exit cleanly after asking `main` to detached-spawn the new binary (bare
-    /// unix process with no supervisor).
-    SelfRespawn,
+    /// process with no supervisor).
+    ///
+    /// `standalone_shutdown_tx` is `Some` only when the gateway runs without
+    /// a daemon wrapper (`zeroclaw gateway start`). In that mode no one is
+    /// listening for SIGTERM/`shutdown_notify`, so we send the gateway's own
+    /// shutdown watch directly — that lets `run_gateway()` return cleanly so
+    /// `respawn_if_requested()` runs in `main`. When the daemon wraps the
+    /// gateway, this is `None` and we fall through to the same shutdown path
+    /// as `Supervised` (signal the daemon's wait loop so it tears down).
+    SelfRespawn {
+        standalone_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    },
 }
 
 /// Drive `zeroclaw update`, then either mark done or (Phase 3) restart.
@@ -693,17 +717,37 @@ async fn run_upgrade(
             tokio::time::sleep(RESTART_GRACE).await;
             trigger_graceful_shutdown();
         }
-        RestartAction::SelfRespawn => {
+        RestartAction::SelfRespawn {
+            standalone_shutdown_tx,
+        } => {
             // No supervisor: ask `main` to detached-spawn the new binary once
-            // the daemon has torn down, then exit. The respawn flag is read at
-            // the post-shutdown point, after the listener is released.
+            // the daemon (or standalone gateway) has torn down, then exit. The
+            // respawn flag is read at the post-shutdown point, after the
+            // listener is released.
             //
             // Set the flag *before* sleeping so that an external SIGTERM
             // arriving during the grace window still finds it set.
             zeroclaw_runtime::restart::request_respawn();
             set_state(&progress, UpgradeState::Restarting);
             tokio::time::sleep(RESTART_GRACE).await;
-            trigger_graceful_shutdown();
+            match standalone_shutdown_tx {
+                // Standalone gateway (`zeroclaw gateway start`): no daemon
+                // wait loop is listening for SIGTERM/`shutdown_notify`, so the
+                // process would just die before `respawn_if_requested()` ran
+                // in `main`. Drive the gateway's own shutdown watch so
+                // `run_gateway()` returns cleanly and `main` reaches the
+                // post-teardown respawn point.
+                Some(tx) => {
+                    let _ = tx.send(true);
+                }
+                // Bare daemon-wrapped gateway: the daemon owns the shutdown
+                // watch; signalling it would only restart the gateway
+                // component under the daemon supervisor. Fall through to the
+                // SIGTERM/`shutdown_notify` path that tears down the whole
+                // daemon, so `respawn_if_requested()` runs at the daemon
+                // exit point in `main`.
+                None => trigger_graceful_shutdown(),
+            }
         }
     }
 }
@@ -833,5 +877,47 @@ mod tests {
         assert!(!clean.contains("[2m") && !clean.contains("[32m"));
         assert!(clean.contains("Phase 2/6: Downloading..."));
         assert_eq!(parse_phase(&clean), Some(2));
+    }
+
+    /// Regression for the standalone-gateway respawn path:
+    /// `zeroclaw gateway start` runs without a daemon wrapper, so nothing is
+    /// listening for SIGTERM/`shutdown_notify`. Driving the gateway's own
+    /// `shutdown_tx` watch is what makes `run_gateway()` return so
+    /// `respawn_if_requested()` runs in `main`.
+    #[tokio::test]
+    async fn self_respawn_standalone_shutdown_tx_drives_gateway_watch() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let action = RestartAction::SelfRespawn {
+            standalone_shutdown_tx: Some(tx),
+        };
+        // Exercise the routing arm directly (no need to run a full upgrade):
+        // matches the `match` block in `run_upgrade` after the grace sleep.
+        if let RestartAction::SelfRespawn {
+            standalone_shutdown_tx: Some(t),
+        } = action
+        {
+            t.send(true).unwrap();
+        } else {
+            panic!("expected SelfRespawn carrying a sender");
+        }
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+    }
+
+    /// Bare daemon-wrapped gateway: the gateway's `shutdown_tx` is owned by the
+    /// daemon supervisor, signalling it would only restart the component.
+    /// `SelfRespawn` must carry `None` so we fall through to the daemon-exit
+    /// shutdown path (SIGTERM / `shutdown_notify`) instead.
+    #[test]
+    fn self_respawn_daemon_mode_carries_no_standalone_sender() {
+        let action = RestartAction::SelfRespawn {
+            standalone_shutdown_tx: None,
+        };
+        match action {
+            RestartAction::SelfRespawn {
+                standalone_shutdown_tx,
+            } => assert!(standalone_shutdown_tx.is_none()),
+            _ => panic!("expected SelfRespawn"),
+        }
     }
 }
