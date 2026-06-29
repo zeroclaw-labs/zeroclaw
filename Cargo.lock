@@ -14161,7 +14161,6 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "clap",
  "crossterm",
  "directories",
