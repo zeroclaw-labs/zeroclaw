@@ -308,6 +308,7 @@ keyactions! {
         Cancel  [Chord::key(KeyCode::Esc), Chord::char('n'), Chord::char('N')] => "cancel",
         Up      [Chord::key(KeyCode::Up)] => "prev",
         Down    [Chord::key(KeyCode::Down)] => "next",
+        Toggle  [Chord::char(' ')] => "toggle selection",
     }
 }
 
