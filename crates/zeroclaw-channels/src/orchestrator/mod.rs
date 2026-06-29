@@ -6038,13 +6038,12 @@ async fn run_message_dispatch_loop(
             // Resolve effective debounce window: per-channel override wins,
             // otherwise falls back to the global default from ChannelsConfig.
             // A per-channel value of 0 is treated as unset (falls back to global).
-            let debounce_window =
-                resolve_effective_debounce_window(
-                    ctx.prompt_config.channels.debounce_ms,
-                    &msg.channel,
-                    msg.channel_alias.as_deref(),
-                    &ctx.prompt_config.channels.telegram,
-                );
+            let debounce_window = resolve_effective_debounce_window(
+                ctx.prompt_config.channels.debounce_ms,
+                &msg.channel,
+                msg.channel_alias.as_deref(),
+                &ctx.prompt_config.channels.telegram,
+            );
 
             match ctx
                 .debouncer
@@ -21403,7 +21402,8 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-                ..Default::default()
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
             },
             CancellationToken::new(),
         )
@@ -23892,24 +23892,45 @@ mod debounce_resolution_tests {
     #[test]
     fn per_channel_debounce_zero_falls_back_to_global() {
         let mut telegram_configs = HashMap::new();
-        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: Some(0), ..Default::default() });
-        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: Some(0),
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
         assert_eq!(duration, Duration::from_millis(1000));
     }
 
     #[test]
     fn per_channel_debounce_positive_overrides_global() {
         let mut telegram_configs = HashMap::new();
-        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: Some(500), ..Default::default() });
-        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: Some(500),
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
         assert_eq!(duration, Duration::from_millis(500));
     }
 
     #[test]
     fn per_channel_debounce_none_falls_back_to_global() {
         let mut telegram_configs = HashMap::new();
-        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: None, ..Default::default() });
-        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        telegram_configs.insert(
+            "default".into(),
+            TelegramConfig {
+                debounce_ms: None,
+                ..Default::default()
+            },
+        );
+        let duration =
+            resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
         assert_eq!(duration, Duration::from_millis(1000));
     }
 
@@ -23923,7 +23944,12 @@ mod debounce_resolution_tests {
     #[test]
     fn unknown_telegram_alias_uses_global() {
         let telegram_configs = HashMap::new();
-        let duration = resolve_effective_debounce_window(1000, "telegram", Some("nonexistent"), &telegram_configs);
+        let duration = resolve_effective_debounce_window(
+            1000,
+            "telegram",
+            Some("nonexistent"),
+            &telegram_configs,
+        );
         assert_eq!(duration, Duration::from_millis(1000));
     }
 }
