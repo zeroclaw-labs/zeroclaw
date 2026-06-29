@@ -101,6 +101,30 @@ pub fn load_personality(workspace_dir: &Path) -> PersonalityProfile {
     load_personality_files(workspace_dir, PERSONALITY_FILES)
 }
 
+/// Seed a freshly created agent's workspace with the default personality
+/// preset so it boots with real base templates instead of empty files.
+///
+/// Builds the [`TemplateContext`] the same way the dashboard's
+/// `GET /api/personality/templates` does — agent name from `alias`,
+/// `include_memory` from the configured memory backend — then delegates to
+/// [`ensure_personality_preset`]. Only missing or blank files are written;
+/// existing user content is preserved.
+///
+/// [`TemplateContext`]: crate::agent::personality_templates::TemplateContext
+/// [`ensure_personality_preset`]: crate::agent::personality_templates::ensure_personality_preset
+pub async fn seed_default_personality(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    workspace_dir: &Path,
+) -> std::io::Result<Vec<&'static str>> {
+    let ctx = crate::agent::personality_templates::TemplateContext {
+        agent: alias.to_string(),
+        include_memory: config.memory.backend.as_str() != "none",
+        ..Default::default()
+    };
+    crate::agent::personality_templates::ensure_personality_preset(workspace_dir, &ctx).await
+}
+
 /// Load a specific set of personality files from a workspace directory.
 pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> PersonalityProfile {
     let mut profile = PersonalityProfile::default();
