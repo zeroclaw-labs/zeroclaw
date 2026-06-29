@@ -16,7 +16,7 @@ pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
-pub use engine::SopEngine;
+pub use engine::{MaintenanceSummary, SopEngine};
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
 pub use step_contract::{StepFailure, StepRouting};

@@ -676,6 +676,29 @@ mod tests {
     }
 
     #[test]
+    fn daemon_gateway_bind_cli_strings_format_from_fluent() {
+        // The daemon gateway-bind pre-flight messages (#7895) are routed through
+        // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
+        // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
+        // operator-facing fail-fast message back to a `{cli-...}` stub.
+        let en = include_str!("../locales/en/cli.ftl");
+        let args = &[("host", "127.0.0.1"), ("port", "9090")][..];
+
+        let already_running =
+            format_ftl_message(en, "en", "cli-daemon-gateway-already-running", args)
+                .expect("cli-daemon-gateway-already-running should format");
+        assert!(already_running.contains("127.0.0.1:9090"));
+        assert!(already_running.contains("ZeroClaw gateway is already running"));
+        assert!(already_running.contains("gateway.port"));
+
+        let port_occupied = format_ftl_message(en, "en", "cli-daemon-gateway-port-occupied", args)
+            .expect("cli-daemon-gateway-port-occupied should format");
+        assert!(port_occupied.contains("127.0.0.1:9090"));
+        assert!(port_occupied.contains("already in use by another process"));
+        assert!(port_occupied.contains("gateway.port"));
+    }
+
+    #[test]
     fn normalize_locale_strips_encoding() {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
