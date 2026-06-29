@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
@@ -844,8 +845,9 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 }
 
 fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<[^>]+>").expect("strip_tags regex must compile"));
+    RE.replace_all(content, "").to_string()
 }
 
 #[async_trait]

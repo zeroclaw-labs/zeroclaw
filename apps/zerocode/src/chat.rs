@@ -85,6 +85,19 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
+    /// Receiver for server-initiated JSON-RPC requests that expect a
+    /// response (today: `elicitation/create`). Drained per draw alongside
+    /// `notif_rx` so an ACP-style multiple-choice prompt routed over the
+    /// Code tab's RPC channel is surfaced as an interactive modal — or
+    /// auto-cancelled when it can't be matched to the active session or
+    /// its schema won't parse — without blocking the daemon's tool call
+    /// indefinitely.
+    ///
+    /// See `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` for the
+    /// emitter side and the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    /// for the wire protocol.
+    inbound_rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
@@ -149,6 +162,7 @@ impl Chat {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
+            inbound_rx: rpc.subscribe_inbound_requests(),
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
@@ -496,6 +510,133 @@ impl Chat {
         }
     }
 
+    /// Drain server-initiated JSON-RPC requests (today: only
+    /// `elicitation/create`) and dispatch them so the daemon's tool call
+    /// doesn't stall.
+    ///
+    /// An `elicitation/create` targeting the active session with a schema
+    /// we understand is installed as an interactive picker modal
+    /// (`handle_inbound_elicitation`); the user's selection is sent back as
+    /// the JSON-RPC response. A request we can't match to the active
+    /// session, or whose schema won't parse, is auto-answered with
+    /// `{"action": "cancel"}`, which the daemon's
+    /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
+    /// calling tool can fall back to its non-channel path. See the ACP
+    /// elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    ///
+    /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
+    /// future daemon-side feature doesn't silently park a request id.
+    fn drain_inbound_requests(&mut self) {
+        loop {
+            let req = match self.inbound_rx.try_recv() {
+                Ok(req) => req,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            match req.method.as_str() {
+                "elicitation/create" => self.handle_inbound_elicitation(req),
+                other => {
+                    let method = other.to_string();
+                    let id = req.id.clone();
+                    let rpc = self.rpc.clone();
+                    tokio::spawn(async move {
+                        let _ = rpc
+                            .respond_to_inbound_request(
+                                id,
+                                Err(crate::jsonrpc::JsonRpcError {
+                                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                                    message: format!("Method not found: {method}"),
+                                    data: None,
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Decode an inbound elicitation and install an interactive modal on
+    /// the matching session so the user can pick an answer.
+    ///
+    /// The modal owns the JSON-RPC request id; the response is sent later
+    /// from the key handler (`confirm_elicitation` / `cancel_elicitation`)
+    /// once the user acts. If the request can't be matched to the active
+    /// session, or its schema is unparseable, we answer `cancel`
+    /// immediately so the daemon's tool call doesn't stall.
+    ///
+    /// Wire shape per the ACP elicitation RFD
+    /// (https://agentclientprotocol.com/rfds/elicitation).
+    fn handle_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
+        let params: Option<crate::wire::ElicitationRequestParams> =
+            serde_json::from_value(req.params.clone()).ok();
+        let shape = params
+            .as_ref()
+            .and_then(|p| crate::wire::ElicitationShape::from_schema(&p.requested_schema));
+
+        // The request must target the active session AND carry a schema
+        // we understand. Anything else gets an immediate `cancel`.
+        let installable = match (&params, &shape) {
+            (Some(p), Some(_)) => matches!(
+                &self.phase,
+                ChatPhase::Active(state) if state.session_id == p.session_id
+            ),
+            _ => false,
+        };
+
+        if !installable {
+            let id = req.id;
+            let rpc = self.rpc.clone();
+            tokio::spawn(async move {
+                let _ = rpc
+                    .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
+                    .await;
+            });
+            return;
+        }
+
+        // Unwraps are safe: `installable` proved both are `Some`.
+        let params = params.unwrap();
+        let shape = shape.unwrap();
+        let pending = match shape {
+            crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
+                request_id: req.id,
+                session_id: params.session_id,
+                message: params.message,
+                choices: choices.into_iter().map(|c| c.title).collect(),
+                multi: false,
+                min_items: 1,
+                max_items: 1,
+                cursor: 0,
+                selected: Vec::new(),
+            },
+            crate::wire::ElicitationShape::Multi {
+                choices,
+                min_items,
+                max_items,
+                ..
+            } => {
+                let n = choices.len();
+                PendingElicitation {
+                    request_id: req.id,
+                    session_id: params.session_id,
+                    message: params.message,
+                    choices: choices.into_iter().map(|c| c.title).collect(),
+                    multi: true,
+                    min_items,
+                    max_items,
+                    cursor: 0,
+                    selected: vec![false; n],
+                }
+            }
+        };
+
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            state.set_pending_elicitation(pending);
+        }
+    }
+
     fn settle_stuck_cancel(&mut self) {
         let expired = matches!(
             self.phase,
@@ -659,6 +800,7 @@ impl Chat {
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
+        self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -820,6 +962,100 @@ impl Chat {
                 _ => {
                     // Any other key while the picker is open is swallowed so it
                     // doesn't leak into the input bar.
+                    return false;
+                }
+            }
+        }
+
+        // ── Elicitation modal key handling ───────────────────────
+        // Highest-priority Active-phase overlay after the model picker:
+        // an outstanding agent question must be answered before normal
+        // chat keys resume. Navigation mutates the modal in place;
+        // confirm/cancel answer the daemon's JSON-RPC request id and
+        // clear the modal.
+        if state.pending_elicitation.is_some() {
+            use crate::keymap::ModalAction;
+            let action = ModalAction::from_chord(&key);
+
+            // Multi-select toggle on Space. Single-select ignores Space.
+            if action == Some(ModalAction::Toggle) {
+                let mut toggled = false;
+                if let Some(e) = state.pending_elicitation.as_mut()
+                    && e.multi
+                    && let Some(slot) = e.selected.get_mut(e.cursor)
+                {
+                    *slot = !*slot;
+                    toggled = true;
+                }
+                if toggled {
+                    state.mark_dirty_full();
+                }
+                return false;
+            }
+
+            match action {
+                Some(ModalAction::Up) => {
+                    if let Some(e) = state.pending_elicitation.as_mut() {
+                        e.cursor = e.cursor.saturating_sub(1);
+                    }
+                    state.mark_dirty_full();
+                    return false;
+                }
+                Some(ModalAction::Down) => {
+                    if let Some(e) = state.pending_elicitation.as_mut()
+                        && e.cursor + 1 < e.choices.len()
+                    {
+                        e.cursor += 1;
+                    }
+                    state.mark_dirty_full();
+                    return false;
+                }
+                Some(ModalAction::Confirm) => {
+                    // Build the response without holding the modal borrow,
+                    // then answer the daemon. For an invalid multi-select
+                    // (bounds unmet) keep the modal open.
+                    let payload = state
+                        .pending_elicitation
+                        .as_ref()
+                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
+                    if let Some((id, content)) = payload {
+                        state.pending_elicitation = None;
+                        state.mark_dirty_full();
+                        let rpc = self.rpc.clone();
+                        tokio::spawn(async move {
+                            let _ = rpc
+                                .respond_to_inbound_request(
+                                    id,
+                                    Ok(serde_json::json!({
+                                        "action": "accept",
+                                        "content": content
+                                    })),
+                                )
+                                .await;
+                        });
+                    }
+                    // else: invalid selection — swallow, leave modal up.
+                    return false;
+                }
+                Some(ModalAction::Cancel) => {
+                    if let Some(e) = state.pending_elicitation.take() {
+                        state.mark_dirty_full();
+                        let id = e.request_id;
+                        let rpc = self.rpc.clone();
+                        tokio::spawn(async move {
+                            let _ = rpc
+                                .respond_to_inbound_request(
+                                    id,
+                                    Ok(serde_json::json!({ "action": "cancel" })),
+                                )
+                                .await;
+                        });
+                    }
+                    return false;
+                }
+                _ => {
+                    // Swallow every other key so the prompt stays modal and
+                    // nothing leaks into the input bar.
                     return false;
                 }
             }
@@ -1982,6 +2218,16 @@ impl Chat {
                 if s.model_picker.is_open() {
                     return true;
                 }
+                // An elicitation modal is modal too: claim text-input (like
+                // the model picker) so global chords — `?` help, `Ctrl+R`
+                // reload — are suppressed by `app.rs` and the pane's own modal
+                // handler owns every key while the daemon waits on the
+                // `elicitation/create` response. Returning `false` here would
+                // let those globals fire *over* an in-flight prompt, breaking
+                // modality.
+                if s.pending_elicitation().is_some() {
+                    return true;
+                }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
                 }
@@ -2055,6 +2301,37 @@ impl crate::widgets::HelpContext for Chat {
                         ]);
                     }
                     SessionOverlay::None => {}
+                }
+                if state.pending_elicitation().is_some() {
+                    // The elicitation modal is keyboard-driven; source its
+                    // hints from the ModalAction registry so they track any
+                    // rebind. Multi-select adds the toggle line.
+                    use crate::keymap::{ModalAction as M, action_key_labels};
+                    let multi = state
+                        .pending_elicitation()
+                        .map(|e| e.multi)
+                        .unwrap_or(false);
+                    let mut entries = vec![E::new(
+                        action_key_labels(M::Up)
+                            .into_iter()
+                            .chain(action_key_labels(M::Down)),
+                        crate::i18n::t("zc-chat-help-move-up"),
+                    )];
+                    if multi {
+                        entries.push(E::new(
+                            action_key_labels(M::Toggle),
+                            crate::i18n::t("zc-elicit-help-toggle"),
+                        ));
+                    }
+                    entries.push(E::new(
+                        action_key_labels(M::Confirm),
+                        crate::i18n::t("zc-elicit-help-confirm"),
+                    ));
+                    entries.push(E::new(
+                        action_key_labels(M::Cancel),
+                        crate::i18n::t("zc-elicit-help-cancel"),
+                    ));
+                    return HelpNode::entries(entries);
                 }
                 if state.pending_approval().is_some() {
                     use crate::keymap::{ChatTabAction as C, action_key_labels};
@@ -2314,7 +2591,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         area
     };
 
-    let show_cursor = state.pending_approval().is_none();
+    let show_cursor = state.pending_approval().is_none() && state.pending_elicitation().is_none();
     let turn_status = state.turn_status.clone();
     let turn_started_at = state.turn_started_at;
 
@@ -2390,6 +2667,10 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
+    }
+
+    if state.pending_elicitation().is_some() {
+        render_elicitation_overlay(f, state, area);
     }
 
     match &state.session_overlay {
@@ -3140,8 +3421,116 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(p, overlay_area);
 }
 
-/// Strip `old_string`, `new_string`, and `content` from an `arguments_summary`
-/// string (format: `"key: val, key: val, …"`) so the approval overlay stays
+/// Render the elicitation modal: the agent's question plus a selectable
+/// list of choices. Single-select shows a `>` cursor; multi-select adds
+/// `[x]`/`[ ]` checkboxes and a live count against the min/max bounds.
+///
+/// Height is derived from the choice count, clamped to the available
+/// area so a long list scrolls rather than overflowing. Mirrors the
+/// bottom-anchored, horizontally-inset geometry of
+/// [`render_approval_overlay`].
+fn render_elicitation_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+    let e = match state.pending_elicitation() {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Body lines: message (wrapped by the List items below it is not, so
+    // we keep the message in the block title area) + one row per choice +
+    // a key-hint footer. Budget: 2 border + 1 message + N choices + 1
+    // footer, clamped to the area height.
+    let choice_rows = e.choices.len() as u16;
+    let desired = choice_rows.saturating_add(5); // borders + msg + footer + pad
+    let max_h = area.height.saturating_sub(2).max(3);
+    let overlay_h = desired.min(max_h).max(3);
+
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(overlay_h)])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(5),
+            Constraint::Min(60),
+            Constraint::Percentage(5),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
+    let fill = theme::fill_style();
+    let title = if e.multi {
+        let n = e.selected_count();
+        format!(
+            " Choose ({n} selected, need {}..={}) ",
+            e.min_items, e.max_items
+        )
+    } else {
+        String::from(" Choose one ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, theme::warn_style()))
+        .border_style(theme::approval_border_style())
+        .style(fill);
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    // Split inner: message line(s), choice list, footer hint.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let msg = Paragraph::new(e.message.clone())
+        .style(fill)
+        .wrap(Wrap { trim: true });
+    f.render_widget(msg, chunks[0]);
+
+    let items: Vec<ListItem> = e
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, title)| {
+            let checkbox = if e.multi {
+                if e.selected.get(i).copied().unwrap_or(false) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                }
+            } else {
+                ""
+            };
+            let line = format!("{checkbox}{title}");
+            let style = if i == e.cursor {
+                theme::selected_style()
+            } else {
+                fill
+            };
+            ListItem::new(Line::from(Span::styled(line, style)))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(e.cursor.min(e.choices.len().saturating_sub(1))));
+    let list = List::new(items).style(fill);
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    let hint = if e.multi {
+        "↑/↓ move  Space toggle  Enter confirm  Esc cancel"
+    } else {
+        "↑/↓ move  Enter confirm  Esc cancel"
+    };
+    let footer = Paragraph::new(Span::styled(hint, theme::dim_style())).style(fill);
+    f.render_widget(footer, chunks[2]);
+}
+
 /// compact when a diff preview is already shown in the conversation.
 fn strip_content_fields(summary: &str) -> String {
     let mut s = summary;
@@ -3738,6 +4127,86 @@ pub struct PendingApproval {
     pub timeout_secs: u64,
 }
 
+/// A pending ACP `elicitation/create` prompt awaiting a user choice.
+///
+/// Unlike [`PendingApproval`] (fixed allow/reject buttons), an
+/// elicitation is a selectable list of choices — single- or
+/// multi-select — that the agent authored. The modal owns the cursor
+/// and (for multi-select) the per-row checkbox state; on confirm we
+/// translate the selection back into the index-based `choice-N` wire
+/// constants the daemon expects and answer the original JSON-RPC
+/// request id.
+///
+/// `request_id` is a `serde_json::Value` (not `String`) because
+/// JSON-RPC permits numeric ids and we must echo the exact id shape
+/// the daemon sent. See the ACP elicitation RFD
+/// (https://agentclientprotocol.com/rfds/elicitation).
+#[derive(Debug, Clone)]
+pub struct PendingElicitation {
+    /// JSON-RPC request id to respond to. Echoed verbatim.
+    pub request_id: serde_json::Value,
+    /// Session this elicitation belongs to. Captured at install time so a
+    /// future mouse handler (or a cross-session correctness assert) can
+    /// confirm the modal still targets the active session. Read indirectly
+    /// today via the install-time match in `handle_inbound_elicitation`.
+    #[allow(dead_code)]
+    pub session_id: String,
+    /// Prompt text shown above the choice list.
+    pub message: String,
+    /// User-visible choice titles, in wire order. The `choice-N` const
+    /// is the index into this vec.
+    pub choices: Vec<String>,
+    /// Whether this is a multi-select (checkbox) prompt.
+    pub multi: bool,
+    /// Multi-select lower bound (inclusive). Ignored for single-select.
+    pub min_items: usize,
+    /// Multi-select upper bound (inclusive). Ignored for single-select.
+    pub max_items: usize,
+    /// Highlighted row.
+    pub cursor: usize,
+    /// Per-row checkbox state for multi-select. Empty / unused for
+    /// single-select.
+    pub selected: Vec<bool>,
+}
+
+impl PendingElicitation {
+    /// Number of currently-checked rows (multi-select only).
+    pub fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|&&b| b).count()
+    }
+
+    /// Whether the current selection satisfies the multi-select
+    /// `min_items`/`max_items` bounds. Always `true` for single-select
+    /// (the cursor itself is the answer).
+    pub fn selection_valid(&self) -> bool {
+        if !self.multi {
+            return !self.choices.is_empty();
+        }
+        let n = self.selected_count();
+        n >= self.min_items && n <= self.max_items
+    }
+
+    /// Build the `accept` content payload for the current selection, or
+    /// `None` if the selection is invalid (e.g. too few boxes checked).
+    pub fn accept_content(&self) -> Option<serde_json::Value> {
+        if !self.selection_valid() {
+            return None;
+        }
+        if self.multi {
+            let consts: Vec<serde_json::Value> = self
+                .selected
+                .iter()
+                .enumerate()
+                .filter(|&(_, &on)| on)
+                .map(|(i, _)| serde_json::json!(format!("choice-{i}")))
+                .collect();
+            Some(serde_json::json!({ "choices": consts }))
+        } else {
+            Some(serde_json::json!({ "choice": format!("choice-{}", self.cursor) }))
+        }
+    }
+}
+
 /// One row in the chat / code-tab transcript. Heavy payloads
 /// (agent messages, tool inputs, tool outputs) are refcounted via
 /// `Arc<str>` so cloning is O(1) — the renderer and the
@@ -3898,6 +4367,12 @@ pub struct ChatState {
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
+    /// A pending ACP elicitation prompt (single- or multi-select). Like
+    /// `pending_approval`, this is a modal overlay that captures keys
+    /// until the user confirms or cancels. Mutually exclusive with
+    /// `pending_approval` in practice — the daemon never has both an
+    /// approval and an elicitation outstanding for the same session.
+    pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
     /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
@@ -4009,6 +4484,7 @@ impl ChatState {
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
+            pending_elicitation: None,
             turn_in_flight: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -4558,6 +5034,24 @@ impl ChatState {
 
     pub fn take_pending_approval(&mut self) -> Option<PendingApproval> {
         self.pending_approval.take()
+    }
+
+    pub fn pending_elicitation(&self) -> Option<&PendingElicitation> {
+        self.pending_elicitation.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn take_pending_elicitation(&mut self) -> Option<PendingElicitation> {
+        self.pending_elicitation.take()
+    }
+
+    /// Install a pending elicitation modal. Replaces any prior one (the
+    /// daemon serializes elicitations per session, so a second arrival
+    /// before the first is answered is a protocol anomaly we resolve by
+    /// keeping the newest).
+    pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.pending_elicitation = Some(e);
+        self.mark_dirty_full();
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -5143,6 +5637,7 @@ impl ChatState {
         self.cached_render_start = 0;
         self.cached_render_width = 0;
         self.pending_approval = None;
+        self.pending_elicitation = None;
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -5466,6 +5961,31 @@ mod tests {
             ));
         }
         assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_makes_chat_claim_text_input() {
+        // Regression: while an `elicitation/create` prompt is pending the
+        // pane MUST be modal — it has to claim
+        // text-input so `app.rs` suppresses global chords (`?` help,
+        // `Ctrl+R` reload) and routes every key to the modal handler. If
+        // this returns `false`, those globals fire over an in-flight
+        // prompt while the daemon waits on the JSON-RPC response, breaking
+        // modality. Mirrors `open_picker_makes_chat_claim_text_input`.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        // Not modal before the prompt arrives (empty input → command mode).
+        assert!(!chat.wants_text_input());
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.set_pending_elicitation(single_elicitation());
+        }
+        assert!(
+            chat.wants_text_input(),
+            "an active pending elicitation must claim modal focus"
+        );
     }
 
     #[tokio::test]
@@ -6969,5 +7489,123 @@ mod tests {
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    // ── Elicitation modal ────────────────────────────────────────
+
+    fn single_elicitation() -> PendingElicitation {
+        PendingElicitation {
+            request_id: serde_json::json!("elicit-1"),
+            session_id: "sess-1".to_string(),
+            message: "Pick a fruit".to_string(),
+            choices: vec![
+                "Apple".to_string(),
+                "Banana".to_string(),
+                "Cherry".to_string(),
+            ],
+            multi: false,
+            min_items: 1,
+            max_items: 1,
+            cursor: 0,
+            selected: Vec::new(),
+        }
+    }
+
+    fn multi_elicitation() -> PendingElicitation {
+        PendingElicitation {
+            request_id: serde_json::json!(42),
+            session_id: "sess-1".to_string(),
+            message: "Pick toppings".to_string(),
+            choices: vec![
+                "Cheese".to_string(),
+                "Olives".to_string(),
+                "Ham".to_string(),
+            ],
+            multi: true,
+            min_items: 1,
+            max_items: 2,
+            cursor: 0,
+            selected: vec![false, false, false],
+        }
+    }
+
+    #[test]
+    fn single_select_accept_content_uses_cursor_index() {
+        let mut e = single_elicitation();
+        e.cursor = 2;
+        let content = e.accept_content().expect("single select always valid");
+        assert_eq!(content, serde_json::json!({ "choice": "choice-2" }));
+    }
+
+    #[test]
+    fn single_select_is_always_valid_when_choices_present() {
+        let e = single_elicitation();
+        assert!(e.selection_valid());
+    }
+
+    #[test]
+    fn single_select_with_no_choices_is_invalid() {
+        let mut e = single_elicitation();
+        e.choices.clear();
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_requires_min_items() {
+        let e = multi_elicitation(); // min 1, nothing selected
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_rejects_over_max_items() {
+        let mut e = multi_elicitation(); // max 2
+        e.selected = vec![true, true, true]; // 3 selected
+        assert_eq!(e.selected_count(), 3);
+        assert!(!e.selection_valid());
+        assert!(e.accept_content().is_none());
+    }
+
+    #[test]
+    fn multi_select_accept_content_lists_checked_indices() {
+        let mut e = multi_elicitation();
+        e.selected = vec![true, false, true]; // indices 0 and 2
+        assert!(e.selection_valid());
+        let content = e.accept_content().expect("2 within 1..=2");
+        assert_eq!(
+            content,
+            serde_json::json!({ "choices": ["choice-0", "choice-2"] })
+        );
+    }
+
+    #[test]
+    fn elicitation_numeric_request_id_is_preserved() {
+        let e = multi_elicitation();
+        // Numeric ids must round-trip as numbers, not strings, so the
+        // daemon can match the response to its outbound request.
+        assert_eq!(e.request_id, serde_json::json!(42));
+    }
+
+    #[test]
+    fn set_and_take_pending_elicitation_round_trip() {
+        let mut s = state();
+        assert!(s.pending_elicitation().is_none());
+        s.set_pending_elicitation(single_elicitation());
+        assert!(s.pending_elicitation().is_some());
+        let taken = s.take_pending_elicitation().expect("was set");
+        assert_eq!(taken.message, "Pick a fruit");
+        assert!(s.pending_elicitation().is_none());
+    }
+
+    #[test]
+    fn reset_for_session_clears_pending_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session("sess-2".to_string(), None);
+        assert!(
+            s.pending_elicitation().is_none(),
+            "a session switch must drop any stale elicitation modal"
+        );
     }
 }
