@@ -167,7 +167,11 @@ mod tests {
         assert_eq!(ResponseType::YesNo.prompt_sigil().as_str(), ">");
         assert_eq!(ResponseType::FreeformText.prompt_sigil().as_str(), ">");
         assert_eq!(
-            ResponseType::Choice { options: Vec::new() }.prompt_sigil().as_str(),
+            ResponseType::Choice {
+                options: Vec::new()
+            }
+            .prompt_sigil()
+            .as_str(),
             ">"
         );
     }
@@ -194,11 +198,23 @@ mod tests {
 
     #[test]
     fn each_response_type_declares_its_expectation() {
-        assert_eq!(ResponseType::YesNo.expectation(), ResponseExpectation::Confirmation);
-        assert_eq!(ResponseType::Secret.expectation(), ResponseExpectation::HiddenText);
-        assert_eq!(ResponseType::FreeformText.expectation(), ResponseExpectation::Text);
         assert_eq!(
-            ResponseType::Choice { options: Vec::new() }.expectation(),
+            ResponseType::YesNo.expectation(),
+            ResponseExpectation::Confirmation
+        );
+        assert_eq!(
+            ResponseType::Secret.expectation(),
+            ResponseExpectation::HiddenText
+        );
+        assert_eq!(
+            ResponseType::FreeformText.expectation(),
+            ResponseExpectation::Text
+        );
+        assert_eq!(
+            ResponseType::Choice {
+                options: Vec::new()
+            }
+            .expectation(),
             ResponseExpectation::Selection
         );
     }
@@ -207,9 +223,16 @@ mod tests {
     fn ask_kind_display_renders_variant_name_verbatim() {
         assert_eq!(ResponseType::Secret.ask_kind().to_string(), "Secret");
         assert_eq!(ResponseType::YesNo.ask_kind().to_string(), "YesNo");
-        assert_eq!(ResponseType::FreeformText.ask_kind().to_string(), "FreeformText");
         assert_eq!(
-            ResponseType::Choice { options: Vec::new() }.ask_kind().to_string(),
+            ResponseType::FreeformText.ask_kind().to_string(),
+            "FreeformText"
+        );
+        assert_eq!(
+            ResponseType::Choice {
+                options: Vec::new()
+            }
+            .ask_kind()
+            .to_string(),
             "Choice"
         );
     }

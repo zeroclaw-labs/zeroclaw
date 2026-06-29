@@ -192,10 +192,8 @@ mod tests {
 
     #[tokio::test]
     async fn choice_matches_option_value_from_llm() {
-        let mut transport = LlmTransport::new(
-            ScriptedResponder::new(vec!["partial"]),
-            PanicSecretReader,
-        );
+        let mut transport =
+            LlmTransport::new(ScriptedResponder::new(vec!["partial"]), PanicSecretReader);
         let prompt = Prompt::new(
             "Mode",
             ResponseType::Choice {

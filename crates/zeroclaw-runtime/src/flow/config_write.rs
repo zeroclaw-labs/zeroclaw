@@ -59,14 +59,24 @@ mod tests {
     #[test]
     fn yes_no_writes_bool_prop() {
         let (_tmp, mut config) = config_with_matrix();
-        write_response(&mut config, &path("mention_only"), &ResponseValue::YesNo(true)).unwrap();
+        write_response(
+            &mut config,
+            &path("mention_only"),
+            &ResponseValue::YesNo(true),
+        )
+        .unwrap();
         assert_eq!(config.get_prop(&path("mention_only")).unwrap(), "true");
     }
 
     #[test]
     fn yes_no_false_writes_false() {
         let (_tmp, mut config) = config_with_matrix();
-        write_response(&mut config, &path("mention_only"), &ResponseValue::YesNo(false)).unwrap();
+        write_response(
+            &mut config,
+            &path("mention_only"),
+            &ResponseValue::YesNo(false),
+        )
+        .unwrap();
         assert_eq!(config.get_prop(&path("mention_only")).unwrap(), "false");
     }
 
@@ -107,10 +117,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.channels.matrix.get(ALIAS).unwrap().access_token.as_deref(),
+            config
+                .channels
+                .matrix
+                .get(ALIAS)
+                .unwrap()
+                .access_token
+                .as_deref(),
             Some("sk-super-secret")
         );
-        assert!(!config.get_prop(&path("access_token")).unwrap().contains("sk-super-secret"));
+        assert!(
+            !config
+                .get_prop(&path("access_token"))
+                .unwrap()
+                .contains("sk-super-secret")
+        );
     }
 
     #[test]

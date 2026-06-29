@@ -3,8 +3,10 @@ use std::io::Cursor;
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use zeroclaw_onboarding::{build_spec, section_fields, CliTransport, LlmResponder, LlmTransport, SecretReader};
 use zeroclaw_config::schema::{Config, MatrixConfig};
+use zeroclaw_onboarding::{
+    CliTransport, LlmResponder, LlmTransport, SecretReader, build_spec, section_fields,
+};
 use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
 
 const SECTION: &str = "channels.matrix.home";
@@ -37,7 +39,10 @@ struct ScriptedResponder {
 
 #[async_trait]
 impl LlmResponder for ScriptedResponder {
-    async fn respond(&mut self, _prompt_text: &str) -> zeroclaw_runtime::flow::TransportResult<String> {
+    async fn respond(
+        &mut self,
+        _prompt_text: &str,
+    ) -> zeroclaw_runtime::flow::TransportResult<String> {
         self.replies
             .pop_front()
             .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
@@ -106,16 +111,28 @@ fn answer_for(field: &zeroclaw_config::traits::PropFieldInfo) -> String {
 }
 
 async fn walk_cli(config: &mut Config, script: &str) -> Outcome {
-    let spec = build_spec(config.prop_fields(), SECTION, "channel", "home", completed())
-        .expect("matrix section yields a spec");
+    let spec = build_spec(
+        config.prop_fields(),
+        SECTION,
+        "channel",
+        "home",
+        completed(),
+    )
+    .expect("matrix section yields a spec");
     let mut output: Vec<u8> = Vec::new();
     let mut transport = CliTransport::new(Cursor::new(script.as_bytes().to_vec()), &mut output);
     spec.walk(&mut transport, config).await.unwrap()
 }
 
 async fn walk_llm(config: &mut Config, llm: Vec<String>, secrets: Vec<String>) -> Outcome {
-    let spec = build_spec(config.prop_fields(), SECTION, "channel", "home", completed())
-        .expect("matrix section yields a spec");
+    let spec = build_spec(
+        config.prop_fields(),
+        SECTION,
+        "channel",
+        "home",
+        completed(),
+    )
+    .expect("matrix section yields a spec");
     let responder = ScriptedResponder {
         replies: llm.into(),
     };

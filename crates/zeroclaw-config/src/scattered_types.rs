@@ -1,7 +1,7 @@
 //! Config types that were originally defined in their home modules (agent, channels, tools, trust)
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
-use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+use crate::traits::ChannelConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -10,7 +10,9 @@ use zeroclaw_macros::Configurable;
 // ── Agent config types ──────────────────────────────────────────
 
 /// How deeply the model should reason for a given message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -21,10 +23,6 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Max,
-}
-
-impl HasPropKind for ThinkingLevel {
-    const PROP_KIND: PropKind = PropKind::Enum;
 }
 
 impl ThinkingLevel {
@@ -711,7 +709,9 @@ impl ChannelConfig for ClawdTalkConfig {
 }
 
 /// Which telephony model_provider to use.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceProvider {
@@ -719,10 +719,6 @@ pub enum VoiceProvider {
     Twilio,
     Telnyx,
     Plivo,
-}
-
-impl HasPropKind for VoiceProvider {
-    const PROP_KIND: PropKind = PropKind::Enum;
 }
 
 impl fmt::Display for VoiceProvider {

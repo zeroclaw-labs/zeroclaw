@@ -182,14 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn enum_field_without_schema_export_falls_back_to_freeform() {
+    fn enum_field_offers_registry_variants_as_choices() {
         let required = required_fields(matrix_fields(), "channels.matrix.home");
         let stream = required
             .iter()
             .find(|field| field.name == "channels.matrix.home.stream_mode")
             .expect("stream_mode is a non-Option enum");
         assert_eq!(stream.kind, PropKind::Enum);
-        assert_eq!(response_type_for(stream), ResponseType::FreeformText);
+        let ResponseType::Choice { options } = response_type_for(stream) else {
+            panic!("enum field must map to a Choice of its registry variants");
+        };
+        let values: Vec<String> = options.into_iter().map(|option| option.value).collect();
+        assert_eq!(values, vec!["off", "partial", "multi_message"]);
     }
 
     #[test]

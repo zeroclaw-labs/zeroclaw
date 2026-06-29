@@ -51,7 +51,9 @@ pub struct ConfiguredItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Completed { configured: Vec<ConfiguredItem> },
+    Completed {
+        configured: Vec<ConfiguredItem>,
+    },
     Cancelled,
     Failed {
         layer: String,

@@ -148,7 +148,14 @@ impl Spec {
             return;
         };
         self.render_edge(&node.on_success, EdgeKind::Ok, prefix, true, path, rendered);
-        self.render_edge(&node.on_failure, EdgeKind::Err, prefix, false, path, rendered);
+        self.render_edge(
+            &node.on_failure,
+            EdgeKind::Err,
+            prefix,
+            false,
+            path,
+            rendered,
+        );
     }
 
     fn render_edge(
@@ -160,7 +167,11 @@ impl Spec {
         path: &mut Vec<NodeId>,
         rendered: &mut String,
     ) {
-        let connector = if has_sibling_below { "├─" } else { "└─" };
+        let connector = if has_sibling_below {
+            "├─"
+        } else {
+            "└─"
+        };
         let child_prefix = if has_sibling_below { "│  " } else { "   " };
         match step {
             Step::Terminal(outcome) => {
@@ -325,7 +336,13 @@ mod tests {
         assert_eq!(outcome, completed());
         assert_eq!(transport.emitted, vec![outcome]);
         assert_eq!(
-            config.channels.matrix.get("home").unwrap().access_token.as_deref(),
+            config
+                .channels
+                .matrix
+                .get("home")
+                .unwrap()
+                .access_token
+                .as_deref(),
             Some("tok")
         );
     }
