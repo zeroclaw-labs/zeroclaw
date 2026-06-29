@@ -40,7 +40,7 @@ Filesystem events are delivered by the `FilesystemChannel`, which watches one or
 
 ### 3.1 Configuration
 
-Configure watched paths with `zeroclaw config set channels.filesystem.<field> <value>`: the keys land under `[channels.filesystem]` in the stored config; the full field index is generated into the config reference. The broad system roots `/`, `/home`, `/etc`, and `/var` are rejected at config validation unless `allow_broad_roots = true`; include/exclude globs scope which paths emit events.
+Configure watched paths with `zeroclaw config set channels.filesystem.<field> <value>`: the keys land under `[channels.filesystem]` in the stored config; the full field index is generated into the config reference. The broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` are rejected at config validation unless `allow_broad_roots = true`; include/exclude globs scope which paths emit events.
 
 ### 3.2 Trigger Definition
 
@@ -63,7 +63,7 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 | Feature | Mechanism |
 |---|---|
 | **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
-| **Filesystem roots** | The broad roots `/`, `/home`, `/etc`, `/var` rejected at config validation (override with `allow_broad_roots`); include/exclude globs scope events |
+| **Filesystem roots** | The broad roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, `/tmp` rejected at config validation (override with `allow_broad_roots`); include/exclude globs scope events |
 | **Filesystem symlinks** | Symlink event paths are rejected before any metadata/hash/content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |
 | **Untrusted trigger input** | Topic and payload text are capped, normalized, prompt-guard screened, and framed before model context. |
 | **Unsafe trigger block** | `untrusted_input_guard = "block"` refuses unsafe untrusted events with `BlockedUnsafe`; default `warn` audits and allows. |
@@ -77,6 +77,6 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 | **MQTT** connection errors | broker URL/TLS mismatch | Verify scheme + TLS flag pairing (`mqtt://`/`false`, `mqtts://`/`true`) |
 | **MQTT** SOP not starting | topic pattern mismatch or failing `condition` | Verify the trigger topic/wildcards match the published topic; check the `condition` against the payload |
 | **Filesystem** SOP not starting | watched path/glob mismatch or excluded by glob | Verify the trigger `path` glob matches the changed file and the path is in `channels.filesystem` include scope |
-| **Filesystem** listener not starting | broad root rejected at validation | Narrow `channels.filesystem` paths away from `/`, `/home`, `/etc`, `/var`, or set `allow_broad_roots` |
+| **Filesystem** listener not starting | broad root rejected at validation | Narrow `channels.filesystem` paths away from `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, `/tmp`, or set `allow_broad_roots` |
 | **SOP started but step not executed** | headless trigger without active agent loop | run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
 | **Webhook/cron/peripheral trigger never fires** | event source not wired into the dispatcher | use an MQTT or filesystem trigger, or start the run with `sop_execute` |
