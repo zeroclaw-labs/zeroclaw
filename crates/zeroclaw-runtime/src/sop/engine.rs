@@ -635,6 +635,33 @@ impl SopEngine {
         self.resolve_deterministic_action(&sop, &run_id, &step, input)
     }
 
+    /// Drive a just-started headless deterministic run to a terminal state.
+    ///
+    /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
+    /// agent loop to execute steps, so a deterministic run that returns
+    /// `DeterministicStep` would otherwise sit in `active_runs` as `Running`
+    /// forever, consuming its `max_concurrent` slot and blocking every later
+    /// event from the same SOP. Advancing each step here drains the chain to
+    /// `Completed`, which evicts the run via `finish_run` and frees the slot so
+    /// the next matching event can fire. A `CheckpointWait` is intentionally
+    /// left paused (an operator gate, not a stuck run).
+    pub fn drive_headless_deterministic(
+        &mut self,
+        run_id: &str,
+        first_action: SopRunAction,
+    ) -> Result<SopRunAction> {
+        let mut action = first_action;
+        loop {
+            match action {
+                SopRunAction::DeterministicStep { ref input, .. } => {
+                    let piped = input.clone();
+                    action = self.advance_deterministic_step(run_id, piped, None)?;
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+    }
+
     /// Advance a deterministic run with the output of the current step.
     /// The output is piped as input to the next step.
     pub fn advance_deterministic_step(
