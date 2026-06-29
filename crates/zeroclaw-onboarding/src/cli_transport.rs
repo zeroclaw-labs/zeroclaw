@@ -21,12 +21,12 @@ pub struct TtyPasswordSource;
 
 #[async_trait]
 impl CliSecretSource for TtyPasswordSource {
-    async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String> {
-        let prompt = prompt_text.to_string();
+    async fn read_secret(&mut self, _prompt_text: &str) -> TransportResult<String> {
         tokio::task::spawn_blocking(move || {
             dialoguer::Password::new()
-                .with_prompt(prompt)
-                .interact()
+                .with_prompt("")
+                .report(false)
+                .interact_on(&dialoguer::console::Term::stdout())
                 .map_err(|_| TransportError::Closed)
         })
         .await
@@ -50,7 +50,7 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
     }
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
-        format!("{} {} ", prompt.text, prompt.sigil().as_str())
+        format!("{} {}\n", prompt.text, prompt.sigil().as_str())
     }
 
     fn read_line(&mut self) -> TransportResult<String> {
@@ -115,18 +115,11 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
                 .write_all(line.as_bytes())
                 .map_err(|_| TransportError::Closed)?;
             self.writer.flush().map_err(|_| TransportError::Closed)?;
-            if prompt.routes_secret() {
-                let raw = self.secret_source.read_secret(&prompt.text).await?;
-                self.writer
-                    .write_all(b"\n")
-                    .map_err(|_| TransportError::Closed)?;
-                self.writer.flush().map_err(|_| TransportError::Closed)?;
-                if let Some(value) = Self::parse(prompt, &raw) {
-                    return Ok(value);
-                }
-                continue;
-            }
-            let raw = self.read_line()?;
+            let raw = if prompt.routes_secret() {
+                self.secret_source.read_secret(&prompt.text).await?
+            } else {
+                self.read_line()?
+            };
             if let Some(value) = Self::parse(prompt, &raw) {
                 return Ok(value);
             }
@@ -187,11 +180,11 @@ mod tests {
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(true));
-        assert_eq!(String::from_utf8(output).unwrap(), "Proceed? > ");
+        assert_eq!(String::from_utf8(output).unwrap(), "Proceed? >\n");
     }
 
     #[tokio::test]
-    async fn secret_prompt_reads_from_secret_source_and_never_echoes_value() {
+    async fn secret_prompt_writes_its_sigil_line_but_never_the_value() {
         let mut output: Vec<u8> = Vec::new();
         let mut transport = CliTransport::with_secret_source(
             Cursor::new(Vec::new()),
@@ -205,7 +198,7 @@ mod tests {
             other => panic!("expected secret, got {other:?}"),
         }
         let rendered = String::from_utf8(output).unwrap();
-        assert_eq!(rendered, "Token # \n");
+        assert_eq!(rendered, "Token #\n");
         assert!(!rendered.contains("sk-secret"));
     }
 
@@ -216,7 +209,10 @@ mod tests {
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(false));
-        assert_eq!(String::from_utf8(output).unwrap(), "Proceed? > Proceed? > ");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Proceed? >\nProceed? >\n"
+        );
     }
 
     #[tokio::test]

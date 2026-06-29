@@ -474,6 +474,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 rcgen = "0.13"
+portable-pty = "0.8"
 
 [[test]]
 name = "component"

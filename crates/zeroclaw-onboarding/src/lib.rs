@@ -10,7 +10,7 @@ pub mod spec_builder;
 pub use agent_responder::{AgentResponder, AgentTurn, InProcessAgentTurn};
 pub use cli_transport::{CliSecretSource, CliTransport, NoSecretSource, TtyPasswordSource};
 pub use driver::{DriverError, FlowRequest, run_flow};
-pub use llm_transport::{LlmResponder, LlmTransport, SecretReader};
+pub use llm_transport::{LlmResponder, LlmTransport, SecretReader, TtySecretReader};
 pub use phrasing::{
     AgentPhraser, DescriptionPhraser, FieldPhrasingContext, PromptPhraser, phrase_spec,
 };

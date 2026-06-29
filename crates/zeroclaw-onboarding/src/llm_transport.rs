@@ -12,6 +12,23 @@ pub trait SecretReader: Send {
     async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String>;
 }
 
+pub struct TtySecretReader;
+
+#[async_trait]
+impl SecretReader for TtySecretReader {
+    async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String> {
+        let prompt = prompt_text.to_string();
+        tokio::task::spawn_blocking(move || {
+            dialoguer::Password::new()
+                .with_prompt(prompt)
+                .interact_on(&dialoguer::console::Term::stdout())
+                .map_err(|_| zeroclaw_runtime::flow::TransportError::Closed)
+        })
+        .await
+        .map_err(|_| zeroclaw_runtime::flow::TransportError::Closed)?
+    }
+}
+
 pub struct LlmTransport<L: LlmResponder, S: SecretReader> {
     responder: L,
     secret_reader: S,

@@ -620,6 +620,31 @@ enum Commands {
         agent: Option<String>,
     },
 
+    /// Run the spec-driven section flow over a chosen transport. The section
+    /// prefix is a dotted config path such as `channels.matrix.home`.
+    #[command(hide = true)]
+    OnboardFlow {
+        /// Dotted config section prefix, e.g. `channels.matrix.home`.
+        #[arg(long)]
+        section: String,
+
+        /// Layer label for the completion outcome (e.g. `channel`).
+        #[arg(long, default_value = "section")]
+        layer: String,
+
+        /// Instance label for the completion outcome (e.g. `home`).
+        #[arg(long, default_value = "default")]
+        instance: String,
+
+        /// Drive the flow with the in-process agent instead of the CLI.
+        #[arg(long)]
+        llm: bool,
+
+        /// Agent alias used when --llm is set.
+        #[arg(long, default_value = "default")]
+        agent: String,
+    },
+
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
     Onboard {
         /// Configure a specific section only. Omit to run the full flow.
@@ -1331,6 +1356,67 @@ fn apply_homebrew_onboard_config_dir() {
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
 /// still open that selector and overwrite it.
 #[cfg(feature = "agent-runtime")]
+async fn run_onboard_flow(
+    mut config: zeroclaw_config::schema::Config,
+    section: &str,
+    layer: &str,
+    instance: &str,
+    use_llm: bool,
+    agent_alias: &str,
+) -> anyhow::Result<()> {
+    use zeroclaw_onboarding::{
+        AgentPhraser, AgentResponder, CliTransport, FlowRequest, InProcessAgentTurn, LlmTransport,
+        TtyPasswordSource, TtySecretReader, build_spec, phrase_spec, run_flow,
+    };
+    use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
+
+    let success = Outcome::Completed {
+        configured: vec![ConfiguredItem {
+            layer: layer.to_string(),
+            instance: instance.to_string(),
+        }],
+    };
+
+    if use_llm {
+        let phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+            &config,
+            agent_alias,
+        ))
+        .await?;
+        let mut spec = build_spec(config.prop_fields(), section, layer, instance, success)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
+            })?;
+        let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent));
+        phrase_spec(&mut spec, &mut phraser).await?;
+
+        let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+            &config,
+            agent_alias,
+        ))
+        .await?;
+        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent));
+        let mut transport = LlmTransport::new(responder, TtySecretReader);
+        let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;
+        Box::pin(config.save()).await?;
+        println!("[{}]", outcome.label());
+        return Ok(());
+    }
+
+    let reader = std::io::BufReader::new(std::io::stdin());
+    let writer = std::io::stdout();
+    let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource);
+    let request = FlowRequest {
+        section_prefix: section,
+        layer,
+        instance,
+    };
+    let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
+    Box::pin(config.save()).await?;
+    println!("[{}]", outcome.label());
+    Ok(())
+}
+
 async fn run_quickstart_cli(
     model_provider: Option<String>,
     model: Option<String>,
@@ -3688,6 +3774,20 @@ async fn main() -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
+            return Ok(());
+        }
+
+        Commands::OnboardFlow {
+            section,
+            layer,
+            instance,
+            llm,
+            agent,
+        } => {
+            Box::pin(run_onboard_flow(
+                config, &section, &layer, &instance, llm, &agent,
+            ))
+            .await?;
             return Ok(());
         }
 

@@ -1,0 +1,151 @@
+use std::io::{Read, Write};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use tempfile::TempDir;
+use zeroclaw_config::schema::{Config, MatrixConfig};
+use zeroclaw_onboarding::{Outcome, build_spec};
+use zeroclaw_runtime::response_type::ResponseType;
+
+const SECTION: &str = "channels.matrix.home";
+
+fn seeded_config_dir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let mut file = std::fs::File::create(tmp.path().join("config.toml")).unwrap();
+    writeln!(
+        file,
+        "schema_version = 3\n\n[channels.matrix.home]\nenabled = false\nhomeserver = \"https://matrix.org\"\n"
+    )
+    .unwrap();
+    tmp
+}
+
+fn scripted_answers() -> Vec<String> {
+    let mut config = Config::default();
+    config
+        .channels
+        .matrix
+        .insert("home".to_string(), MatrixConfig::default());
+    let spec = build_spec(
+        config.prop_fields(),
+        SECTION,
+        "channel",
+        "home",
+        Outcome::Cancelled,
+    )
+    .expect("matrix section yields a spec");
+
+    let mut ordered: Vec<_> = spec.nodes.values().collect();
+    ordered.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    ordered
+        .into_iter()
+        .map(|node| match &node.prompt.response_type {
+            ResponseType::Secret => "sk-token".to_string(),
+            ResponseType::YesNo => "y".to_string(),
+            ResponseType::Number => "100".to_string(),
+            ResponseType::Choice { options } => options[0].value.clone(),
+            ResponseType::FreeformText => "https://walked.test".to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn onboard_flow_walks_the_matrix_section_over_a_real_pty_and_writes_config() {
+    let tmp = seeded_config_dir();
+    let config_path = tmp.path().join("config.toml");
+    let binary = env!("CARGO_BIN_EXE_zeroclaw");
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let mut cmd = CommandBuilder::new(binary);
+    cmd.arg("--config-dir");
+    cmd.arg(tmp.path());
+    cmd.arg("onboard-flow");
+    cmd.arg("--section");
+    cmd.arg(SECTION);
+    cmd.arg("--layer");
+    cmd.arg("channel");
+    cmd.arg("--instance");
+    cmd.arg("home");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn child");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut answers = scripted_answers().into_iter();
+    assert!(
+        answers.len() > 3,
+        "matrix section should ask several fields"
+    );
+
+    let mut transcript = String::new();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut idle_since = Instant::now();
+    let mut completed = false;
+
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => {
+                transcript.push_str(&String::from_utf8_lossy(&chunk));
+                idle_since = Instant::now();
+                if transcript.contains("[completed") {
+                    completed = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if idle_since.elapsed() >= Duration::from_millis(200) {
+                    if let Some(answer) = answers.next() {
+                        writer
+                            .write_all(format!("{answer}\n").as_bytes())
+                            .expect("write answer");
+                        writer.flush().expect("flush");
+                        idle_since = Instant::now();
+                    } else if transcript.contains("[completed") {
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.wait();
+
+    assert!(
+        completed,
+        "flow did not reach a completed outcome.\ntranscript:\n{transcript}"
+    );
+
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("https://walked.test"),
+        "freeform answer should have been written, got:\n{written}"
+    );
+}
