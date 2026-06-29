@@ -8,6 +8,7 @@
 pub mod cli_input;
 pub mod identity;
 pub mod migration;
+pub mod response_type;
 pub mod util;
 
 pub mod agent;
