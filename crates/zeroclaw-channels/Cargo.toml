@@ -63,7 +63,7 @@ lettre = { version = "0.11.22", default-features = false, features = [
 ], optional = true }
 pulldown-cmark = { version = "0.13", optional = true }
 mail-parser = { version = "0.11.2", optional = true }
-matrix-sdk = { version = "0.17", optional = true, default-features = false, features = [
+matrix-sdk = { version = "0.18", optional = true, default-features = false, features = [
   "e2e-encryption",
   "markdown",
   "sqlite",

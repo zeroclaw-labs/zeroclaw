@@ -1,5 +1,42 @@
 use std::time::Duration;
 
+/// A single conversation message captured for OTel GenAI semconv export.
+/// Structurally mirrors [`crate::model_provider::ChatMessage`] but is defined
+/// independently to keep the observability API decoupled from the model-provider
+/// API and to signal that `content` has been credential-scrubbed at capture time.
+#[derive(Debug, Clone)]
+pub struct MessageSnapshot {
+    pub role: String,
+    pub content: String,
+}
+
+/// A tool call the model emitted, captured for `gen_ai.output.messages`.
+/// `arguments_json` is the raw JSON arguments string, credential-scrubbed.
+#[derive(Debug, Clone)]
+pub struct ToolCallSnapshot {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+/// Full prompt/completion content for one `llm.call`, captured and
+/// credential-scrubbed at the agent-loop boundary so the OTel exporter can emit
+/// `gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.system_instructions`.
+///
+/// Populated at the agent-loop capture boundary when the `observability-otel`
+/// feature is active; `None` otherwise (other observers and non-OTel builds leave it `None`).
+#[derive(Debug, Clone)]
+pub struct LlmMessageSnapshot {
+    /// Non-system input messages, in send order.
+    pub input: Vec<MessageSnapshot>,
+    /// Assistant text output, if any. Empty text is captured as `None`.
+    pub output_text: Option<String>,
+    /// Tool calls the assistant emitted this turn.
+    pub output_tool_calls: Vec<ToolCallSnapshot>,
+    /// System prompt, carried separately from `input`.
+    pub system_instructions: Option<String>,
+}
+
 /// Token usage breakdown for a single agent turn.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TurnTokenUsage {
@@ -18,6 +55,9 @@ pub struct TurnTokenUsage {
 /// degrade gracefully when new variants are added in future minor
 /// releases — they must include a wildcard arm in their `match`
 /// expressions and will simply ignore unknown event kinds.
+/// Exception: under the `observability-otel` feature, [`ObserverEvent::LlmResponse`]
+/// carries credential-scrubbed prompt/completion content in `messages` for GenAI
+/// semantic-convention export. See [`LlmMessageSnapshot`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ObserverEvent {
@@ -50,6 +90,10 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Credential-scrubbed prompt/completion content for OTel GenAI export.
+        /// `None` unless the `observability-otel` feature is active. See
+        /// [`LlmMessageSnapshot`].
+        messages: Option<LlmMessageSnapshot>,
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
