@@ -14,7 +14,7 @@ surfaces. The code lives in `crates/zeroclaw-config/src/cost/` and
 
 Two related sections own the surface. `cost` covers budget enforcement and recording behavior. `cost.rates.*`
 is the operator-managed rate sheet; every subsection's dotted path mirrors
-the matching `providers.*` path with the trailing `<alias>` segment
+the matching `providers.*` path with the trailing ``<alias>`` segment
 replaced by the upstream resource being priced.
 
 ### Why the key is a resource id, not an alias
