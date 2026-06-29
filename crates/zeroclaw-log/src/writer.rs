@@ -169,7 +169,7 @@ fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
         tracing::warn!(
             target: "zeroclaw_log",
             error = %err,
-            "log: failed to spawn zeroclaw-log-writer thread; falling back to inline writes"
+            "log: failed to spawn zeroclaw-log-writer thread; persistence disabled"
         );
         dead.store(true, Ordering::Release);
     }
