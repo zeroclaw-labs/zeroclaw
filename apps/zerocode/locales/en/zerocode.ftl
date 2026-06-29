@@ -213,6 +213,7 @@ zc-dashboard-detail-last-status = Last Status
 zc-dashboard-detail-sessions = Sessions
 zc-dashboard-detail-persisted-sessions = Persisted Sessions
 zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
+zc-dashboard-cost-org-error = Organization billing snapshot is present but could not be read. Check the org_cost.json sync.
 
 zc-dashboard-message-history = Message History ({ $count })
 zc-dashboard-loading-messages = Loading messages…
@@ -224,6 +225,8 @@ zc-dashboard-section-process = Process
 zc-dashboard-section-components = Components
 zc-dashboard-section-details = Details
 zc-dashboard-section-summary = Summary
+zc-dashboard-section-by-period = By Period (your account)
+zc-dashboard-section-org = Organization (billed)
 zc-dashboard-section-by-model = By Model
 zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
