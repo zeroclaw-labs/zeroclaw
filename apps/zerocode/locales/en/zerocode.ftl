@@ -365,6 +365,9 @@ zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-toggle-thinking-cmd = Toggle thinking visibility
 zc-chat-help-new-session = New session
 zc-chat-help-session-list = Session list
+zc-elicit-help-toggle = Toggle choice
+zc-elicit-help-confirm = Confirm choice
+zc-elicit-help-cancel = Cancel
 
 zc-chat-approval-title = Approve tool call: { $tool }  [{ $secs }s]
 zc-chat-approval-action-allow = Allow
