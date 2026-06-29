@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use super::scope::StepToolScope;
+use super::step_contract::{StepFailure, StepRouting};
+
 // ── Priority ────────────────────────────────────────────────────
 
 /// SOP priority level, used for execution mode resolution and scheduling.
@@ -155,6 +158,49 @@ pub struct SopStep {
     /// Typed input/output schemas for deterministic data flow validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<StepSchema>,
+    /// Tool scope for this step. `suggested_tools` remains the legacy alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<StepToolScope>,
+    /// Conditional routing metadata. Default preserves linear execution.
+    #[serde(default, skip_serializing_if = "StepRouting::is_default")]
+    pub routing: StepRouting,
+    /// Failure handling metadata. Default preserves fail-the-run behavior.
+    #[serde(default, skip_serializing_if = "StepFailure::is_fail")]
+    pub on_failure: StepFailure,
+    /// Optional per-step execution mode override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SopExecutionMode>,
+}
+
+impl Default for SopStep {
+    fn default() -> Self {
+        Self {
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            suggested_tools: Vec::new(),
+            requires_confirmation: false,
+            kind: SopStepKind::Execute,
+            schema: None,
+            scope: None,
+            routing: StepRouting::default(),
+            on_failure: StepFailure::default(),
+            mode: None,
+        }
+    }
+}
+
+impl SopStep {
+    pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
+        let mut scope = self.scope.clone();
+        if !self.suggested_tools.is_empty() {
+            let scope = scope.get_or_insert_with(StepToolScope::default);
+            if scope.allow.is_none() {
+                scope.allow = Some(self.suggested_tools.clone());
+            }
+        }
+        scope
+    }
 }
 
 // ── SOP ─────────────────────────────────────────────────────────
@@ -414,6 +460,13 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
+    /// Routing selected a step whose dependencies are not yet satisfied.
+    Pending {
+        run_id: String,
+        sop_name: String,
+        step: u32,
+        reason: String,
+    },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
     /// The SOP run failed.
@@ -562,6 +615,22 @@ condition = "$.value > 85"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+    }
+
+    #[test]
+    fn default_step_contract_fields_do_not_serialize() {
+        let step = SopStep {
+            number: 1,
+            title: "Check".into(),
+            body: "Verify readings".into(),
+            ..SopStep::default()
+        };
+        let value = serde_json::to_value(step).unwrap();
+
+        assert!(value.get("scope").is_none());
+        assert!(value.get("routing").is_none());
+        assert!(value.get("on_failure").is_none());
+        assert!(value.get("mode").is_none());
     }
 
     #[test]
