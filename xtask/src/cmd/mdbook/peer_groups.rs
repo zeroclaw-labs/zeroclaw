@@ -262,19 +262,20 @@ fn render_secret_config(path: &str) -> String {
     // Dashboard deep-link path: dotted prefix minus `<alias>` and the field,
     // slash-joined (`channels.matrix.<alias>.password` -> `channels/matrix`).
     let section = dashboard_section(path);
+    let display_path = display_config_path(path);
     format!(
-        r#"> **`{path}` is a secret.** Stored encrypted, never in plain
+        r#"> **`{display_path}` is a secret.** Stored encrypted, never in plain
 > `config.toml`. Set it through one of these, which encrypt on write:
 
 <div class="os-tabs-src">
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{path}` field there.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
 
 #### zerocode
 
-In the **Config** pane, set the `{path}` field (input is masked).
+In the **Config** pane, set the `{display_path}` field (input is masked).
 
 #### zeroclaw config
 
@@ -352,6 +353,7 @@ fn render_thread_context(arg: &str) -> anyhow::Result<String> {
     let configure = match path {
         Some(p) => {
             let section = dashboard_section(p);
+            let display_path = display_config_path(p);
             format!(
                 r#"
 
@@ -361,11 +363,11 @@ Set the thread behavior on any surface:
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{p}` field.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{display_path}` field.
 
 #### zerocode
 
-In the **Config** pane, set the `{p}` field.
+In the **Config** pane, set the `{display_path}` field.
 
 #### zeroclaw config
 
@@ -447,6 +449,7 @@ fn render_streaming(arg: &str) -> anyhow::Result<String> {
     let configure = match (path, mode) {
         (Some(p), m) if m == STREAM_MODE || m == STREAM_DRAFTS => {
             let section = dashboard_section(p);
+            let display_path = display_config_path(p);
             format!(
                 r#"
 
@@ -456,11 +459,11 @@ Set it on any surface:
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{p}` field.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field.
 
 #### zerocode
 
-In the **Config** pane, set the `{p}` field.
+In the **Config** pane, set the `{display_path}` field.
 
 #### zeroclaw config
 
@@ -528,6 +531,10 @@ fn parse_kv_args(arg: &str) -> std::collections::HashMap<String, String> {
         map.insert(key, value);
     }
     map
+}
+
+fn display_config_path(path: &str) -> String {
+    path.replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn render_example(p: &PeerParams) -> String {
@@ -974,6 +981,38 @@ mod generated_prose_gate {
             }
         }
         false
+    }
+
+    #[test]
+    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
+        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+
+        assert!(rendered.contains("`channels.discord.&lt;alias&gt;.bot_token`"));
+        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
+        assert!(!rendered.contains("`channels.discord.<alias>.bot_token`"));
+    }
+
+    #[test]
+    fn config_explainers_escape_alias_placeholder_in_rendered_markdown() {
+        let thread = super::render_thread_context(
+            r#"channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread""#,
+        )
+        .expect("thread context should render");
+        let streaming = super::render_streaming(
+            r#"channel="Slack" mode="stream_drafts" path="channels.slack.<alias>.stream_drafts""#,
+        )
+        .expect("streaming context should render");
+
+        assert!(thread.contains("`channels.matrix.&lt;alias&gt;.reply_in_thread`"));
+        assert!(
+            thread.contains("zeroclaw config set channels.matrix.<alias>.reply_in_thread true")
+        );
+        assert!(!thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
+        assert!(streaming.contains("`channels.slack.&lt;alias&gt;.stream_drafts`"));
+        assert!(
+            streaming.contains("zeroclaw config set channels.slack.<alias>.stream_drafts <value>")
+        );
+        assert!(!streaming.contains("`channels.slack.<alias>.stream_drafts`"));
     }
 
     #[test]

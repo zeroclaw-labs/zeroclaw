@@ -6625,8 +6625,9 @@ fn is_cli_placeholder_name(name: &str) -> bool {
 #[must_use]
 fn is_common_html_tag(name: &str) -> bool {
     const COMMON_HTML_TAGS: &[&str] = &[
-        "a", "abbr", "br", "code", "details", "div", "em", "img", "kbd", "li", "ol", "p", "samp",
-        "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr", "ul", "var",
+        "a", "abbr", "br", "code", "details", "div", "em", "i", "img", "kbd", "li", "ol", "p",
+        "samp", "small", "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr",
+        "ul", "var",
     ];
 
     let normalized = name.to_ascii_lowercase();
@@ -7930,11 +7931,11 @@ mod tests {
 
     #[test]
     fn markdown_help_does_not_escape_common_html_or_autolinks() {
-        let markdown = "Use <br> for HTML, see <https://example.com>, then pass <arg-name>.\n";
+        let markdown = "Use <br> and <small><i>HTML</i></small>, see <https://example.com>, then pass <arg-name>.\n";
 
         assert_eq!(
             escape_mdbook_placeholder_tags(markdown),
-            "Use <br> for HTML, see <https://example.com>, then pass `<arg-name>`.\n"
+            "Use <br> and <small><i>HTML</i></small>, see <https://example.com>, then pass `<arg-name>`.\n"
         );
     }
 
