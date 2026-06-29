@@ -86,6 +86,7 @@ pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::McpRegistry;
+pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
     build_deferred_tools_section_filtered,

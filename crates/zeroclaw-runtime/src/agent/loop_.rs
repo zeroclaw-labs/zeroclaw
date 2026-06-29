@@ -1418,6 +1418,16 @@ pub async fn run(
                             mcp_policy.as_ref(),
                         );
                     }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
+                    if !pinned_section.is_empty() {
+                        deferred_section.push_str("\n\n");
+                        deferred_section.push_str(&pinned_section);
+                    }
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -3039,6 +3049,16 @@ pub async fn process_message(
                             delegate_handle_pm.as_ref(),
                             mcp_policy_pm.as_ref(),
                         );
+                    }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy_pm.as_ref(),
+                    )
+                    .await;
+                    if !pinned_section.is_empty() {
+                        deferred_section.push_str("\n\n");
+                        deferred_section.push_str(&pinned_section);
                     }
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
