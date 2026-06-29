@@ -3549,7 +3549,7 @@ mod tests {
         seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
-    use crate::agent::tool_execution::execute_one_tool;
+    use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3559,6 +3559,33 @@ mod tests {
     };
     use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
+
+    fn extract_sop_started_run_id(content: &str) -> Option<String> {
+        content
+            .split("SOP run started: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(str::to_string)
+    }
+
+    fn sop_started_run_id_from_history(history: &[ChatMessage]) -> Option<String> {
+        history.iter().find_map(|msg| {
+            if let Some(content) = msg.content.strip_prefix("[Tool results]\n")
+                && let Some(run_id) = extract_sop_started_run_id(content)
+            {
+                return Some(run_id);
+            }
+
+            if msg.role == "tool"
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(content) = value.get("content").and_then(|content| content.as_str())
+            {
+                return extract_sop_started_run_id(content);
+            }
+
+            extract_sop_started_run_id(&msg.content)
+        })
+    }
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -4042,8 +4069,11 @@ mod tests {
             "unknown_tool",
             call_arguments,
             None,
-            &[],
-            None,
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4081,8 +4111,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4126,8 +4159,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4156,8 +4192,11 @@ mod tests {
             "empty_success",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4207,8 +4246,11 @@ mod tests {
             "credential_output",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -6221,6 +6263,286 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_executes_queued_sop_steps_after_sop_execute() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"sop_execute","arguments":{"name":"live-sop"}}
+</tool_call>"#,
+            "step one done",
+            "step two done",
+            "outer done",
+        ]);
+
+        let sop = crate::sop::Sop {
+            name: "live-sop".to_string(),
+            description: "live sop".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![
+                crate::sop::SopStep {
+                    number: 1,
+                    title: "First".to_string(),
+                    body: "Do the first step".to_string(),
+                    suggested_tools: Vec::new(),
+                    requires_confirmation: false,
+                    kind: crate::sop::SopStepKind::default(),
+                    schema: None,
+                    ..crate::sop::SopStep::default()
+                },
+                crate::sop::SopStep {
+                    number: 2,
+                    title: "Second".to_string(),
+                    body: "Do the second step".to_string(),
+                    suggested_tools: Vec::new(),
+                    requires_confirmation: false,
+                    kind: crate::sop::SopStepKind::default(),
+                    schema: None,
+                    ..crate::sop::SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::SopExecuteTool::new(
+            Arc::clone(&engine),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the live sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable after completion");
+        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+        assert_eq!(run.step_results.len(), 2);
+        assert_eq!(run.step_results[0].output, "step one done");
+        assert_eq!(run.step_results[1].output, "step two done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "outer-sop".to_string(),
+                        name: "sop_execute".to_string(),
+                        arguments: r#"{"name":"scoped-sop"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-denied".to_string(),
+                        name: "denied_tool".to_string(),
+                        arguments: r#"{"value":"blocked"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("step recovered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("outer done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let sop = crate::sop::Sop {
+            name: "scoped-sop".to_string(),
+            description: "scoped sop".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![crate::sop::SopStep {
+                number: 1,
+                title: "Scoped".to_string(),
+                body: "Use only allowed tools".to_string(),
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["allowed_tool".to_string()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+            step_scope_enforce: true,
+            ..zeroclaw_config::schema::SopConfig::default()
+        });
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let allowed_invocations = Arc::new(AtomicUsize::new(0));
+        let denied_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+            Box::new(CountingTool::new(
+                "allowed_tool",
+                Arc::clone(&allowed_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "denied_tool",
+                Arc::clone(&denied_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the scoped sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("scoped SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+        assert!(
+            history.iter().any(|msg| msg
+                .content
+                .contains("Tool not available in this turn: denied_tool")),
+            "denied tool call should be recorded as unavailable in history: {history:?}"
+        );
+
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable after completion");
+        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+        assert_eq!(run.step_results.len(), 1);
+        assert_eq!(run.step_results[0].output, "step recovered");
     }
 
     /// Regression: a native provider emitting multiple parallel tool calls

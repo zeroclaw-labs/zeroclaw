@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime"]
+plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -17,21 +17,26 @@ plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 ring = "0.17"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-extism = "1.30"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
 toml = "1.0"
 wasmtime = { version = "43", default-features = false, features = [
   "component-model",
   "runtime",
+  "std",
+  "async",
+], optional = true }
+wasmtime-wasi = { version = "43", default-features = false, features = [
+  "p2",
 ], optional = true }
 
 [dev-dependencies]
 tempfile = "3.26"
+zeroclaw-config = { path = "../zeroclaw-config" }

@@ -264,6 +264,7 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 2,
@@ -374,6 +375,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "s1".into(),
             trigger_event: manual_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
             current_step: 1,
             total_steps: 1,
@@ -410,6 +412,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "s1".into(),
             trigger_event: manual_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,
             current_step: 1,
             total_steps: 2,
