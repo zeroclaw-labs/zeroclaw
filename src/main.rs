@@ -649,6 +649,11 @@ enum Commands {
         /// existing one.
         #[arg(long)]
         create: bool,
+
+        /// Ask only for required (non-Option) fields, leaving optional fields
+        /// at their defaults. Useful for a fast brand-new alias setup.
+        #[arg(long)]
+        required_only: bool,
     },
 
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
@@ -1370,12 +1375,19 @@ async fn run_onboard_flow(
     use_llm: bool,
     agent_alias: &str,
     create: bool,
+    required_only: bool,
 ) -> anyhow::Result<()> {
     use zeroclaw_onboarding::{
-        AgentPhraser, AgentResponder, CliTransport, FlowRequest, InProcessAgentTurn, LlmTransport,
-        TtyPasswordSource, TtySecretReader, build_spec, phrase_spec, run_flow,
+        AgentPhraser, AgentResponder, CliTransport, FieldScope, FlowRequest, InProcessAgentTurn,
+        LlmTransport, TtyPasswordSource, TtySecretReader, build_spec_scoped, phrase_spec, run_flow,
     };
     use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
+
+    let scope = if required_only {
+        FieldScope::RequiredOnly
+    } else {
+        FieldScope::All
+    };
 
     if create && use_llm {
         let family = section
@@ -1399,10 +1411,17 @@ async fn run_onboard_flow(
             agent_alias,
         ))
         .await?;
-        let mut spec = build_spec(config.prop_fields(), section, layer, instance, success)
-            .ok_or_else(|| {
-                anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
-            })?;
+        let mut spec = build_spec_scoped(
+            config.prop_fields(),
+            section,
+            layer,
+            instance,
+            success,
+            scope,
+        )
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
+        })?;
         let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent));
         phrase_spec(&mut spec, &mut phraser).await?;
 
@@ -1427,6 +1446,7 @@ async fn run_onboard_flow(
         layer,
         instance,
         create,
+        scope,
     };
     let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
     Box::pin(config.save()).await?;
@@ -3801,9 +3821,17 @@ async fn main() -> Result<()> {
             llm,
             agent,
             create,
+            required_only,
         } => {
             Box::pin(run_onboard_flow(
-                config, &section, &layer, &instance, llm, &agent, create,
+                config,
+                &section,
+                &layer,
+                &instance,
+                llm,
+                &agent,
+                create,
+                required_only,
             ))
             .await?;
             return Ok(());

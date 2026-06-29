@@ -1,7 +1,7 @@
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::flow::{ConfiguredItem, FlowTransport, Outcome};
 
-use crate::spec_builder::build_spec;
+use crate::spec_builder::{FieldScope, build_spec_scoped};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -22,6 +22,7 @@ pub struct FlowRequest<'section> {
     pub layer: &'section str,
     pub instance: &'section str,
     pub create: bool,
+    pub scope: FieldScope,
 }
 
 fn family_of(section_prefix: &str, instance: &str) -> String {
@@ -52,12 +53,13 @@ pub async fn run_flow(
             instance: request.instance.to_string(),
         }],
     };
-    let spec = build_spec(
+    let spec = build_spec_scoped(
         config.prop_fields(),
         request.section_prefix,
         request.layer,
         request.instance,
         success,
+        request.scope,
     )
     .ok_or_else(|| DriverError::EmptySection(request.section_prefix.to_string()))?;
     Ok(spec.walk(transport, config).await?)
@@ -154,6 +156,7 @@ mod tests {
             layer: "channel",
             instance: "home",
             create: false,
+            scope: FieldScope::All,
         };
         let outcome = run_flow(&mut config, &request, &mut transport)
             .await
@@ -172,6 +175,7 @@ mod tests {
             layer: "channel",
             instance: "home",
             create: false,
+            scope: FieldScope::All,
         };
         run_flow(&mut config, &request, &mut transport)
             .await
@@ -188,6 +192,7 @@ mod tests {
             layer: "channel",
             instance: "absent",
             create: false,
+            scope: FieldScope::All,
         };
         let error = run_flow(&mut config, &request, &mut transport)
             .await
@@ -210,6 +215,7 @@ mod tests {
             layer: "channel",
             instance: "fresh",
             create: true,
+            scope: FieldScope::All,
         };
         let outcome = run_flow(&mut config, &request, &mut transport)
             .await
@@ -231,10 +237,38 @@ mod tests {
             layer: "channel",
             instance: "fresh",
             create: true,
+            scope: FieldScope::All,
         };
         let error = run_flow(&mut config, &request, &mut transport)
             .await
             .unwrap_err();
         assert!(matches!(error, DriverError::AliasCreate { .. }));
+    }
+
+    #[tokio::test]
+    async fn run_flow_required_only_skips_optional_fields() {
+        let mut config = config_with_matrix_alias();
+        let mut transport = AutoTransport {
+            emitted: Vec::new(),
+        };
+        let request = FlowRequest {
+            section_prefix: SECTION,
+            layer: "channel",
+            instance: "home",
+            create: false,
+            scope: FieldScope::RequiredOnly,
+        };
+        run_flow(&mut config, &request, &mut transport)
+            .await
+            .unwrap();
+        let matrix = config.channels.matrix.get("home").unwrap();
+        assert_eq!(
+            matrix.homeserver, "42",
+            "a required field is still walked and persisted"
+        );
+        assert!(
+            matrix.access_token.is_none(),
+            "an Option field is never asked, so it keeps its default"
+        );
     }
 }

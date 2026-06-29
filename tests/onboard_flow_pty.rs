@@ -207,3 +207,31 @@ fn onboard_flow_create_inserts_a_new_alias_over_a_real_pty_and_writes_config() {
         "the walked answer should have been written into the new alias, got:\n{written}"
     );
 }
+
+#[test]
+fn onboard_flow_required_only_create_omits_optional_fields_on_disk() {
+    let tmp = bare_config_dir();
+    let config_path = tmp.path().join("config.toml");
+
+    let result = drive_flow_over_pty(tmp.path(), &["--create", "--required-only"], "home");
+
+    assert!(
+        result.completed,
+        "required-only create flow did not complete.\ntranscript:\n{}",
+        result.transcript
+    );
+
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("[channels.matrix.home]"),
+        "the new alias block should have been written, got:\n{written}"
+    );
+    assert!(
+        written.contains("https://walked.test"),
+        "a required field should have been walked, got:\n{written}"
+    );
+    assert!(
+        !written.contains("access_token"),
+        "an Option field must not be asked or written in required-only mode, got:\n{written}"
+    );
+}

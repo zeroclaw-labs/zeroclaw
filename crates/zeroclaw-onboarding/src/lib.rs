@@ -14,7 +14,9 @@ pub use llm_transport::{LlmResponder, LlmTransport, SecretReader, TtySecretReade
 pub use phrasing::{
     AgentPhraser, DescriptionPhraser, FieldPhrasingContext, PromptPhraser, phrase_spec,
 };
-pub use spec_builder::{build_spec, required_fields, response_type_for, section_fields};
+pub use spec_builder::{
+    FieldScope, build_spec, build_spec_scoped, required_fields, response_type_for, section_fields,
+};
 pub use zeroclaw_runtime::flow::{
     ConfiguredItem, FlowTransport, Node, NodeId, Outcome, Prompt, Spec, Step,
 };

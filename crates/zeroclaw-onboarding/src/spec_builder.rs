@@ -76,6 +76,12 @@ fn write_prop_for(field: &PropFieldInfo, section_prefix: &str) -> String {
     format!("{type_prefix}.{leaf}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldScope {
+    All,
+    RequiredOnly,
+}
+
 pub fn build_spec(
     fields: Vec<PropFieldInfo>,
     section_prefix: &str,
@@ -83,7 +89,28 @@ pub fn build_spec(
     instance: &str,
     success: Outcome,
 ) -> Option<Spec> {
-    let mut all = section_fields(fields, section_prefix);
+    build_spec_scoped(
+        fields,
+        section_prefix,
+        layer,
+        instance,
+        success,
+        FieldScope::All,
+    )
+}
+
+pub fn build_spec_scoped(
+    fields: Vec<PropFieldInfo>,
+    section_prefix: &str,
+    layer: &str,
+    instance: &str,
+    success: Outcome,
+    scope: FieldScope,
+) -> Option<Spec> {
+    let mut all = match scope {
+        FieldScope::All => section_fields(fields, section_prefix),
+        FieldScope::RequiredOnly => required_fields(fields, section_prefix),
+    };
     if all.is_empty() {
         return None;
     }
@@ -218,5 +245,43 @@ mod tests {
         )
         .expect("matrix has required fields");
         assert!(spec.nodes.contains_key(&spec.start));
+    }
+
+    #[test]
+    fn required_only_scope_drops_option_typed_nodes() {
+        let all = build_spec_scoped(
+            matrix_fields(),
+            "channels.matrix.home",
+            "channel",
+            "home",
+            Outcome::Cancelled,
+            FieldScope::All,
+        )
+        .expect("all scope yields a spec");
+        let required = build_spec_scoped(
+            matrix_fields(),
+            "channels.matrix.home",
+            "channel",
+            "home",
+            Outcome::Cancelled,
+            FieldScope::RequiredOnly,
+        )
+        .expect("required scope yields a spec");
+        assert!(
+            required.nodes.len() < all.nodes.len(),
+            "required-only must ask fewer fields than the full walk"
+        );
+        assert!(
+            required
+                .nodes
+                .contains_key(&NodeId::new("channels.matrix.home.homeserver")),
+            "a non-Option String stays in the required walk"
+        );
+        assert!(
+            !required
+                .nodes
+                .contains_key(&NodeId::new("channels.matrix.home.access_token")),
+            "an Option<String> is dropped from the required walk"
+        );
     }
 }
