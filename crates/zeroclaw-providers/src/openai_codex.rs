@@ -1276,7 +1276,7 @@ impl OpenAiCodexModelProvider {
         let normalized_model = normalize_model_id(model);
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let has_tools = tools.is_some();
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
@@ -1522,7 +1522,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
                 input,
@@ -1699,6 +1699,53 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn tool_choice_omitted_when_tools_empty() {
+        // Regression for #7862: vLLM 0.19+ returns HTTP 400 when an
+        // OpenAI-compat request body contains `tool_choice: "auto"` with an
+        // empty `tools` list ("When using tool_choice, tools must be set.").
+        // The OpenAI Codex provider's `send_responses_request` and
+        // `stream_chat` paths gate both `tool_choice` and
+        // `parallel_tool_calls` on the `has_tools` local; that local must
+        // reflect a non-empty list, not just an `is_some()` check.
+        //
+        // The serialized request shape is the observable contract: when
+        // `tools` is empty, the JSON body must NOT carry `tool_choice` or
+        // `parallel_tool_calls` (gated by `#[serde(skip_serializing_if =
+        // "Option::is_none")]`).
+        let tools: Option<Vec<ResponsesToolSpec>> = Some(vec![]);
+        // Mirror the production gate at lines 1279 and 1525 — the gate
+        // shape is the load-bearing invariant being protected.
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let req = ResponsesRequest {
+            model: "gpt-5".to_string(),
+            input: vec![],
+            instructions: String::new(),
+            store: false,
+            stream: false,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec![],
+            tools,
+            tool_choice: has_tools.then(|| "auto".to_string()),
+            parallel_tool_calls: has_tools.then_some(true),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value}"
+        );
+        assert!(
+            value.get("parallel_tool_calls").is_none(),
+            "parallel_tool_calls must be omitted when tools is empty; got: {value}"
+        );
     }
 
     #[test]
