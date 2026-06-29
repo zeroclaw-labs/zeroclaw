@@ -135,10 +135,10 @@ from connected servers.
 
 Two built-in tools are available (subject to your agent's tool access policy):
 
-- `mcp_resources` — `action: "list"` (optional `server`, `cursor`) lists
+- `mcp_resources`: `action: "list"` (optional `server`, `cursor`) lists
   resources; `action: "read"` with `uri` (prefixed `<server>__<uri>`) returns
   contents.
-- `mcp_prompts` — `action: "list"` lists prompts; `action: "get"` with `name`
+- `mcp_prompts`: `action: "list"` lists prompts; `action: "get"` with `name`
   (prefixed `<server>__<name>`) and optional `arguments` returns the rendered
   prompt messages.
 
