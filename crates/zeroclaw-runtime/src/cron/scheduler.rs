@@ -1133,13 +1133,13 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    // Resolve the shell output format from config. Imperative jobs (created
-    // via CLI/API) are not in config.cron and default to Wrapped.
-    let output_format = config
+    // Resolve the shell output format: declarative jobs read from config
+    // (the canonical source), imperative jobs use the stored field.
+    let output_format: &CronShellOutputFormat = config
         .cron
         .get(&job.id)
         .map(|decl| &decl.shell_output_format)
-        .unwrap_or(&CronShellOutputFormat::Wrapped);
+        .unwrap_or(&job.shell_output_format);
 
     let child = match build_cron_shell_command(&job.command, &config.data_dir) {
         Ok(mut cmd) => match cmd.spawn() {
@@ -1309,6 +1309,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             source: "imperative".into(),
+            shell_output_format: CronShellOutputFormat::default(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
