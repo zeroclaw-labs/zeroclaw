@@ -101,6 +101,7 @@ pub enum Method {
 
     // Cost
     CostQuery,
+    CostOrg,
 
     // Skills
     SkillsBundles,
@@ -202,6 +203,7 @@ impl Method {
         (Method::AgentsStatus, "agents/status"),
         // Cost
         (Method::CostQuery, "cost/query"),
+        (Method::CostOrg, "cost/org"),
         // Skills
         (Method::SkillsBundles, "skills/bundles"),
         (Method::SkillsList, "skills/list"),
@@ -637,6 +639,7 @@ impl RpcDispatcher {
 
             // Cost
             Method::CostQuery => self.handle_cost_query(&req.params),
+            Method::CostOrg => self.handle_cost_org(),
 
             // Skills
             Method::SkillsBundles => self.handle_skills_bundles(),
@@ -3113,9 +3116,23 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
         let req: CostQueryParams = parse_params(params)?;
+        // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
+        // Reports view, or an external CLI report) pull day/month/quarter/YTD
+        // scalars rather than only the daemon's today/this-month aggregates.
+        let parse_bound = |raw: &str| -> Result<chrono::DateTime<chrono::Utc>, _> {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid date {raw:?}: {e}")))
+        };
+        let from = req.from.as_deref().map(parse_bound).transpose()?;
+        let to = req.to.as_deref().map(parse_bound).transpose()?;
         let summary = if let Some(agent) = req.agent {
             tracker
                 .get_summary_for_agent(&agent)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
+        } else if from.is_some() || to.is_some() {
+            tracker
+                .get_summary_in_bounds(from, to)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
         } else {
             tracker
@@ -3123,6 +3140,29 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
         };
         to_result(summary)
+    }
+
+    /// Optional organization-level cost snapshot, read from
+    /// `<data_dir>/org_cost.json` if present. Vendor-neutral and
+    /// presence-gated: an integrator's `sync` can write this file from an
+    /// upstream billing source so the dashboard can show org + personal
+    /// billed totals; a vanilla build never writes it, so this returns `null`
+    /// and the dashboard simply omits the organization row. The file is
+    /// returned verbatim (the daemon does not interpret its shape).
+    fn handle_cost_org(&self) -> RpcResult {
+        let path = self.ctx.config.read().data_dir.join("org_cost.json");
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let value: Value = serde_json::from_str(&raw).map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("org_cost.json is not valid JSON: {e}"),
+                    )
+                })?;
+                Ok(value)
+            }
+            Err(_) => Ok(Value::Null),
+        }
     }
 
     // ── Skills handlers ──────────────────────────────────────────
