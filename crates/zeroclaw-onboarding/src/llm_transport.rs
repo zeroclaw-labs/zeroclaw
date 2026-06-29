@@ -1,0 +1,211 @@
+use async_trait::async_trait;
+use zeroclaw_runtime::flow::{FlowTransport, Outcome, Prompt, TransportResult};
+use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
+
+#[async_trait]
+pub trait LlmResponder: Send {
+    async fn respond(&mut self, prompt_text: &str) -> TransportResult<String>;
+}
+
+#[async_trait]
+pub trait SecretReader: Send {
+    async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String>;
+}
+
+pub struct LlmTransport<L: LlmResponder, S: SecretReader> {
+    responder: L,
+    secret_reader: S,
+    emitted: Vec<Outcome>,
+}
+
+impl<L: LlmResponder, S: SecretReader> LlmTransport<L, S> {
+    pub fn new(responder: L, secret_reader: S) -> Self {
+        Self {
+            responder,
+            secret_reader,
+            emitted: Vec::new(),
+        }
+    }
+
+    pub fn emitted(&self) -> &[Outcome] {
+        &self.emitted
+    }
+
+    fn parse_non_secret(prompt: &Prompt, raw: &str) -> Option<ResponseValue> {
+        let trimmed = raw.trim();
+        match &prompt.response_type {
+            ResponseType::Secret => None,
+            ResponseType::FreeformText => {
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(ResponseValue::FreeformText(trimmed.to_string()))
+                }
+            }
+            ResponseType::YesNo => parse_yes_no(trimmed).map(ResponseValue::YesNo),
+            ResponseType::Choice { options } => options
+                .iter()
+                .find(|option| option.value == trimmed)
+                .map(|option| ResponseValue::Choice(option.value.clone())),
+        }
+    }
+}
+
+fn parse_yes_no(raw: &str) -> Option<bool> {
+    let normalized = raw.to_ascii_lowercase();
+    let affirmative = ["y", "yes", "true"];
+    let negative = ["n", "no", "false"];
+    if affirmative.contains(&normalized.as_str()) {
+        Some(true)
+    } else if negative.contains(&normalized.as_str()) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[async_trait]
+impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
+    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        if prompt.routes_secret() {
+            loop {
+                let raw = self.secret_reader.read_secret(&prompt.text).await?;
+                if !raw.is_empty() {
+                    return Ok(ResponseValue::Secret(SecretValue::new(raw)));
+                }
+            }
+        }
+        loop {
+            let raw = self.responder.respond(&prompt.text).await?;
+            if let Some(value) = Self::parse_non_secret(prompt, &raw) {
+                return Ok(value);
+            }
+        }
+    }
+
+    async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()> {
+        self.emitted.push(outcome.clone());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use zeroclaw_runtime::flow::TransportError;
+    use zeroclaw_runtime::response_type::ChoiceOption;
+
+    struct ScriptedResponder {
+        replies: VecDeque<String>,
+        calls: Vec<String>,
+    }
+
+    impl ScriptedResponder {
+        fn new(replies: Vec<&str>) -> Self {
+            Self {
+                replies: replies.into_iter().map(String::from).collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmResponder for ScriptedResponder {
+        async fn respond(&mut self, prompt_text: &str) -> TransportResult<String> {
+            self.calls.push(prompt_text.to_string());
+            self.replies.pop_front().ok_or(TransportError::Closed)
+        }
+    }
+
+    struct RecordingSecretReader {
+        replies: VecDeque<String>,
+        calls: Vec<String>,
+    }
+
+    impl RecordingSecretReader {
+        fn new(replies: Vec<&str>) -> Self {
+            Self {
+                replies: replies.into_iter().map(String::from).collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SecretReader for RecordingSecretReader {
+        async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String> {
+            self.calls.push(prompt_text.to_string());
+            self.replies.pop_front().ok_or(TransportError::Closed)
+        }
+    }
+
+    struct PanicResponder;
+
+    #[async_trait]
+    impl LlmResponder for PanicResponder {
+        async fn respond(&mut self, _prompt_text: &str) -> TransportResult<String> {
+            panic!("the LLM responder must never be called for a secret prompt");
+        }
+    }
+
+    struct PanicSecretReader;
+
+    #[async_trait]
+    impl SecretReader for PanicSecretReader {
+        async fn read_secret(&mut self, _prompt_text: &str) -> TransportResult<String> {
+            panic!("the secret reader must never be called for a non-secret prompt");
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_prompt_bypasses_llm_and_reads_from_secret_channel() {
+        let mut transport =
+            LlmTransport::new(PanicResponder, RecordingSecretReader::new(vec!["sk-live"]));
+        let prompt = Prompt::new("API key", ResponseType::Secret);
+        let value = transport.ask(&prompt).await.unwrap();
+        match value {
+            ResponseValue::Secret(secret) => assert_eq!(secret.expose(), "sk-live"),
+            other => panic!("expected secret, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_secret_prompt_never_touches_secret_reader() {
+        let mut transport =
+            LlmTransport::new(ScriptedResponder::new(vec!["yes"]), PanicSecretReader);
+        let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::YesNo(true));
+    }
+
+    #[tokio::test]
+    async fn llm_reply_is_reparsed_until_valid() {
+        let mut transport = LlmTransport::new(
+            ScriptedResponder::new(vec!["maybe", "no"]),
+            PanicSecretReader,
+        );
+        let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::YesNo(false));
+    }
+
+    #[tokio::test]
+    async fn choice_matches_option_value_from_llm() {
+        let mut transport = LlmTransport::new(
+            ScriptedResponder::new(vec!["partial"]),
+            PanicSecretReader,
+        );
+        let prompt = Prompt::new(
+            "Mode",
+            ResponseType::Choice {
+                options: vec![ChoiceOption {
+                    value: "partial".into(),
+                    label: "Partial".into(),
+                }],
+            },
+        );
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::Choice("partial".into()));
+    }
+}

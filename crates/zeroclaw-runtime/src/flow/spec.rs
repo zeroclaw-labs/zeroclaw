@@ -1,7 +1,9 @@
+use crate::flow::config_write::write_response;
 use crate::flow::transport::{FlowTransport, Outcome, Prompt};
 use crate::response_type::ResponseValue;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use zeroclaw_config::schema::Config;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -24,6 +26,8 @@ pub struct Node {
     pub id: NodeId,
     pub layer: String,
     pub instance: String,
+    pub prop: String,
+    pub optional: bool,
     pub prompt: Prompt,
     pub on_success: Step,
     pub on_failure: Step,
@@ -50,6 +54,15 @@ impl Node {
     }
 }
 
+fn response_is_empty(response: &ResponseValue) -> bool {
+    match response {
+        ResponseValue::Secret(secret) => secret.expose().is_empty(),
+        ResponseValue::FreeformText(text) => text.is_empty(),
+        ResponseValue::Choice(choice) => choice.is_empty(),
+        ResponseValue::YesNo(_) => false,
+    }
+}
+
 pub struct Spec {
     pub start: NodeId,
     pub nodes: BTreeMap<NodeId, Node>,
@@ -61,10 +74,16 @@ pub enum WalkError {
     UnknownNode(NodeId),
     #[error(transparent)]
     Transport(#[from] crate::flow::transport::TransportError),
+    #[error(transparent)]
+    Write(#[from] crate::flow::config_write::WriteError),
 }
 
 impl Spec {
-    pub async fn walk(&self, transport: &mut dyn FlowTransport) -> Result<Outcome, WalkError> {
+    pub async fn walk(
+        &self,
+        transport: &mut dyn FlowTransport,
+        config: &mut Config,
+    ) -> Result<Outcome, WalkError> {
         let mut current = self.start.clone();
         loop {
             let node = self
@@ -72,6 +91,25 @@ impl Spec {
                 .get(&current)
                 .ok_or_else(|| WalkError::UnknownNode(current.clone()))?;
             let response = transport.ask(&node.prompt).await?;
+
+            if node.optional && response_is_empty(&response) {
+                match node.on_success.clone() {
+                    Step::Node(next) => {
+                        current = next;
+                        continue;
+                    }
+                    Step::Terminal(outcome) => {
+                        transport.emit(&outcome).await?;
+                        return Ok(outcome);
+                    }
+                }
+            }
+
+            let succeeded = (node.validate)(&response).is_ok();
+            if succeeded && !node.prop.is_empty() {
+                write_response(config, &node.prop, &response)?;
+            }
+
             match node.resolve(&response) {
                 Step::Node(next) => current = next,
                 Step::Terminal(outcome) => {
@@ -178,6 +216,8 @@ mod tests {
     use crate::flow::transport::{ConfiguredItem, TransportError, TransportResult};
     use crate::response_type::ResponseType;
     use std::collections::VecDeque;
+    use tempfile::TempDir;
+    use zeroclaw_config::schema::MatrixConfig;
 
     struct ScriptedTransport {
         scripted: VecDeque<ResponseValue>,
@@ -205,6 +245,19 @@ mod tests {
         }
     }
 
+    fn test_config() -> (TempDir, Config) {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config
+            .channels
+            .matrix
+            .insert("home".to_string(), MatrixConfig::default());
+        (tmp, config)
+    }
+
     fn completed() -> Outcome {
         Outcome::Completed {
             configured: vec![ConfiguredItem {
@@ -219,6 +272,8 @@ mod tests {
             id: NodeId::new("confirm"),
             layer: "agent".into(),
             instance: "scout".into(),
+            prop: String::new(),
+            optional: false,
             prompt: Prompt::new("Proceed?", ResponseType::YesNo),
             on_success: Step::Node(NodeId::new("token")),
             on_failure: Step::Terminal(Outcome::Cancelled),
@@ -234,6 +289,8 @@ mod tests {
             id: NodeId::new("token"),
             layer: "channel".into(),
             instance: "matrix".into(),
+            prop: "channels.matrix.access_token".into(),
+            optional: false,
             prompt: Prompt::new("Access token", ResponseType::Secret),
             on_success: Step::Terminal(completed()),
             on_failure: Step::Node(NodeId::new("token")),
@@ -257,34 +314,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_edges_reach_completed() {
+    async fn success_edges_reach_completed_and_persist_secret() {
         use crate::response_type::SecretValue;
+        let (_tmp, mut config) = test_config();
         let mut transport = ScriptedTransport::new(vec![
             ResponseValue::YesNo(true),
             ResponseValue::Secret(SecretValue::new("tok".into())),
         ]);
-        let outcome = spec().walk(&mut transport).await.unwrap();
+        let outcome = spec().walk(&mut transport, &mut config).await.unwrap();
         assert_eq!(outcome, completed());
         assert_eq!(transport.emitted, vec![outcome]);
+        assert_eq!(
+            config.channels.matrix.get("home").unwrap().access_token.as_deref(),
+            Some("tok")
+        );
     }
 
     #[tokio::test]
     async fn failure_on_confirm_cancels() {
+        let (_tmp, mut config) = test_config();
         let mut transport = ScriptedTransport::new(vec![ResponseValue::YesNo(false)]);
-        let outcome = spec().walk(&mut transport).await.unwrap();
+        let outcome = spec().walk(&mut transport, &mut config).await.unwrap();
         assert_eq!(outcome, Outcome::Cancelled);
     }
 
     #[tokio::test]
     async fn failure_on_token_loops_back_then_succeeds() {
         use crate::response_type::SecretValue;
+        let (_tmp, mut config) = test_config();
         let mut transport = ScriptedTransport::new(vec![
             ResponseValue::YesNo(true),
             ResponseValue::Secret(SecretValue::new(String::new())),
             ResponseValue::Secret(SecretValue::new("tok".into())),
         ]);
-        let outcome = spec().walk(&mut transport).await.unwrap();
+        let outcome = spec().walk(&mut transport, &mut config).await.unwrap();
         assert_eq!(outcome, completed());
+    }
+
+    #[tokio::test]
+    async fn optional_empty_response_skips_without_writing() {
+        let (_tmp, mut config) = test_config();
+        let mut nodes = BTreeMap::new();
+        let optional = Node {
+            id: NodeId::new("homeserver"),
+            layer: "channel".into(),
+            instance: "matrix".into(),
+            prop: "channels.matrix.home.homeserver".into(),
+            optional: true,
+            prompt: Prompt::new("Homeserver", ResponseType::FreeformText),
+            on_success: Step::Terminal(completed()),
+            on_failure: Step::Node(NodeId::new("homeserver")),
+            validate: Box::new(|_| Ok(())),
+        };
+        nodes.insert(optional.id.clone(), optional);
+        let spec = Spec {
+            start: NodeId::new("homeserver"),
+            nodes,
+        };
+        let before = config
+            .channels
+            .matrix
+            .get("home")
+            .unwrap()
+            .homeserver
+            .clone();
+        let mut transport =
+            ScriptedTransport::new(vec![ResponseValue::FreeformText(String::new())]);
+        let outcome = spec.walk(&mut transport, &mut config).await.unwrap();
+        assert_eq!(outcome, completed());
+        assert_eq!(
+            config.channels.matrix.get("home").unwrap().homeserver,
+            before,
+            "optional skip must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_non_empty_response_writes() {
+        let (_tmp, mut config) = test_config();
+        let mut nodes = BTreeMap::new();
+        let optional = Node {
+            id: NodeId::new("homeserver"),
+            layer: "channel".into(),
+            instance: "matrix".into(),
+            prop: "channels.matrix.home.homeserver".into(),
+            optional: true,
+            prompt: Prompt::new("Homeserver", ResponseType::FreeformText),
+            on_success: Step::Terminal(completed()),
+            on_failure: Step::Node(NodeId::new("homeserver")),
+            validate: Box::new(|_| Ok(())),
+        };
+        nodes.insert(optional.id.clone(), optional);
+        let spec = Spec {
+            start: NodeId::new("homeserver"),
+            nodes,
+        };
+        let mut transport = ScriptedTransport::new(vec![ResponseValue::FreeformText(
+            "https://example.org".into(),
+        )]);
+        spec.walk(&mut transport, &mut config).await.unwrap();
+        assert_eq!(
+            config.channels.matrix.get("home").unwrap().homeserver,
+            "https://example.org"
+        );
     }
 
     #[test]
