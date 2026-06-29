@@ -170,6 +170,7 @@ fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessag
         interruption_scope_id: msg.interruption_scope_id,
         attachments: msg.attachments.into_iter().map(from_wit_media).collect(),
         subject: msg.subject,
+        ..Default::default()
     }
 }
 
