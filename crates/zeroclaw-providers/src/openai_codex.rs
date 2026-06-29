@@ -1175,6 +1175,11 @@ impl OpenAiCodexModelProvider {
             Err(err) => return Err(err),
         };
 
+        // Distinguish "no credentials at all" from "credentials present but
+        // unusable" (expired / could not be refreshed) so the call-time error
+        // stops blaming a missing profile when the real fix is re-authentication.
+        let had_profile = profile.is_some();
+
         let account_id = profile.and_then(|p| p.account_id).or_else(|| {
             oauth_access_token
                 .as_deref()
@@ -1185,16 +1190,35 @@ impl OpenAiCodexModelProvider {
             oauth_access_token
         } else {
             Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
+                if had_profile {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": true,
+                            })),
+                        "openai_codex: auth profile present but no usable access token"
+                    );
+                    anyhow::Error::msg(
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --provider openai-codex` to sign in again.",
+                    )
+                } else {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": false,
+                            })),
+                        "openai_codex: no auth profile found"
+                    );
+                    anyhow::Error::msg(
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --provider openai-codex` to sign in.",
+                    )
+                }
             })?)
         };
 

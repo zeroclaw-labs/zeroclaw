@@ -27,6 +27,16 @@ impl ::zeroclaw_api::attribution::Attributable for CliChannel {
 
 #[async_trait]
 impl Channel for CliChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // The CLI surface has no remote typing indicator to drive.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // The CLI surface has no remote typing indicator to drive.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "cli"
     }
@@ -97,6 +107,7 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                suppress_voice: false,
             })
             .await;
         assert!(result.is_ok());
@@ -114,6 +125,7 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                suppress_voice: false,
             })
             .await;
         assert!(result.is_ok());

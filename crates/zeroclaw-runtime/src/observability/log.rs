@@ -192,9 +192,7 @@ impl Observer for LogObserver {
                 error_message,
                 input_tokens,
                 output_tokens,
-                channel: _,
-                agent_alias: _,
-                turn_id: _,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
@@ -350,6 +348,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -362,6 +361,7 @@ mod tests {
             error_message: Some("rate limited".into()),
             input_tokens: None,
             output_tokens: None,
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
