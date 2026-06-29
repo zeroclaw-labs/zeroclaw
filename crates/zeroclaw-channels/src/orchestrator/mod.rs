@@ -6669,6 +6669,26 @@ fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
         })
 }
 
+/// Resolve effective debounce window: a per-channel override with a positive
+/// value wins, otherwise falls back to the global default from `ChannelsConfig`.
+/// A per-channel value of `0` is treated as unset (falls back to global).
+fn resolve_effective_debounce_window(
+    global_ms: u64,
+    channel: &str,
+    channel_alias: Option<&str>,
+    telegram_configs: &std::collections::HashMap<String, zeroclaw_config::schema::TelegramConfig>,
+) -> std::time::Duration {
+    let per_channel_ms = if channel == "telegram" {
+        channel_alias
+            .and_then(|alias| telegram_configs.get(alias))
+            .and_then(|cfg| cfg.debounce_ms)
+            .filter(|ms| *ms > 0)
+    } else {
+        None
+    };
+    std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6732,18 +6752,14 @@ async fn run_message_dispatch_loop(
 
             // Resolve effective debounce window: per-channel override wins,
             // otherwise falls back to the global default from ChannelsConfig.
-            let debounce_window = {
-                let global_ms = ctx.prompt_config.channels.debounce_ms;
-                let per_channel_ms = if msg.channel == "telegram" {
-                    msg.channel_alias
-                        .as_ref()
-                        .and_then(|alias| ctx.prompt_config.channels.telegram.get(alias))
-                        .and_then(|cfg| cfg.debounce_ms)
-                } else {
-                    None
-                };
-                std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
-            };
+            // A per-channel value of 0 is treated as unset (falls back to global).
+            let debounce_window =
+                resolve_effective_debounce_window(
+                    ctx.prompt_config.channels.debounce_ms,
+                    &msg.channel,
+                    msg.channel_alias.as_deref(),
+                    &ctx.prompt_config.channels.telegram,
+                );
 
             match ctx
                 .debouncer
@@ -26847,5 +26863,51 @@ mod omitted_feature_tests {
             "Telegram must be absent from collect_configured_channels when \
              channel-telegram feature is not compiled in"
         );
+    }
+}
+
+#[cfg(test)]
+mod debounce_resolution_tests {
+    use super::resolve_effective_debounce_window;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use zeroclaw_config::schema::TelegramConfig;
+
+    #[test]
+    fn per_channel_debounce_zero_falls_back_to_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: Some(0), ..Default::default() });
+        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn per_channel_debounce_positive_overrides_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: Some(500), ..Default::default() });
+        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn per_channel_debounce_none_falls_back_to_global() {
+        let mut telegram_configs = HashMap::new();
+        telegram_configs.insert("default".into(), TelegramConfig { debounce_ms: None, ..Default::default() });
+        let duration = resolve_effective_debounce_window(1000, "telegram", Some("default"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn non_telegram_channel_uses_global() {
+        let telegram_configs = HashMap::new();
+        let duration = resolve_effective_debounce_window(1000, "discord", None, &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn unknown_telegram_alias_uses_global() {
+        let telegram_configs = HashMap::new();
+        let duration = resolve_effective_debounce_window(1000, "telegram", Some("nonexistent"), &telegram_configs);
+        assert_eq!(duration, Duration::from_millis(1000));
     }
 }
