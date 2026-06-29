@@ -107,6 +107,21 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
+
+/// Snapshot the live `channel_key → Arc<dyn Channel>` map from the injected
+/// channel-map factory as a [`tools::PerToolChannelHandle`], for channel-less
+/// turn paths (`process_message`) that must reach a live approver channel to
+/// honor a risk profile's cross-channel `approval_route`. Returns `None` when no
+/// factory is registered (e.g. CLI/tests) or no channels are live — callers then
+/// keep today's channel-less behavior (the gate auto-denies gated tools).
+pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
+    let factory = CHANNEL_MAP_FN.get()?;
+    let map = factory();
+    if map.is_empty() {
+        return None;
+    }
+    Some(Arc::new(parking_lot::RwLock::new(map)))
+}
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -3448,6 +3463,24 @@ pub async fn process_message(
             }
         }
 
+        // ── Cross-channel HITL on the channel-less path ───────────────────
+        // process_message (gateway chat/webhook dispatch, agent-to-agent peer
+        // messages) runs with no originating channel, so a gated tool can only
+        // reach a human through the profile's `approval_route`. When one is set
+        // and a live channel registry is available, hand the turn a route-only
+        // approval bridge: it asks the named approver alone, bounded by
+        // `timeout_secs` and fail-closed by default. Absent a route (or with no
+        // live channels) this stays `None` and the gate keeps today's
+        // non-interactive auto-deny.
+        let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
+            live_channel_registry().map(|handles| {
+                crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
+            })
+        });
+        let routed_approval_channel_ref = routed_approval_channel
+            .as_ref()
+            .map(|c| c as &dyn zeroclaw_api::channel::Channel);
+
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
@@ -3473,7 +3506,10 @@ pub async fn process_message(
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.max_context_tokens,
-                    None, // channel: process_message path has no channel ref
+                    // Cross-channel HITL: a route-only approval bridge when the
+                    // profile sets `approval_route` and channels are live, else
+                    // `None` (today's channel-less auto-deny). See above.
+                    routed_approval_channel_ref,
                 ),
             )
             .await
