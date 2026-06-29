@@ -27,12 +27,12 @@ struct GoalStartArgs {
 #[async_trait]
 impl Tool for GoalStartTool {
     fn name(&self) -> &str {
-        "goal.start"
+        "goal_start"
     }
 
     fn description(&self) -> &str {
-        crate::i18n::get_tool_description("goal.start")
-            .expect("goal.start tool description must be in Fluent catalogue")
+        crate::i18n::get_tool_description("goal_start")
+            .expect("goal_start tool description must be in Fluent catalogue")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

@@ -235,11 +235,11 @@ impl PromptSection for GoalModeSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let can_start_goal = ctx.tools.iter().any(|tool| tool.name() == "goal.start");
+        let can_start_goal = ctx.tools.iter().any(|tool| tool.name() == "goal_start");
         let mut out = String::from("## Goal Mode\n\n");
         if can_start_goal {
             out.push_str(
-                "- Use `goal.start` only to request a durable goal from the runtime; do not invent goal IDs, owners, routes, principals, budgets, or lifecycle state.\n",
+                "- Use `goal_start` only to request a durable goal from the runtime; do not invent goal IDs, owners, routes, principals, budgets, or lifecycle state.\n",
             );
         }
         out.push_str(
@@ -371,7 +371,7 @@ mod tests {
     #[async_trait]
     impl Tool for GoalStartPromptTool {
         fn name(&self) -> &str {
-            "goal.start"
+            "goal_start"
         }
 
         fn description(&self) -> &str {
@@ -523,7 +523,7 @@ mod tests {
         let output = GoalModeSection.build(&ctx_for_prompt_tests()).unwrap();
 
         assert!(output.contains("untrusted text"));
-        assert!(!output.contains("goal.start"));
+        assert!(!output.contains("goal_start"));
         assert!(output.contains("synchronous delegation"));
     }
 
@@ -546,7 +546,7 @@ mod tests {
 
         let output = GoalModeSection.build(&ctx).unwrap();
 
-        assert!(output.contains("goal.start"));
+        assert!(output.contains("goal_start"));
         assert!(output.contains("do not invent goal IDs"));
     }
 

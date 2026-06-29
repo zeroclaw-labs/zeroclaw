@@ -1642,6 +1642,20 @@ mod tests {
 
     #[test]
     fn goal_start_tool_requires_goal_admission_registry_scope() {
+        fn assert_openai_compatible_tool_names(tools: &[Box<dyn Tool>]) {
+            for tool in tools {
+                let name = tool.name();
+                assert!(
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                    "tool name {name:?} must be 1-64 chars and contain only letters, numbers, underscores, or hyphens"
+                );
+            }
+        }
+
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -1680,9 +1694,10 @@ mod tests {
             None,
         )
         .tools;
+        assert_openai_compatible_tool_names(&general_tools);
         assert!(
-            general_tools.iter().all(|tool| tool.name() != "goal.start"),
-            "general registries must not expose goal.start without trusted admission context"
+            general_tools.iter().all(|tool| tool.name() != "goal_start"),
+            "general registries must not expose goal_start without trusted admission context"
         );
 
         let scoped_tools = all_tools_with_runtime(
@@ -1709,9 +1724,10 @@ mod tests {
             GoalAdmissionToolPolicy::Include,
         )
         .tools;
+        assert_openai_compatible_tool_names(&scoped_tools);
         assert!(
-            scoped_tools.iter().any(|tool| tool.name() == "goal.start"),
-            "goal.start should be exposed only when the caller scopes trusted admission context"
+            scoped_tools.iter().any(|tool| tool.name() == "goal_start"),
+            "goal_start should be exposed only when the caller scopes trusted admission context"
         );
     }
 

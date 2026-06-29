@@ -27,7 +27,7 @@ trusted route and principal context. Use the channel slash command:
 agent, route, and principal when no `task_id` is provided. Passing a task id is
 allowed only when that goal is visible to the same trusted context.
 
-The model-facing `goal.start` tool is registered only for tool loops that have
+The model-facing `goal_start` tool is registered only for tool loops that have
 trusted goal admission context. General CLI, gateway, and tool-listing
 registries do not advertise it yet. If those surfaces grow a trusted admission
 context later, they can opt in explicitly.

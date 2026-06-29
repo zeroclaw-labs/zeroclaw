@@ -433,9 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn dotted_tool_names_resolve_to_fluent_description_keys() {
+    fn underscored_tool_names_resolve_to_fluent_description_keys() {
         assert!(
-            get_tool_description("goal.start")
+            get_tool_description("goal_start")
                 .is_some_and(|description| description.contains("durable goal run"))
         );
     }
@@ -448,9 +448,9 @@ mod tests {
         };
         let value =
             format_tool_string_with_args(&sources, "tool-goal-start-error-empty-objective", &[])
-                .expect("goal.start tool error should format");
+                .expect("goal_start tool error should format");
 
-        assert_eq!(value, "goal.start requires a non-empty objective");
+        assert_eq!(value, "goal_start requires a non-empty objective");
     }
 
     #[test]
