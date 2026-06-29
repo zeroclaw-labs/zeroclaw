@@ -21239,6 +21239,8 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
             },
             CancellationToken::new(),
         )
