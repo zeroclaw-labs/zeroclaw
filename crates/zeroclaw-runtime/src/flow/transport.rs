@@ -1,10 +1,34 @@
 use crate::response_type::{PromptSigil, ResponseType, ResponseValue};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Localizable {
+    pub message_id: String,
+    pub args: Vec<(String, String)>,
+}
+
+impl Localizable {
+    #[must_use]
+    pub fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_arg(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.args.push((name.into(), value.into()));
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prompt {
     pub text: String,
     pub response_type: ResponseType,
+    pub message: Option<Localizable>,
 }
 
 impl Prompt {
@@ -13,7 +37,14 @@ impl Prompt {
         Self {
             text: text.into(),
             response_type,
+            message: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_message(mut self, message: Localizable) -> Self {
+        self.message = Some(message);
+        self
     }
 
     #[must_use]
@@ -45,13 +76,13 @@ pub trait FlowTransport: Send {
     async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredItem {
     pub layer: String,
     pub instance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Completed {
         configured: Vec<ConfiguredItem>,
@@ -178,5 +209,34 @@ mod tests {
         let prompt = Prompt::new("Agent name", ResponseType::FreeformText);
         assert_eq!(prompt.sigil().as_str(), ">");
         assert!(!prompt.routes_secret());
+    }
+
+    #[test]
+    fn prompt_carries_a_serializable_localizable_descriptor() {
+        let prompt = Prompt::new("Choose a language", ResponseType::FreeformText)
+            .with_message(Localizable::new("onboard-flow-locale-prompt"));
+        let descriptor = prompt
+            .message
+            .as_ref()
+            .expect("prompt carries a localizable descriptor");
+        assert_eq!(descriptor.message_id, "onboard-flow-locale-prompt");
+
+        let json = serde_json::to_string(&prompt).expect("prompt serializes");
+        let restored: Prompt = serde_json::from_str(&json).expect("prompt deserializes");
+        assert_eq!(restored, prompt);
+    }
+
+    #[test]
+    fn localizable_carries_named_args_as_data() {
+        let descriptor =
+            Localizable::new("onboard-flow-completed").with_arg("items", "channel:home");
+        assert_eq!(descriptor.message_id, "onboard-flow-completed");
+        assert_eq!(
+            descriptor.args,
+            vec![("items".to_string(), "channel:home".to_string())]
+        );
+        let json = serde_json::to_string(&descriptor).expect("descriptor serializes");
+        let restored: Localizable = serde_json::from_str(&json).expect("descriptor deserializes");
+        assert_eq!(restored, descriptor);
     }
 }
