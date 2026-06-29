@@ -5015,7 +5015,7 @@ mod tests {
 
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
-        use zeroclaw_config::schema::AliasedAgentConfig;
+        use zeroclaw_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
 
         let mut config = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -5027,7 +5027,7 @@ mod tests {
         config.acp.default_agent = Some("alpha".to_string());
 
         let mut alpha = AliasedAgentConfig {
-            delegates: vec!["alpha".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
             ..Default::default()
         };
         alpha
@@ -5037,7 +5037,7 @@ mod tests {
         config.agents.insert("alpha".to_string(), alpha);
 
         let mut reviewer = AliasedAgentConfig {
-            delegates: vec!["alpha".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
             ..Default::default()
         };
         reviewer
@@ -5084,7 +5084,12 @@ mod tests {
         assert!(config.agents.contains_key("beta"));
         assert_eq!(config.heartbeat.agent, "beta");
         assert_eq!(config.acp.default_agent.as_deref(), Some("beta"));
-        assert_eq!(config.agents["beta"].delegates, vec!["beta".to_string()]);
+        assert_eq!(
+            config.agents["beta"].delegates,
+            vec![zeroclaw_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
+        );
         assert!(
             config.agents["beta"]
                 .workspace
@@ -5093,7 +5098,9 @@ mod tests {
         );
         assert_eq!(
             config.agents["reviewer"].delegates,
-            vec!["beta".to_string()]
+            vec![zeroclaw_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
         );
         assert_eq!(
             config.agents["reviewer"].workspace.read_memory_from,

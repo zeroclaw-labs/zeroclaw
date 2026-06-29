@@ -80,6 +80,10 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// When `true`, channels that support TTS must not synthesise this
+    /// message as a voice note. Use for error notices, system alerts, and
+    /// other non-conversational content that should never be voiced.
+    pub suppress_voice: bool,
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -143,7 +147,14 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
+    }
+
+    /// Prevent TTS channels from voicing this message.
+    pub fn suppress_voice(mut self) -> Self {
+        self.suppress_voice = true;
+        self
     }
 
     /// Create a new message with content, recipient, and subject
@@ -160,6 +171,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
     }
 
