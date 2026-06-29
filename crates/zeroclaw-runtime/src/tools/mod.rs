@@ -548,10 +548,14 @@ pub fn all_tools_with_runtime(
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    // Keep a shared runtime adapter available after constructing ShellTool.
+    // Independent agentic delegates use it later to build the target-owned tool
+    // registry; bounded delegates continue to use the parent `tool_arcs`
+    // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
                     .with_timeout_secs(if security.shell_timeout_secs > 0 {
                         security.shell_timeout_secs
                     } else {
@@ -1370,6 +1374,7 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
+        .with_runtime(runtime.clone())
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
