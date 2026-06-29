@@ -1218,6 +1218,8 @@ struct NativeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
@@ -2033,6 +2035,7 @@ impl OpenAiCompatibleModelProvider {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
+        let mut tool_call_name_by_id = std::collections::HashMap::new();
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
 
         messages
@@ -2046,27 +2049,30 @@ impl OpenAiCompatibleModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| ToolCall {
-                            id: Some({
-                                let normalized_id = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(tc.id.clone()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(tc.id, normalized_id.clone());
-                                normalized_id
-                            }),
-                            kind: Some("function".to_string()),
-                            function: Some(Function {
-                                name: Some(tc.name),
-                                arguments: Some(tc.arguments),
-                            }),
-                            name: None,
-                            arguments: None,
-                            parameters: None,
-                            // Round-trip extra_content (e.g. Gemini
-                            // thoughtSignature) — dropping it here was the bug.
-                            extra_content: tc.extra_content,
+                        .map(|tc| {
+                            let normalized_id = reserve_tool_call_id_for_contract(
+                                targets_mistral_tool_call_contract,
+                                Some(tc.id.clone()),
+                                &mut used_tool_call_ids,
+                            );
+                            tool_call_id_map.insert(tc.id, normalized_id.clone());
+                            if !tc.name.is_empty() {
+                                tool_call_name_by_id.insert(normalized_id.clone(), tc.name.clone());
+                            }
+                            ToolCall {
+                                id: Some(normalized_id),
+                                kind: Some("function".to_string()),
+                                function: Some(Function {
+                                    name: Some(tc.name),
+                                    arguments: Some(tc.arguments),
+                                }),
+                                name: None,
+                                arguments: None,
+                                parameters: None,
+                                // Round-trip extra_content (e.g. Gemini
+                                // thoughtSignature) — dropping it here was the bug.
+                                extra_content: tc.extra_content,
+                            }
                         })
                         .collect::<Vec<_>>();
 
@@ -2090,6 +2096,7 @@ impl OpenAiCompatibleModelProvider {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
+                        name: None,
                         tool_calls: Some(tool_calls),
                         reasoning_content,
                         reasoning,
@@ -2126,6 +2133,7 @@ impl OpenAiCompatibleModelProvider {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
+                        name: None,
                         tool_calls: None,
                         reasoning_content,
                         reasoning,
@@ -2156,6 +2164,17 @@ impl OpenAiCompatibleModelProvider {
                     if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
                         tool_call_id = last_assistant_tool_call_ids.first().cloned();
                     }
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            tool_call_id
+                                .as_ref()
+                                .and_then(|id| tool_call_name_by_id.get(id))
+                                .cloned()
+                        });
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
@@ -2166,6 +2185,7 @@ impl OpenAiCompatibleModelProvider {
                         role: "tool".to_string(),
                         content,
                         tool_call_id,
+                        name,
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
@@ -2180,6 +2200,7 @@ impl OpenAiCompatibleModelProvider {
                         allow_user_image_parts,
                     )),
                     tool_call_id: None,
+                    name: None,
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
@@ -3525,6 +3546,7 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hello".to_string())),
                 tool_call_id: None,
+                name: None,
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
@@ -4184,6 +4206,26 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_for_native_adds_tool_result_name_from_assistant_call() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_search","name":"web_search","arguments":"{}"}]}"#.to_string(),
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_search","content":"done"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&messages, true);
+
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[1].role, "tool");
+        assert_eq!(native[1].tool_call_id.as_deref(), Some("call_search"));
+        assert_eq!(native[1].name.as_deref(), Some("web_search"));
+    }
+
+    #[test]
     fn native_chat_request_mistral_serializes_matching_valid_tool_call_ids() {
         let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
         let invalid_id = "chatcmpl-tool-abc";
@@ -4234,10 +4276,14 @@ mod tests {
         let tool_id = value["messages"][1]["tool_call_id"]
             .as_str()
             .expect("tool result id should serialize");
+        let tool_name = value["messages"][1]["name"]
+            .as_str()
+            .expect("tool result name should serialize");
 
         assert_ne!(assistant_id, invalid_id);
         assert!(is_valid_mistral_tool_call_id(assistant_id));
         assert_eq!(assistant_id, tool_id);
+        assert_eq!(tool_name, "shell");
     }
 
     #[test]
@@ -5792,6 +5838,7 @@ mod tests {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
+            name: None,
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
@@ -5806,6 +5853,7 @@ mod tests {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
+            name: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
@@ -6637,6 +6685,7 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_123"));
+        assert_eq!(native[1].name.as_deref(), Some("search"));
     }
 
     #[test]
