@@ -7,6 +7,12 @@ use crate::spec_builder::build_spec;
 pub enum DriverError {
     #[error("section {0:?} has no configurable fields")]
     EmptySection(String),
+    #[error("cannot create alias {alias:?} under {family:?}: {reason}")]
+    AliasCreate {
+        family: String,
+        alias: String,
+        reason: String,
+    },
     #[error(transparent)]
     Walk(#[from] zeroclaw_runtime::flow::WalkError),
 }
@@ -15,6 +21,14 @@ pub struct FlowRequest<'section> {
     pub section_prefix: &'section str,
     pub layer: &'section str,
     pub instance: &'section str,
+    pub create: bool,
+}
+
+fn family_of(section_prefix: &str, instance: &str) -> String {
+    section_prefix
+        .strip_suffix(&format!(".{instance}"))
+        .unwrap_or(section_prefix)
+        .to_string()
 }
 
 pub async fn run_flow(
@@ -22,6 +36,16 @@ pub async fn run_flow(
     request: &FlowRequest<'_>,
     transport: &mut dyn FlowTransport,
 ) -> Result<Outcome, DriverError> {
+    if request.create {
+        let family = family_of(request.section_prefix, request.instance);
+        config
+            .create_map_key(&family, request.instance)
+            .map_err(|reason| DriverError::AliasCreate {
+                family,
+                alias: request.instance.to_string(),
+                reason,
+            })?;
+    }
     let success = Outcome::Completed {
         configured: vec![ConfiguredItem {
             layer: request.layer.to_string(),
@@ -129,6 +153,7 @@ mod tests {
             section_prefix: SECTION,
             layer: "channel",
             instance: "home",
+            create: false,
         };
         let outcome = run_flow(&mut config, &request, &mut transport)
             .await
@@ -146,6 +171,7 @@ mod tests {
             section_prefix: SECTION,
             layer: "channel",
             instance: "home",
+            create: false,
         };
         run_flow(&mut config, &request, &mut transport)
             .await
@@ -161,10 +187,54 @@ mod tests {
             section_prefix: "channels.matrix.absent",
             layer: "channel",
             instance: "absent",
+            create: false,
         };
         let error = run_flow(&mut config, &request, &mut transport)
             .await
             .unwrap_err();
         assert!(matches!(error, DriverError::EmptySection(_)));
+    }
+
+    #[tokio::test]
+    async fn run_flow_creates_a_brand_new_alias_then_walks_it() {
+        let mut config = Config::default();
+        assert!(
+            !config.channels.matrix.contains_key("fresh"),
+            "precondition: the alias must not exist before the flow"
+        );
+        let mut transport = AutoTransport {
+            emitted: Vec::new(),
+        };
+        let request = FlowRequest {
+            section_prefix: "channels.matrix.fresh",
+            layer: "channel",
+            instance: "fresh",
+            create: true,
+        };
+        let outcome = run_flow(&mut config, &request, &mut transport)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Completed { .. }));
+        assert_eq!(
+            config.channels.matrix.get("fresh").unwrap().homeserver,
+            "42",
+            "the freshly-created alias must carry the walked answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_flow_create_rejects_an_unknown_family() {
+        let mut config = Config::default();
+        let mut transport = ScriptedTransport::new(Vec::new());
+        let request = FlowRequest {
+            section_prefix: "channels.nonsense.fresh",
+            layer: "channel",
+            instance: "fresh",
+            create: true,
+        };
+        let error = run_flow(&mut config, &request, &mut transport)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DriverError::AliasCreate { .. }));
     }
 }

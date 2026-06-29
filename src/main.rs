@@ -643,6 +643,12 @@ enum Commands {
         /// Agent alias used when --llm is set.
         #[arg(long, default_value = "default")]
         agent: String,
+
+        /// Create the alias instance under its family before walking it,
+        /// onboarding a brand-new section instance rather than editing an
+        /// existing one.
+        #[arg(long)]
+        create: bool,
     },
 
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
@@ -1363,12 +1369,22 @@ async fn run_onboard_flow(
     instance: &str,
     use_llm: bool,
     agent_alias: &str,
+    create: bool,
 ) -> anyhow::Result<()> {
     use zeroclaw_onboarding::{
         AgentPhraser, AgentResponder, CliTransport, FlowRequest, InProcessAgentTurn, LlmTransport,
         TtyPasswordSource, TtySecretReader, build_spec, phrase_spec, run_flow,
     };
     use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
+
+    if create && use_llm {
+        let family = section
+            .strip_suffix(&format!(".{instance}"))
+            .unwrap_or(section);
+        config
+            .create_map_key(family, instance)
+            .map_err(anyhow::Error::msg)?;
+    }
 
     let success = Outcome::Completed {
         configured: vec![ConfiguredItem {
@@ -1410,6 +1426,7 @@ async fn run_onboard_flow(
         section_prefix: section,
         layer,
         instance,
+        create,
     };
     let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
     Box::pin(config.save()).await?;
@@ -3783,9 +3800,10 @@ async fn main() -> Result<()> {
             instance,
             llm,
             agent,
+            create,
         } => {
             Box::pin(run_onboard_flow(
-                config, &section, &layer, &instance, llm, &agent,
+                config, &section, &layer, &instance, llm, &agent, create,
             ))
             .await?;
             return Ok(());

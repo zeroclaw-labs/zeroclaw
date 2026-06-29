@@ -21,41 +21,24 @@ fn seeded_config_dir() -> TempDir {
     tmp
 }
 
-fn scripted_answers() -> Vec<String> {
-    let mut config = Config::default();
-    config
-        .channels
-        .matrix
-        .insert("home".to_string(), MatrixConfig::default());
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        "channel",
-        "home",
-        Outcome::Cancelled,
-    )
-    .expect("matrix section yields a spec");
-
-    let mut ordered: Vec<_> = spec.nodes.values().collect();
-    ordered.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    ordered
-        .into_iter()
-        .map(|node| match &node.prompt.response_type {
-            ResponseType::Secret => "sk-token".to_string(),
-            ResponseType::YesNo => "y".to_string(),
-            ResponseType::Number => "100".to_string(),
-            ResponseType::Choice { options } => options[0].value.clone(),
-            ResponseType::FreeformText => "https://walked.test".to_string(),
-        })
-        .collect()
+fn bare_config_dir() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let mut file = std::fs::File::create(tmp.path().join("config.toml")).unwrap();
+    writeln!(file, "schema_version = 3\n").unwrap();
+    tmp
 }
 
-#[test]
-fn onboard_flow_walks_the_matrix_section_over_a_real_pty_and_writes_config() {
-    let tmp = seeded_config_dir();
-    let config_path = tmp.path().join("config.toml");
-    let binary = env!("CARGO_BIN_EXE_zeroclaw");
+struct DriveResult {
+    completed: bool,
+    transcript: String,
+}
 
+fn drive_flow_over_pty(
+    config_dir: &std::path::Path,
+    extra_args: &[&str],
+    instance: &str,
+) -> DriveResult {
+    let binary = env!("CARGO_BIN_EXE_zeroclaw");
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -68,14 +51,17 @@ fn onboard_flow_walks_the_matrix_section_over_a_real_pty_and_writes_config() {
 
     let mut cmd = CommandBuilder::new(binary);
     cmd.arg("--config-dir");
-    cmd.arg(tmp.path());
+    cmd.arg(config_dir);
     cmd.arg("onboard-flow");
     cmd.arg("--section");
     cmd.arg(SECTION);
     cmd.arg("--layer");
     cmd.arg("channel");
     cmd.arg("--instance");
-    cmd.arg("home");
+    cmd.arg(instance);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn child");
     drop(pair.slave);
@@ -137,15 +123,87 @@ fn onboard_flow_walks_the_matrix_section_over_a_real_pty_and_writes_config() {
     }
 
     let _ = child.wait();
+    DriveResult {
+        completed,
+        transcript,
+    }
+}
+
+fn scripted_answers() -> Vec<String> {
+    let mut config = Config::default();
+    config
+        .channels
+        .matrix
+        .insert("home".to_string(), MatrixConfig::default());
+    let spec = build_spec(
+        config.prop_fields(),
+        SECTION,
+        "channel",
+        "home",
+        Outcome::Cancelled,
+    )
+    .expect("matrix section yields a spec");
+
+    let mut ordered: Vec<_> = spec.nodes.values().collect();
+    ordered.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    ordered
+        .into_iter()
+        .map(|node| match &node.prompt.response_type {
+            ResponseType::Secret => "sk-token".to_string(),
+            ResponseType::YesNo => "y".to_string(),
+            ResponseType::Number => "100".to_string(),
+            ResponseType::Choice { options } => options[0].value.clone(),
+            ResponseType::FreeformText => "https://walked.test".to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn onboard_flow_walks_the_matrix_section_over_a_real_pty_and_writes_config() {
+    let tmp = seeded_config_dir();
+    let config_path = tmp.path().join("config.toml");
+
+    let result = drive_flow_over_pty(tmp.path(), &[], "home");
 
     assert!(
-        completed,
-        "flow did not reach a completed outcome.\ntranscript:\n{transcript}"
+        result.completed,
+        "flow did not reach a completed outcome.\ntranscript:\n{}",
+        result.transcript
     );
 
     let written = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         written.contains("https://walked.test"),
         "freeform answer should have been written, got:\n{written}"
+    );
+}
+
+#[test]
+fn onboard_flow_create_inserts_a_new_alias_over_a_real_pty_and_writes_config() {
+    let tmp = bare_config_dir();
+    let config_path = tmp.path().join("config.toml");
+
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !before.contains("[channels.matrix.home]"),
+        "precondition: the alias must be absent before the flow"
+    );
+
+    let result = drive_flow_over_pty(tmp.path(), &["--create"], "home");
+
+    assert!(
+        result.completed,
+        "create flow did not reach a completed outcome.\ntranscript:\n{}",
+        result.transcript
+    );
+
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("[channels.matrix.home]"),
+        "the brand-new alias block should have been written, got:\n{written}"
+    );
+    assert!(
+        written.contains("https://walked.test"),
+        "the walked answer should have been written into the new alias, got:\n{written}"
     );
 }
