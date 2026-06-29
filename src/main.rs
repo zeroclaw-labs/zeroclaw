@@ -402,8 +402,19 @@ fn pause_after_no_command_help() {
     println!();
     print!("{}", t("cli-press-enter", "Press Enter to exit..."));
     let _ = std::io::stdout().flush();
+    // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
+    // command) cannot blow up RSS in this trivial one-Enter prompt.
+    // Matches `zeroclaw_runtime::agent::loop_::MAX_INTERACTIVE_INPUT_BYTES`
+    // (1 MiB) by convention; the cap is duplicated here because this
+    // Windows-only path runs regardless of whether the `agent-runtime`
+    // feature is on.
+    const CAP: usize = 1024 * 1024;
+    let mut stdin = std::io::stdin().take((CAP + 1) as u64);
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+    let _ = std::io::BufRead::read_line(&mut stdin, &mut line);
+    if line.len() > CAP {
+        line.truncate(CAP);
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
