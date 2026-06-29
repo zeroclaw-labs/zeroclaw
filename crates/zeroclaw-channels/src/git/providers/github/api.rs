@@ -1,8 +1,8 @@
 //! Minimal GitHub REST client for the provider.
 //!
 //! Typed wrappers over the handful of endpoints the channel uses. Every
-//! method takes its bearer credential (app JWT or installation token) as
-//! an argument — this module knows nothing about how credentials are
+//! method takes its auth credential (app JWT or installation token) as
+//! an argument; this module knows nothing about how credentials are
 //! minted, and nothing about polling or message mapping.
 
 use chrono::{DateTime, Utc};
@@ -50,11 +50,11 @@ impl GithubApi {
         &self,
         method: reqwest::Method,
         url: String,
-        bearer: &str,
+        auth_header: &str,
     ) -> reqwest::RequestBuilder {
         self.http_client()
             .request(method, url)
-            .bearer_auth(bearer)
+            .bearer_auth(auth_header)
             .header(reqwest::header::ACCEPT, GITHUB_ACCEPT)
             .header(reqwest::header::USER_AGENT, GITHUB_USER_AGENT)
             .header("X-GitHub-Api-Version", GITHUB_API_VERSION)

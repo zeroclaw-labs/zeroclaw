@@ -12298,7 +12298,7 @@ impl ChannelsConfig {
             ChannelInfo {
                 kind: "git",
                 name: "Git",
-                desc: "Git forge (GitHub) — issues, PRs & events",
+                desc: "Git forge (GitHub): issues, PRs & events",
                 configured: !self.git.is_empty(),
             },
             ChannelInfo {
@@ -15566,7 +15566,7 @@ impl ChannelConfig for BlueskyConfig {
 
 /// Git-forge channel configuration (polling-based; no webhook required).
 ///
-/// A `provider` selects the forge — GitHub is the first and current
+/// A `provider` selects the forge; GitHub is the first and current
 /// implementation. The GitHub provider authenticates as a GitHub App: a
 /// short-lived RS256 JWT signed with the app's private key is exchanged
 /// for per-installation access tokens. Inbound issue/PR comments are
@@ -15592,7 +15592,7 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub app_id: u64,
-    /// Path to the app's RS256 private key — the `.pem` file GitHub
+    /// Path to the app's RS256 private key, the `.pem` file GitHub
     /// generates on the app's settings page. Should be readable only by
     /// the daemon user (0600); looser permissions log a startup warning.
     /// GitHub provider only.
@@ -15635,7 +15635,7 @@ pub struct GitConfig {
     /// back to the conversational default: `issue_comment.created`,
     /// `issues.opened`, and `pull_request.opened` are delivered as
     /// messages (mention-gated); everything else is ignored. Which API
-    /// endpoints are polled is derived from this table — routing an event
+    /// endpoints are polled is derived from this table; routing an event
     /// type is also subscribing to it.
     #[tab(Behavior)]
     #[serde(default)]
@@ -15692,7 +15692,7 @@ impl ChannelConfig for GitConfig {
         "Git"
     }
     fn desc() -> &'static str {
-        "Git forge (GitHub) — issues, PRs & events"
+        "Git forge (GitHub): issues, PRs & events"
     }
 }
 
@@ -15710,15 +15710,11 @@ pub struct GitEventRoute {
     /// Deliver the event into the agent loop as a normal channel message.
     #[serde(default)]
     pub message: bool,
-    /// Route the event to the named SOP. Channel→SOP dispatch is not wired
-    /// into the runtime yet: until it lands, sop-routed events are
-    /// delivered as messages (without the mention gate) and the fallback
-    /// is logged, so configs written today keep working unchanged later.
+    /// Route the event to the named SOP through channel-sourced SOP ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sop: Option<String>,
-    /// After the SOP completes, also deliver the event as a message.
-    /// Meaningful only together with `sop`; behaves like `message = true`
-    /// until SOP dispatch lands.
+    /// Reserved for future SOP-completion fan-out. Meaningful only together
+    /// with `sop`; currently not delivered as a chat fallback.
     #[serde(default)]
     pub then_message: bool,
 }

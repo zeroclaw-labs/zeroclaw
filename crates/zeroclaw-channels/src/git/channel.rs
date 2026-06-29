@@ -254,20 +254,31 @@ impl GitChannel {
     /// Route one typed event through the per-event table and deliver it.
     /// Returns `false` when the orchestrator hung up.
     ///
-    /// SOP routing is forward-declared only: channel→SOP dispatch does
-    /// not exist in the runtime yet, so sop-routed events degrade to the
-    /// message path (mention gate off) with a log line. Once dispatch
-    /// lands, only this arm changes — configs keep working unchanged.
+    /// SOP-routed events are emitted as channel-carried SOP envelopes;
+    /// the orchestrator consumes them before normal chat processing.
     async fn dispatch_event(
         &self,
         event: GitEvent,
         filter: &EventFilter<'_>,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> bool {
-        let gate_mentions = match router::resolve_route(event.event_type(), &self.cfg.events) {
+        let msg = match router::resolve_route(event.event_type(), &self.cfg.events) {
             RouteAction::Ignore => return true,
-            RouteAction::Message => true,
-            RouteAction::SopDegraded { sop } => {
+            RouteAction::Message => {
+                events::event_to_message(&event, filter, CHANNEL_KEY, &self.alias, true)
+            }
+            RouteAction::Sop { sop, then_message } => {
+                if then_message {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop": sop,
+                                "event_type": event.event_type(),
+                            })),
+                        "git route requested then_message; SOP completion fan-out is not wired, emitting only the SOP event"
+                    );
+                }
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -275,14 +286,19 @@ impl GitChannel {
                             "sop": sop,
                             "event_type": event.event_type(),
                         })),
-                    "event routed to sop; SOP dispatch not yet available, delivering as message"
+                    "git event routed to SOP ingress"
                 );
-                false
+                events::event_to_sop_message(
+                    &event,
+                    filter,
+                    CHANNEL_KEY,
+                    &self.alias,
+                    &self.cfg.provider,
+                    &sop,
+                )
             }
         };
-        let Some(msg) =
-            events::event_to_message(&event, filter, CHANNEL_KEY, &self.alias, gate_mentions)
-        else {
+        let Some(msg) = msg else {
             return true;
         };
         if !self.is_user_allowed(&msg.sender) {
@@ -812,7 +828,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sop_route_degrades_to_message_without_mention_gate() {
+        async fn sop_route_emits_sop_event_without_mention_gate() {
             use wiremock::matchers::{method, path};
             use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -860,15 +876,21 @@ mod tests {
                 .unwrap();
             drop(tx);
 
-            // The load-bearing fallback: SOP dispatch doesn't exist yet,
-            // so the sop-routed event is delivered as a normal message —
-            // and the mention gate doesn't apply to sop routes
-            // (mention_only is on in `test_filter`, and the PR body has no
-            // mention).
+            // SOP-routed events bypass the mention gate and enter SOP
+            // ingress with a reserved subject.
             let msg = rx.recv().await.unwrap();
             assert_eq!(msg.id, "ghpr_octo/repo#31");
             assert_eq!(msg.reply_target, "octo/repo#31");
-            assert_eq!(msg.content, "Implements the event enum.");
+            assert_eq!(
+                msg.subject.as_deref(),
+                Some("zeroclaw:sop-event:git.main:pull_request.opened")
+            );
+            let payload: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+            assert_eq!(payload["sop"], "pr-triage");
+            assert_eq!(payload["event_type"], "pull_request.opened");
+            assert_eq!(payload["repo"], "octo/repo");
+            assert_eq!(payload["number"], 31);
+            assert_eq!(payload["body"], "Implements the event enum.");
             assert!(rx.recv().await.is_none());
         }
 

@@ -130,6 +130,11 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    Channel {
+        topic: String,
+        #[serde(default)]
+        condition: Option<String>,
+    },
     Manual,
 }
 
@@ -144,6 +149,7 @@ impl fmt::Display for SopTrigger {
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { topic, .. } => write!(f, "channel:{topic}"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -328,6 +334,7 @@ pub enum SopTriggerSource {
     Peripheral,
     Filesystem,
     Calendar,
+    Channel,
     Manual,
 }
 
@@ -340,6 +347,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Peripheral => write!(f, "peripheral"),
             Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
+            Self::Channel => write!(f, "channel"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -677,6 +685,19 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"octo/repo\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Channel { ref topic, .. } if topic == "git.main:pull_request.opened")
+        );
+    }
+
+    #[test]
     fn filesystem_event_kind_display_and_serde() {
         assert_eq!(FilesystemEventKind::Created.to_string(), "created");
         assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
@@ -814,6 +835,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 

@@ -12,6 +12,7 @@
 //! `providers::<forge>::mapping`.
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use zeroclaw_api::channel::ChannelMessage;
 
 use super::types::{
@@ -19,6 +20,10 @@ use super::types::{
     EVT_PULL_REQUEST_CLOSED, EVT_PULL_REQUEST_MERGED, EVT_PULL_REQUEST_OPENED,
     EVT_RELEASE_PUBLISHED, EVT_WORKFLOW_RUN_COMPLETED, EVT_WORKFLOW_RUN_FAILED, IssueRef, RepoRef,
 };
+
+/// Reserved `ChannelMessage.subject` prefix for events that should be
+/// consumed by the orchestrator's SOP ingress instead of the chat loop.
+pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
 /// The accountable actor behind an event, normalized across forges: the
 /// login used for allowlisting and self/bot filtering, plus whether the
@@ -382,6 +387,158 @@ pub fn event_to_message(
     }
 }
 
+/// Map a routed git event into a channel-carried SOP event. The message
+/// envelope exists only to reuse the channel listener bus; the orchestrator
+/// consumes it before debounce, `/stop`, or LLM processing.
+pub fn event_to_sop_message(
+    event: &GitEvent,
+    filter: &EventFilter<'_>,
+    channel_key: &str,
+    alias: &str,
+    provider: &str,
+    sop: &str,
+) -> Option<ChannelMessage> {
+    // Authorless events carry no identity to gate on; keep that behavior
+    // aligned with conversational messages.
+    let author = event.author()?;
+    if !filter.admit_author(author) {
+        return None;
+    }
+
+    let id = event.dedup_id();
+    let timestamp = event.created_at().timestamp();
+    let target = event_target(event);
+    let topic = sop_topic(channel_key, alias, event.event_type());
+    let payload = event_payload(event, channel_key, alias, provider, sop, &topic);
+    let ctx = MessageCtx { channel_key, alias };
+    Some(message(
+        id,
+        author.login.clone(),
+        &target,
+        payload.to_string(),
+        timestamp,
+        Some(format!("{CHANNEL_SOP_SUBJECT_PREFIX}{topic}")),
+        &ctx,
+    ))
+}
+
+fn sop_topic(channel_key: &str, alias: &str, event_type: &str) -> String {
+    format!("{channel_key}.{alias}:{event_type}")
+}
+
+fn event_target(event: &GitEvent) -> String {
+    match event {
+        GitEvent::IssueCommentCreated(p) | GitEvent::PullRequestReviewCommentCreated(p) => {
+            issue_target(&p.repo, p.number)
+        }
+        GitEvent::IssueOpened(p) => issue_target(&p.repo, p.number),
+        GitEvent::PullRequestOpened(p) => issue_target(&p.repo, p.number),
+        GitEvent::PullRequestClosed(t) | GitEvent::PullRequestMerged(t) => {
+            issue_target(&t.repo, t.number)
+        }
+        GitEvent::WorkflowRunCompleted(r) | GitEvent::WorkflowRunFailed(r) => match r.pr_number {
+            Some(number) => issue_target(&r.repo, number),
+            None => r.repo.to_string(),
+        },
+        GitEvent::ReleasePublished(r) => r.repo.to_string(),
+    }
+}
+
+fn actor_payload(actor: &EventActor) -> serde_json::Value {
+    json!({
+        "login": actor.login,
+        "is_bot": actor.is_bot,
+    })
+}
+
+fn common_payload(
+    event: &GitEvent,
+    channel_key: &str,
+    alias: &str,
+    provider: &str,
+    sop: &str,
+    topic: &str,
+) -> serde_json::Value {
+    json!({
+        "source": "channel",
+        "channel": channel_key,
+        "channel_alias": alias,
+        "provider": provider,
+        "sop": sop,
+        "topic": topic,
+        "event_type": event.event_type(),
+        "dedup_id": event.dedup_id(),
+        "created_at": event.created_at().to_rfc3339(),
+        "target": event_target(event),
+    })
+}
+
+fn event_payload(
+    event: &GitEvent,
+    channel_key: &str,
+    alias: &str,
+    provider: &str,
+    sop: &str,
+    topic: &str,
+) -> serde_json::Value {
+    let mut payload = common_payload(event, channel_key, alias, provider, sop, topic);
+    let obj = payload
+        .as_object_mut()
+        .expect("common_payload produces a JSON object");
+    match event {
+        GitEvent::IssueCommentCreated(p) | GitEvent::PullRequestReviewCommentCreated(p) => {
+            obj.insert("repo".into(), json!(p.repo.to_string()));
+            obj.insert("number".into(), json!(p.number));
+            obj.insert("comment_id".into(), json!(p.comment_id));
+            obj.insert("author".into(), actor_payload(&p.author));
+            obj.insert("body".into(), json!(p.body));
+        }
+        GitEvent::IssueOpened(p) => {
+            obj.insert("repo".into(), json!(p.repo.to_string()));
+            obj.insert("number".into(), json!(p.number));
+            obj.insert("issue_id".into(), json!(p.issue_id));
+            obj.insert("author".into(), actor_payload(&p.author));
+            obj.insert("title".into(), json!(p.title));
+            obj.insert("body".into(), json!(p.body));
+        }
+        GitEvent::PullRequestOpened(p) => {
+            obj.insert("repo".into(), json!(p.repo.to_string()));
+            obj.insert("number".into(), json!(p.number));
+            obj.insert("author".into(), actor_payload(&p.author));
+            obj.insert("title".into(), json!(p.title));
+            obj.insert("body".into(), json!(p.body));
+        }
+        GitEvent::PullRequestClosed(t) | GitEvent::PullRequestMerged(t) => {
+            obj.insert("repo".into(), json!(t.repo.to_string()));
+            obj.insert("number".into(), json!(t.number));
+            obj.insert("author".into(), actor_payload(&t.author));
+            obj.insert("title".into(), json!(t.title));
+            obj.insert("html_url".into(), json!(t.html_url));
+        }
+        GitEvent::WorkflowRunCompleted(r) | GitEvent::WorkflowRunFailed(r) => {
+            obj.insert("repo".into(), json!(r.repo.to_string()));
+            obj.insert("run_id".into(), json!(r.run_id));
+            obj.insert("attempt".into(), json!(r.attempt));
+            obj.insert("name".into(), json!(r.name));
+            obj.insert("branch".into(), json!(r.branch));
+            obj.insert("run_number".into(), json!(r.run_number));
+            obj.insert("pr_number".into(), json!(r.pr_number));
+            obj.insert("actor".into(), r.actor.as_ref().map(actor_payload).into());
+            obj.insert("html_url".into(), json!(r.html_url));
+        }
+        GitEvent::ReleasePublished(r) => {
+            obj.insert("repo".into(), json!(r.repo.to_string()));
+            obj.insert("release_id".into(), json!(r.release_id));
+            obj.insert("tag".into(), json!(r.tag));
+            obj.insert("name".into(), json!(r.name));
+            obj.insert("author".into(), actor_payload(&r.author));
+            obj.insert("body".into(), json!(r.body));
+            obj.insert("html_url".into(), json!(r.html_url));
+        }
+    }
+    payload
+}
+
 /// Per-message attribution context: the channel key and configured alias.
 struct MessageCtx<'a> {
     channel_key: &'a str,
@@ -585,6 +742,46 @@ mod tests {
         assert_eq!(pr.event_type(), "pull_request.opened");
         // PRs have no transport-stable object id; identity is repo#number.
         assert_eq!(pr.dedup_id(), "ghpr_octo/repo#12");
+    }
+
+    #[test]
+    fn sop_message_carries_reserved_subject_and_structured_payload() {
+        let event = GitEvent::PullRequestOpened(PullPost {
+            repo: repo(),
+            number: 12,
+            author: actor("marc", false),
+            title: "Route through SOP".to_string(),
+            body: "Please review".to_string(),
+            created_at: at("2026-06-13T01:00:00Z"),
+        });
+
+        let msg = event_to_sop_message(
+            &event,
+            &filter(true, false),
+            "git",
+            "main",
+            "github",
+            "triage",
+        )
+        .unwrap();
+        assert_eq!(
+            msg.subject.as_deref(),
+            Some("zeroclaw:sop-event:git.main:pull_request.opened")
+        );
+        assert_eq!(msg.reply_target, "octo/repo#12");
+
+        let payload: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        assert_eq!(payload["source"], "channel");
+        assert_eq!(payload["channel"], "git");
+        assert_eq!(payload["channel_alias"], "main");
+        assert_eq!(payload["provider"], "github");
+        assert_eq!(payload["sop"], "triage");
+        assert_eq!(payload["topic"], "git.main:pull_request.opened");
+        assert_eq!(payload["event_type"], "pull_request.opened");
+        assert_eq!(payload["repo"], "octo/repo");
+        assert_eq!(payload["number"], 12);
+        assert_eq!(payload["author"]["login"], "marc");
+        assert_eq!(payload["title"], "Route through SOP");
     }
 
     #[test]

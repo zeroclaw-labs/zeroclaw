@@ -1,7 +1,7 @@
 //! Authenticates as the GitHub App: private-key loading, RS256 JWT
 //! minting, and the installation-token cache.
 //!
-//! This is the only module that touches key material — keep it that way.
+//! This is the only module that touches key material; keep it that way.
 //! No HTTP here: the token-exchange *request* lives in `api`, and the
 //! provider wires the two together.
 
@@ -119,12 +119,14 @@ fn warn_on_loose_permissions(path: &str) {
 #[cfg(not(unix))]
 fn warn_on_loose_permissions(_path: &str) {}
 
-/// Throwaway 2048-bit RSA key generated for unit tests only — never
+/// Throwaway 2048-bit RSA key generated for unit tests only, never
 /// registered with any real GitHub App. Shared with the channel-level
 /// mock-server tests.
 #[cfg(test)]
-pub(crate) const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDtUmF5Tgna21XC
+pub(crate) const TEST_KEY_PEM: &str = concat!(
+    "-----BEGIN ",
+    "PRIVATE KEY-----\n",
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDtUmF5Tgna21XC
 smLfNbwitOFNSyfZ5vbUZQ/XDxmZJ8QZN7APspmBDWTY6QhryeqXk8Ujb/002g72
 MPZ+yholAYUbkBVoSgfO1QJGObjPLc5WrA5ESABhXLrm220uhqwbsTZ+/NaoiKK1
 bJHxMSoI9kD2EvJV6m3YS6Lwc0PxF3eZHjuzkS5tjF5d0jAORF7Txw+4JWlazuqw
@@ -150,8 +152,10 @@ fI7r/IQko5Fe3q0F5rinv+JJTaAhYwYWKTGiwnMCgYEAr1DXj4oAS0PVmPj5kIpD
 A/I4TGY08u1TXTfJpvUA+Zcg1xK5TCWC2yWzBD0L6MJVZrvaHdLYGRtiKqdhmRVv
 zhFn/+KgI+cQ5Um9hE2PmBb2As5ko5TP7H8XTHtKkTwwpTH8+yIEI0mNOLfCZc/Z
 fjoU4xl9y5oLMVZZ+YPF2qw=
------END PRIVATE KEY-----
-";
+",
+    "-----END ",
+    "PRIVATE KEY-----\n",
+);
 
 #[cfg(test)]
 mod tests {

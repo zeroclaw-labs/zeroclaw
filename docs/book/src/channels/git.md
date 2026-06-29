@@ -1,26 +1,26 @@
 # Git
 
-Converse with the agent through a git forge's issue and pull-request comments, and surface repository events — PR lifecycle, review comments, CI outcomes, releases — through a per-event routing table. The channel is built around a **provider seam**: a `provider` field selects the forge. **GitHub is the first and current provider**; new forges (GitLab, Gitea) drop in as sibling providers without changing the generic channel.
+Converse with the agent through a git forge's issue and pull-request comments, and surface repository events, including PR lifecycle, review comments, CI outcomes, and releases, through a per-event routing table. The channel is built around a **provider seam**: a `provider` field selects the forge. **GitHub is the first and current provider**; new forges (GitLab, Gitea) drop in as sibling providers without changing the generic channel.
 
-With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies as the app's own bot identity (`your-app[bot]`), so it works on any repository the app is installed on — no personal access token, no shared user account.
+With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies as the app's own bot identity (`your-app[bot]`), so it works on any repository the app is installed on. There is no personal access token and no shared user account.
 
 > **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). The GitHub provider is on by default under `channel-git`; build a forge subset with `--features channel-git` plus the desired `provider-*` features.
 
 ## How it works
 
-- **Polling, not webhooks.** The channel polls the forge REST API for new issues, pull requests, and comments on a `since` cursor. The daemon needs no public URL, tunnel, or inbound exposure — it works behind NAT.
+- **Polling, not webhooks.** The channel polls the forge REST API for new issues, pull requests, and comments on a `since` cursor. The daemon needs no public URL, tunnel, or inbound exposure; it works behind NAT.
 - **Issue-scoped conversations.** Every message on the same issue or PR shares one conversation thread; the agent replies as a comment on that issue.
 - **Streaming replies.** The agent posts a draft comment and edits it in place as the response grows (edits are spaced ≥ 2 s to respect forge abuse limits).
 - **Reactions.** Acknowledgement reactions map onto the forge's reaction set (with GitHub: 👀 → `eyes`, ✅ → `+1`, ⚠️ → `confused`, …); unmappable emoji are skipped.
-- **Cold start.** Events created before the daemon started are never processed, so restarting can't replay history. The flip side: comments posted while the daemon was down are missed — mention the app again.
+- **Cold start.** Events created before the daemon started are never processed, so restarting can't replay history. The flip side: comments posted while the daemon was down are missed, so mention the app again.
 - **Comment edits are ignored.** Only newly created comments and issue/PR opening posts trigger the agent.
 
 ## Create the GitHub App
 
 1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**.
-2. **Webhook:** uncheck *Active* — this channel doesn't use one.
+2. **Webhook:** uncheck *Active*; this channel doesn't use one.
 3. **Repository permissions:** Issues *Read & write*, Pull requests *Read & write*, Metadata *Read-only*. Nothing else.
-4. After creating, note the **App ID** and **generate a private key** — GitHub downloads a `.pem` file. Move it somewhere stable and `chmod 600` it (looser permissions log a startup warning).
+4. After creating, note the **App ID** and **generate a private key**. GitHub downloads a `.pem` file. Move it somewhere stable and `chmod 600` it (looser permissions log a startup warning).
 5. **Install the app** on your account or organization, selecting the repositories the agent should see.
 
 ## Configure
@@ -66,19 +66,27 @@ Beyond conversation, the channel normalizes repository activity into typed event
 
 Known event types: `issue_comment.created`, `issues.opened`, `pull_request.opened`, `pull_request.closed`, `pull_request.merged`, `pull_request_review_comment.created`, `workflow_run.completed`, `workflow_run.failed`, `release.published`.
 
-- **Defaults.** With no `events` table, the channel behaves conversationally: `issue_comment.created`, `issues.opened`, and `pull_request.opened` are delivered as messages (mention-gated as described above); everything else is ignored. Event types absent from a non-empty table get the same per-type defaults — listing `workflow_run.failed` doesn't turn conversation off. An entry with neither `message = true` nor a `sop` explicitly disables that event type.
+- **Defaults.** With no `events` table, the channel behaves conversationally: `issue_comment.created`, `issues.opened`, and `pull_request.opened` are delivered as messages (mention-gated as described above); everything else is ignored. Event types absent from a non-empty table get the same per-type defaults: listing `workflow_run.failed` doesn't turn conversation off. An entry with neither `message = true` nor a `sop` explicitly disables that event type.
 - **Routing an event type is subscribing to it.** The channel derives which API endpoints to poll from the table: review comments, releases, and Actions runs are only fetched when their event types are routed, so an unconfigured channel costs exactly what it did before.
-- **`sop` routing is forward-declared.** Channel→SOP dispatch isn't wired into the runtime yet. Until it lands, a `sop`-routed event is **delivered as a normal message** and the fallback is logged (`event routed to sop; SOP dispatch not yet available, delivering as message`) — configs written today keep working unchanged once dispatch exists. `then_message` likewise behaves as `message = true` for now.
-- **Mention gating per route.** The `mention_only` gate applies to conversational events on the message path. `sop`-routed events skip it — a PR routed to `pr-triage` is captured whether or not the author mentioned the app. Lifecycle/CI/release events have no mention surface and are never gated. The app's own activity is always dropped; other bots' activity follows `listen_to_bots`; every delivery passes the peer-group allowlist on the author's login.
-- **Reply surfaces.** Comment, issue, and PR events reply onto their issue/PR thread. Workflow-run events reply onto the run's associated PR when the forge reports one; otherwise — and for releases — the target is the bare repository and the agent cannot reply on-platform (route those to a SOP or act through other tools).
-- **Events API backbone (optional, GitHub).** `events_backbone = true` additionally polls `/repos/{owner}/{repo}/events` with ETag-conditional requests (one request per repo per tick; an idle repo answers 304 and costs almost nothing). Caveats: the feed lags by up to ~5 minutes, payloads are trimmed, and **Actions events never appear in it** — workflow runs always use their dedicated endpoint. Anything surfaced by both the feed and a targeted endpoint is de-duplicated, so it's safe to combine.
+- **`sop` routing.** A `sop` route emits a channel-sourced SOP event with topic `git.<alias>:<event_type>` and a structured JSON payload. `then_message` is reserved for future SOP-completion fan-out; today the routed event is consumed by SOP ingress rather than delivered as chat. Match it from `SOP.toml` like this:
+
+```toml
+[[triggers]]
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"octo/repo\""
+```
+
+- **Mention gating per route.** The `mention_only` gate applies to conversational events on the message path. `sop`-routed events skip it: a PR routed to `pr-triage` is captured whether or not the author mentioned the app. Lifecycle/CI/release events have no mention surface and are never gated. The app's own activity is always dropped; other bots' activity follows `listen_to_bots`; every delivery passes the peer-group allowlist on the author's login.
+- **Reply surfaces.** Comment, issue, and PR events reply onto their issue/PR thread. Workflow-run events reply onto the run's associated PR when the forge reports one; otherwise, and for releases, the target is the bare repository and the agent cannot reply on-platform (route those to a SOP or act through other tools).
+- **Events API backbone (optional, GitHub).** `events_backbone = true` additionally polls `/repos/{owner}/{repo}/events` with ETag-conditional requests (one request per repo per tick; an idle repo answers 304 and costs almost nothing). Caveats: the feed lags by up to ~5 minutes, payloads are trimmed, and **Actions events never appear in it**: workflow runs always use their dedicated endpoint. Anything surfaced by both the feed and a targeted endpoint is de-duplicated, so it's safe to combine.
 
 ## Operating notes
 
 - **Rate budget (GitHub):** each installation gets 5,000 requests/hour; the conversational default spends 2 requests per repository per poll tick (5 repos at a 30 s interval ≈ 1,200/hour). Each additionally routed endpoint family (review comments, releases, Actions runs) adds 1 per repo per tick, and the Events API backbone adds 1 conditional request (304s on idle repos are effectively free). On a rate-limit response the channel backs off until the limit window resets.
-- **Many repositories:** when `repos` is empty and the installation can see more than 100 repositories, only the first page is polled (a warning is logged) — list `repos` explicitly in that case.
+- **Many repositories:** when `repos` is empty and the installation can see more than 100 repositories, only the first page is polled (a warning is logged). List `repos` explicitly in that case.
 - **Multiple installations:** one channel alias serves one installation. If the app is installed on several accounts, set `installation_id` (and add more aliases for the others).
 
 ## Safety
 
-Issues and PR comments on public repositories are adversarial input. Keep `mention_only = true`, gate senders with a peer group (an empty peer set denies everyone, `["*"]` accepts anyone), and keep autonomy at `Supervised` or lower for public-facing repositories — the same guidance as [social channels](./social.md#operating-social-channels-safely).
+Issues and PR comments on public repositories are adversarial input. Keep `mention_only = true`, gate senders with a peer group (an empty peer set denies everyone, `["*"]` accepts anyone), and keep autonomy at `Supervised` or lower for public-facing repositories. This is the same guidance as [social channels](./social.md#operating-social-channels-safely).

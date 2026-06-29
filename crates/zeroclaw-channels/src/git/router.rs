@@ -21,11 +21,9 @@ pub enum RouteAction {
     /// Deliver as a channel message with the conversational filters
     /// (mention gate under `mention_only`).
     Message,
-    /// Routed to a SOP. Channel→SOP dispatch is not wired into the
-    /// runtime yet — the caller delivers the event as a message (mention
-    /// gate off) and logs the fallback, so these configs keep working
-    /// unchanged once dispatch lands.
-    SopDegraded { sop: String },
+    /// Emit a channel-sourced SOP event. `then_message` is reserved for a
+    /// later SOP-completion fan-out and is not a chat fallback.
+    Sop { sop: String, then_message: bool },
 }
 
 /// Resolve one event type against the routing table. Event types absent
@@ -42,8 +40,9 @@ pub fn resolve_route(event_type: &str, table: &HashMap<String, GitEventRoute>) -
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                RouteAction::SopDegraded {
+                RouteAction::Sop {
                     sop: sop.to_string(),
+                    then_message: route.then_message,
                 }
             } else if route.message {
                 RouteAction::Message
@@ -193,8 +192,9 @@ mod tests {
         );
         assert_eq!(
             resolve_route(EVT_PULL_REQUEST_OPENED, &table),
-            RouteAction::SopDegraded {
-                sop: "pr-triage".to_string()
+            RouteAction::Sop {
+                sop: "pr-triage".to_string(),
+                then_message: true,
             }
         );
     }
