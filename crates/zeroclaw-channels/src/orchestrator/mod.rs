@@ -21192,6 +21192,7 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                ..Default::default()
             },
             CancellationToken::new(),
         )
