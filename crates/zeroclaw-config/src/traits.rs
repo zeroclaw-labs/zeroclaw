@@ -241,6 +241,12 @@ impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
 impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
+impl HasPropKind for crate::schema::DelegateExecutionMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for Vec<crate::schema::DelegateTargetConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
 impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }

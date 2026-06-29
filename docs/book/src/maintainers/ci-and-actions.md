@@ -58,6 +58,12 @@ Docs are built and published as part of the release pipeline rather than on ever
 
 ## Manual and Advisory Workflows
 
+### Monthly Outdated Scan (`monthly-outdated.yml`)
+
+Scheduled monthly scan on the 1st of every month at 09:00 UTC. Runs `cargo outdated --workspace` across all workspace members. Opens a `dependencies`-labeled issue when stale deps are found. Permissions: `contents: read` + `issues: write`. Dedup guard prevents piling up if the previous issue is still open.
+
+First triage step for a new issue: check if the reported outdated crates have semver-incompatible bumps and whether the consuming crate's API changed. If the bump is trivial (patch/minor), create a short dep-only PR. If the upgrade is blocked by semver breaks, close the issue with a note and the blocking crate name.
+
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
 
 Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
@@ -135,6 +141,9 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `docker/setup-buildx-action` (`v4.0.0`) | `release-stable-manual.yml` | Docker Buildx setup |
 | `docker/login-action` (`v4.1.0`) | `release-stable-manual.yml` | GHCR authentication |
 | `docker/build-push-action` (`v7.1.0`) | `release-stable-manual.yml` | Multi-platform image build and push |
+| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
+| `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
+| `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -145,6 +154,9 @@ actions/*
 dtolnay/rust-toolchain@*
 Swatinem/rust-cache@*
 docker/*
+sigstore/cosign-installer@*
+anchore/sbom-action@*
+slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
 ```
 
 Export the current effective policy:

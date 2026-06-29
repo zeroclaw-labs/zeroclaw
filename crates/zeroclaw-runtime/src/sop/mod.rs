@@ -1,16 +1,25 @@
+pub mod active_scope;
 pub mod approval;
 pub mod audit;
 pub mod condition;
 pub mod dispatch;
 pub mod engine;
+pub mod executor;
 pub mod metrics;
 pub mod payload_safety;
+pub mod route;
+pub mod rundata;
+pub mod schema;
+pub mod scope;
+pub mod step_contract;
 pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
-pub use engine::SopEngine;
+pub use engine::{MaintenanceSummary, SopEngine};
 pub use metrics::SopMetricsCollector;
+pub use scope::StepToolScope;
+pub use step_contract::{StepFailure, StepRouting};
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
     SqliteRunStore, StoreError, build_run_store,
@@ -207,16 +216,11 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
 ///
 /// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
-/// Sub-bullets `- tools:` and `- requires_confirmation: true` are parsed.
+/// Sub-bullets parse execution hints and dark per-step contract metadata.
 pub fn parse_steps(md: &str) -> Vec<SopStep> {
     let mut steps = Vec::new();
     let mut in_steps_section = false;
-    let mut current_number: Option<u32> = None;
-    let mut current_title = String::new();
-    let mut current_body = String::new();
-    let mut current_tools: Vec<String> = Vec::new();
-    let mut current_requires_confirmation = false;
-    let mut current_kind = SopStepKind::Execute;
+    let mut current = StepParseState::default();
 
     for line in md.lines() {
         let trimmed = line.trim();
@@ -231,15 +235,7 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
             // Any other ## heading ends the steps section
             if in_steps_section {
                 // Flush pending step
-                flush_step(
-                    &mut steps,
-                    &mut current_number,
-                    &mut current_title,
-                    &mut current_body,
-                    &mut current_tools,
-                    &mut current_requires_confirmation,
-                    &mut current_kind,
-                );
+                current.flush_into(&mut steps);
                 in_steps_section = false;
             }
             continue;
@@ -252,113 +248,193 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
         // Check for numbered item: `1.`, `2.`, etc.
         if let Some(rest) = parse_numbered_item(trimmed) {
             // Flush previous step
-            flush_step(
-                &mut steps,
-                &mut current_number,
-                &mut current_title,
-                &mut current_body,
-                &mut current_tools,
-                &mut current_requires_confirmation,
-                &mut current_kind,
-            );
+            current.flush_into(&mut steps);
 
             let step_num = u32::try_from(steps.len())
                 .unwrap_or(u32::MAX)
                 .saturating_add(1);
-            current_number = Some(step_num);
+            current.reset_for_step(step_num);
 
             // Extract title from bold text: **title** — body
             if let Some((title, body)) = extract_bold_title(rest) {
-                current_title = title;
-                current_body = body;
+                current.title = title;
+                current.body = body;
             } else {
-                current_title = rest.to_string();
-                current_body = String::new();
+                current.title = rest.to_string();
             }
-            current_tools = Vec::new();
-            current_requires_confirmation = false;
             continue;
         }
 
         // Sub-bullet parsing (only when inside a step)
-        if current_number.is_some() && trimmed.starts_with("- ") {
+        if current.number.is_some() && trimmed.starts_with("- ") {
             let bullet = trimmed.trim_start_matches("- ").trim();
             if let Some(tools_str) = bullet.strip_prefix("tools:") {
-                current_tools = tools_str
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
+                current.tools = parse_csv_list(tools_str);
+            } else if let Some(tools_str) = bullet
+                .strip_prefix("allow-tools:")
+                .or_else(|| bullet.strip_prefix("allow_tools:"))
+            {
+                ensure_scope(&mut current.scope).allow = Some(parse_csv_list(tools_str));
+            } else if let Some(tools_str) = bullet
+                .strip_prefix("deny-tools:")
+                .or_else(|| bullet.strip_prefix("deny_tools:"))
+            {
+                ensure_scope(&mut current.scope).deny = parse_csv_list(tools_str);
             } else if bullet.starts_with("requires_confirmation:") {
                 if let Some(val) = bullet.strip_prefix("requires_confirmation:") {
-                    current_requires_confirmation = val.trim().eq_ignore_ascii_case("true");
+                    current.requires_confirmation = val.trim().eq_ignore_ascii_case("true");
                 }
             } else if bullet.starts_with("kind:") {
                 if let Some(val) = bullet.strip_prefix("kind:") {
                     let val = val.trim();
                     if val.eq_ignore_ascii_case("checkpoint") {
-                        current_kind = SopStepKind::Checkpoint;
+                        current.kind = SopStepKind::Checkpoint;
                     } else {
-                        current_kind = SopStepKind::Execute;
+                        current.kind = SopStepKind::Execute;
                     }
                 }
+            } else if let Some(val) = bullet.strip_prefix("input:") {
+                ensure_schema(&mut current.schema).input = Some(parse_schema_fragment(val.trim()));
+            } else if let Some(val) = bullet.strip_prefix("output:") {
+                ensure_schema(&mut current.schema).output = Some(parse_schema_fragment(val.trim()));
+            } else if let Some(val) = bullet.strip_prefix("when:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    current.routing.when = Some(val.to_string());
+                }
+            } else if let Some(val) = bullet.strip_prefix("next:") {
+                current.routing.next = val.trim().parse::<u32>().ok();
+            } else if let Some(val) = bullet
+                .strip_prefix("depends_on:")
+                .or_else(|| bullet.strip_prefix("depends-on:"))
+            {
+                current.routing.depends_on = parse_u32_list(val);
+            } else if let Some(val) = bullet
+                .strip_prefix("on_failure:")
+                .or_else(|| bullet.strip_prefix("on-failure:"))
+            {
+                current.on_failure = parse_step_failure(val);
+            } else if let Some(val) = bullet.strip_prefix("mode:") {
+                current.mode = Some(parse_execution_mode(val));
             } else {
                 // Continuation body line
-                if !current_body.is_empty() {
-                    current_body.push('\n');
+                if !current.body.is_empty() {
+                    current.body.push('\n');
                 }
-                current_body.push_str(trimmed);
+                current.body.push_str(trimmed);
             }
             continue;
         }
 
         // Continuation line for step body
-        if current_number.is_some() && !trimmed.is_empty() {
-            if !current_body.is_empty() {
-                current_body.push('\n');
+        if current.number.is_some() && !trimmed.is_empty() {
+            if !current.body.is_empty() {
+                current.body.push('\n');
             }
-            current_body.push_str(trimmed);
+            current.body.push_str(trimmed);
         }
     }
 
     // Flush final step
-    flush_step(
-        &mut steps,
-        &mut current_number,
-        &mut current_title,
-        &mut current_body,
-        &mut current_tools,
-        &mut current_requires_confirmation,
-        &mut current_kind,
-    );
+    current.flush_into(&mut steps);
 
     steps
 }
 
-/// Flush accumulated step state into the steps vector.
-fn flush_step(
-    steps: &mut Vec<SopStep>,
-    number: &mut Option<u32>,
-    title: &mut String,
-    body: &mut String,
-    tools: &mut Vec<String>,
-    requires_confirmation: &mut bool,
-    kind: &mut SopStepKind,
-) {
-    if let Some(n) = number.take() {
+#[derive(Default)]
+struct StepParseState {
+    number: Option<u32>,
+    title: String,
+    body: String,
+    tools: Vec<String>,
+    requires_confirmation: bool,
+    kind: SopStepKind,
+    schema: Option<StepSchema>,
+    scope: Option<StepToolScope>,
+    routing: StepRouting,
+    on_failure: StepFailure,
+    mode: Option<SopExecutionMode>,
+}
+
+impl StepParseState {
+    fn reset_for_step(&mut self, number: u32) {
+        *self = Self {
+            number: Some(number),
+            ..Self::default()
+        };
+    }
+
+    fn flush_into(&mut self, steps: &mut Vec<SopStep>) {
+        let Some(n) = self.number.take() else {
+            return;
+        };
         steps.push(SopStep {
             number: n,
-            title: std::mem::take(title),
-            body: body.trim().to_string(),
-            suggested_tools: std::mem::take(tools),
-            requires_confirmation: *requires_confirmation,
-            kind: *kind,
-            schema: None,
+            title: std::mem::take(&mut self.title),
+            body: self.body.trim().to_string(),
+            suggested_tools: std::mem::take(&mut self.tools),
+            requires_confirmation: self.requires_confirmation,
+            kind: self.kind,
+            schema: self.schema.take(),
+            scope: self.scope.take(),
+            routing: std::mem::take(&mut self.routing),
+            on_failure: std::mem::take(&mut self.on_failure),
+            mode: self.mode.take(),
         });
-        *body = String::new();
-        *requires_confirmation = false;
-        *kind = SopStepKind::Execute;
+        *self = Self::default();
     }
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn parse_u32_list(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|item| item.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn parse_schema_fragment(value: &str) -> serde_json::Value {
+    serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()))
+}
+
+fn parse_step_failure(value: &str) -> StepFailure {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("fail") {
+        return StepFailure::Fail;
+    }
+    if let Some(max) = value
+        .strip_prefix("retry:")
+        .or_else(|| value.strip_prefix("retry "))
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+    {
+        return StepFailure::Retry { max };
+    }
+    if let Some(step) = value
+        .strip_prefix("goto:")
+        .or_else(|| value.strip_prefix("goto "))
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+    {
+        return StepFailure::Goto { step };
+    }
+    StepFailure::Fail
+}
+
+fn ensure_schema(schema: &mut Option<StepSchema>) -> &mut StepSchema {
+    schema.get_or_insert(StepSchema {
+        input: None,
+        output: None,
+    })
+}
+
+fn ensure_scope(scope: &mut Option<StepToolScope>) -> &mut StepToolScope {
+    scope.get_or_insert_with(StepToolScope::default)
 }
 
 /// Try to parse `N. rest` from a line, returning `rest` if successful.
@@ -426,4 +502,79 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     }
 
     warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn parse_steps_keeps_legacy_tools_hint() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Collect** - Gather context.
+   - tools: read_file, shell
+"#,
+        );
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].suggested_tools, vec!["read_file", "shell"]);
+        assert!(steps[0].scope.is_none());
+        assert_eq!(
+            steps[0]
+                .effective_tool_scope()
+                .as_ref()
+                .and_then(|scope| scope.allow.clone()),
+            Some(vec!["read_file".to_string(), "shell".to_string()])
+        );
+        assert!(steps[0].routing.when.is_none());
+        assert_eq!(steps[0].on_failure, StepFailure::Fail);
+    }
+
+    #[test]
+    fn parse_steps_populates_contract_bullets() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Collect** - Gather context.
+   - input: {"type":"object","required":["ticket"]}
+   - output: {"type":"object","properties":{"ok":{"type":"boolean"}}}
+   - allow-tools: fs
+   - deny-tools: shell
+   - when: $.steps.1.ok == true
+   - next: 3
+   - depends_on: 1, 2
+   - on_failure: retry:2
+   - mode: auto
+"#,
+        );
+
+        let step = &steps[0];
+        assert_eq!(
+            step.schema.as_ref().and_then(|schema| schema.input.clone()),
+            Some(json!({"type":"object","required":["ticket"]}))
+        );
+        assert_eq!(
+            step.schema
+                .as_ref()
+                .and_then(|schema| schema.output.clone()),
+            Some(json!({"type":"object","properties":{"ok":{"type":"boolean"}}}))
+        );
+        assert_eq!(
+            step.scope.as_ref().and_then(|scope| scope.allow.clone()),
+            Some(vec!["fs".to_string()])
+        );
+        assert_eq!(
+            step.scope.as_ref().map(|scope| scope.deny.clone()),
+            Some(vec!["shell".to_string()])
+        );
+        assert_eq!(step.routing.when.as_deref(), Some("$.steps.1.ok == true"));
+        assert_eq!(step.routing.next, Some(3));
+        assert_eq!(step.routing.depends_on, vec![1, 2]);
+        assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
+        assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
 }

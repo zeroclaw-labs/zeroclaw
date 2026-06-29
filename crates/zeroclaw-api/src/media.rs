@@ -97,3 +97,74 @@ impl MediaAttachment {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn att(file_name: &str, mime_type: Option<&str>) -> MediaAttachment {
+        MediaAttachment {
+            file_name: file_name.to_string(),
+            data: Vec::new(),
+            mime_type: mime_type.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kind_prefers_mime_type_over_extension() {
+        // A known media MIME type wins even when the extension says otherwise.
+        assert_eq!(att("photo.jpg", Some("audio/ogg")).kind(), MediaKind::Audio);
+    }
+
+    #[test]
+    fn kind_mime_match_is_case_insensitive() {
+        assert_eq!(att("x", Some("IMAGE/PNG")).kind(), MediaKind::Image);
+        assert_eq!(att("x", Some("Video/MP4")).kind(), MediaKind::Video);
+    }
+
+    #[test]
+    fn kind_falls_back_to_extension_when_mime_uninformative() {
+        // octet-stream is not audio/image/video, so the extension decides.
+        assert_eq!(
+            att("voice.mp3", Some("application/octet-stream")).kind(),
+            MediaKind::Audio
+        );
+    }
+
+    #[test]
+    fn kind_classifies_by_extension_when_no_mime() {
+        let cases = [
+            ("voice.ogg", MediaKind::Audio),
+            ("song.FLAC", MediaKind::Audio),
+            ("photo.jpeg", MediaKind::Image),
+            ("pic.HEIC", MediaKind::Image),
+            ("clip.mp4", MediaKind::Video),
+            ("movie.mkv", MediaKind::Video),
+            ("doc.pdf", MediaKind::Unknown),
+            ("data.bin", MediaKind::Unknown),
+            ("noextension", MediaKind::Unknown),
+        ];
+        for (name, want) in cases {
+            assert_eq!(att(name, None).kind(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn from_file_reads_data_and_maps_extension_to_mime() {
+        let path = std::env::temp_dir().join("zeroclaw_media_kind_test_sample.png");
+        std::fs::write(&path, b"\x89PNG fake-bytes").unwrap();
+        let att = MediaAttachment::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(att.file_name, "zeroclaw_media_kind_test_sample.png");
+        assert_eq!(att.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(att.data, b"\x89PNG fake-bytes");
+        assert_eq!(att.kind(), MediaKind::Image);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_propagates_read_error_for_missing_path() {
+        let missing = std::env::temp_dir().join("zeroclaw_media_kind_missing_xyz.bin");
+        let _ = std::fs::remove_file(&missing);
+        assert!(MediaAttachment::from_file(missing.to_str().unwrap()).is_err());
+    }
+}

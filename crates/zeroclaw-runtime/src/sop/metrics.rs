@@ -103,6 +103,12 @@ impl SopMetricsCollector {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_for_test(&self) {
+        let mut state = self.inner.write().expect("metrics collector lock poisoned");
+        *state = CollectorState::default();
+    }
+
     // ── Push methods (sync, write lock) ────────────────────────
 
     /// Record a terminal run (Completed/Failed/Cancelled).

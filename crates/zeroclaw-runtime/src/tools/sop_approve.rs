@@ -3,14 +3,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::sop::SopEngine;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::{SopRunAction, SopRunStatus};
+use crate::sop::{SopAuditLogger, SopEngine};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
     agent_alias: String,
 }
 
@@ -18,8 +19,14 @@ impl SopApproveTool {
     pub fn new(engine: Arc<Mutex<SopEngine>>) -> Self {
         Self {
             engine,
+            audit: None,
             agent_alias: "agent".to_string(),
         }
+    }
+
+    pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Set the agent alias recorded as the approval principal (default `"agent"`).
@@ -100,7 +107,9 @@ impl Tool for SopApproveTool {
                         Some(SopRunStatus::PausedCheckpoint)
                     );
                     if is_checkpoint {
-                        engine.approve_step(run_id).map(ResolveOutcome::Resumed)
+                        engine
+                            .approve_step(run_id)
+                            .map(|action| ResolveOutcome::Resumed(Box::new(action)))
                     } else {
                         Ok(ResolveOutcome::NotWaiting)
                     }
@@ -111,7 +120,12 @@ impl Tool for SopApproveTool {
 
         match result {
             Ok(ResolveOutcome::Resumed(action)) => {
-                let output = match action {
+                crate::sop::executor::enqueue_live_action(
+                    Arc::clone(&self.engine),
+                    self.audit.clone(),
+                    &action,
+                );
+                let output = match *action {
                     SopRunAction::ExecuteStep {
                         run_id, context, ..
                     } => {
@@ -184,6 +198,7 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
