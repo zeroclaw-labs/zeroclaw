@@ -39,6 +39,7 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::WaitApproval { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
         | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
     }
@@ -51,6 +52,7 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::WaitApproval { .. } => "WaitApproval",
         SopRunAction::DeterministicStep { .. } => "DeterministicStep",
         SopRunAction::CheckpointWait { .. } => "CheckpointWait",
+        SopRunAction::Pending { .. } => "Pending",
         SopRunAction::Completed { .. } => "Completed",
         SopRunAction::Failed { .. } => "Failed",
     }
@@ -261,6 +263,15 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                         )
                     );
                 }
+                SopRunAction::Pending { step, reason, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "SOP headless dispatch: run {run_id} ('{sop_name}') pending before step {step}: {reason}"
+                        )
+                    );
+                }
                 SopRunAction::Completed { .. } => {
                     ::zeroclaw_log::record!(
                         INFO,
@@ -410,8 +421,12 @@ pub async fn check_sop_cron_triggers(
 ) -> Vec<DispatchResult> {
     let now = chrono::Utc::now();
     let mut all_results = Vec::new();
+    let mut fired_expressions = std::collections::HashSet::new();
 
     for (_sop_name, expression, schedule) in &cache.schedules {
+        if fired_expressions.contains(expression) {
+            continue;
+        }
         // Check if any occurrence fell in the window (last_check, now].
         // At-most-once semantics: even if multiple ticks of the same expression
         // fell in the window (e.g., scheduler delayed), we fire only once.
@@ -420,6 +435,7 @@ pub async fn check_sop_cron_triggers(
         if let Some(next) = upcoming.next()
             && next <= now
         {
+            fired_expressions.insert(expression.clone());
             // This expression fired in the window
             let event = SopEvent {
                 source: SopTriggerSource::Cron,
@@ -463,6 +479,7 @@ mod tests {
                 requires_confirmation: false,
                 kind: crate::sop::SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 2,
@@ -806,6 +823,38 @@ mod tests {
             .collect();
         assert!(started_names.contains(&"every-min"));
         assert!(!started_names.contains(&"yearly"));
+    }
+
+    #[tokio::test]
+    async fn cron_sop_shared_expression_dispatches_once() {
+        let sop1 = test_sop(
+            "first",
+            vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+        );
+        let sop2 = test_sop(
+            "second",
+            vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+        );
+        let engine = test_engine(vec![sop1, sop2]);
+        let audit = test_audit();
+        let cache = SopCronCache::from_engine(&engine);
+
+        let mut last_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let results = check_sop_cron_triggers(&engine, &audit, &cache, &mut last_check).await;
+
+        let started_names: Vec<&str> = results
+            .iter()
+            .filter_map(|r| match r {
+                DispatchResult::Started { sop_name, .. } => Some(sop_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started_names, vec!["first", "second"]);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 2);
     }
 
     #[tokio::test]

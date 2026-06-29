@@ -7009,6 +7009,16 @@ pub struct BrowserConfig {
     #[serde(default)]
     #[nested]
     pub computer_use: BrowserComputerUseConfig,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Listed hosts also bypass `allowed_domains`. Both the `browser` tool and
+    /// `browser_open` accept `http://` for listed hosts — internal services
+    /// frequently lack a public TLS cert.
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_browser_allowed_domains() -> Vec<String> {
@@ -7035,6 +7045,7 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+            allowed_private_hosts: vec![],
         }
     }
 }
@@ -20037,6 +20048,15 @@ pub struct SopConfig {
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
 
+    /// How often (seconds) the daemon runs the SOP maintenance tick: fire
+    /// fail-closed approval timeouts (per `approval_timeout_secs` /
+    /// `approval_timeout_action`), reap expired concurrency-claim leases, and
+    /// prune terminal runs past `max_finished_runs`. Default `60`; set to `0` to
+    /// disable the tick entirely. The tick itself self-approves nothing - timeout
+    /// handling is governed by `approval_timeout_action` (default `escalate`).
+    #[serde(default = "default_sop_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
+
     /// Persist run state durably across restarts. Default `false` keeps today's
     /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
     /// to `true`, `build_sop_engine` selects the configured backend and in-flight
@@ -20066,6 +20086,26 @@ pub struct SopConfig {
     /// approval-routing fail-closed default; reconcile with that model if both land.)
     #[serde(default)]
     pub approval_timeout_action: ApprovalTimeoutAction,
+
+    /// Enforce per-step tool scope. Default false keeps `tools:` advisory.
+    #[serde(default)]
+    pub step_scope_enforce: bool,
+
+    /// Tool names that remain available while step scope is enforced.
+    #[serde(default = "default_sop_step_mandatory_tools")]
+    pub step_mandatory_tools: Vec<String>,
+
+    /// Enforce per-step input/output schemas when a step declares them.
+    #[serde(default = "default_sop_step_schema_enforce")]
+    pub step_schema_enforce: bool,
+
+    /// Maximum times a routed SOP run can visit one step.
+    #[serde(default = "default_sop_max_step_visits")]
+    pub max_step_visits: u32,
+
+    /// Maximum retries allowed by a step failure policy.
+    #[serde(default = "default_sop_max_step_retries")]
+    pub max_step_retries: u32,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -20137,6 +20177,29 @@ fn default_sop_max_finished_runs() -> usize {
     100
 }
 
+fn default_sop_step_mandatory_tools() -> Vec<String> {
+    ["sop_advance", "sop_approve", "sop_status"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_sop_step_schema_enforce() -> bool {
+    true
+}
+
+fn default_sop_max_step_visits() -> u32 {
+    256
+}
+
+fn default_sop_max_step_retries() -> u32 {
+    2
+}
+
+fn default_sop_maintenance_interval_secs() -> u64 {
+    60
+}
+
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
@@ -20145,11 +20208,17 @@ impl Default for SopConfig {
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
+            maintenance_interval_secs: default_sop_maintenance_interval_secs(),
             persist_runs: false,
             run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
             approval_mode: ApprovalMode::Both,
             approval_timeout_action: ApprovalTimeoutAction::Escalate,
+            step_scope_enforce: false,
+            step_mandatory_tools: default_sop_step_mandatory_tools(),
+            step_schema_enforce: default_sop_step_schema_enforce(),
+            max_step_visits: default_sop_max_step_visits(),
+            max_step_retries: default_sop_max_step_retries(),
         }
     }
 }
@@ -24133,6 +24202,7 @@ default_temperature = 0.7
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
+            allowed_private_hosts: vec![],
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
