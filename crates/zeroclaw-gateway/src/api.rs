@@ -4260,5 +4260,262 @@ mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+
+        /// Build a state with a2a disabled at runtime, but a still-paired
+        /// token. Discovery and task routes must 404 — the public card
+        /// surface is not a read-through-when-off fallback.
+        fn disabled_state() -> AppState {
+            let state = paired_state();
+            state.config.write().a2a.server.enabled = false;
+            state
+        }
+
+        /// Build a state with a second alias that exists but is not
+        /// published, so a request to the right URL still hits the
+        /// "agent not advertised" gate.
+        fn unpublished_alias_state() -> AppState {
+            let state = paired_state();
+            let mut cfg = state.config.write();
+            cfg.agents.insert(
+                "hidden".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                        published: false,
+                        exposed_skills: Vec::new(),
+                    },
+                    ..Default::default()
+                },
+            );
+            cfg.agents.insert(
+                "offline".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+            );
+            drop(cfg);
+            state
+        }
+
+        fn task_body_for(method: &str) -> String {
+            // Shape is what `handle_alias_task` actually walks: `jsonrpc`
+            // is required (or BAD_REQUEST), `method` is required, and the
+            // params must contain at least one text part or the handler
+            // returns invalid-params. Use `message/send` so the params
+            // path is exercised end-to-end.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"message":{{"parts":[{{"kind":"text","text":"hi"}}]}}}}}}"#
+            )
+        }
+
+        // ── Task endpoint: auth ────────────────────────────────────
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_wrong_bearer_token() {
+            // A wrong token must not be silently accepted — auth is
+            // the load-bearing line for the task endpoint (it runs a
+            // full agent turn), so the rejection must be 401, not a
+            // 200 with an embedded error.
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer not-the-real-token")
+                .body(axum::body::Body::from(task_body_for("message/send")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        // ── Task endpoint: gates ───────────────────────────────────
+
+        #[tokio::test]
+        async fn task_endpoint_404s_when_a2a_server_disabled() {
+            // Even with a valid token, an admin who flipped the
+            // server off must not have live task endpoints. The
+            // discovery surface shares the same gate, so the test
+            // also pins that contract.
+            let router = crate::a2a::a2a_task_route().with_state(disabled_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(task_body_for("message/send")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_404s_for_unknown_agent_alias() {
+            // Auth + server enabled, but the alias isn't an agent at
+            // all — must look the same as "doesn't exist" to a
+            // probing peer, not 403/401/200.
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/no-such-agent")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(task_body_for("message/send")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_404s_for_unpublished_agent() {
+            // Agent exists but `a2a.published = false` — admin did
+            // not opt it into the A2A surface. Same shape as
+            // "doesn't exist" to avoid leaking agent inventory.
+            let router = crate::a2a::a2a_task_route().with_state(unpublished_alias_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/hidden")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(task_body_for("message/send")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_404s_for_disabled_agent() {
+            // `enabled = false` short-circuits `published` — even an
+            // admin who forgot to flip the A2A flag can't reach a
+            // disabled agent through the task endpoint.
+            let router = crate::a2a::a2a_task_route().with_state(unpublished_alias_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/offline")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(task_body_for("message/send")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        // ── Task endpoint: body validation ─────────────────────────
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_malformed_json() {
+            // The handler wraps axum's JSON rejection into a
+            // JSON-RPC `-32700` parse error with HTTP 400. Without
+            // that, a peer that sends a half-encoded body could
+            // crash the turn or get an empty 5xx.
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from("{not-json"))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_wrong_jsonrpc_version() {
+            // The A2A wire contract is JSON-RPC 2.0 only — anything
+            // else is a hard client bug, not a protocol version we
+            // want to negotiate. 400 with an explicit jsonrpc error
+            // code is the right answer.
+            let body = r#"{"jsonrpc":"1.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#;
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unsupported_method_with_method_not_found() {
+            // Per the file's `if req.method != "message/send"` branch,
+            // unknown methods return 200 + JSON-RPC `-32601`. The
+            // status must NOT be 4xx — peers parse the JSON-RPC body
+            // for the method-not-found detail, not HTTP status.
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(task_body_for("tasks/cancel")))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_message_with_no_text_parts() {
+            // The handler joins text parts; a payload with no text
+            // parts (or all non-text) would dispatch an empty prompt
+            // to the agent. Reject before the turn runs.
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"file","text":""}]}}}"#;
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        // ── Card routes: disabled server ───────────────────────────
+
+        #[tokio::test]
+        async fn catalog_card_404s_when_a2a_server_disabled() {
+            // The catalog is the entry point peers hit first; it
+            // must follow the same gate as the task endpoint, or a
+            // peer could enumerate the agent inventory while the
+            // server is "off".
+            let router = crate::a2a::a2a_routes().with_state(disabled_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn alias_card_404s_when_a2a_server_disabled() {
+            let router = crate::a2a::a2a_routes().with_state(disabled_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn alias_card_404s_for_unknown_alias() {
+            // The card is supposed to advertise the published
+            // surface; asking about a non-existent alias must
+            // 404, not 200 with an empty body.
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/no-such-agent/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn alias_card_404s_for_unpublished_agent() {
+            let router = crate::a2a::a2a_routes().with_state(unpublished_alias_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/hidden/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::NOT_FOUND);
+        }
     }
 }
