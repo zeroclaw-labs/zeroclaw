@@ -392,7 +392,11 @@ impl CopilotModelProvider {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — spec-compliant
+            // validators reject tool_choice without a non-empty tools field.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
         };
 
