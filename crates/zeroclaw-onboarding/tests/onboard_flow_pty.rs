@@ -161,16 +161,25 @@ fn scripted_answers() -> Vec<String> {
 
     let mut ordered: Vec<_> = spec.nodes.values().collect();
     ordered.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    ordered
-        .into_iter()
-        .map(|node| match &node.prompt.response_type {
-            ResponseType::Secret => "sk-token".to_string(),
-            ResponseType::YesNo => "y".to_string(),
-            ResponseType::Number => "100".to_string(),
-            ResponseType::Choice { options } => options[0].value.clone(),
-            ResponseType::FreeformText => "https://walked.test".to_string(),
-        })
-        .collect()
+    let mut answers = vec![
+        zeroclaw_runtime::i18n::available_locales()
+            .first()
+            .expect("registry lists at least one locale")
+            .code
+            .clone(),
+    ];
+    answers.extend(
+        ordered
+            .into_iter()
+            .map(|node| match &node.prompt.response_type {
+                ResponseType::Secret => "sk-token".to_string(),
+                ResponseType::YesNo => "y".to_string(),
+                ResponseType::Number => "100".to_string(),
+                ResponseType::Choice { options } => options[0].value.clone(),
+                ResponseType::FreeformText => "https://walked.test".to_string(),
+            }),
+    );
+    answers
 }
 
 #[test]

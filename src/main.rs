@@ -1404,6 +1404,15 @@ async fn run_onboard_flow(
         FieldScope::All
     };
 
+    {
+        let locale_reader = std::io::BufReader::new(std::io::stdin());
+        let locale_writer = std::io::stdout();
+        let mut locale_transport =
+            CliTransport::with_secret_source(locale_reader, locale_writer, TtyPasswordSource);
+        let _selected_locale =
+            zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?;
+    }
+
     if create && use_llm {
         let family = section
             .strip_suffix(&format!(".{instance}"))

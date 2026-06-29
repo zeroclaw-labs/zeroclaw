@@ -32,6 +32,46 @@ fn family_of(section_prefix: &str, instance: &str) -> String {
         .to_string()
 }
 
+const LOCALE_PROMPT_ID: &str = "onboard-flow-locale-prompt";
+
+fn locale_prompt() -> zeroclaw_runtime::flow::Prompt {
+    use zeroclaw_runtime::flow::{Localizable, Prompt};
+    use zeroclaw_runtime::response_type::{ChoiceOption, ResponseType};
+
+    let options = zeroclaw_runtime::i18n::available_locales()
+        .iter()
+        .map(|locale| ChoiceOption {
+            value: locale.code.clone(),
+            label: locale.label.clone(),
+        })
+        .collect();
+    let text = crate::i18n::get_required_onboard_string(LOCALE_PROMPT_ID);
+    Prompt::new(text, ResponseType::Choice { options })
+        .with_message(Localizable::new(LOCALE_PROMPT_ID))
+}
+
+/// First onboarding step: select the active locale before any section walk.
+///
+/// The options are derived from the `locales.toml` registry via
+/// `available_locales()`, never a literal list. On selection `i18n::init` is
+/// called so every later string reflects the choice, and the chosen code is
+/// returned for the guide to speak. The flow engine stays locale-free: this is
+/// a driver-level step, not an engine node.
+pub async fn select_locale(
+    transport: &mut dyn FlowTransport,
+) -> Result<String, zeroclaw_runtime::flow::WalkError> {
+    use zeroclaw_runtime::response_type::ResponseValue;
+
+    let prompt = locale_prompt();
+    let response = transport.ask(&prompt).await?;
+    let code = match response {
+        ResponseValue::Choice(value) => value,
+        _ => zeroclaw_runtime::i18n::detect_locale(),
+    };
+    zeroclaw_runtime::i18n::init(&code);
+    Ok(code)
+}
+
 pub async fn run_flow(
     config: &mut Config,
     request: &FlowRequest<'_>,
@@ -269,6 +309,53 @@ mod tests {
         assert!(
             matrix.access_token.is_none(),
             "an Option field is never asked, so it keeps its default"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_locale_offers_every_registered_locale_and_returns_the_choice() {
+        let available = zeroclaw_runtime::i18n::available_locales();
+        let target = available
+            .get(if available.len() > 1 { 1 } else { 0 })
+            .expect("registry lists at least one locale")
+            .code
+            .clone();
+        let mut transport = ScriptedTransport::new(vec![ResponseValue::Choice(target.clone())]);
+        let chosen = select_locale(&mut transport).await.unwrap();
+        assert_eq!(chosen, target);
+    }
+
+    #[tokio::test]
+    async fn select_locale_options_come_from_the_registry_not_a_literal_list() {
+        struct CapturingTransport {
+            seen_options: Vec<String>,
+        }
+        #[async_trait]
+        impl FlowTransport for CapturingTransport {
+            async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+                if let zeroclaw_runtime::response_type::ResponseType::Choice { options } =
+                    &prompt.response_type
+                {
+                    self.seen_options = options.iter().map(|o| o.value.clone()).collect();
+                    return Ok(ResponseValue::Choice(options[0].value.clone()));
+                }
+                Err(TransportError::Closed)
+            }
+            async fn emit(&mut self, _outcome: &Outcome) -> TransportResult<()> {
+                Ok(())
+            }
+        }
+        let mut transport = CapturingTransport {
+            seen_options: Vec::new(),
+        };
+        select_locale(&mut transport).await.unwrap();
+        let registry: Vec<String> = zeroclaw_runtime::i18n::available_locales()
+            .iter()
+            .map(|l| l.code.clone())
+            .collect();
+        assert_eq!(
+            transport.seen_options, registry,
+            "locale options must mirror the registry exactly, in order"
         );
     }
 }
