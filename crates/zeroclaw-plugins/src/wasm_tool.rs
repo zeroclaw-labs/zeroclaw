@@ -41,7 +41,7 @@ impl WasmTool {
         }
     }
 
-    /// Create a WasmTool by loading metadata from the plugin's `tool_metadata` export.
+    /// Create a WasmTool by loading metadata from the plugin's `tool` export.
     /// Falls back to manifest-supplied values if the export is missing.
     pub fn from_wasm(
         wasm_path: PathBuf,
@@ -50,26 +50,16 @@ impl WasmTool {
         fallback_description: String,
         config: HashMap<String, String>,
     ) -> Self {
-        // Try to load metadata from the WASM module itself.
-        let (name, description, schema) = match runtime::create_plugin(&wasm_path, &permissions) {
-            Ok(mut plugin) => match runtime::call_tool_metadata(&mut plugin) {
-                Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "plugin at {} has no tool_metadata export ({e}), using fallback",
-                            wasm_path.display()
-                        )
-                    );
-                    (
-                        fallback_name.clone(),
-                        fallback_description.clone(),
-                        default_schema(),
-                    )
-                }
-            },
+        let probe = {
+            let wasm_path = wasm_path.clone();
+            let permissions = permissions.clone();
+            block_probe(async move {
+                let mut plugin = runtime::create_plugin(&wasm_path, &permissions).await?;
+                runtime::call_tool_metadata(&mut plugin).await
+            })
+        };
+        let (name, description, schema) = match probe {
+            Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -99,7 +89,28 @@ impl WasmTool {
     }
 }
 
-/// The JSON Schema returned when a plugin lacks a `tool_metadata` export or fails
+/// Run a one-shot async plugin probe to completion from a synchronous context.
+/// A scratch current-thread runtime on a dedicated thread keeps this safe to
+/// call whether or not an outer tokio runtime is active.
+fn block_probe<F, T>(fut: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(fut)
+            })
+            .join()
+            .map_err(|_| anyhow::Error::msg("plugin probe thread panicked"))?
+    })
+}
+
+/// The JSON Schema returned when a plugin lacks a tool metadata export or fails
 /// to load at discovery time. Single source of truth so the fallback shape stays
 /// consistent across code paths.
 fn default_schema() -> Value {
@@ -130,16 +141,8 @@ impl Tool for WasmTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let wasm_path = self.wasm_path.clone();
-        let permissions = self.permissions.clone();
-        let config = self.config.clone();
         let args_json = serde_json::to_vec(&args)?;
-
-        // Extism Plugin is !Send, so we must create it inside spawn_blocking.
-        tokio::task::spawn_blocking(move || {
-            let mut plugin = runtime::create_plugin(&wasm_path, &permissions)?;
-            runtime::call_execute(&mut plugin, &args_json, &config, &permissions)
-        })
-        .await?
+        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.permissions).await?;
+        runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
     }
 }
