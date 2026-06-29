@@ -6889,9 +6889,7 @@ mod tests {
             .tools(vec![])
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
-            .tool_dispatcher(Box::new(
-                crate::agent::dispatcher::NativeToolDispatcher,
-            ))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
             .workspace_dir(std::env::temp_dir())
             .build()
             .expect("minimal Agent should build");
@@ -6919,12 +6917,8 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            approval_pending: Arc::new(
-                crate::rpc::context::ApprovalPendingMap::default(),
-            ),
-            tui_registry: Arc::new(
-                crate::rpc::tui_identity::TuiRegistry::new_unsigned(),
-            ),
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
