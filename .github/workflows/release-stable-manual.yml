@@ -431,10 +431,6 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-      packages: write   # retained from workflow-level — publish job doesn't
-                        # push packages today, but explicitly listed so
-                        # future changes don't silently break on missing
-                        # permission. Docker/build jobs also have it.
     environment:
       name: github-releases
       url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
@@ -503,47 +499,123 @@ jobs:
         with:
           subject-path: release-assets/*
 
+      - id: attestation_bundles
+        name: Download attestation bundles for offline verification
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release-stable-manual.yml
+        run: |
+          set -euo pipefail
+
+          cd release-assets
+          tmp_dir="$(mktemp -d ../attestation-bundles.XXXXXX)"
+          gh attestation trusted-root > "$tmp_dir/trusted_root.jsonl"
+          printf 'Artifact | SHA256 | Bundle\n' > "$tmp_dir/ATTESTATION-BUNDLES.md"
+          printf '%s\n' '--- | --- | ---' >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+
+          artifact_count=0
+          bundle_count=0
+          for artifact in *.tar.gz *.zip *.dmg SHA256SUMS install.sh; do
+            [ -f "$artifact" ] || continue
+            artifact_count=$((artifact_count + 1))
+            digest=$(sha256sum "$artifact" | awk '{print $1}')
+            bundle="sha256:${digest}.jsonl"
+            target="${artifact}.attestation.jsonl"
+
+            for attempt in 1 2 3 4 5; do
+              gh attestation download "$artifact" --repo "$GITHUB_REPOSITORY" && break
+              if [[ "$attempt" == 5 ]]; then
+                exit 1
+              fi
+              sleep 10
+            done
+
+            test -f "$bundle"
+            mv "$bundle" "$tmp_dir/$target"
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$SIGNER_WORKFLOW" \
+              --source-digest "$GITHUB_SHA" \
+              --bundle "$tmp_dir/$target" \
+              --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
+            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            bundle_count=$((bundle_count + 1))
+          done
+
+          test "$artifact_count" -gt 0
+          test "$bundle_count" -eq "$artifact_count"
+          mv "$tmp_dir"/* .
+
+          echo "--- Attestation bundles ---"
+          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+
       - name: Write release notes
         env:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
 
       - name: Append verification instructions to release notes
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          BUNDLE_OUTCOME: ${{ steps.attestation_bundles.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DIGEST: ${{ github.sha }}
         run: |
-          cat >> release-notes.md <<'VERIFY_EOF'
+          if [[ "$ATTEST_OUTCOME" == "success" ]]; then
+            cat >> release-notes.md <<VERIFY_EOF
 
           ---
           ### Verify SLSA Provenance
 
-          Release artifacts are signed with SLSA Build L3 provenance.
+          Release artifacts have GitHub artifact provenance attestations.
 
-          **Online (gh CLI)**
-            gh attestation verify <artifact> --repo zeroclaw-labs/zeroclaw
-
-          **Offline (slsa-verifier)**
-            # Download the .attestation bundle from the release assets, then:
-            slsa-verifier verify-artifact <artifact> \
-              --provenance-path <artifact>.attestation \
-              --source-uri github.com/zeroclaw-labs/zeroclaw
-
-          Install gh: https://cli.github.com/
-          Install slsa-verifier: https://github.com/slsa-framework/slsa-verifier
+          **Online**
+          ```bash
+          gh attestation verify <artifact> \
+            --repo zeroclaw-labs/zeroclaw \
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+            --source-digest ${SOURCE_DIGEST}
+          ```
           VERIFY_EOF
 
-      - name: Download attestation bundles for offline verification
-        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for artifact in release-assets/*.tar.gz release-assets/*.zip release-assets/*.dmg release-assets/SHA256SUMS; do
-            [ -f "$artifact" ] || continue
-            gh attestation download "$artifact" \
-              --repo "$GITHUB_REPOSITORY" \
-              --output-dir release-assets/
-          done
-          echo "--- Attestation bundles ---"
-          ls -lh release-assets/*.attestation 2>/dev/null || echo "(no bundles — step may have been skipped)"
+            if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
+              cat >> release-notes.md <<VERIFY_EOF
+
+          **Offline**
+          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
+          ```bash
+          gh attestation verify <artifact> \
+            --repo zeroclaw-labs/zeroclaw \
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+            --source-digest ${SOURCE_DIGEST} \
+            --bundle <artifact>.attestation.jsonl \
+            --custom-trusted-root trusted_root.jsonl
+          ```
+          VERIFY_EOF
+            else
+              cat >> release-notes.md <<VERIFY_EOF
+
+          Offline attestation bundles were unavailable in this best-effort release.
+          Inspect the release workflow run for details: ${RUN_URL}
+          VERIFY_EOF
+            fi
+
+            cat >> release-notes.md <<'VERIFY_EOF'
+
+          Install gh: https://cli.github.com/
+          VERIFY_EOF
+          else
+            cat >> release-notes.md <<VERIFY_EOF
+
+          ---
+          ### SLSA Provenance
+
+          Provenance attestation was unavailable in this best-effort Phase A release.
+          Inspect the release workflow run for details: ${RUN_URL}
+          VERIFY_EOF
+          fi
 
       - name: Create tag and release
         env:

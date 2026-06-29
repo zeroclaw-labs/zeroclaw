@@ -1,7 +1,7 @@
 # Release Runbook — Attestation Step Failure
 
-**File:** `.github/workflows/release-stable-manual.yml` — `publish` job  
-**Step:** `Attach SLSA provenance attestation`  
+**File:** `.github/workflows/release-stable-manual.yml` — `publish` job
+**Step:** `Attach SLSA provenance attestation`
 **Policy:** `continue-on-error: true` (Phase A — best-effort)
 
 ---
@@ -9,9 +9,10 @@
 ## Symptoms
 
 - The `Attach SLSA provenance attestation` step logs a failure
-- The `Download attestation bundles for offline verification` step also fails (depends on first step)
-- The `Create tag and release` step runs anyway — release is published but **without attestation bundles**
-- Release notes still include verification instructions, but verification will fail because no attestation exists
+- The `Download attestation bundles for offline verification` step fails or is skipped
+- The `Create tag and release` step runs anyway
+- If attestation failed, release notes include an attestation-unavailable note with the workflow run URL
+- If bundle download failed, online verification still works but release assets lack offline bundle files
 
 ---
 
@@ -24,8 +25,9 @@ Read the step log. Match the error:
 | `401 Unauthorized` | OIDC token issue — transient | Retry the workflow. If it passes, done. |
 | `429 Too Many Requests` | GitHub API rate limit — burst | Wait 5 minutes, retry. |
 | `500 Internal Server Error` | GitHub API outage | Check [status.github.com](https://status.github.com). Retry when green. |
-| `404 Not Found` | Subject path glob matched nothing | Check `release-assets/` directory contents. File names may have changed. |
+| `404 Not Found` | Subject path glob matched nothing or attestation not visible yet | Check `release-assets/` directory contents. Retry if assets exist. |
 | `could not parse OIDC token` | Runner identity issue | Check `id-token: write` permission is still on the `publish` job. |
+| `unknown flag` | GitHub CLI interface changed | Update the affected `gh attestation` invocation and docs together. |
 | Timeout (>260s) | Network issue or GH API slow | Retry. If persistent, check runner connectivity. |
 
 ---
@@ -47,25 +49,24 @@ Read the step log. Match the error:
 2. Click **Re-run jobs** → **Re-run failed jobs**
 3. Only the `publish` job re-runs — build artifacts are preserved
 
-If the attestation step passes but the download bundles step fails:
-- The release still has attestations in GitHub's API
-- Only offline verification via `.attestation` bundles is affected
-- No need to re-release
-
----
-
 ## If All Else Fails — Manual Remediation
 
-If the release was published without attestations and you need to add them:
+If attestation succeeded but bundle download failed, users can still download bundles themselves:
 
 ```bash
-# 1. Download the release artifacts locally
-gh release download <tag> --dir release-assets/
+gh attestation download <artifact> --repo zeroclaw-labs/zeroclaw
+gh attestation trusted-root > trusted_root.jsonl
+gh attestation verify <artifact> \
+  --repo zeroclaw-labs/zeroclaw \
+  --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+  --source-digest <commit-sha> \
+  --bundle sha256:<digest>.jsonl \
+  --custom-trusted-root trusted_root.jsonl
+```
 
-# 2. Generate attestation manually (requires OIDC token — must run in GH Actions)
-# This cannot be done outside GitHub Actions. Instead:
+If the release was published without attestations, document the gap in the release notes:
 
-# 3. Document the gap in the release notes
+```bash
 gh release edit <tag> --notes-file - <<EOF
 NOTE: SLSA attestation is unavailable for this release due to a
 transient pipeline failure. See PR #8277 for context.
