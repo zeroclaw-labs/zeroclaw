@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use zeroclaw_config::traits::{PropFieldInfo, PropKind};
-use zeroclaw_runtime::flow::{Node, NodeId, Outcome, Prompt, Spec, Step};
+use zeroclaw_runtime::flow::{Localizable, Node, NodeId, Outcome, Prompt, Spec, Step};
 use zeroclaw_runtime::response_type::{ChoiceOption, ResponseType, ResponseValue};
 
 const OPTION_PREFIX: &str = "Option<";
@@ -132,7 +132,8 @@ pub fn build_spec_scoped(
             instance: instance.to_string(),
             prop: write_prop_for(field, section_prefix),
             optional,
-            prompt: Prompt::new(prompt_text(field), response_type_for(field)),
+            prompt: Prompt::new(prompt_text(field), response_type_for(field))
+                .with_message(Localizable::new(&field.name).with_arg("text", prompt_text(field))),
             on_success,
             on_failure: Step::Node(id.clone()),
             validate: Box::new(validate_response),
@@ -283,5 +284,33 @@ mod tests {
                 .contains_key(&NodeId::new("channels.matrix.home.access_token")),
             "an Option<String> is dropped from the required walk"
         );
+    }
+
+    #[test]
+    fn each_field_prompt_carries_a_localizable_keyed_by_field_name() {
+        let spec = build_spec(
+            matrix_fields(),
+            "channels.matrix.home",
+            "channel",
+            "home",
+            Outcome::Cancelled,
+        )
+        .expect("matrix has fields");
+        for (id, node) in &spec.nodes {
+            let descriptor = node.prompt.message.as_ref().unwrap_or_else(|| {
+                panic!("field prompt for {id:?} must carry a localizable descriptor")
+            });
+            assert_eq!(
+                descriptor.message_id, id.0,
+                "every node's descriptor id is its own field name, not a cherry-picked one"
+            );
+            assert!(
+                descriptor
+                    .args
+                    .iter()
+                    .any(|(name, value)| name == "text" && !value.is_empty()),
+                "node {id:?} must carry its schema-sourced prompt text as a data arg"
+            );
+        }
     }
 }

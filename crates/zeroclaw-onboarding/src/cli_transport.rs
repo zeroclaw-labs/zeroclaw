@@ -50,7 +50,11 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
     }
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
-        format!("{} {}\n", prompt.text, prompt.sigil().as_str())
+        format!(
+            "{} {}\n",
+            crate::i18n::resolve_prompt_text(prompt),
+            prompt.sigil().as_str()
+        )
     }
 
     fn read_line(&mut self) -> TransportResult<String> {
@@ -116,7 +120,8 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
                 .map_err(|_| TransportError::Closed)?;
             self.writer.flush().map_err(|_| TransportError::Closed)?;
             let raw = if prompt.routes_secret() {
-                self.secret_source.read_secret(&prompt.text).await?
+                let secret_prompt = crate::i18n::resolve_prompt_text(prompt);
+                self.secret_source.read_secret(&secret_prompt).await?
             } else {
                 self.read_line()?
             };

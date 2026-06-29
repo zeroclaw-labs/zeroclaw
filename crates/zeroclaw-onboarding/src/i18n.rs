@@ -34,6 +34,22 @@ pub fn get_required_onboard_string_with_args(key: &str, args: &[(&str, &str)]) -
         .unwrap_or_else(|| missing_onboard_string(key))
 }
 
+#[must_use]
+pub fn resolve_prompt_text(prompt: &zeroclaw_runtime::flow::Prompt) -> String {
+    let Some(descriptor) = prompt.message.as_ref() else {
+        return prompt.text.clone();
+    };
+    if let Some(catalog) = get_onboard_string(&descriptor.message_id) {
+        return catalog;
+    }
+    descriptor
+        .args
+        .iter()
+        .find(|(name, _)| name == "text")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| prompt.text.clone())
+}
+
 fn active_locale() -> &'static str {
     LOCALE
         .get_or_init(zeroclaw_runtime::i18n::detect_locale)

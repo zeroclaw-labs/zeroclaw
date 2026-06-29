@@ -89,16 +89,17 @@ fn parse_yes_no(raw: &str) -> Option<bool> {
 #[async_trait]
 impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
     async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        let prompt_text = crate::i18n::resolve_prompt_text(prompt);
         if prompt.routes_secret() {
             loop {
-                let raw = self.secret_reader.read_secret(&prompt.text).await?;
+                let raw = self.secret_reader.read_secret(&prompt_text).await?;
                 if !raw.is_empty() {
                     return Ok(ResponseValue::Secret(SecretValue::new(raw)));
                 }
             }
         }
         loop {
-            let raw = self.responder.respond(&prompt.text).await?;
+            let raw = self.responder.respond(&prompt_text).await?;
             if let Some(value) = Self::parse_non_secret(prompt, &raw) {
                 return Ok(value);
             }
