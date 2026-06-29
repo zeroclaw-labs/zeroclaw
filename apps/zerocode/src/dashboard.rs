@@ -2293,17 +2293,33 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
     let quarter = (now.month() - 1) / 3; // 0..=3
     vec![
         (
-            "Today".to_string(),
+            crate::i18n::t("zc-dashboard-period-today"),
             start(now.month(), now.day()),
             to.clone(),
         ),
-        ("Month".to_string(), start(now.month(), 1), to.clone()),
         (
-            format!("Q{}", quarter + 1),
+            crate::i18n::t("zc-dashboard-period-month"),
+            start(now.month(), 1),
+            to.clone(),
+        ),
+        (
+            format!(
+                "{}{}",
+                crate::i18n::t("zc-dashboard-period-quarter-prefix"),
+                quarter + 1
+            ),
             start(quarter * 3 + 1, 1),
             to.clone(),
         ),
-        (format!("YTD {}", now.year()), start(1, 1), to),
+        (
+            format!(
+                "{} {}",
+                crate::i18n::t("zc-dashboard-period-ytd"),
+                now.year()
+            ),
+            start(1, 1),
+            to,
+        ),
     ]
 }
 
@@ -2347,20 +2363,32 @@ fn org_section_lines(
         let org_label = org
             .org_label
             .clone()
-            .unwrap_or_else(|| "Organization".into());
+            .unwrap_or_else(|| crate::i18n::t("zc-dashboard-org-name"));
         if let Some(ref scope) = org.org {
             lines.push(org_scope_line(&org_label, scope, frac));
         }
         if let Some(ref scope) = org.personal {
-            lines.push(org_scope_line("You (billed)", scope, frac));
+            lines.push(org_scope_line(
+                &crate::i18n::t("zc-dashboard-org-personal"),
+                scope,
+                frac,
+            ));
         }
         if !org.generated.is_empty() || org.year != 0 {
             let mut note = String::from("  ");
             if org.year != 0 {
-                note.push_str(&format!("FY{} ", org.year));
+                note.push_str(&format!(
+                    "{}{} ",
+                    crate::i18n::t("zc-dashboard-org-fy-prefix"),
+                    org.year
+                ));
             }
             if !org.generated.is_empty() {
-                note.push_str(&format!("as of {}", org.generated));
+                note.push_str(&format!(
+                    "{} {}",
+                    crate::i18n::t("zc-dashboard-org-asof"),
+                    org.generated
+                ));
             }
             lines.push(Line::from(Span::styled(note, theme::dim_style())));
         }

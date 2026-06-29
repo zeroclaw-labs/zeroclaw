@@ -2124,11 +2124,6 @@ pub struct CostSummaryResult {
 /// be the partial current month).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct OrgMonthCost {
-    /// Calendar month label (`YYYY-MM`); part of the on-disk shape and kept for
-    /// completeness even though the dashboard currently rolls up by cost only.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub month: String,
     #[serde(default)]
     pub cost_usd: f64,
 }
