@@ -13,6 +13,7 @@ pub enum ResponseType {
     YesNo,
     Secret,
     FreeformText,
+    Number,
     Choice { options: Vec<ChoiceOption> },
 }
 
@@ -21,9 +22,10 @@ impl ResponseType {
     pub fn prompt_sigil(&self) -> PromptSigil {
         match self {
             ResponseType::Secret => PromptSigil::Secret,
-            ResponseType::YesNo | ResponseType::FreeformText | ResponseType::Choice { .. } => {
-                PromptSigil::Visible
-            }
+            ResponseType::YesNo
+            | ResponseType::FreeformText
+            | ResponseType::Number
+            | ResponseType::Choice { .. } => PromptSigil::Visible,
         }
     }
 
@@ -33,6 +35,7 @@ impl ResponseType {
             ResponseType::YesNo => ResponseExpectation::Confirmation,
             ResponseType::Secret => ResponseExpectation::HiddenText,
             ResponseType::FreeformText => ResponseExpectation::Text,
+            ResponseType::Number => ResponseExpectation::Number,
             ResponseType::Choice { .. } => ResponseExpectation::Selection,
         }
     }
@@ -43,6 +46,7 @@ impl ResponseType {
             ResponseType::YesNo => AskKind::YesNo,
             ResponseType::Secret => AskKind::Secret,
             ResponseType::FreeformText => AskKind::FreeformText,
+            ResponseType::Number => AskKind::Number,
             ResponseType::Choice { .. } => AskKind::Choice,
         }
     }
@@ -54,6 +58,7 @@ pub enum AskKind {
     YesNo,
     Secret,
     FreeformText,
+    Number,
     Choice,
 }
 
@@ -63,6 +68,7 @@ impl std::fmt::Display for AskKind {
             AskKind::YesNo => "YesNo",
             AskKind::Secret => "Secret",
             AskKind::FreeformText => "FreeformText",
+            AskKind::Number => "Number",
             AskKind::Choice => "Choice",
         };
         formatter.write_str(label)
@@ -92,6 +98,7 @@ pub enum ResponseExpectation {
     Confirmation,
     HiddenText,
     Text,
+    Number,
     Selection,
 }
 
@@ -101,6 +108,7 @@ pub enum ResponseValue {
     YesNo(bool),
     Secret(SecretValue),
     FreeformText(String),
+    Number(String),
     Choice(String),
 }
 
@@ -112,8 +120,22 @@ impl ResponseValue {
             (ResponseValue::YesNo(_), ResponseType::YesNo)
                 | (ResponseValue::Secret(_), ResponseType::Secret)
                 | (ResponseValue::FreeformText(_), ResponseType::FreeformText)
+                | (ResponseValue::Number(_), ResponseType::Number)
                 | (ResponseValue::Choice(_), ResponseType::Choice { .. })
         )
+    }
+
+    #[must_use]
+    pub fn parse_number(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.parse::<i128>().is_ok() || trimmed.parse::<f64>().is_ok() {
+            Some(ResponseValue::Number(trimmed.to_string()))
+        } else {
+            None
+        }
     }
 }
 
@@ -227,6 +249,7 @@ mod tests {
             ResponseType::FreeformText.ask_kind().to_string(),
             "FreeformText"
         );
+        assert_eq!(ResponseType::Number.ask_kind().to_string(), "Number");
         assert_eq!(
             ResponseType::Choice {
                 options: Vec::new()
@@ -234,6 +257,49 @@ mod tests {
             .ask_kind()
             .to_string(),
             "Choice"
+        );
+    }
+
+    #[test]
+    fn parse_number_accepts_integers_and_floats() {
+        assert_eq!(
+            ResponseValue::parse_number("42"),
+            Some(ResponseValue::Number("42".into()))
+        );
+        assert_eq!(
+            ResponseValue::parse_number("  3.14 "),
+            Some(ResponseValue::Number("3.14".into()))
+        );
+        assert_eq!(
+            ResponseValue::parse_number("18446744073709551615"),
+            Some(ResponseValue::Number("18446744073709551615".into()))
+        );
+    }
+
+    #[test]
+    fn parse_number_rejects_non_numeric_and_empty() {
+        assert_eq!(ResponseValue::parse_number("https://x"), None);
+        assert_eq!(ResponseValue::parse_number(""), None);
+        assert_eq!(ResponseValue::parse_number("  "), None);
+    }
+
+    #[test]
+    fn number_response_matches_only_number_type() {
+        let value = ResponseValue::Number("7".into());
+        assert!(value.response_type_matches(&ResponseType::Number));
+        assert!(!value.response_type_matches(&ResponseType::FreeformText));
+    }
+
+    #[test]
+    fn number_uses_angle_sigil() {
+        assert_eq!(ResponseType::Number.prompt_sigil().as_str(), ">");
+    }
+
+    #[test]
+    fn number_declares_number_expectation() {
+        assert_eq!(
+            ResponseType::Number.expectation(),
+            ResponseExpectation::Number
         );
     }
 }

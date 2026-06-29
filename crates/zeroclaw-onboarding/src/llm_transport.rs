@@ -46,6 +46,7 @@ impl<L: LlmResponder, S: SecretReader> LlmTransport<L, S> {
                     Some(ResponseValue::FreeformText(trimmed.to_string()))
                 }
             }
+            ResponseType::Number => ResponseValue::parse_number(trimmed),
             ResponseType::YesNo => parse_yes_no(trimmed).map(ResponseValue::YesNo),
             ResponseType::Choice { options } => options
                 .iter()

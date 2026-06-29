@@ -23,6 +23,9 @@ pub fn write_response(
         ResponseValue::FreeformText(text) => {
             config.set_prop_persistent(prop, text)?;
         }
+        ResponseValue::Number(number) => {
+            config.set_prop_persistent(prop, number)?;
+        }
         ResponseValue::Choice(selected) => {
             config.set_prop_persistent(prop, selected)?;
         }

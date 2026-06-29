@@ -94,6 +94,9 @@ mod tests {
             zeroclaw_runtime::response_type::ResponseType::Choice { options } => {
                 ResponseValue::Choice(options[0].value.clone())
             }
+            zeroclaw_runtime::response_type::ResponseType::Number => {
+                ResponseValue::Number("42".into())
+            }
             zeroclaw_runtime::response_type::ResponseType::FreeformText => {
                 ResponseValue::FreeformText("42".into())
             }

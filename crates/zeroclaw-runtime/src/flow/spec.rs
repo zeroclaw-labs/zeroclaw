@@ -58,6 +58,7 @@ fn response_is_empty(response: &ResponseValue) -> bool {
     match response {
         ResponseValue::Secret(secret) => secret.expose().is_empty(),
         ResponseValue::FreeformText(text) => text.is_empty(),
+        ResponseValue::Number(number) => number.is_empty(),
         ResponseValue::Choice(choice) => choice.is_empty(),
         ResponseValue::YesNo(_) => false,
     }

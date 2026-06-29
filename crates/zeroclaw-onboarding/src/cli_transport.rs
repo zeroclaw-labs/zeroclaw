@@ -81,6 +81,7 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
                     Some(ResponseValue::FreeformText(raw.to_string()))
                 }
             }
+            ResponseType::Number => ResponseValue::parse_number(raw),
             ResponseType::YesNo => parse_yes_no(raw).map(ResponseValue::YesNo),
             ResponseType::Choice { options } => options
                 .iter()

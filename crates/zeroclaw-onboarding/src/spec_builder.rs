@@ -44,9 +44,8 @@ pub fn response_type_for(field: &PropFieldInfo) -> ResponseType {
                 ResponseType::Choice { options }
             }
         }
+        PropKind::Integer | PropKind::Float => ResponseType::Number,
         PropKind::String
-        | PropKind::Integer
-        | PropKind::Float
         | PropKind::AliasRef
         | PropKind::StringArray
         | PropKind::ObjectArray
@@ -124,6 +123,7 @@ fn validate_response(response: &ResponseValue) -> Result<(), ()> {
     match response {
         ResponseValue::Secret(secret) if secret.expose().is_empty() => Err(()),
         ResponseValue::FreeformText(text) if text.is_empty() => Err(()),
+        ResponseValue::Number(number) if number.is_empty() => Err(()),
         ResponseValue::Choice(choice) if choice.is_empty() => Err(()),
         _ => Ok(()),
     }
@@ -194,6 +194,17 @@ mod tests {
         };
         let values: Vec<String> = options.into_iter().map(|option| option.value).collect();
         assert_eq!(values, vec!["off", "partial", "multi_message"]);
+    }
+
+    #[test]
+    fn numeric_field_maps_to_number() {
+        let required = required_fields(matrix_fields(), "channels.matrix.home");
+        let interval = required
+            .iter()
+            .find(|field| field.name == "channels.matrix.home.draft_update_interval_ms")
+            .expect("draft_update_interval_ms is a non-Option u64");
+        assert!(matches!(interval.kind, PropKind::Integer | PropKind::Float));
+        assert_eq!(response_type_for(interval), ResponseType::Number);
     }
 
     #[test]
