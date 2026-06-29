@@ -6842,4 +6842,107 @@ mod tests {
             "session_end must not fire when delete targets a missing session"
         );
     }
+
+    // ── Positive lifecycle regression: close on a real session must fire
+    //    session_end so that configured hooks observe RPC lifecycles ──
+
+    struct DummyModelProvider;
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for DummyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for DummyModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "dummy"
+        }
+    }
+
+    #[tokio::test]
+    async fn session_close_real_session_fires_session_end_hook() {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let sid = "real-session-close-hook".to_string();
+
+        // Build a minimal agent and insert it into the store so the
+        // dispatcher sees a live session.
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(
+                crate::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.clone(), rpc_session).await.unwrap();
+
+        // Wire a counting hook.
+        let mut runner = crate::hooks::HookRunner::new();
+        let (_hook, end_count) = EndCountingHook::new();
+        runner.register(Box::new(_hook));
+
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+            sessions: Arc::clone(&sessions),
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(
+                crate::rpc::context::ApprovalPendingMap::default(),
+            ),
+            tui_registry: Arc::new(
+                crate::rpc::tui_identity::TuiRegistry::new_unsigned(),
+            ),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: Some(Arc::new(runner)),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());
+
+        // Close the real session.
+        let result = dispatcher
+            .handle_session_close(&serde_json::json!({"session_id": sid}))
+            .await;
+        assert!(result.is_ok(), "close on real session must succeed");
+
+        assert_eq!(
+            end_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "session_end must fire when a real session is closed"
+        );
+    }
 }
