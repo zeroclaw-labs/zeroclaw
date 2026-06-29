@@ -227,6 +227,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
