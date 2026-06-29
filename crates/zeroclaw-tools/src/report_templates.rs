@@ -599,4 +599,31 @@ mod tests {
         let result = substitute("{{x}} and {{x}}", &vars);
         assert_eq!(result, "1 and 1");
     }
+
+    #[test]
+    fn substitute_does_not_re_expand_injected_placeholders() {
+        // A value that itself contains "{{...}}" is emitted literally and is
+        // NOT treated as a new placeholder (single pass prevents injection).
+        let mut vars = HashMap::new();
+        vars.insert("a".to_string(), "{{b}}".to_string());
+        vars.insert("b".to_string(), "SECRET".to_string());
+        assert_eq!(substitute("{{a}}", &vars), "{{b}}");
+    }
+
+    #[test]
+    fn substitute_leaves_unclosed_placeholder_literal() {
+        let vars = HashMap::new();
+        assert_eq!(substitute("a {{ b", &vars), "a {{ b");
+        assert_eq!(substitute("{{unterminated", &vars), "{{unterminated");
+    }
+
+    #[test]
+    fn escape_html_encodes_all_entities_ampersand_first() {
+        // `&` must be encoded first so the entities it introduces are not
+        // re-escaped; quotes and apostrophes are encoded too.
+        assert_eq!(
+            escape_html("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#x27;"
+        );
+    }
 }

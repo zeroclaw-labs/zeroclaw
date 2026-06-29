@@ -798,6 +798,8 @@ impl EmailChannel {
             interruption_scope_id: None,
             attachments: email.attachments,
             subject: Some(email.subject),
+
+            ..Default::default()
         };
         Ok(tx.send(msg).await.is_ok())
     }

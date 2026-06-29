@@ -42,6 +42,19 @@
           - "src/channels/**"
           - "crates/zeroclaw-channels/src/**"
 
+"channel:acp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/bin/zeroclaw-acp-bridge.rs"
+          - "docs/book/src/channels/acp.md"
+          - "apps/zerocode/src/acp.rs"
+          - "web/src/lib/acp.ts"
+          - "web/src/pages/AcpConsole.tsx"
+          - "crates/zeroclaw-channels/src/acp_channel.rs"
+          - "crates/zeroclaw-channels/src/orchestrator/acp_server.rs"
+          - "crates/zeroclaw-gateway/src/acp.rs"
+          - "crates/zeroclaw-infra/src/acp_session_store.rs"
+
 "channel:bluesky":
   - changed-files:
       - any-glob-to-any-file:
@@ -273,11 +286,49 @@
           - "src/security/**"
           - "crates/zeroclaw-runtime/src/security/**"
 
+"security:bubblewrap":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/bubblewrap.rs"
+
+"security:docker":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/docker.rs"
+
+"security:pairing":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/pairing.rs"
+          - "crates/zeroclaw-gateway/src/api_pairing.rs"
+          - "apps/tauri/src/commands/pairing.rs"
+          - "web/src/pages/Pairing.tsx"
+
+"security:policy":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/policy.rs"
+          - "crates/zeroclaw-runtime/src/security/iam_policy.rs"
+          - "crates/zeroclaw-config/src/policy.rs"
+
+"security:secrets":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/secrets.rs"
+          - "crates/zeroclaw-config/src/secrets.rs"
+
 "runtime":
   - changed-files:
       - any-glob-to-any-file:
           - "src/runtime/**"
           - "crates/zeroclaw-runtime/src/**"
+
+"runtime:wasm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/platform/wasm.rs"
+          - "crates/zeroclaw-plugins/src/wasm_tool.rs"
+          - "crates/zeroclaw-plugins/src/wasm_channel.rs"
 
 "quickstart":
   - changed-files:
@@ -369,6 +420,11 @@
           - "src/providers/openrouter.rs"
           - "crates/zeroclaw-providers/src/openrouter.rs"
 
+"provider:reliable":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-providers/src/reliable.rs"
+
 "provider:telnyx":
   - changed-files:
       - any-glob-to-any-file:
@@ -455,6 +511,12 @@
       - any-glob-to-any-file:
           - "src/tools/google_workspace.rs"
           - "crates/zeroclaw-tools/src/google_workspace.rs"
+
+"tool:pushover":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/pushover.rs"
+          - "crates/zeroclaw-tools/src/pushover.rs"
 
 "tool:mcp":
   - changed-files:
@@ -549,6 +611,11 @@
       - any-glob-to-any-file:
           - "src/observability/**"
           - "crates/zeroclaw-runtime/src/observability/**"
+
+"observability:prometheus":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/observability/prometheus.rs"
 
 "tests":
   - changed-files:

@@ -531,6 +531,8 @@ async fn handle_webhook(
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         if state.tx.send(channel_msg).await.is_err() {

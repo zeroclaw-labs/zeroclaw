@@ -35,6 +35,98 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
+/// True when an LLM-produced output is a *quiet* `NO_REPLY` sentinel — one that
+/// means "nothing to report" — rather than content meant to be delivered.
+///
+/// Cron jobs and heartbeat tasks routinely instruct the model to answer with
+/// `NO_REPLY` when a health/status check finds nothing worth surfacing. The
+/// delivery path must recognise this sentinel and skip sending, otherwise the
+/// literal string "NO_REPLY" is announced to the channel (the bug reported in
+/// zeroclaw-labs/zeroclaw#2128).
+///
+/// # Why only the *quiet* forms are suppressed
+///
+/// The channel reply-intent classifier (see `zeroclaw-channels`
+/// `parse_reply_intent`) emits kinded forms with distinct operational meaning:
+///
+/// - `NO_REPLY` / `NO_REPLY: <reason>` / `NO_REPLY[INFO]: <reason>` — quiet,
+///   "nothing to report". **Suppressed here.**
+/// - `NO_REPLY[REFUSE]: <reason>` — refused for safety/policy/prompt-injection.
+/// - `NO_REPLY[FAIL]: <reason>` — tried but couldn't fulfil (timeout, bad URL,
+///   missing resource).
+///
+/// In the channel path a refusal or failure still surfaces out-of-band via a
+/// chat reaction (🚫 / ⚠️). Cron and heartbeat *announce* delivery have no such
+/// side channel: if we suppressed `NO_REPLY[FAIL]: database check timed out`,
+/// that operator-visible failure would silently vanish into a DEBUG log. So
+/// only the informational/legacy/bare forms are treated as suppressible here;
+/// refusal and failure kinds fall through and are delivered as visible text.
+///
+/// Matching is case-insensitive and trim-tolerant. The kinded `[...]` form is
+/// only treated as a sentinel when the kind is explicitly `INFO`; any other
+/// bracketed kind (including unknown future kinds) is conservatively delivered.
+#[must_use]
+pub fn is_no_reply_sentinel(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.eq_ignore_ascii_case("NO_REPLY") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Legacy form (`NO_REPLY: ...`) is documented as "treated as INFO".
+    if lower.starts_with("no_reply:") {
+        return true;
+    }
+    // Kinded form (`NO_REPLY[KIND]: ...`): only the informational kind is a
+    // "nothing to report" sentinel. REFUSE / FAIL (and any other/unknown kind)
+    // carry operator-visible meaning and must be delivered, not suppressed.
+    if let Some(rest) = lower.strip_prefix("no_reply[") {
+        if let Some((kind, _)) = rest.split_once(']') {
+            return kind.trim() == "info";
+        }
+        // Malformed `NO_REPLY[...` with no closing bracket: not a clean
+        // sentinel — deliver it rather than guess.
+        return false;
+    }
+    false
+}
+
+/// The delivery decision for an announce-mode cron job or heartbeat task.
+///
+/// Separated from the I/O so the suppression behaviour can be unit-tested
+/// without a registered `DELIVERY_FN`, a live channel, or the full heartbeat
+/// worker. Both the cron announce site (`deliver_if_configured`) and the
+/// heartbeat worker route their suppression decision through
+/// [`announce_delivery_decision`], so a regression that drops the guard at
+/// either site is caught by the decision tests (zeroclaw-labs/zeroclaw#2128).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceDecision {
+    /// Send the output to the configured channel.
+    Deliver,
+    /// Suppress delivery: the output is a quiet `NO_REPLY` sentinel.
+    SuppressNoReply,
+}
+
+impl AnnounceDecision {
+    /// True when the announcement should actually be sent to the channel.
+    #[must_use]
+    pub fn should_deliver(self) -> bool {
+        matches!(self, AnnounceDecision::Deliver)
+    }
+}
+
+/// Decide whether an announce-mode output should be delivered or suppressed.
+///
+/// Suppresses only the *quiet* `NO_REPLY` forms (see [`is_no_reply_sentinel`]);
+/// failure/refusal kinds and all real content are delivered.
+#[must_use]
+pub fn announce_delivery_decision(output: &str) -> AnnounceDecision {
+    if is_no_reply_sentinel(output) {
+        AnnounceDecision::SuppressNoReply
+    } else {
+        AnnounceDecision::Deliver
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum CronDeliveryContext {
     Scheduled,
@@ -999,6 +1091,22 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    // Skip delivery when the job's agent signalled "nothing to report" via the
+    // quiet NO_REPLY sentinel. Without this guard the literal sentinel string is
+    // announced to the channel (zeroclaw-labs/zeroclaw#2128). Failure/refusal
+    // kinds (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are *not* suppressed — they
+    // carry operator-visible meaning and are delivered as visible text.
+    if !announce_delivery_decision(output).should_deliver() {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"job_id": job.id})),
+            "Cron job returned NO_REPLY sentinel — skipping delivery"
+        );
+        return Ok(());
+    }
+
     let channel = delivery.channel.as_deref().ok_or_else(|| {
         ::zeroclaw_log::record!(
             WARN,
@@ -1220,6 +1328,60 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     const TEST_AGENT: &str = "test-agent";
+
+    #[test]
+    fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("no_reply"));
+        assert!(is_no_reply_sentinel("No_Reply"));
+        // Trim tolerance.
+        assert!(is_no_reply_sentinel("  NO_REPLY  "));
+        assert!(is_no_reply_sentinel("\nNO_REPLY\n"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_matches_quiet_info_and_legacy_prefixes() {
+        // Legacy form is documented as "treated as INFO".
+        assert!(is_no_reply_sentinel("NO_REPLY: nothing to report"));
+        assert!(is_no_reply_sentinel("  NO_REPLY: trimmed  "));
+        // Explicit informational kind.
+        assert!(is_no_reply_sentinel("NO_REPLY[INFO]: all healthy"));
+        assert!(is_no_reply_sentinel("no_reply[info]: all healthy"));
+        // Bracket whitespace tolerance.
+        assert!(is_no_reply_sentinel("NO_REPLY[ info ]: spaced"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_does_not_suppress_failure_or_refusal_kinds() {
+        // REFUSE / FAIL carry operator-visible meaning. In the cron/heartbeat
+        // announce context there is no reaction side-channel, so suppressing
+        // them would silently drop a failure/refusal the operator must see
+        // (zeroclaw-labs/zeroclaw#2128 review feedback).
+        assert!(!is_no_reply_sentinel(
+            "NO_REPLY[FAIL]: database check timed out"
+        ));
+        assert!(!is_no_reply_sentinel("no_reply[fail]: timed out"));
+        assert!(!is_no_reply_sentinel(
+            "NO_REPLY[REFUSE]: policy prevented the check"
+        ));
+        assert!(!is_no_reply_sentinel("no_reply[refuse]: blocked"));
+        // Unknown/future kinds are conservatively delivered, not suppressed.
+        assert!(!is_no_reply_sentinel("NO_REPLY[WARN]: disk at 90%"));
+        // Malformed kinded form with no closing bracket is delivered.
+        assert!(!is_no_reply_sentinel("NO_REPLY[INFO without close"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_rejects_real_content() {
+        assert!(!is_no_reply_sentinel(""));
+        assert!(!is_no_reply_sentinel("   "));
+        assert!(!is_no_reply_sentinel("All systems nominal"));
+        // Sentinel-looking but not a sentinel: word embedded in real prose.
+        assert!(!is_no_reply_sentinel(
+            "The job returned NO_REPLY which means nothing happened"
+        ));
+        assert!(!is_no_reply_sentinel("NO_REPLYING is the status"));
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config {
@@ -2174,16 +2336,7 @@ mod tests {
     async fn persist_job_result_delivery_failure_best_effort_marks_degraded() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
-                Box::pin(async move {
-                    if channel == "fail-delivery" {
-                        anyhow::bail!("synthetic delivery failure");
-                    }
-                    Ok(())
-                })
-            },
-        ));
+        register_recording_delivery_fn();
         let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -2218,16 +2371,7 @@ mod tests {
     async fn delivery_failure_classification_preserves_empty_output_evidence() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
-                Box::pin(async move {
-                    if channel == "fail-delivery" {
-                        anyhow::bail!("synthetic delivery failure");
-                    }
-                    Ok(())
-                })
-            },
-        ));
+        register_recording_delivery_fn();
         let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -2294,6 +2438,125 @@ mod tests {
 
         // Default delivery mode is not "announce", so should be a no-op.
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+    }
+
+    /// Process-global recorder for the injected delivery fn. `deliver_announcement`
+    /// reads a single `OnceLock`-backed handler, so the whole test binary shares
+    /// one handler regardless of registration order. This recorder is a superset
+    /// of the failure-contract handler the delivery-classification tests rely on:
+    /// it fails for `channel == "fail-delivery"`, counts deliveries on the
+    /// dedicated `count-delivery` channel, and otherwise just succeeds. Counting
+    /// only the dedicated channel keeps the suppression test's count deltas
+    /// immune to deliveries from other tests running in parallel.
+    static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Channel name the recorder counts. Used only by the suppression test.
+    const COUNT_CHANNEL: &str = "count-delivery";
+
+    fn register_recording_delivery_fn() {
+        // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
+        // so repeated calls across tests are safe and the first writer wins. The
+        // handler honours the `fail-delivery` failure contract used by the
+        // delivery-classification tests so it composes regardless of order.
+        register_delivery_fn(Box::new(|_config, channel, _target, _thread, _output| {
+            Box::pin(async move {
+                if channel == "fail-delivery" {
+                    anyhow::bail!("synthetic delivery failure");
+                }
+                if channel == COUNT_CHANNEL {
+                    DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }));
+    }
+
+    fn announce_job() -> CronJob {
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(COUNT_CHANNEL.to_string()),
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        job
+    }
+
+    /// Regression for zeroclaw-labs/zeroclaw#2128: the cron announce delivery
+    /// path must NOT call the channel delivery fn for a quiet `NO_REPLY`
+    /// sentinel, but MUST call it for real content and for failure/refusal
+    /// kinds. This exercises `deliver_if_configured` end-to-end, so it fails if
+    /// the suppression guard is removed from that call site.
+    #[tokio::test]
+    async fn deliver_if_configured_suppresses_no_reply_but_delivers_real_and_failure() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announce_job();
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Quiet sentinel forms must NOT trigger delivery.
+        for quiet in [
+            "NO_REPLY",
+            "NO_REPLY: nothing to report",
+            "NO_REPLY[INFO]: healthy",
+        ] {
+            let before = DELIVERED.load(SeqCst);
+            deliver_if_configured(&config, &job, quiet).await.unwrap();
+            assert_eq!(
+                DELIVERED.load(SeqCst),
+                before,
+                "quiet sentinel {quiet:?} must be suppressed (no delivery)"
+            );
+        }
+
+        // Real content must be delivered.
+        let before = DELIVERED.load(SeqCst);
+        deliver_if_configured(&config, &job, "All systems nominal")
+            .await
+            .unwrap();
+        assert_eq!(
+            DELIVERED.load(SeqCst),
+            before + 1,
+            "real content must be delivered"
+        );
+
+        // Failure / refusal kinds must be delivered (operator-visible).
+        for visible in [
+            "NO_REPLY[FAIL]: database check timed out",
+            "NO_REPLY[REFUSE]: policy prevented the check",
+        ] {
+            let before = DELIVERED.load(SeqCst);
+            deliver_if_configured(&config, &job, visible).await.unwrap();
+            assert_eq!(
+                DELIVERED.load(SeqCst),
+                before + 1,
+                "failure/refusal kind {visible:?} must be delivered, not suppressed"
+            );
+        }
+    }
+
+    /// Mirrors the heartbeat worker's suppression decision (daemon/mod.rs).
+    /// The worker computes `suppress_delivery` from `announce_delivery_decision`,
+    /// so this locks the two user-visible heartbeat behaviors from #2128:
+    /// a `NO_REPLY` heartbeat sends nothing, while real output (and the
+    /// empty-output `💓 heartbeat task completed` fallback) still deliver.
+    #[test]
+    fn heartbeat_announce_decision_matches_worker_behavior() {
+        // NO_REPLY heartbeat: suppressed.
+        assert!(!announce_delivery_decision("NO_REPLY").should_deliver());
+        assert!(!announce_delivery_decision("NO_REPLY[INFO]: all good").should_deliver());
+        // Non-sentinel heartbeat output: delivered.
+        assert!(announce_delivery_decision("disk usage 42%").should_deliver());
+        // Empty-output fallback string the worker builds: must deliver.
+        assert!(
+            announce_delivery_decision("💓 heartbeat task completed: db health").should_deliver(),
+            "the empty-output heartbeat fallback must never be mistaken for a sentinel"
+        );
+        // Failure/refusal kinds: delivered (operator-visible).
+        assert!(announce_delivery_decision("NO_REPLY[FAIL]: db timed out").should_deliver());
+        assert!(announce_delivery_decision("NO_REPLY[REFUSE]: blocked by policy").should_deliver());
     }
 
     #[tokio::test]
