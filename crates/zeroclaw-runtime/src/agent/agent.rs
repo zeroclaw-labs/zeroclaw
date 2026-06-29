@@ -1485,8 +1485,7 @@ impl Agent {
         if let Some(ref raw) = all_tools_result.pipeline_raw
             && security.is_tool_allowed("execute_pipeline")
         {
-            let policy =
-                crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+            let policy = crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
             if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
                 tools.push(pipe);
             }
