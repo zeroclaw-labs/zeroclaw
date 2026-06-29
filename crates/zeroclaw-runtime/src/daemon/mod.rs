@@ -1082,13 +1082,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         output
                     };
                     // Skip delivery when the heartbeat agent signalled "nothing
-                    // to report" via the NO_REPLY sentinel. Without this guard
-                    // the literal sentinel string is announced to the channel
-                    // (zeroclaw-labs/zeroclaw#2128). The empty-output branch
-                    // above never produces the sentinel, so checking the final
-                    // announcement is sufficient.
+                    // to report" via the quiet NO_REPLY sentinel. Without this
+                    // guard the literal sentinel string is announced to the
+                    // channel (zeroclaw-labs/zeroclaw#2128). The empty-output
+                    // branch above never produces the sentinel, so checking the
+                    // final announcement is sufficient. Failure/refusal kinds
+                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
+                    // suppressed — they carry operator-visible meaning.
                     let suppress_delivery =
-                        crate::cron::scheduler::is_no_reply_sentinel(&announcement);
+                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                            .should_deliver();
                     if suppress_delivery {
                         ::zeroclaw_log::record!(
                             DEBUG,
