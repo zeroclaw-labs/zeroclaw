@@ -7,6 +7,46 @@ use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
+/// Resolve the output filename stem (no extension) for a generated image.
+///
+/// A caller-supplied `filename` is used verbatim with path components stripped
+/// (traversal-safe). When none is given, a unique timestamped default
+/// (`generated_image_<nanos>`) is returned so successive default generations
+/// never clobber each other. `nanos` is injected so the selection is testable.
+fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
+    filename_arg
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            PathBuf::from(s).file_name().map_or_else(
+                || "generated_image".to_string(),
+                |n| n.to_string_lossy().to_string(),
+            )
+        })
+        .unwrap_or_else(|| format!("generated_image_{nanos}"))
+}
+
+/// Format the tool output for a saved image.
+///
+/// Emits the saved path in BOTH a durable `File:` line (survives marker
+/// stripping in older turns) and an explicit `[IMAGE:<path>]` marker the
+/// multimodal pipeline inlines. Both carry the same path so the runtime
+/// canonicalizer dedups them.
+fn format_image_tool_output(
+    path_display: &str,
+    size_kb: usize,
+    model: &str,
+    prompt: &str,
+) -> String {
+    format!(
+        "Image generated successfully.\n\
+         File: {path_display}\n\
+         Size: {size_kb} KB\n\
+         Model: {model}\n\
+         Prompt: {prompt}\n\
+         [IMAGE:{path_display}]",
+    )
+}
+
 /// Standalone image generation tool using fal.ai (Flux / Nano Banana models).
 ///
 /// Reads the API key from an environment variable (default: `FAL_API_KEY`),
@@ -92,17 +132,15 @@ impl ImageGenTool {
             }
         };
 
-        let filename = args
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("generated_image");
-
         // Sanitize filename — strip path components to prevent traversal.
-        let safe_name = PathBuf::from(filename).file_name().map_or_else(
-            || "generated_image".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
+        // When the caller doesn't provide one, generate a unique default so
+        // successive calls without an explicit name never clobber each other.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let safe_name =
+            resolve_image_filename(args.get("filename").and_then(|v| v.as_str()), nanos);
 
         let size = args
             .get("size")
@@ -248,19 +286,17 @@ impl ImageGenTool {
 
         let size_kb = bytes.len() / 1024;
 
+        // Emit a durable `File:` line (survives marker-stripping in older turns)
+        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
+        // Both carry the same path string so the promoter
+        // (`canonicalize_tool_result_media_markers`) dedups the bare path
+        // against the already-wrapped marker and does not double-count.
+        let path_display = output_path.display().to_string();
+        let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
+
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Image generated successfully.\n\
-                 File: {}\n\
-                 Size: {} KB\n\
-                 Model: {}\n\
-                 Prompt: {}",
-                output_path.display(),
-                size_kb,
-                model,
-                prompt,
-            ),
+            output,
             error: None,
         })
     }
@@ -535,6 +571,52 @@ mod tests {
             |n| n.to_string_lossy().to_string(),
         );
         assert_eq!(sanitized, "generated_image");
+    }
+
+    #[test]
+    fn resolve_image_filename_default_is_non_clobbering_and_unique() {
+        // Exercises the PRODUCTION filename-selection helper (#7874): an omitted
+        // filename must yield a unique timestamped name, never the bare
+        // `generated_image` that would clobber prior generations, and two
+        // default calls must differ. Fails if the code reverts to a fixed name.
+        let a = resolve_image_filename(None, 1_000);
+        let b = resolve_image_filename(None, 2_000);
+        assert_eq!(a, "generated_image_1000");
+        assert_ne!(
+            a, "generated_image",
+            "default must not clobber the bare name"
+        );
+        assert_ne!(a, b, "successive default names must differ");
+        // An explicit filename is used verbatim, with path components stripped.
+        assert_eq!(resolve_image_filename(Some("my_pic"), 1_000), "my_pic");
+        assert_eq!(
+            resolve_image_filename(Some("../../etc/passwd"), 1_000),
+            "passwd"
+        );
+        // Blank/whitespace filename falls back to the timestamped default.
+        assert_eq!(
+            resolve_image_filename(Some("   "), 1_000),
+            "generated_image_1000"
+        );
+    }
+
+    #[test]
+    fn image_output_emits_matching_file_line_and_image_marker() {
+        // Exercises the PRODUCTION output formatter (#7874): the saved path must
+        // appear in BOTH the durable `File:` line and the `[IMAGE:<path>]`
+        // marker, with the same concrete path, so the multimodal pipeline can
+        // inline the attachment and the canonicalizer dedups them. Fails if the
+        // marker (or the matching path) is dropped.
+        let path = "/ws/images/generated_image_42.png";
+        let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
+        assert!(
+            out.contains(&format!("File: {path}")),
+            "output must carry a durable File: line: {out}"
+        );
+        assert!(
+            out.contains(&format!("[IMAGE:{path}]")),
+            "output must carry a matching [IMAGE:<path>] marker: {out}"
+        );
     }
 
     #[test]

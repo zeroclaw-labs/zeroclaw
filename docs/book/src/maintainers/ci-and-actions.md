@@ -18,7 +18,7 @@ Composite job with multiple matrix legs:
 - **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
-- **docs-style**: markdown lint + em-dash prose check via `scripts/ci/docs_quality_gate.sh`
+- **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
 
 `fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
@@ -135,6 +135,9 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `docker/setup-buildx-action` (`v4.0.0`) | `release-stable-manual.yml` | Docker Buildx setup |
 | `docker/login-action` (`v4.1.0`) | `release-stable-manual.yml` | GHCR authentication |
 | `docker/build-push-action` (`v7.1.0`) | `release-stable-manual.yml` | Multi-platform image build and push |
+| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
+| `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
+| `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -145,6 +148,9 @@ actions/*
 dtolnay/rust-toolchain@*
 Swatinem/rust-cache@*
 docker/*
+sigstore/cosign-installer@*
+anchore/sbom-action@*
+slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
 ```
 
 Export the current effective policy:
@@ -168,7 +174,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
 - Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned, the same quality gates run locally and in CI.
 - Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
-- The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check). Run the same script locally before pushing docs changes.
+- The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check) and `bash scripts/ci/docs_links_gate.sh` (changed-line link gate). Run both scripts locally before pushing docs changes.
 
 ## Emergency rollback
 

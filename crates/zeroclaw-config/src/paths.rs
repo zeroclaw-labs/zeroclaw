@@ -85,4 +85,13 @@ mod tests {
             root.join("skills/coding"),
         );
     }
+
+    #[test]
+    fn dotdot_within_root_is_normalized() {
+        let root = Path::new("/tmp/install/shared");
+        assert_eq!(
+            resolve_under(root, "skills/../coding").unwrap(),
+            root.join("coding"),
+        );
+    }
 }

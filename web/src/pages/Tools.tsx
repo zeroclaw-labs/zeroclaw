@@ -21,6 +21,7 @@ import {
   patchConfig,
   ApiError,
 } from '@/lib/api';
+import { loadAgentPickerSummaries, type AgentPickerSummary } from '@/lib/agents';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 
@@ -77,16 +78,42 @@ export default function Tools() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Agent selector. Empty string = the gateway's default agent listing
+  // (no `?agent=`). The agent-tools list re-fetches scoped to the pick so
+  // each agent's own tools (built-ins + its `mcp_bundles` MCP tools) show,
+  // instead of one arbitrary agent's.
+  const [agents, setAgents] = useState<AgentPickerSummary[]>([]);
+  const [selectedAgent, setSelectedAgent] = useState('');
+
   // Risk-profile access, keyed by profile name. `null` until loaded.
   const [access, setAccess] = useState<Record<string, ProfileAccess> | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
 
+  // Agent list for the selector (non-fatal: the page still works as the
+  // default listing if this fails).
   useEffect(() => {
-    Promise.all([getTools(), getCliTools()])
-      .then(([t, c]) => { setTools(t); setCliTools(c); })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+    loadAgentPickerSummaries()
+      .then(setAgents)
+      .catch(() => setAgents([]));
   }, []);
+
+  // CLI tools are not agent-scoped, so load them once.
+  useEffect(() => {
+    getCliTools()
+      .then(setCliTools)
+      .catch((err) => setError(err.message));
+  }, []);
+
+  // Agent tools re-fetch whenever the selected agent changes.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getTools(selectedAgent || undefined)
+      .then((toolList) => { if (!cancelled) setTools(toolList); })
+      .catch((err) => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedAgent]);
 
   // Load every risk profile's allowed/excluded tool lists for the matrix.
   useEffect(() => {
@@ -205,6 +232,22 @@ export default function Tools() {
         }
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
+            {agents.length > 0 && (
+              <select
+                value={selectedAgent}
+                onChange={(e) => setSelectedAgent(e.target.value)}
+                className="h-9 min-w-0 max-w-full rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-sm font-medium text-pc-text-secondary transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30"
+                aria-label={t('tools.agent_select_label')}
+                title={t('tools.agent_select_label')}
+              >
+                <option value="">{t('tools.agent_select_default')}</option>
+                {agents.map((a) => (
+                  <option key={a.alias} value={a.alias} disabled={!a.enabled}>
+                    {a.alias}{a.enabled ? '' : ` (${t('tools.agent_disabled')})`}
+                  </option>
+                ))}
+              </select>
+            )}
             <div className="relative w-64 max-w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-pc-text-faint pointer-events-none" />
               <input

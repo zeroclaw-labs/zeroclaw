@@ -19,6 +19,9 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  # OIDC (`id-token: write`) is granted at the `publish` job level only — the
+  # `matrix` resolution job does not perform keyless signing and should not
+  # inherit OIDC minting.
 
 env:
   REGISTRY: ghcr.io
@@ -45,6 +48,10 @@ jobs:
     needs: [matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
     strategy:
       fail-fast: false
       matrix:
@@ -59,17 +66,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build and push pinned + floating tags
+        id: build-push
         uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          # Platforms are resolved per tag from the generated matrix: Dockerfile
+          # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
+          # native amd64 builder), Containerfile tags stay amd64-only.
+          platforms: ${{ matrix.platforms }}
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+
+      - name: Sign container image (keyless / Rekor)
+        # Signs by digest so the signature is immutable regardless of tag mutations.
+        # Consumers verify with:
+        #   cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
+        #     ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build-push.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
