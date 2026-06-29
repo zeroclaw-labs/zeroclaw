@@ -74,6 +74,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
 
+    // Chat toolbar buttons (#7139)
+    'agent.clear_all': '全部清除',
+    'agent.delete_message': '删除消息',
+    'agent.compact_mode': '紧凑模式',
+    'agent.tool_activity_show': '显示工具活动',
+    'agent.tool_activity_hide': '隐藏工具活动',
+    'agent.running': '运行中...',
+    'agent.stop': '停止',
+
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': '需要授权工具调用',
     'agent.approval_tool': '工具',
@@ -3585,6 +3594,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Verbunden',
     'agent.disconnected_status': 'Getrennt',
 
+    // Chat toolbar buttons (#7139)
+    'agent.clear_all': 'Alle löschen',
+    'agent.delete_message': 'Nachricht löschen',
+    'agent.compact_mode': 'Kompakter Modus',
+    'agent.tool_activity_show': 'Werkzeugaktivität anzeigen',
+    'agent.tool_activity_hide': 'Werkzeugaktivität ausblenden',
+    'agent.running': 'Läuft...',
+    'agent.stop': 'Stoppen',
+
     // Slash commands (#7137)
     'agent.cmd_unknown': 'Unbekannter Befehl: {cmd}. Geben Sie /help ein, um verfügbare Befehle zu sehen.',
     'agent.cmd_help_header': 'Verfügbare Befehle:',
@@ -4335,6 +4353,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
 
+    // Chat toolbar buttons (#7139)
+    'agent.clear_all': 'Borrar todo',
+    'agent.delete_message': 'Eliminar mensaje',
+    'agent.compact_mode': 'Modo compacto',
+    'agent.tool_activity_show': 'Mostrar actividad de herramientas',
+    'agent.tool_activity_hide': 'Ocultar actividad de herramientas',
+    'agent.running': 'Ejecutando...',
+    'agent.stop': 'Detener',
+
     // Slash commands (#7137)
     'agent.cmd_unknown': 'Comando desconocido: {cmd}. Escribe /help para ver los comandos disponibles.',
     'agent.cmd_help_header': 'Comandos disponibles:',
@@ -5084,6 +5111,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copier le message',
     'agent.connected_status': 'Connecté',
     'agent.disconnected_status': 'Déconnecté',
+
+    // Chat toolbar buttons (#7139)
+    'agent.clear_all': 'Tout effacer',
+    'agent.delete_message': 'Supprimer le message',
+    'agent.compact_mode': 'Mode compact',
+    'agent.tool_activity_show': 'Afficher l'activité des outils',
+    'agent.tool_activity_hide': 'Masquer l'activité des outils',
+    'agent.running': 'En cours...',
+    'agent.stop': 'Arrêter',
 
     // Slash commands (#7137)
     'agent.cmd_unknown': 'Commande inconnue : {cmd}. Tapez /help pour voir les commandes disponibles.',
@@ -7348,6 +7384,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'メッセージをコピー',
     'agent.connected_status': '接続済み',
     'agent.disconnected_status': '切断済み',
+
+    // Chat toolbar buttons (#7139)
+    'agent.clear_all': 'すべてクリア',
+    'agent.delete_message': 'メッセージを削除',
+    'agent.compact_mode': 'コンパクトモード',
+    'agent.tool_activity_show': 'ツールアクティビティを表示',
+    'agent.tool_activity_hide': 'ツールアクティビティを隠す',
+    'agent.running': '実行中...',
+    'agent.stop': '停止',
 
     // Slash commands (#7137)
     'agent.cmd_unknown': '不明なコマンド: {cmd}。利用可能なコマンドを見るには /help と入力してください。',
