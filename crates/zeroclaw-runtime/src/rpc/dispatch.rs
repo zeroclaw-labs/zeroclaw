@@ -3126,6 +3126,9 @@ impl RpcDispatcher {
         };
         let from = req.from.as_deref().map(parse_bound).transpose()?;
         let to = req.to.as_deref().map(parse_bound).transpose()?;
+        // Precedence (inherited from the existing per-agent path): an explicit
+        // `agent` selects that agent's summary and the [from, to) window does
+        // NOT apply; the window scopes only the fleet-wide summary.
         let summary = if let Some(agent) = req.agent {
             tracker
                 .get_summary_for_agent(&agent)
@@ -4327,8 +4330,10 @@ mod tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.data_dir = data_dir.to_path_buf();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
         let ctx = RpcContext::minimal(config, sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         RpcDispatcher::new(ctx, tx, "test-peer-cost:pid=1".into())
