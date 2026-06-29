@@ -2158,10 +2158,9 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
-                debounce_ms: None,
             },
         );
-        assert!(has_supervised_channels(&config));
+        assert!(!has_supervised_channels(&config));
     }
 
     #[test]
@@ -2183,6 +2182,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         assert!(has_supervised_channels(&config));
