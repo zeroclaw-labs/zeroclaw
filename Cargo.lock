@@ -13822,6 +13822,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-onboarding"
+version = "0.8.2"
+
+[[package]]
 name = "zeroclaw-plugins"
 version = "0.8.2"
 dependencies = [
@@ -14146,6 +14150,7 @@ dependencies = [
  "zeroclaw-log",
  "zeroclaw-macros",
  "zeroclaw-memory",
+ "zeroclaw-onboarding",
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
