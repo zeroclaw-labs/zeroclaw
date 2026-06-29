@@ -358,4 +358,49 @@ mod tests {
             "locale options must mirror the registry exactly, in order"
         );
     }
+
+    #[tokio::test]
+    async fn the_selected_locale_reaches_the_guide_system_prompt() {
+        use crate::agent_responder::{AgentResponder, AgentTurn};
+        use crate::llm_transport::LlmResponder;
+        use std::sync::{Arc, Mutex};
+
+        let target = zeroclaw_runtime::i18n::available_locales()
+            .iter()
+            .find(|l| l.code != "en")
+            .cloned()
+            .expect("at least one non-English locale is registered");
+
+        struct CapturingTurn {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl AgentTurn for CapturingTurn {
+            async fn run_single(&mut self, message: &str) -> TransportResult<String> {
+                self.seen.lock().unwrap().push(message.to_string());
+                Ok("ok".to_string())
+            }
+        }
+
+        let mut selector = ScriptedTransport::new(vec![ResponseValue::Choice(target.code.clone())]);
+        let chosen = select_locale(&mut selector).await.unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut responder = AgentResponder::new(CapturingTurn {
+            seen: Arc::clone(&seen),
+        })
+        .with_locale(chosen);
+        responder
+            .respond("Provide the homeserver URL")
+            .await
+            .unwrap();
+
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains(&target.label)),
+            "the locale chosen by the selector must reach the guide's system prompt"
+        );
+    }
 }

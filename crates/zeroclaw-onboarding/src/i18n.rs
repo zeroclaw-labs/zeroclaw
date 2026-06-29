@@ -208,8 +208,7 @@ mod tests {
         assert!(value.contains("channel:home"));
     }
 
-    #[test]
-    fn every_locale_catalogue_has_the_same_message_ids() {
+    fn onboard_catalogue_ids(code: &str) -> std::collections::BTreeSet<String> {
         let template = zeroclaw_config::schema::FTL_CATALOGS
             .iter()
             .find(|(name, _, _)| *name == "onboard")
@@ -219,29 +218,76 @@ mod tests {
             .parent()
             .and_then(|p| p.parent())
             .expect("workspace root above the crate");
+        let path = repo_root.join(template.replace("{locale}", code));
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing onboard catalogue for {code}"));
+        format_ftl_messages(&source, code).into_keys().collect()
+    }
 
-        let mut reference_ids: Option<std::collections::BTreeSet<String>> = None;
+    #[test]
+    fn every_locale_catalogue_matches_the_english_reference_id_for_id() {
+        let reference = onboard_catalogue_ids("en");
+        assert!(
+            !reference.is_empty(),
+            "the English onboard catalogue must define ids"
+        );
+        assert!(
+            reference.iter().all(|id| id.starts_with("onboard-")),
+            "every onboard id must carry the onboard- prefix"
+        );
         for locale in zeroclaw_runtime::i18n::available_locales() {
-            let path = repo_root.join(template.replace("{locale}", &locale.code));
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("missing onboard catalogue for {}", locale.code));
-            let ids: std::collections::BTreeSet<String> =
-                format_ftl_messages(&source, &locale.code)
-                    .into_keys()
-                    .collect();
-            assert!(!ids.is_empty(), "{} catalogue must define ids", locale.code);
-            match &reference_ids {
-                None => reference_ids = Some(ids),
-                Some(reference) => assert_eq!(
-                    &ids, reference,
-                    "{} onboard catalogue must carry the same ids as the first locale",
-                    locale.code
-                ),
+            let ids = onboard_catalogue_ids(&locale.code);
+            assert_eq!(
+                ids, reference,
+                "{} onboard catalogue must carry exactly the English reference ids",
+                locale.code
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_a_non_default_locale_drives_a_different_rendered_string() {
+        let shared_id = "onboard-flow-completed";
+        let english = format_onboard_string_with_args(
+            &OnboardFtlSources {
+                locale: "en".to_string(),
+                disk: None,
+            },
+            shared_id,
+            &[("items", "channel:home")],
+        )
+        .expect("english renders the shared id");
+        let template = zeroclaw_config::schema::FTL_CATALOGS
+            .iter()
+            .find(|(name, _, _)| *name == "onboard")
+            .map(|(_, path_template, _)| *path_template)
+            .expect("onboard catalogue registered");
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let mut diverged = false;
+        for locale in zeroclaw_runtime::i18n::available_locales() {
+            if locale.code == "en" {
+                continue;
+            }
+            let disk =
+                std::fs::read_to_string(repo_root.join(template.replace("{locale}", &locale.code)))
+                    .ok();
+            let sources = OnboardFtlSources {
+                locale: locale.code.clone(),
+                disk,
+            };
+            let localized =
+                format_onboard_string_with_args(&sources, shared_id, &[("items", "channel:home")])
+                    .expect("locale renders the shared id");
+            if localized != english {
+                diverged = true;
             }
         }
         assert!(
-            reference_ids.is_some(),
-            "registry must list at least one locale"
+            diverged,
+            "selecting a non-English locale must change at least one rendered onboard string"
         );
     }
 }
