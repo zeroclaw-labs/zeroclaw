@@ -19,8 +19,6 @@
 
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
-#[cfg(feature = "channel-filesystem")]
-pub mod filesystem;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -38,6 +36,8 @@ pub use crate::dingtalk::DingTalkChannel;
 pub use crate::discord::DiscordChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
+#[cfg(feature = "channel-filesystem")]
+pub use crate::filesystem::FilesystemChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -9603,6 +9603,40 @@ pub async fn start_channels(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Nostr channel is configured but this build was compiled without \
                      `channel-nostr`; skipping Nostr."
+                );
+            }
+            #[cfg(feature = "channel-filesystem")]
+            if let (Some(engine), Some(audit)) = (sop_engine.as_ref(), sop_audit.as_ref()) {
+                let active = ActiveChannelAliases::compute(&config);
+                for (alias, fs_cfg) in &config.channels.filesystem {
+                    if !active.contains(&format!("filesystem.{alias}")) {
+                        continue;
+                    }
+                    if !fs_cfg.enabled {
+                        continue;
+                    }
+                    configured_channels.push(ConfiguredChannel {
+                        display_name: "Filesystem",
+                        alias: Some(alias.clone()),
+                        channel: Arc::new(crate::filesystem::FilesystemChannel::new(
+                            crate::filesystem::FilesystemChannelConfig {
+                                config: fs_cfg.clone(),
+                                alias: alias.clone(),
+                                engine: engine.clone(),
+                                audit: audit.clone(),
+                            },
+                        )),
+                    });
+                }
+            }
+            #[cfg(not(feature = "channel-filesystem"))]
+            if !config.channels.filesystem.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Filesystem channel is configured but this build was compiled without \
+                     `channel-filesystem`; skipping Filesystem."
                 );
             }
             let channels: Vec<Arc<dyn Channel>> = configured_channels

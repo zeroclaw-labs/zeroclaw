@@ -36,11 +36,11 @@ The SOP's trigger is defined in its `SOP.toml` (see [Syntax](./syntax.md)). Topi
 
 ## 3. Filesystem Integration
 
-Filesystem events are delivered by `run_filesystem_sop_listener`, which watches one or more paths with a `notify` recursive watcher, debounces and settles each change, builds a filesystem `SopEvent` per change, and calls `dispatch_sop_event`. This path is gated by the `channel-filesystem` build feature (default-on).
+Filesystem events are delivered by the `FilesystemChannel`, which watches one or more paths with a `notify` recursive watcher, debounces and settles each change, builds a filesystem `SopEvent` per change, and calls `dispatch_sop_event`. This path is gated by the `channel-filesystem` build feature (default-on).
 
 ### 3.1 Configuration
 
-Configure watched paths with `zeroclaw config set channels.filesystem.<field> <value>`: the keys land under `[channels.filesystem]` in the stored config. See the [Config reference](../reference/config.md) for all fields. Broad roots (`/`, `$HOME`, and similar) are rejected at config validation; include/exclude globs scope which paths emit events.
+Configure watched paths with `zeroclaw config set channels.filesystem.<field> <value>`: the keys land under `[channels.filesystem]` in the stored config; the full field index is generated into the config reference. The broad system roots `/`, `/home`, `/etc`, and `/var` are rejected at config validation unless `allow_broad_roots = true`; include/exclude globs scope which paths emit events.
 
 ### 3.2 Trigger Definition
 
@@ -63,7 +63,7 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 | Feature | Mechanism |
 |---|---|
 | **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
-| **Filesystem roots** | Broad roots (`/`, `$HOME`) rejected at config validation; include/exclude globs scope events |
+| **Filesystem roots** | The broad roots `/`, `/home`, `/etc`, `/var` rejected at config validation (override with `allow_broad_roots`); include/exclude globs scope events |
 | **Cron validation** | Invalid cron expressions fail closed during parsing/cache build |
 | **Headless dispatch** | Headless callers log run progression instead of auto-executing `ExecuteStep` |
 
@@ -74,6 +74,6 @@ Defining one of these triggers in a `SOP.toml` is valid and will not error, but 
 | **MQTT** connection errors | broker URL/TLS mismatch | Verify scheme + TLS flag pairing (`mqtt://`/`false`, `mqtts://`/`true`) |
 | **MQTT** SOP not starting | topic pattern mismatch or failing `condition` | Verify the trigger topic/wildcards match the published topic; check the `condition` against the payload |
 | **Filesystem** SOP not starting | watched path/glob mismatch or excluded by glob | Verify the trigger `path` glob matches the changed file and the path is in `channels.filesystem` include scope |
-| **Filesystem** listener not starting | broad root rejected at validation | Narrow `channels.filesystem` paths away from `/` or `$HOME` |
+| **Filesystem** listener not starting | broad root rejected at validation | Narrow `channels.filesystem` paths away from `/`, `/home`, `/etc`, `/var`, or set `allow_broad_roots` |
 | **SOP started but step not executed** | headless trigger without active agent loop | run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
 | **Webhook/cron/peripheral trigger never fires** | event source not wired into the dispatcher | use an MQTT or filesystem trigger, or start the run with `sop_execute` |

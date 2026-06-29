@@ -13845,10 +13845,6 @@ pub struct FilesystemConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
-    /// Follow symlinks while watching. Off by default.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub follow_symlinks: bool,
     /// Tools excluded from this channel's tool spec.
     #[tab(Behavior)]
     #[serde(default)]
@@ -13869,7 +13865,6 @@ impl Default for FilesystemConfig {
             read_content: false,
             max_content_bytes: default_filesystem_max_content_bytes(),
             allow_broad_roots: false,
-            follow_symlinks: false,
             excluded_tools: Vec::new(),
         }
     }
@@ -20309,7 +20304,6 @@ mod tests {
         assert!(cfg.recursive);
         assert!(!cfg.read_content);
         assert!(!cfg.allow_broad_roots);
-        assert!(!cfg.follow_symlinks);
         assert_eq!(cfg.debounce_ms, 500);
         assert_eq!(cfg.settle_ms, 250);
         assert_eq!(cfg.max_content_bytes, 65536);

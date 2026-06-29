@@ -81,6 +81,7 @@ pub enum ChannelKind {
     DingTalk,
     Discord,
     Email,
+    Filesystem,
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,

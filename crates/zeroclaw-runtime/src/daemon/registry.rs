@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::schema::{Config, FilesystemConfig, MqttConfig};
+use zeroclaw_config::schema::{Config, MqttConfig};
 
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
@@ -54,9 +54,6 @@ pub type RpcStarter = Box<
 /// Starts the MQTT SOP listener for one configured MQTT channel alias.
 pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 
-/// Starts the filesystem SOP listener for one configured filesystem channel alias.
-pub type FilesystemStarter = Box<dyn Fn(FilesystemConfig) -> StarterFuture + Send + Sync>;
-
 /// Typed startup registry injected by the binary crate.
 ///
 /// This registry is the source of truth for startup hook values for the current
@@ -69,7 +66,6 @@ pub struct DaemonRegistry {
     socket_start: Option<RpcStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
-    filesystem_start: Option<FilesystemStarter>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
@@ -131,16 +127,6 @@ impl DaemonRegistry {
         self.mqtt_start.is_some()
     }
 
-    pub fn register_filesystem(&mut self, starter: FilesystemStarter) -> &mut Self {
-        self.filesystem_start = Some(starter);
-        self
-    }
-
-    #[cfg(test)]
-    fn has_filesystem_start(&self) -> bool {
-        self.filesystem_start.is_some()
-    }
-
     pub(crate) fn take_gateway_start(&mut self) -> Option<GatewayStarter> {
         self.gateway_start.take()
     }
@@ -159,10 +145,6 @@ impl DaemonRegistry {
 
     pub(crate) fn take_mqtt_start(&mut self) -> Option<MqttStarter> {
         self.mqtt_start.take()
-    }
-
-    pub(crate) fn take_filesystem_start(&mut self) -> Option<FilesystemStarter> {
-        self.filesystem_start.take()
     }
 
     /// Set the shared SOP engine for this daemon iteration.
@@ -206,10 +188,6 @@ mod tests {
         Box::new(|_| Box::pin(async { Ok(()) }))
     }
 
-    fn filesystem_starter() -> FilesystemStarter {
-        Box::new(|_| Box::pin(async { Ok(()) }))
-    }
-
     #[test]
     fn new_registry_has_no_start_hooks() {
         let registry = DaemonRegistry::new();
@@ -229,15 +207,13 @@ mod tests {
             .register_channels(channels_starter())
             .register_socket(rpc_starter())
             .register_wss(rpc_starter())
-            .register_mqtt(mqtt_starter())
-            .register_filesystem(filesystem_starter());
+            .register_mqtt(mqtt_starter());
 
         assert!(registry.has_gateway_start());
         assert!(registry.has_channels_start());
         assert!(registry.has_socket_start());
         assert!(registry.has_wss_start());
         assert!(registry.has_mqtt_start());
-        assert!(registry.has_filesystem_start());
     }
 
     #[test]
@@ -248,21 +224,18 @@ mod tests {
             .register_channels(channels_starter())
             .register_socket(rpc_starter())
             .register_wss(rpc_starter())
-            .register_mqtt(mqtt_starter())
-            .register_filesystem(filesystem_starter());
+            .register_mqtt(mqtt_starter());
 
         assert!(registry.take_gateway_start().is_some());
         assert!(registry.take_channels_start().is_some());
         assert!(registry.take_socket_start().is_some());
         assert!(registry.take_wss_start().is_some());
         assert!(registry.take_mqtt_start().is_some());
-        assert!(registry.take_filesystem_start().is_some());
 
         assert!(!registry.has_gateway_start());
         assert!(!registry.has_channels_start());
         assert!(!registry.has_socket_start());
         assert!(!registry.has_wss_start());
         assert!(!registry.has_mqtt_start());
-        assert!(!registry.has_filesystem_start());
     }
 }

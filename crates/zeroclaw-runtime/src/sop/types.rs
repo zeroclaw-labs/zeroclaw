@@ -84,6 +84,14 @@ impl fmt::Display for FilesystemEventKind {
     }
 }
 
+impl std::str::FromStr for FilesystemEventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| ())
+    }
+}
+
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
