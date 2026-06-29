@@ -712,6 +712,12 @@ pub async fn run(
     if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
+        // Reuse the daemon's `channels_cancel` token so the scheduler
+        // receives the same shutdown signal as every other supervised
+        // component. See `daemon/mod.rs:584` — the token is cancelled
+        // before the supervisor's `.abort()` fallback, so the scheduler
+        // returns `Ok(())` cleanly via its own `select!` arm.
+        let scheduler_cancel = channels_cancel.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -719,7 +725,8 @@ pub async fn run(
             move || {
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx))).await }
+                let cancel = scheduler_cancel.clone();
+                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
             },
         ));
     } else {
