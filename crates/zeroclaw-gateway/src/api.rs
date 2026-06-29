@@ -127,6 +127,11 @@ pub struct CronAddBody {
     pub delete_after_run: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
+    /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
+    /// shell when no prompt is given). Ignored for agent jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +153,10 @@ pub struct CronPatchBody {
     pub enabled: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format override. `"wrapped"` (default) or `"raw"`.
+    /// Only applied to shell-type jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 enum CronTimezonePatch {
@@ -419,6 +428,7 @@ pub async fn handle_api_cron_add(
         allowed_tools,
         delete_after_run,
         uses_memory,
+        shell_output_format,
     } = body;
 
     let config = state.config.read().clone();
@@ -496,7 +506,8 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let fmt = shell_output_format.unwrap_or_default();
+        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -504,6 +515,7 @@ pub async fn handle_api_cron_add(
             command,
             delivery,
             false,
+            fmt,
         )
     };
 
@@ -633,6 +645,7 @@ pub async fn handle_api_cron_patch(
         prompt,
         enabled,
         uses_memory,
+        shell_output_format,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -708,6 +721,7 @@ pub async fn handle_api_cron_patch(
         prompt: patch_prompt,
         enabled,
         uses_memory,
+        shell_output_format,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 

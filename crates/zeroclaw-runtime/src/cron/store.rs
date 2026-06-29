@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
@@ -61,6 +61,7 @@ pub fn add_job(
     add_shell_job(config, agent_alias, None, schedule, command, None)
 }
 
+#[cfg(test)]
 pub fn add_shell_job(
     config: &Config,
     agent_alias: &str,
@@ -68,6 +69,26 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
     delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        CronShellOutputFormat::default(),
+    )
+}
+
+pub fn add_shell_job_with_format(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -84,12 +105,17 @@ pub fn add_shell_job(
         anyhow::bail!("agent_alias is required; cron jobs must name an owning agent");
     }
 
+    let shell_output_format_str = match shell_output_format {
+        CronShellOutputFormat::Wrapped => "wrapped",
+        CronShellOutputFormat::Raw => "raw",
+    };
+
     with_initialized_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10)",
+                enabled, delivery, delete_after_run, agent_alias, created_at, next_run, shell_output_format
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 expression,
@@ -101,6 +127,7 @@ pub fn add_shell_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                shell_output_format_str,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -172,8 +199,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -196,8 +223,8 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     let Some(job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -269,8 +296,8 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
         )?;
         let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
@@ -321,8 +348,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC
@@ -357,8 +384,8 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
@@ -434,6 +461,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     if let Some(uses_memory) = patch.uses_memory {
         job.uses_memory = uses_memory;
     }
+    if let Some(shell_output_format) = patch.shell_output_format {
+        job.shell_output_format = shell_output_format;
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
@@ -444,8 +474,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-             WHERE id = ?15",
+                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+             WHERE id = ?16",
             params![
                 job.expression,
                 job.command,
@@ -461,6 +491,10 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
                 if job.uses_memory { 1 } else { 0 },
+                match job.shell_output_format {
+                    CronShellOutputFormat::Wrapped => "wrapped",
+                    CronShellOutputFormat::Raw => "raw",
+                },
                 job.id,
             ],
         )
@@ -882,6 +916,11 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let source: Option<String> = row.get(18)?;
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
+    let shell_output_format_raw: Option<String> = row.get(21)?;
+    let shell_output_format = shell_output_format_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<CronShellOutputFormat>(&format!("\"{s}\"")).ok())
+        .unwrap_or_default();
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -901,6 +940,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         delete_after_run: row.get::<_, i64>(11)? != 0,
         source: source.unwrap_or_else(|| "imperative".to_string()),
         uses_memory: uses_memory != Some(0),
+        shell_output_format,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
@@ -1476,6 +1516,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "shell_output_format",
+        "TEXT NOT NULL DEFAULT 'wrapped'",
+    )?;
 
     Ok(())
 }
@@ -2701,6 +2746,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: false,
             source: "imperative".to_string(),
+            shell_output_format: CronShellOutputFormat::default(),
             created_at: now,
             next_run: next_run_for_schedule(schedule, now).unwrap_or(now),
             last_run: None,

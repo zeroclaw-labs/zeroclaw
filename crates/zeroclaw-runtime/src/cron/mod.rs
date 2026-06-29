@@ -1,6 +1,6 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 mod schedule;
 mod store;
@@ -118,9 +118,40 @@ pub fn add_shell_job_with_approval(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
+    add_shell_job_with_approval_and_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        approved,
+        CronShellOutputFormat::default(),
+    )
+}
+
+/// Like `add_shell_job_with_approval` but with an explicit shell output format.
+pub fn add_shell_job_with_approval_and_format(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+) -> Result<CronJob> {
     validate_shell_command(config, agent_alias, command, approved)?;
     validate_delivery_config(delivery.as_ref())?;
-    store::add_shell_job(config, agent_alias, name, schedule, command, delivery)
+    store::add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        shell_output_format,
+    )
 }
 
 /// Update a shell job's command with security validation.
@@ -173,7 +204,16 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
-    add_shell_job_with_approval(config, agent_alias, name, schedule, command, None, false)
+    add_shell_job_with_approval_and_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        None,
+        false,
+        CronShellOutputFormat::default(),
+    )
 }
 
 pub fn add_job(
