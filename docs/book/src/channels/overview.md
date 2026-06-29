@@ -50,6 +50,14 @@ One-to-many or public-feed integrations.
 
 See [Social channels](./social.md).
 
+### Developer platforms
+
+| Channel | Feature flag | Protocol / service |
+|---|---|---|
+| Git | `channel-git` | Git forge behind a provider seam (GitHub first); REST polling of issues, PRs, CI runs & releases with per-event routing |
+
+See [Git](./git.md).
+
 ### Email
 
 | Channel | Feature flag | Notes |

@@ -71,6 +71,7 @@
   - [WhatsApp](./channels/whatsapp.md)
   - [Other chat platforms](./channels/chat-others.md)
   - [Social (Bluesky, Nostr, Twitter, Reddit)](./channels/social.md)
+  - [Git](./channels/git.md)
   - [Email](./channels/email.md)
   - [Voice & telephony](./channels/voice.md)
   - [Webhooks](./channels/webhook.md)

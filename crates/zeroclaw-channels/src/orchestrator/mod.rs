@@ -38,6 +38,8 @@ pub use crate::discord::DiscordChannel;
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-filesystem")]
 pub use crate::filesystem::FilesystemChannel;
+#[cfg(feature = "channel-git")]
+pub use crate::git::GitChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -6943,6 +6945,25 @@ fn build_channel_by_id(
         "twitter" => {
             anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
         }
+        #[cfg(feature = "channel-git")]
+        "git" => {
+            let g = config
+                .channels
+                .git
+                .get("default")
+                .context("Git channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+            };
+            Ok(Arc::new(GitChannel::new(g.clone(), alias, peer_resolver)?))
+        }
+        #[cfg(not(feature = "channel-git"))]
+        "git" => {
+            anyhow::bail!("Git channel requires the `channel-git` feature");
+        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -7028,7 +7049,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8428,6 +8449,51 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "X/Twitter channel is configured but this build was compiled without \
              `channel-twitter`; skipping X/Twitter."
+        );
+    }
+
+    #[cfg(feature = "channel-git")]
+    for (alias, g) in &config.channels.git {
+        if !active_channel_aliases.contains(&format!("git.{alias}")) {
+            continue;
+        }
+        if !g.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+        };
+        match GitChannel::new(g.clone(), alias.clone(), peer_resolver) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "Git",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": e.to_string(),
+                        })),
+                    "Git channel alias misconfigured; skipping"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-git"))]
+    if !config.channels.git.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Git channel is configured but this build was compiled without \
+             `channel-git`; skipping Git."
         );
     }
 

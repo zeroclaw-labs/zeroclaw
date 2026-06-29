@@ -168,6 +168,15 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
+# GitHub App channel — RS256 JWT signing for app authentication. The
+# `rust_crypto` backend keeps the workspace on the RustCrypto/ring stack
+# instead of pulling in aws-lc-rs.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = [
+  "rust_crypto",
+  "use_pem",
+] }
+thiserror = { version = "2.0", optional = true }
+
 [features]
 default = ["default-channels"]
 default-channels = [
@@ -183,6 +192,7 @@ channels-full = [
   "channel-clawdtalk",
   "channel-dingtalk",
   "channel-discord",
+  "channel-git",
   "channel-imessage",
   "channel-irc",
   "channel-lark",
@@ -216,6 +226,11 @@ channel-email = [
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
+channel-git = ["provider-github"]
+# Forge providers for the git channel. `provider-github` (GitHub Apps) is
+# default-on under `channel-git`; future forges (e.g. `provider-gitlab`) add
+# their own sub-feature and deps here.
+provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
 whatsapp-web = [
