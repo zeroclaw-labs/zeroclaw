@@ -30,16 +30,27 @@ impl PromptPhraser for DescriptionPhraser {
 
 pub struct AgentPhraser<T: AgentTurn> {
     turn: T,
+    locale: String,
 }
 
 impl<T: AgentTurn> AgentPhraser<T> {
     pub fn new(turn: T) -> Self {
-        Self { turn }
+        Self {
+            turn,
+            locale: crate::agent_responder::default_locale(),
+        }
     }
 
-    fn instruction(context: &FieldPhrasingContext) -> String {
+    #[must_use]
+    pub fn with_locale(mut self, locale: impl Into<String>) -> Self {
+        self.locale = locale.into();
+        self
+    }
+
+    fn instruction(&self, context: &FieldPhrasingContext) -> String {
+        let directive = crate::agent_responder::locale_directive(&self.locale);
         format!(
-            "Rewrite this configuration field as a single short imperative \
+            "{directive}Rewrite this configuration field as a single short imperative \
              instruction to the operator, like \"Provide the Discord bot token\" \
              or \"Describe the agent\". Reply with only the instruction, no \
              quotes, no trailing punctuation.\nField path: {}\nField docs: {}\n\
@@ -52,7 +63,7 @@ impl<T: AgentTurn> AgentPhraser<T> {
 #[async_trait]
 impl<T: AgentTurn> PromptPhraser for AgentPhraser<T> {
     async fn phrase(&mut self, context: &FieldPhrasingContext) -> TransportResult<String> {
-        let reply = self.turn.run_single(&Self::instruction(context)).await?;
+        let reply = self.turn.run_single(&self.instruction(context)).await?;
         let cleaned = reply.trim().trim_matches('"').trim().to_string();
         if cleaned.is_empty() {
             Ok(context.description.clone())
@@ -142,6 +153,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(phrased, "Provide the Discord bot token");
+    }
+
+    #[tokio::test]
+    async fn agent_phraser_injects_the_locale_directive_into_the_instruction() {
+        let mut phraser =
+            AgentPhraser::new(ScriptedTurn::new(vec!["Fournir le jeton"])).with_locale("fr");
+        phraser
+            .phrase(&context("channels.discord.token", "The Discord bot token."))
+            .await
+            .unwrap();
+        let label = zeroclaw_runtime::i18n::available_locales()
+            .iter()
+            .find(|o| o.code == "fr")
+            .map(|o| o.label.clone())
+            .expect("fr is registered");
+        assert!(
+            phraser.turn.prompts[0].contains(&label),
+            "the phrasing instruction must tell the guide to write in the chosen locale"
+        );
     }
 
     #[tokio::test]

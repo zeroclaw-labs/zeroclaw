@@ -1404,14 +1404,13 @@ async fn run_onboard_flow(
         FieldScope::All
     };
 
-    {
+    let selected_locale = {
         let locale_reader = std::io::BufReader::new(std::io::stdin());
         let locale_writer = std::io::stdout();
         let mut locale_transport =
             CliTransport::with_secret_source(locale_reader, locale_writer, TtyPasswordSource);
-        let _selected_locale =
-            zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?;
-    }
+        zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?
+    };
 
     if create && use_llm {
         let family = section
@@ -1446,7 +1445,8 @@ async fn run_onboard_flow(
         .ok_or_else(|| {
             anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
         })?;
-        let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent));
+        let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
+            .with_locale(selected_locale.clone());
         phrase_spec(&mut spec, &mut phraser).await?;
 
         let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
@@ -1454,7 +1454,8 @@ async fn run_onboard_flow(
             agent_alias,
         ))
         .await?;
-        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent));
+        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent))
+            .with_locale(selected_locale.clone());
         let mut transport = LlmTransport::new(responder, TtySecretReader);
         let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;
         Box::pin(config.save()).await?;
