@@ -33,12 +33,27 @@ struct DriveResult {
     transcript: String,
 }
 
+fn zeroclaw_binary() -> std::path::PathBuf {
+    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            escargot::CargoBuild::new()
+                .package("zeroclawlabs")
+                .bin("zeroclaw")
+                .run()
+                .expect("build the zeroclaw binary for the onboarding pty test")
+                .path()
+                .to_path_buf()
+        })
+        .clone()
+}
+
 fn drive_flow_over_pty(
     config_dir: &std::path::Path,
     extra_args: &[&str],
     instance: &str,
 ) -> DriveResult {
-    let binary = env!("CARGO_BIN_EXE_zeroclaw");
+    let binary = zeroclaw_binary();
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {

@@ -18,3 +18,5 @@ tokio = { version = "1.50", features = ["rt"] }
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt", "macros", "sync"] }
 tempfile = "3.26"
+portable-pty = "0.8"
+escargot = "0.5"
