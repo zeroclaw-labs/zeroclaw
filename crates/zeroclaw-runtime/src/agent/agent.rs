@@ -322,6 +322,10 @@ pub struct Agent {
     /// may be overridden per-request (e.g. by the OpenAI chat completions
     /// endpoint to honour `tools` / `tool_choice` request parameters).
     tool_specs: Vec<zeroclaw_api::tool::ToolSpec>,
+    /// When true, the agent's tools are disabled for this request
+    /// (tool_choice: "none"). Set by `disable_tools()`, cleared by
+    /// `set_tool_specs()`.
+    tools_disabled: bool,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -825,6 +829,7 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tool_specs: tools.iter().map(|t| t.spec()).collect::<Vec<_>>(),
+            tools_disabled: false,
             tools,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
@@ -1128,12 +1133,14 @@ impl Agent {
     /// and `tool_choice` request parameters.
     pub fn set_tool_specs(&mut self, specs: Vec<zeroclaw_api::tool::ToolSpec>) {
         self.tool_specs = specs;
+        self.tools_disabled = false;
     }
 
     /// Clear all tool specs so the LLM sees no available tools.
     /// Corresponds to `tool_choice: "none"`.
     pub fn disable_tools(&mut self) {
         self.tool_specs.clear();
+        self.tools_disabled = true;
     }
 
     /// Return the names of all registered tools.
@@ -1971,7 +1978,9 @@ impl Agent {
         let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
             || self.tool_dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
-        let prompt_tools = if expose_text_tool_protocol {
+        let prompt_tools = if self.tools_disabled {
+            &no_tools
+        } else if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
@@ -1986,7 +1995,8 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs()
+            sends_native_tool_specs: !self.tools_disabled
+                && self.tool_dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
@@ -2303,67 +2313,85 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
-        let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+
+        let tool_specs_override = if self.tools_disabled {
+            Some(Vec::new())
+        } else if !self.tool_specs.is_empty() {
+            Some(self.tool_specs.clone())
+        } else {
+            None
+        };
+
+        let loop_result = zeroclaw_api::TOOL_SPECS_OVERRIDE
             .scope(
-                Some(cost_context.clone()),
-                crate::agent::tool_receipts::scope_receipts(
-                    receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: false,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: None,
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: None,
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: None,
-                        steering: None,
-                        new_messages_out: Some(&mut loop_new_messages),
-                        image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        turn_id: &turn_id,
-                    }),
+                tool_specs_override,
+                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context.clone()),
+                    crate::agent::tool_receipts::scope_receipts(
+                        receipt_scope.clone(),
+                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &self.model_provider_name,
+                                    model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: false,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    context_token_budget: self
+                                        .config
+                                        .resolved
+                                        .effective_context_budget(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            channel_name: &self.channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: None,
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: None,
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: None,
+                            steering: None,
+                            new_messages_out: Some(&mut loop_new_messages),
+                            image_cache: Some(&mut self.image_cache),
+                            // Phase 1: stamp Internal/Trusted. Real per-transport
+                            // stamping is PR C (RFC #6971 §4).
+                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            turn_id: &turn_id,
+                        }),
+                    ),
                 ),
             )
             .await;
@@ -2712,6 +2740,14 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
 
+        let tool_specs_override = if self.tools_disabled {
+            Some(Vec::new())
+        } else if !self.tool_specs.is_empty() {
+            Some(self.tool_specs.clone())
+        } else {
+            None
+        };
+
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
@@ -2747,23 +2783,25 @@ impl Agent {
             // error exits — never derived from history indices, which the
             // loop's own preflight pruning can invalidate.
             let mut round_added: Vec<ChatMessage> = Vec::new();
-            let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            let loop_result = zeroclaw_api::TOOL_SPECS_OVERRIDE
                 .scope(
-                    Some(cost_context.clone()),
-                    crate::agent::tool_receipts::scope_receipts(
-                        receipt_scope.clone(),
-                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                                crate::agent::loop_::ResolvedModelAccess {
-                                    model_provider: self.model_provider.as_ref(),
-                                    provider_name: &self.model_provider_name,
-                                    model: &effective_model,
-                                    temperature: self.temperature,
-                                },
-                                crate::agent::loop_::ResolvedIo {
-                                    tools_registry: &self.tools,
-                                    observer: self.observer.as_ref(),
-                                    silent: true,
+                    tool_specs_override.clone(),
+                    crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        Some(cost_context.clone()),
+                        crate::agent::tool_receipts::scope_receipts(
+                            receipt_scope.clone(),
+                            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                    crate::agent::loop_::ResolvedModelAccess {
+                                        model_provider: self.model_provider.as_ref(),
+                                        provider_name: &self.model_provider_name,
+                                        model: &effective_model,
+                                        temperature: self.temperature,
+                                    },
+                                    crate::agent::loop_::ResolvedIo {
+                                        tools_registry: &self.tools,
+                                        observer: self.observer.as_ref(),
+                                        silent: true,
                                     approval: self.approval_manager.as_deref(),
                                     multimodal_config: &self.multimodal_config,
                                     hooks: self.hook_runner.as_deref(),
@@ -2815,8 +2853,9 @@ impl Agent {
                             turn_id: &turn_id,
                         }),
                     ),
-                )
-                .await;
+                ),
+            )
+            .await;
 
             // Feed cumulative usage into the AgentEnd guard before any return
             // below drops it — the error paths must still report usage from

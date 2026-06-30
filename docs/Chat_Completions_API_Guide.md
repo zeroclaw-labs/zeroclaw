@@ -1,150 +1,152 @@
-# ZeroClaw Chat Completions API 使用指南
-> **文档版本**: v3.0
-> **创建日期**: 2026-05-15
-> **更新日期**: 2026-06-26
-> **项目**: ZeroClaw v0.8.0-beta
-> **接口**: `POST /v1/chat/completions`
-> **兼容性**: OpenAI Chat Completions API 兼容
+# ZeroClaw Chat Completions API Guide
+
+> **Document Version**: v1.0
+> **Created**: 2026-05-15
+> **Updated**: 2026-06-30
+> **Project**: ZeroClaw v0.8.0
+> **Endpoint**: `POST /v1/chat/completions`
+> **Compatibility**: OpenAI Chat Completions API compatible
 
 ---
 
-## 零、参数快速速查表
+## 0. Parameter Quick Reference
 
-### 请求参数汇总
+### Request Parameters
 
-#### HTTP Header 参数
+#### HTTP Header Parameters
 
-| 参数名 | 类型 | 必填 | 默认值 | 说明 |
-|--------|------|------|--------|------|
-| `Authorization` | string | ❌ | - | Bearer Token 认证（`Bearer <token>`），由配置开关 `require_pairing` 决定 |
-| `x-session-key` | string | ❌ | - | 会话 ID。建议客户端生成并携带以保持多轮对话上下文 |
-| `x-zeroclaw-model` | string | ❌ | - | 后端 wire model 覆盖（不切换 provider） |
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `Authorization` | string | ❌ | - | Bearer Token auth (`Bearer <token>`), required when `require_pairing=true` |
+| `x-session-key` | string | ❌ | - | Session ID. Recommended for multi-turn context continuity |
+| `x-zeroclaw-model` | string | ❌ | - | Backend wire model override (does not switch provider) |
 
-#### 请求体参数（JSON Body）
+#### Request Body Parameters (JSON)
 
-| 参数名 | 类型 | 必填 | 默认值 | 范围/枚举 | 说明 |
-|--------|------|------|--------|-----------|------|
-| **`model`** | string | ❌ | 默认 agent | `zeroclaw/<alias>` 或普通 label | **Agent 路由目标**（非 provider 模型名）。`"zeroclaw"` / `""` / 普通 label → 默认 agent |
-| **`messages`** | array | ✅ | - | 至少 1 条 | 对话消息列表。支持多轮对话（历史消息会被分流为 conversation history） |
-| `stream` | boolean | ❌ | `false` | `true`/`false` | 是否流式响应（SSE） |
-| `temperature` | float | ❌ | `0.7` | `0.0`~`2.0` | 采样温度 |
-| `max_tokens` | integer | ❌ | - | 正整数 | 最大生成 token 数 |
-| `top_p` | float | ❌ | - | `0.0`~`1.0` | Nucleus 采样 |
-| `stop` | string/array | ❌ | - | 字符串列表 | 停止序列 |
-| `presence_penalty` | float | ❌ | - | `-2.0`~`2.0` | 存在惩罚 |
-| `frequency_penalty` | float | ❌ | - | `-2.0`~`2.0` | 频率惩罚 |
-| `tools` | array | ❌ | - | 工具对象列表 | 本次对话可用的工具定义 |
-| `tool_choice` | string/object | ❌ | `auto` | `"auto"`/`"none"`/`"required"`/`{"type":"function",...}` | 工具选择策略 |
-| `stream_options` | object | ❌ | - | `{"include_usage": true}` | 流式选项（控制 usage 报告） |
+| Parameter | Type | Required | Default | Range/Enum | Description |
+|-----------|------|----------|---------|------------|-------------|
+| **`model`** | string | ❌ | default agent | `zeroclaw/<alias>` or plain label | **Agent routing target** (not provider model name). `"zeroclaw"` / `""` / plain label → default agent |
+| **`messages`** | array | ✅ | - | ≥ 1 message | Message list. Multi-turn supported (history messages are split into conversation context) |
+| `stream` | boolean | ❌ | `false` | `true`/`false` | SSE streaming response |
+| `temperature` | float | ❌ | `0.7` | `0.0`~`2.0` | Sampling temperature |
+| ~~`max_tokens`~~ | - | ❌ | - | - | ⛔ **Not supported** — returns 400 if provided. Configure in provider settings instead |
+| ~~`top_p`~~ | - | ❌ | - | - | ⛔ **Not supported** — returns 400 if provided |
+| ~~`stop`~~ | - | ❌ | - | - | ⛔ **Not supported** — returns 400 if provided |
+| ~~`presence_penalty`~~ | - | ❌ | - | - | ⛔ **Not supported** — returns 400 if provided |
+| ~~`frequency_penalty`~~ | - | ❌ | - | - | ⛔ **Not supported** — returns 400 if provided |
+| `tools` | array | ❌ | - | Tool object list | Available tool definitions for this request (filtered against agent's configured tools) |
+| `tool_choice` | string/object | ❌ | `auto` | `"auto"`/`"none"`/`"required"`/`{"type":"function",...}` | Tool selection strategy. `"none"` disables all tools; `"required"` prompts tool use; specific function restricts to one tool |
+| `stream_options` | object | ❌ | - | `{"include_usage": true}` | Stream options (controls usage reporting) |
 
-**消息对象结构**（`messages[]`）：
+**Message object structure** (`messages[]`):
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
 | `role` | string | ✅ | `system` / `developer` / `user` / `assistant` / `tool` / `function` |
-| `content` | string | ✅ | 消息内容（仅支持 string 类型） |
-| `name` | string | ❌ | 可选名称 |
-| `tool_calls` | array | ❌ | assistant 角色的工具调用 |
-| `tool_call_id` | string | ❌ | tool 角色的工具调用 ID |
+| `content` | string | ✅ | Message content (string only) |
+| `name` | string | ❌ | Optional name |
+| `tool_calls` | array | ❌ | Tool calls for assistant role |
+| `tool_call_id` | string | ❌ | Tool call ID for tool role |
 
 ---
 
-### 响应参数汇总
+### Response Parameters
 
-#### 非流式响应（JSON）
+#### Non-streaming Response (JSON)
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| **`id`** | string | 完成请求的唯一标识符（如：`chatcmpl-<uuid>`） |
-| **`object`** | string | 对象类型，始终为 `"chat.completion"` |
-| **`created`** | integer | Unix 时间戳（秒） |
-| **`model`** | string | 回显请求中的 model 值（空字符串归一为 `"zeroclaw"`） |
-| **`choices`** | array | 生成的候选答案列表 |
-| **`usage`** | object | token 使用统计（通过 cost tracking 获取，未配置时可能全为 0） |
+| Field | Type | Description |
+|-------|------|-------------|
+| **`id`** | string | Unique completion identifier (e.g. `chatcmpl-<uuid>`) |
+| **`object`** | string | Object type, always `"chat.completion"` |
+| **`created`** | integer | Unix timestamp (seconds) |
+| **`model`** | string | Echo of request model (empty string normalized to `"zeroclaw"`) |
+| **`choices`** | array | Generated candidate answers |
+| **`usage`** | object | Token usage stats (via cost tracking; may be all zeros if unconfigured) |
 
-**`choices[]` 对象结构**：
+**`choices[]` object structure**:
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `index` | integer | 选择索引（通常为 0） |
-| `message` | object | 助手消息 |
-| `finish_reason` | string | 停止原因（始终为 `"stop"`，即使内部调用了工具） |
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | integer | Choice index (typically 0) |
+| `message` | object | Assistant message |
+| `finish_reason` | string | Stop reason (`"stop"` for text-only, `"tool_calls"` when tool calls present) |
 
-**`message` 对象结构**：
+**`message` object structure**:
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `role` | string | 始终为 `"assistant"` |
-| `content` | string | 助手回答内容 |
-| `tool_calls` | array\|null | 非流式模式下，从 agent history 中提取的工具调用；无工具调用时为 `null` |
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | Always `"assistant"` |
+| `content` | string\|null | Assistant response text (null when tool_calls present) |
+| `tool_calls` | array\|null | Tool calls extracted from agent history; null when no tool calls |
 
-**`usage` 对象结构**：
+**`usage` object structure**:
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `prompt_tokens` | integer | 输入 token 数（通过 cost tracking 采集，未配置时为 0） |
-| `completion_tokens` | integer | 输出 token 数（通过 cost tracking 采集，未配置时为 0） |
-| `total_tokens` | integer | 总消耗 token 数 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt_tokens` | integer | Input token count (via cost tracking; 0 if unconfigured) |
+| `completion_tokens` | integer | Output token count (via cost tracking; 0 if unconfigured) |
+| `total_tokens` | integer | Total tokens consumed |
 
 ---
 
-#### 流式响应（SSE）
+#### Streaming Response (SSE)
 
-**SSE 事件流格式**：
+**SSE event stream format**:
 
 ```
 data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"model":"zeroclaw","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
-data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"model":"zeroclaw","choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
+data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"model":"zeroclaw","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
 data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"model":"zeroclaw","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"model":"zeroclaw","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
 data: [DONE]
 ```
 
-**流式响应字段说明**：
+**Streaming response field descriptions**:
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | string | 完成请求 ID（与非流式相同） |
-| `object` | string | 始终为 `"chat.completion.chunk"` |
-| `created` | integer | Unix 时间戳 |
-| `model` | string | 回显请求中的 model 值（空字符串归一为 `"zeroclaw"`） |
-| `choices[]` | array | 流式分块 |
-| `choices[].delta` | object | 增量内容（`role` / `content` / `tool_calls`） |
-| `choices[].finish_reason` | string | 停止原因（始终为 `"stop"`） |
-| `usage` | object | token 统计（仅当 `stream_options.include_usage: true` 时返回） |
-
----
-
-### 响应 Header 汇总
-
-| Header 名 | 说明 | 出现条件 |
-|-----------|------|---------|
-| `Content-Type` | `application/json` 或 `text/event-stream` | 始终 |
-| `X-Request-ID` | 请求唯一标识符（UUID） | 始终 |
-| `x-session-key` | 会话 ID（不带 `gw_` 前缀） | **始终返回**（无论客户端是否提供） |
-| `X-RateLimit-Limit` | 每分钟最大请求数 | 始终 |
-| `X-RateLimit-Remaining` | 剩余可用请求数 | 始终 |
-| `X-RateLimit-Reset` | 速率限制重置时间戳 | 始终 |
-| `Retry-After` | 429 错误时重试等待秒数 | 仅 429 响应 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Completion ID (same as non-streaming) |
+| `object` | string | Always `"chat.completion.chunk"` |
+| `created` | integer | Unix timestamp |
+| `model` | string | Echo of request model (empty string normalized to `"zeroclaw"`) |
+| `choices[]` | array | Streaming chunks |
+| `choices[].delta` | object | Incremental content (`role` / `content` / `tool_calls`) |
+| `choices[].finish_reason` | string | Stop reason (`"stop"`) |
+| `usage` | object | Token stats (only when `stream_options.include_usage: true`) |
 
 ---
 
-### 错误响应汇总
+### Response Headers
 
-| HTTP 状态码 | error.type | 说明 | 常见原因 |
-|------------|------------|------|----------|
-| **400** | `invalid_request_error` | 无效请求 | messages 为空、JSON 格式错误、未知 agent、格式错误的 agent target |
-| **401** | `authentication_error` | 认证失败 | token 缺失或无效（仅 `require_pairing=true` 时） |
-| **429** | `rate_limit_error` | 速率限制 | 请求超过 `chat_rate_limit_per_minute` 配置值 |
-| **500** | `internal_error` | 服务器内部错误 | Provider API 异常 |
-| **503** | `server_error` | Agent 未配置 | agent 缺少模型配置（需完成 onboarding） |
+| Header | Description | Condition |
+|--------|-------------|-----------|
+| `Content-Type` | `application/json` or `text/event-stream` | Always |
+| `X-Request-ID` | Unique request identifier (UUID) | Always |
+| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** (even if client doesn't provide one) |
+| `X-RateLimit-Limit` | Max requests per minute | Always |
+| `X-RateLimit-Remaining` | Remaining request allowance | Always |
+| `X-RateLimit-Reset` | Rate limit reset timestamp | Always |
+| `Retry-After` | Retry wait seconds on 429 | Only on 429 responses |
 
-**错误响应格式**：
+---
+
+### Error Responses
+
+| HTTP Status | error.type | Description | Common Cause |
+|-------------|------------|-------------|--------------|
+| **400** | `invalid_request_error` | Invalid request | Empty messages, JSON parse error, unknown agent, malformed agent target |
+| **400** | `unsupported_parameter` | Unsupported parameter | `max_tokens`, `top_p`, `stop`, `presence_penalty`, or `frequency_penalty` provided |
+| **401** | `authentication_error` | Auth failure | Missing or invalid token (only when `require_pairing=true`) |
+| **429** | `rate_limit_error` | Rate limited | Exceeded `chat_rate_limit_per_minute` config |
+| **500** | `internal_error` | Internal server error | Provider API exception |
+| **503** | `server_error` | Agent not configured | Agent missing model config (complete onboarding) |
+
+**Error response format**:
 ```json
 {
   "error": {
-    "message": "错误描述信息",
-    "type": "错误类型",
+    "message": "Error description",
+    "type": "error_type",
     "code": null,
     "param": null,
     "status": 400
@@ -154,46 +156,46 @@ data: [DONE]
 
 ---
 
-## 一、快速开始
+## 1. Quick Start
 
-### 1.1 基础调用示例
+### 1.1 Basic Request
 
 ```bash
-# 最简单的非流式调用（不指定 model，使用默认 agent）
+# Simplest non-streaming call (no model = default agent)
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
     "messages": [
-      {"role": "user", "content": "你好！"}
+      {"role": "user", "content": "Hello!"}
     ]
   }'
 
-# 指定 agent（zeroclaw/<alias> 格式）
+# Specify agent (zeroclaw/<alias> format)
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw/coding",
     "messages": [
-      {"role": "user", "content": "写一个快速排序"}
+      {"role": "user", "content": "Write a quicksort"}
     ]
   }'
 
-# 使用任意 model 名称（兼容标准客户端，自动路由到默认 agent）
+# Any model name works (compatible with standard clients, routes to default agent)
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4",
     "messages": [
-      {"role": "user", "content": "你好！"}
+      {"role": "user", "content": "Hello!"}
     ]
   }'
 ```
 
-### 1.2 流式调用示例
+### 1.2 Streaming Request
 
 ```bash
-# 流式调用（实时输出，建议携带 x-session-key）
+# Streaming call (real-time output, recommended with x-session-key)
 curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'x-session-key: my-session-123' \
@@ -201,78 +203,69 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
     "model": "zeroclaw/default",
     "stream": true,
     "messages": [
-      {"role": "user", "content": "你好！"}
+      {"role": "user", "content": "Hello!"}
     ]
   }'
 ```
 
 ---
 
-## 二、接口端点
+## 2. Endpoint
 
-| 属性 | 值 |
-|------|-----|
+| Attribute | Value |
+|-----------|-------|
 | **URL** | `POST /v1/chat/completions` |
 | **Content-Type** | `application/json` |
-| **Accept** | `text/event-stream`（流式）或 `application/json`（非流式） |
-| **认证** | Bearer Token（由 `require_pairing` 配置决定） |
-| **超时** | 长运行超时（600s，与 cron 任务共享子路由） |
+| **Accept** | `text/event-stream` (streaming) or `application/json` (non-streaming) |
+| **Auth** | Bearer Token (required when `require_pairing=true`) |
+| **Timeout** | Long-running timeout (600s, shared with cron sub-route) |
 
 ---
 
-## 三、请求参数详解
+## 3. Request Parameters
 
-### 3.1 HTTP Header 参数
+### 3.1 HTTP Header Parameters
 
-#### 3.1.1 Authorization（认证令牌）
+#### 3.1.1 Authorization
 
-**格式**：
+**Format**:
 ```
 Authorization: Bearer <your-token>
 ```
 
-**说明**：
-- **何时必需**：当 ZeroClaw 配置中 `require_pairing=true` 时必需
-- **何时可选**：当 `require_pairing=false` 时可选（调试模式）
-- **验证逻辑**：配置开启时验证 token 有效性，无效返回 401
-
-**示例**：
-```bash
-# 认证开启时必须带有效 token
-curl -H 'Authorization: Bearer valid-token-123' ...
-
-# 认证关闭时可以不带 token
-curl ...
-```
+**Details**:
+- **Required when**: `require_pairing=true` in ZeroClaw config
+- **Optional when**: `require_pairing=false` (debug mode)
+- **Validation**: If enabled, invalid/missing token returns 401
 
 ---
 
-#### 3.1.2 x-session-key（会话控制键）
+#### 3.1.2 x-session-key
 
-**格式**：
+**Format**:
 ```
 x-session-key: <session-id>
 ```
 
-**说明**：
-- **作用**：保持多轮对话的上下文连贯性
-- **生成方式**：
-  - **客户端提供**：使用客户端提供的 session_id
-  - **客户端未提供**：服务端生成 UUID，并在响应 Header `x-session-key` 中返回
-- **持久化**：会话历史会存储到 session backend（自动添加 `gw_` 前缀）
-- **单轮 vs 多轮行为**：
-  - 当 `messages` 只有 1 条时：自动加载 backend session 历史（如果有 `x-session-key`）
-  - 当 `messages` 多于 1 条时：请求 messages 作为权威上下文，**不加载** backend 历史（避免重复）
+**Details**:
+- **Purpose**: Maintain multi-turn conversation context
+- **Generation**:
+  - **Client-provided**: Uses the client-supplied session_id
+  - **Client omitted**: Server generates a UUID, returned in `x-session-key` response header
+- **Persistence**: Session history stored in session backend (auto-prefixed with `gw_`)
+- **Single vs multi-turn behavior**:
+  - `messages` has only 1 entry: auto-loads backend session history (if `x-session-key` present)
+  - `messages` has > 1 entry: request messages are authoritative context, **does not** load backend history
 
-**重要说明**：
+**Important notes**:
 ```
-📌 x-session-key 在 HTTP Response Header 中始终返回（流式和非流式行为一致）
-📌 返回的 session_key 不带 "gw_" 前缀（如："550e8400-e29b-41d4-a716-446655440000"）
-📌 服务端内部存储时会自动添加 "gw_" 前缀
-📌 建议：客户端在首次请求时主动生成并携带 x-session-key，后续请求复用该值
+📌 x-session-key is always returned in the HTTP Response Header (both streaming and non-streaming)
+📌 Returned session_key does NOT include the "gw_" prefix
+📌 Server storage auto-adds the "gw_" prefix internally
+📌 Recommendation: Generate and send x-session-key on first request, then reuse it
 ```
 
-**客户端生成示例**：
+**Client generation example**:
 ```javascript
 // JavaScript/Node.js
 const sessionId = crypto.randomUUID();
@@ -285,259 +278,153 @@ session_id = str(uuid.uuid4())
 session_id=$(cat /proc/sys/kernel/random/uuid)
 ```
 
-**多轮对话示例**：
-```bash
-SESSION_ID="550e8400-e29b-41d4-a716-446655440000"
-
-# 第 1 轮对话
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "x-session-key: $SESSION_ID" \
-  -d '{"model": "", "messages": [{"role": "user", "content": "我叫小明"}]}'
-
-# 第 2 轮对话 - 复用同一 session_id（单条 message 自动加载 backend 历史）
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "x-session-key: $SESSION_ID" \
-  -d '{"model": "", "messages": [{"role": "user", "content": "我叫什么名字？"}]}'
-# 助手会记得你叫小明
-```
-
 ---
 
-#### 3.1.3 x-zeroclaw-model（后端模型覆盖）
+#### 3.1.3 x-zeroclaw-model
 
-**格式**：
+**Format**:
 ```
 x-zeroclaw-model: <model-name>
 ```
 
-**说明**：
-- **作用**：覆盖当前 agent provider 下的实际调用模型名，**不切换 provider**
-- **何时使用**：需要临时使用同一 provider 下的其他模型时
-- **可选性**：完全可选，仅在 header 存在且非空时生效
-
-**示例**：
-```bash
-# 使用 agent 默认 provider 但替换为其他模型
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'x-zeroclaw-model: qwen-plus' \
-  -d '{
-    "model": "zeroclaw/default",
-    "messages": [{"role": "user", "content": "hi"}]
-  }'
-```
+**Details**:
+- **Purpose**: Override the actual model name called by the current agent's provider, **without switching providers**
+- **When to use**: Temporarily use a different model under the same provider
+- **Optionality**: Fully optional; only takes effect when header exists and is non-empty
 
 ---
 
-### 3.2 请求体参数（JSON）
+### 3.2 Request Body Parameters (JSON)
 
-#### 3.2.1 model（Agent 路由目标）
+#### 3.2.1 model (Agent Routing Target)
 
-**类型**：`string`
-**必填**：❌ 否（缺失走默认 agent）
+**Type**: `string`
+**Required**: ❌ No (defaults to default agent)
 
-**核心语义**：`model` 字段是 **agent 路由目标**，不是 provider 模型名称。与 OpenClaw 的 `openclaw/<agentId>` 语义一致，ZeroClaw 使用 `zeroclaw/<alias>` 选择目标 agent。
+**Core semantics**: The `model` field is an **agent routing target**, not a provider model name. Similar to OpenClaw's `openclaw/<agentId>`, ZeroClaw uses `zeroclaw/<alias>` to select the target agent.
 
-**解析规则**：
+**Parsing rules**:
 
-| `model` 值 | 路由结果 | 说明 |
-|------------|---------|------|
-| 缺失 / `""` | 默认 agent | `#[serde(default)]` 转为空字符串；响应 model 归一为 `"zeroclaw"` |
-| `"zeroclaw"` | 默认 agent | 显式默认 |
-| `"zeroclaw/default"` | 默认 agent | 显式默认 |
-| `"zeroclaw/<alias>"` | `<alias>` | 路由到指定 agent |
-| `"zeroclaw:<alias>"` | `<alias>` | 兼容别名格式 |
-| `"agent:<alias>"` | `<alias>` | 兼容别名格式 |
-| `"zeroclaw/"` / `"zeroclaw:"` / `"agent:"` | 400 错误 | 空 alias，格式错误 |
-| 普通 label（如 `"gpt-4"`） | 默认 agent | **标准客户端兼容兜底**，不报错 |
+| `model` value | Routing result | Notes |
+|---------------|---------------|-------|
+| Missing / `""` | Default agent | `#[serde(default)]` converts to empty string; response normalizes to `"zeroclaw"` |
+| `"zeroclaw"` | Default agent | Explicit default |
+| `"zeroclaw/default"` | Default agent | Explicit default |
+| `"zeroclaw/<alias>"` | `<alias>` | Routes to specified agent |
+| `"zeroclaw:<alias>"` | `<alias>` | Compatible alias format |
+| `"agent:<alias>"` | `<alias>` | Compatible alias format |
+| `"zeroclaw/"` / `"zeroclaw:"` / `"agent:"` | 400 error | Empty alias, malformed |
+| Plain label (e.g. `"gpt-4"`) | Default agent | **Standard client compatibility fallback** |
 
-**与 WebSocket 的一致性**：
-
-| 项目 | `/ws/chat` | `/v1/chat/completions` |
-|------|----------|----------------------|
-| 传参方式 | `?agent=<alias>` 查询参数 | `model` 字段（如 `"zeroclaw/<alias>"`） |
-| 必填 | 是 | 否（缺失/空值走默认 agent） |
-| 校验 | `cfg.agent(&alias).is_none()` → 400 | 相同逻辑 |
-
-**调用示例**：
-```bash
-# 使用默认 agent（空字符串、"zeroclaw" 或任意普通 label）
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-# 响应中 model 字段回显为 "zeroclaw"
-
-# 指定特定 agent（zeroclaw/<alias> 格式）
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -d '{"model": "zeroclaw/assistant", "messages": [...]}'
-
-# 标准客户端兼容：传入任意 model 名称自动路由到默认 agent
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -d '{"model": "gpt-4o", "messages": [...]}'
-# 不会报错，自动路由到默认 agent
-```
-
-**错误处理**：
-| 场景 | HTTP 状态码 | 错误信息 |
-|------|-----------|---------|
-| agent 不存在 | 400 | `Unknown agent 'xxx' — no [agents.xxx] entry configured.` |
-| agent target 格式错误 | 400 | `Invalid agent target 'zeroclaw/': missing agent alias` |
-| agent 未配置 model_provider | 503 | `Agent not configured — complete onboarding at /onboard` |
+**Error handling**:
+| Scenario | HTTP Status | Error Message |
+|----------|------------|---------------|
+| Agent doesn't exist | 400 | `Unknown agent 'xxx' — no [agents.xxx] entry configured.` |
+| Malformed agent target | 400 | `Invalid agent target 'zeroclaw/': missing agent alias` |
+| Agent missing model_provider | 503 | `Agent not configured — complete onboarding at /onboard` |
 
 ---
 
-#### 3.2.2 messages（对话消息列表）🔑 必填
+#### 3.2.2 messages (Message List) 🔑 Required
 
-**类型**：`array[object]`
-**必填**：✅ 是
-**约束**：数组不能为空
+**Type**: `array[object]`
+**Required**: ✅ Yes
+**Constraint**: Array must not be empty
 
-**消息对象结构**：
-```json
-{
-  "role": "user",
-  "content": "消息内容",
-  "name": "可选名称",
-  "tool_calls": "assistant 角色的工具调用",
-  "tool_call_id": "tool 角色的工具调用 ID"
-}
-```
+**Supported role types**:
+| role | Description | Example |
+|------|-------------|---------|
+| `system` | System instruction (extracted as current-turn prefix, not persisted) | `"You are a helpful assistant"` |
+| `developer` | Developer instruction (same as system) | `"You are a code assistant"` |
+| `user` | User message | `"Hello!"` |
+| `assistant` | Assistant response | `"Hi, how can I help?"` |
+| `tool` | Tool call result | `{"role": "tool", "tool_call_id": "call_123", "content": "Sunny"}` |
+| `function` | Function call result (auto-normalized to `tool`) | `{"role": "function", "content": "..."}` |
 
-**支持的 role 类型**：
-| role | 说明 | 示例 |
-|------|------|------|
-| `system` | 系统指令（提取为当前轮前缀，不持久化） | `"你是一个有帮助的助手"` |
-| `developer` | 开发者指令（同 system） | `"你是一个代码助手"` |
-| `user` | 用户消息 | `"你好！"` |
-| `assistant` | 助手响应 | `"你好，有什么可以帮你？"` |
-| `tool` | 工具调用结果 | `{"role": "tool", "tool_call_id": "call_123", "content": "天气晴朗"}` |
-| `function` | 函数调用结果（自动归一化为 `tool`） | `{"role": "function", "content": "..."}` |
+**Multi-turn message processing**:
 
-**多轮 messages 处理逻辑**：
+1. Find the last `user`/`tool`/`function` message as the **active turn**
+2. Remaining non-`system`/`developer` messages become **request history** (injected via `agent.seed_history()`)
+3. `system`/`developer` messages extracted as **current-turn prefix** (prepended to user message, not persisted)
+4. `function` role auto-normalized to `tool`
 
-请求体 `messages` 按 role 自动分流：
+**Authoritative context rules**:
 
-1. 从后向前找到最后一条 `user`/`tool`/`function` 消息作为**当前活跃轮**
-2. 其余非 `system`/`developer` 消息作为**请求体历史**（通过 `agent.seed_history()` 注入）
-3. `system`/`developer` 消息提取为**当前轮前缀**（拼接到当前轮 user 消息前，但不持久化到 session backend）
-4. `function` role 自动归一化为 `tool`
-
-**权威上下文规则**：
-
-| `messages` 长度 | 是否加载 backend 历史 | 是否使用请求消息历史 |
-|----------------|---------------------|------------------|
-| `len() > 1` | 否（请求 messages 为权威上下文） | 是 |
-| `len() == 1` | 是（如果有 `x-session-key`） | 否 |
-
-**完整示例**：
-```json
-{
-  "messages": [
-    {"role": "system", "content": "你是一个专业的天气助手。"},
-    {"role": "user", "content": "北京今天天气怎么样？"},
-    {"role": "assistant", "content": "让我查询一下北京的天气..."},
-    {"role": "tool", "tool_call_id": "call_abc123", "content": "北京今天晴朗，气温 25°C"},
-    {"role": "user", "content": "那适合穿什么衣服呢？"}
-  ]
-}
-```
-
-上述请求的处理：
-- `system` 消息 → 提取为当前轮前缀（不持久化）
-- 第 1 条 `user` + `assistant` + `tool` → 作为历史注入 agent
-- 最后 1 条 `user` → 当前活跃轮，拼接 system 前缀后发送
+| `messages` length | Load backend history? | Use request message history? |
+|-------------------|----------------------|------------------------------|
+| `len() > 1` | No (request messages are authoritative) | Yes |
+| `len() == 1` | Yes (if `x-session-key` present) | No |
 
 ---
 
-#### 3.2.3 stream（流式响应开关）
+#### 3.2.3 stream (Streaming Toggle)
 
-**类型**：`boolean`
-**默认值**：`false`
-**必填**：❌ 否
+**Type**: `boolean`
+**Default**: `false`
+**Required**: ❌ No
 
-**说明**：
-- `true` → 使用 SSE（Server-Sent Events）流式响应
-- `false` → 使用 JSON 非流式响应（一次性返回完整结果）
-
----
-
-#### 3.2.4 temperature（采样温度）
-
-**类型**：`float`
-**默认值**：`0.7`
-**必填**：❌ 否
-
-**说明**：
-- 控制输出的随机性，值越高输出越随机
-- 范围：`0.0`（确定性输出）~ `2.0`（高度随机）
+- `true` → SSE (Server-Sent Events) streaming response
+- `false` → JSON non-streaming response (complete result at once)
 
 ---
 
-#### 3.2.5 max_tokens（最大 token 数）
+#### 3.2.4 temperature (Sampling Temperature)
 
-**类型**：`integer`
-**必填**：❌ 否
+**Type**: `float`
+**Default**: `0.7`
+**Required**: ❌ No
 
-**说明**：
-- 限制生成的最大 token 数量
-- 不设置时使用模型默认值
-
----
-
-#### 3.2.6 stream_options（流式选项）
-
-**类型**：`object`
-**必填**：❌ 否
-
-**说明**：
-- `include_usage: true` → 在 SSE 流结束时返回 `usage` 块（包含 token 统计）
-- 不设置时不返回 usage 信息
-
-**示例**：
-```json
-{
-  "stream": true,
-  "stream_options": {"include_usage": true}
-}
-```
+- Controls output randomness; higher values = more random
+- Range: `0.0` (deterministic) ~ `2.0` (highly random)
 
 ---
 
-#### 3.2.7 其他参数
+#### 3.2.5 Unsupported Parameters
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `top_p` | float | Nucleus 采样参数 |
-| `stop` | string/array | 停止序列（如 `["。", "！"]`） |
-| `presence_penalty` | float | 存在惩罚（`-2.0`~`2.0`） |
-| `frequency_penalty` | float | 频率惩罚（`-2.0`~`2.0`） |
-| `tools` | array | 工具定义列表（见 3.2.8） |
-| `tool_choice` | string/object | 工具选择策略（见 3.2.9） |
+The following parameters are **not supported** per-request and will return a **400 error** if provided:
 
-> **注意**：`stop`、`presence_penalty`、`frequency_penalty` 等参数会被接收，但其效果取决于底层 LLM provider 是否支持。
+| Parameter | Type | Error Message |
+|-----------|------|---------------|
+| `max_tokens` | integer | `max_tokens is not supported per-request; configure it in provider settings` |
+| `top_p` | float | `top_p is not supported per-request` |
+| `stop` | string/array | `stop is not supported per-request` |
+| `presence_penalty` | float | `presence_penalty is not supported per-request` |
+| `frequency_penalty` | float | `frequency_penalty is not supported per-request` |
+
+**Why are these rejected?** These parameters are parsed from the request but the ZeroClaw runtime does not forward them to the underlying LLM provider. Rather than silently ignoring them (which could mislead callers into thinking they take effect), the endpoint returns an explicit 400 error with `error.type: "unsupported_parameter"`.
+
+**Alternative**: To configure `max_tokens` for your agent, set it in the ZeroClaw provider configuration (e.g. `[providers.<type>.<alias>]` section).
 
 ---
 
-#### 3.2.8 tools（动态工具定义）
+#### 3.2.6 stream_options (Streaming Options)
 
-**类型**：`array[object]`
-**必填**：❌ 否
+**Type**: `object`
+**Required**: ❌ No
 
-**说明**：
-- **作用**：动态指定本次对话可用的工具子集（从 agent 已配置工具中过滤）
-- **透明执行**：ZeroClaw 采用工具自动执行模式，工具调用对客户端透明
-- **过滤逻辑**：仅请求中与 agent 已配置工具名称匹配的工具生效
+- `include_usage: true` → Returns a `usage` chunk at the end of the SSE stream (with token statistics)
+- Not set → No usage information in stream
 
-**工具对象结构**：
+---
+
+#### 3.2.7 tools (Dynamic Tool Definitions)
+
+**Type**: `array[object]`
+**Required**: ❌ No
+
+**Details**:
+- **Purpose**: Dynamically specify the subset of tools available for this request (filtered from the agent's configured tools)
+- **Transparent execution**: ZeroClaw uses automatic tool execution mode — tool calls are transparent to the client
+- **Filtering logic**: Only tools whose names match the agent's currently configured tools take effect. Tools not in the agent's configuration are silently ignored
+- **Security**: Tools excluded by the agent's risk profile are automatically blocked, even if requested
+
+**Tool object structure**:
 ```json
 {
   "type": "function",
   "function": {
-    "name": "工具名称",
-    "description": "工具描述",
+    "name": "tool_name",
+    "description": "Tool description",
     "parameters": {
       "type": "object",
       "properties": { ... },
@@ -549,28 +436,33 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ---
 
-#### 3.2.9 tool_choice（工具选择策略）
+#### 3.2.8 tool_choice (Tool Selection Strategy)
 
-**类型**：`string` 或 `object`
-**默认值**：`auto`
-**必填**：❌ 否
+**Type**: `string` or `object`
+**Default**: `auto`
+**Required**: ❌ No
 
-**支持的枚举值**：
+**Supported values**:
 
-| 值 | 说明 | ZeroClaw 行为 |
-|------|------|------|
-| `"auto"` | 模型自主决定是否调用工具 | 默认行为，模型根据问题判断 |
-| `"none"` | 禁用所有工具 | 纯文本对话 |
-| `"required"` | 应该调用工具 | 提示模型应调用至少一个工具（依赖模型遵守） |
-| `{"type":"function","function":{"name":"..."}}` | 指定特定工具 | 限制可用工具为该函数（需同时提供 `tools`） |
+| Value | Description | ZeroClaw Behavior |
+|-------|-------------|-------------------|
+| `"auto"` | Model decides whether to call tools | Default behavior — model judges based on the query |
+| `"none"` | Disable all tools | LLM receives no tool definitions and no tool protocol in system prompt. Pure text conversation |
+| `"required"` | Should call a tool | Prompts the model to call at least one tool (depends on model compliance). If `tools` provided, only those tools are available |
+| `{"type":"function","function":{"name":"..."}}` | Specify a single tool | Restricts available tools to only the named function (must also provide `tools`). The function name must be in the agent's configured tools; otherwise it is silently ignored |
+
+**Key behavior notes**:
+- `tool_choice: "none"` takes effect at multiple levels: the system prompt excludes tool protocol, the LLM request omits tool definitions, and any tool calls in the model response are discarded
+- When `tools` is provided with `"auto"` or `"required"`, only tools matching the agent's configured tool names are activated
+- When `tool_choice` specifies a specific function, the function must exist in the agent's configured tools (security policy enforced)
 
 ---
 
-## 四、响应格式
+## 4. Response Format
 
-### 4.1 非流式响应（JSON）
+### 4.1 Non-streaming Response (JSON)
 
-**响应结构**：
+**Response structure**:
 ```json
 {
   "id": "chatcmpl-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -582,7 +474,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "你好！有什么可以帮你？"
+        "content": "Hello! How can I help?"
       },
       "finish_reason": "stop"
     }
@@ -595,70 +487,36 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 }
 ```
 
-**字段说明**：
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | `string` | 请求唯一标识符（`chatcmpl-<uuid>`） |
-| `object` | `string` | 始终为 `"chat.completion"` |
-| `created` | `integer` | Unix 时间戳（秒） |
-| `model` | `string` | 回显请求 model（空字符串归一为 `"zeroclaw"`） |
-| `choices` | `array` | 候选答案列表 |
-| `usage` | `object` | token 统计（通过 cost tracking 采集，未配置时可能全为 0） |
+**finish_reason details**:
+- `"stop"` — Normal text completion (no tool calls)
+- `"tool_calls"` — Response includes tool calls (extracted from agent history)
 
-**finish_reason 说明**：
-- **ZeroClaw 行为**：始终返回 `"stop"`（即使内部调用了工具）
-- **原因**：ZeroClaw 采用透明执行模式，自动执行所有工具调用直到得到最终文本响应
-- **tool_calls**：非流式模式下从 agent history 提取工具调用信息；无工具调用时为 `null`
+**tool_calls in non-streaming mode**: When the agent internally executes tool calls, they are extracted from agent history and included in the `message.tool_calls` field. When no tool calls occurred, `tool_calls` is `null`.
 
 ---
 
-### 4.2 流式响应（SSE）
+### 4.2 Streaming Response (SSE)
 
-**响应格式**：
-```
-HTTP/1.1 200 OK
-Content-Type: text/event-stream
-Cache-Control: no-cache
-Connection: keep-alive
-X-Request-ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-x-session-key: 550e8400-e29b-41d4-a716-446655440000
-X-RateLimit-Limit: 10
-X-RateLimit-Remaining: 9
-X-RateLimit-Reset: 1749560060
-
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1749560000,"model":"zeroclaw","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1749560000,"model":"zeroclaw","choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1749560000,"model":"zeroclaw","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1749560000,"model":"zeroclaw","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1749560000,"model":"zeroclaw","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
-
-data: [DONE]
-```
-
-**SSE 事件类型**：
-1. **首帧**：`delta.role: "assistant"` + `delta.content: ""`
-2. **内容块**：`delta.content` 包含增量文本
-3. **Thinking 块**（如触发）：`delta.content` 包含思考过程
-4. **工具调用块**（如触发）：`delta.tool_calls` 包含工具调用信息
-5. **结束帧**：`delta: {}` + `finish_reason: "stop"`
-6. **Usage 块**（可选）：包含 `usage` 统计（需 `stream_options.include_usage: true`）
-7. **结束标记**：`data: [DONE]`
+**SSE event types**:
+1. **First frame**: `delta.role: "assistant"` + `delta.content: ""`
+2. **Content chunks**: `delta.content` contains incremental text
+3. **Thinking chunks** (if triggered): `delta.content` contains thinking process
+4. **Tool call chunks** (if triggered): `delta.tool_calls` contains tool call info
+5. **Final frame**: `delta: {}` + `finish_reason: "stop"`
+6. **Usage chunk** (optional): Contains `usage` stats (requires `stream_options.include_usage: true`)
+7. **End marker**: `data: [DONE]`
 
 ---
 
-## 五、错误处理
+## 5. Error Handling
 
-### 5.1 错误响应格式
+### 5.1 Error Response Format
 
 ```json
 {
   "error": {
-    "message": "错误描述信息",
-    "type": "错误类型",
+    "message": "Error description",
+    "type": "error_type",
     "code": null,
     "param": null,
     "status": 400
@@ -666,27 +524,28 @@ data: [DONE]
 }
 ```
 
-### 5.2 常见错误类型
+### 5.2 Common Error Types
 
-| HTTP 状态码 | error.type | 说明 | 解决方案 |
-|------------|------------|------|----------|
-| **400** | `invalid_request_error` | 无效请求 | 检查请求参数格式 |
-| **400** | `invalid_request_error` | 未知 agent | 使用配置文件中存在的 agent 别名 |
-| **400** | `invalid_request_error` | agent target 格式错误 | 使用正确格式（如 `zeroclaw/<alias>`，不能为空 alias） |
-| **400** | `invalid_request_error` | messages 为空 | 提供至少一条消息 |
-| **401** | `authentication_error` | 认证失败 | 提供有效的 Bearer Token |
-| **429** | `rate_limit_error` | 速率限制 | 等待后重试（查看 `Retry-After` Header） |
-| **500** | `internal_error` | 服务器内部错误 | 联系管理员，提供 `X-Request-ID` |
-| **503** | `server_error` | Agent 未配置 | 完成 onboarding 或检查 agent 的 model_provider 配置 |
+| HTTP Status | error.type | Description | Solution |
+|-------------|------------|-------------|----------|
+| **400** | `invalid_request_error` | Invalid request | Check request parameter format |
+| **400** | `invalid_request_error` | Unknown agent | Use an agent alias that exists in config |
+| **400** | `invalid_request_error` | Malformed agent target | Use correct format (e.g. `zeroclaw/<alias>`, not empty alias) |
+| **400** | `invalid_request_error` | Empty messages | Provide at least one message |
+| **400** | `unsupported_parameter` | Unsupported per-request parameter | Remove `max_tokens`, `top_p`, `stop`, `presence_penalty`, or `frequency_penalty` from request |
+| **401** | `authentication_error` | Auth failure | Provide a valid Bearer Token |
+| **429** | `rate_limit_error` | Rate limited | Retry after wait (see `Retry-After` header) |
+| **500** | `internal_error` | Internal server error | Contact admin, provide `X-Request-ID` |
+| **503** | `server_error` | Agent not configured | Complete onboarding or check agent's model_provider config |
 
-### 5.3 错误示例
+### 5.3 Error Examples
 
-**400 错误 - messages 为空**：
+**400 — unsupported parameter**:
 ```json
 {
   "error": {
-    "message": "messages must not be empty",
-    "type": "invalid_request_error",
+    "message": "max_tokens is not supported per-request; configure it in provider settings",
+    "type": "unsupported_parameter",
     "code": null,
     "param": null,
     "status": 400
@@ -694,7 +553,7 @@ data: [DONE]
 }
 ```
 
-**400 错误 - 未知 agent**：
+**400 — unknown agent**:
 ```json
 {
   "error": {
@@ -707,20 +566,7 @@ data: [DONE]
 }
 ```
 
-**400 错误 - agent target 格式错误**：
-```json
-{
-  "error": {
-    "message": "Invalid agent target `zeroclaw/`: missing agent alias",
-    "type": "invalid_request_error",
-    "code": null,
-    "param": null,
-    "status": 400
-  }
-}
-```
-
-**401 错误 - 认证失败**：
+**401 — authentication failure**:
 ```json
 {
   "error": {
@@ -733,7 +579,7 @@ data: [DONE]
 }
 ```
 
-**503 错误 - Agent 未配置**：
+**503 — agent not configured**:
 ```json
 {
   "error": {
@@ -746,59 +592,25 @@ data: [DONE]
 }
 ```
 
-**429 响应 Header**：
-```
-HTTP/1.1 429 Too Many Requests
-Content-Type: application/json
-Retry-After: 60
-X-Request-ID: <uuid>
-X-RateLimit-Limit: 10
-X-RateLimit-Remaining: 0
-X-RateLimit-Reset: 1749560060
-```
+---
+
+## 6. Response Headers
+
+| Header | Description | Condition |
+|--------|-------------|-----------|
+| `Content-Type` | Response content type | Always (`application/json` or `text/event-stream`) |
+| `X-Request-ID` | Unique request identifier (UUID) | Always |
+| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** |
+| `X-RateLimit-Limit` | Max requests per minute (config: `chat_rate_limit_per_minute`) | Always |
+| `X-RateLimit-Remaining` | Remaining request allowance | Always |
+| `X-RateLimit-Reset` | Rate limit reset Unix timestamp | Always |
+| `Retry-After` | Retry wait seconds on 429 (fixed 60s window) | Only on 429 |
 
 ---
 
-## 六、响应 Header 说明
+## 7. Practical Scenarios
 
-### 6.1 标准 Header
-
-| Header | 说明 | 示例 |
-|--------|------|------|
-| `Content-Type` | 响应内容类型 | `application/json` 或 `text/event-stream` |
-| `X-Request-ID` | 请求唯一标识符（UUID 格式） | `a1b2c3d4-e5f6-7890-abcd-ef1234567890` |
-
-### 6.2 会话控制 Header
-
-| Header | 说明 | 出现条件 |
-|--------|------|----------|
-| `x-session-key` | 会话 ID（不带 `gw_` 前缀） | **始终返回** |
-
-**示例**：
-```bash
-# 非流式首次请求（未提供 x-session-key）
-curl -sS -D - -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "", "messages": [{"role": "user", "content": "Hello!"}]}'
-
-# 响应 Header 会包含：
-# x-session-key: 550e8400-e29b-41d4-a716-446655440000
-```
-
-### 6.3 速率限制 Header
-
-| Header | 说明 | 示例 |
-|--------|------|------|
-| `X-RateLimit-Limit` | 每分钟允许的最大请求数（配置项 `chat_rate_limit_per_minute`） | `10` |
-| `X-RateLimit-Remaining` | 当前剩余可用请求数 | `9` |
-| `X-RateLimit-Reset` | 速率限制重置的 Unix 时间戳 | `1749560060` |
-| `Retry-After` | 429 时重试等待秒数（固定 60s） | `60` |
-
----
-
-## 七、实战场景
-
-### 场景 1：单轮对话（非流式）
+### Scenario 1: Single-turn Conversation (Non-streaming)
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
@@ -806,14 +618,14 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -d '{
     "model": "",
     "messages": [
-      {"role": "user", "content": "你好，请介绍一下你自己"}
+      {"role": "user", "content": "Hello, please introduce yourself"}
     ]
   }'
 ```
 
 ---
 
-### 场景 2：多轮对话（带会话保持，单条 message 自动加载历史）
+### Scenario 2: Multi-turn with Session (Single message auto-loads history)
 
 ```bash
 #!/bin/bash
@@ -821,58 +633,55 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 SESSION_ID=$(cat /proc/sys/kernel/random/uuid)
 echo "Session ID: $SESSION_ID"
 
-# 第 1 轮：用户自我介绍
-echo "=== 第 1 轮 ==="
+# Turn 1: User introduces themselves
+echo "=== Turn 1 ==="
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-session-key: $SESSION_ID" \
   -d '{
     "model": "",
     "messages": [
-      {"role": "user", "content": "我叫小明，今年 25 岁"}
+      {"role": "user", "content": "My name is Alice, I am 25 years old"}
     ]
   }' | jq '.choices[0].message.content'
 
-# 第 2 轮：询问用户信息（单条 message 自动加载 backend 历史）
-echo "=== 第 2 轮 ==="
+# Turn 2: Ask about user info (single message auto-loads backend history)
+echo "=== Turn 2 ==="
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-session-key: $SESSION_ID" \
   -d '{
     "model": "",
     "messages": [
-      {"role": "user", "content": "我叫什么名字？"}
+      {"role": "user", "content": "What is my name?"}
     ]
   }' | jq '.choices[0].message.content'
-# 输出会包含"小明"
+# Response will include "Alice"
 ```
 
 ---
 
-### 场景 3：多轮对话（带完整历史，请求 messages 作为权威上下文）
+### Scenario 3: Multi-turn with Full History (Request messages as authoritative context)
 
 ```bash
-#!/bin/bash
-
-# 在请求中直接提供完整对话历史（不需要 x-session-key）
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
     "messages": [
-      {"role": "system", "content": "你是一个友好的助手。"},
-      {"role": "user", "content": "我叫小明，今年 25 岁"},
-      {"role": "assistant", "content": "你好小明！"},
-      {"role": "user", "content": "我叫什么名字？"}
+      {"role": "system", "content": "You are a friendly assistant."},
+      {"role": "user", "content": "My name is Alice, I am 25"},
+      {"role": "assistant", "content": "Hi Alice!"},
+      {"role": "user", "content": "What is my name?"}
     ]
-  }' | jq '.choices[0].message.content'
-# system 消息自动提取为当前轮前缀（不持久化）
-# 请求 messages 作为权威上下文，不加载 backend 历史
+  }'
+# system message auto-extracted as current-turn prefix (not persisted)
+# Request messages used as authoritative context, no backend history loaded
 ```
 
 ---
 
-### 场景 4：流式输出（实时显示）
+### Scenario 4: Streaming Output
 
 ```bash
 #!/bin/bash
@@ -885,7 +694,7 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
   -d '{
     "model": "",
     "stream": true,
-    "messages": [{"role": "user", "content": "请写一首关于春天的诗"}]
+    "messages": [{"role": "user", "content": "Write a poem about spring"}]
   }' | while read -r line; do
     if [[ $line == data:* ]]; then
       content=$(echo "$line" | sed 's/^data: //' | jq -r '.choices[0].delta.content // empty')
@@ -898,110 +707,91 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ---
 
-### 场景 5：指定 Agent 路由
+### Scenario 5: Specify Agent Routing
 
 ```bash
-#!/bin/bash
-
-# 使用 model 字段指定 agent（zeroclaw/<alias> 格式）
+# Use model field to specify agent (zeroclaw/<alias> format)
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw/coding",
-    "messages": [{"role": "user", "content": "写一个快速排序"}]
+    "messages": [{"role": "user", "content": "Write a quicksort"}]
   }'
 
-# 如果配置了多个 agent，可以指定不同的 agent
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "zeroclaw/assistant",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-
-# 标准客户端兼容：任意 model 名称路由到默认 agent
+# Standard client compatibility: any model name routes to default agent
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4",
-    "messages": [{"role": "user", "content": "你好"}]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
 ---
 
-### 场景 6：后端模型覆盖（x-zeroclaw-model）
+### Scenario 6: Backend Model Override (x-zeroclaw-model)
 
 ```bash
-#!/bin/bash
-
-# 使用 agent 默认 provider，但切换为其他模型
+# Use agent's default provider but switch to a different model
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'x-zeroclaw-model: qwen-plus' \
   -d '{
     "model": "zeroclaw/default",
-    "messages": [{"role": "user", "content": "你好"}]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
 ---
 
-### 场景 7：流式响应 + Usage 统计
+### Scenario 7: Streaming + Usage Statistics
 
 ```bash
-#!/bin/bash
-
-# 流式调用并获取 token 使用统计
 curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
     "stream": true,
     "stream_options": {"include_usage": true},
-    "messages": [{"role": "user", "content": "你好"}]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
-# 最后会多一个 usage 块：
+# A usage chunk appears at the end:
 # data: {"id":"chatcmpl-...","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
 ```
 
 ---
 
-### 场景 8：临时禁用所有工具
+### Scenario 8: Disable All Tools
 
 ```bash
+# tool_choice: "none" disables all tools for this request
+# The LLM receives no tool definitions and no tool protocol in the system prompt
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
-    "messages": [{"role": "user", "content": "你好，请介绍一下你自己"}],
+    "messages": [{"role": "user", "content": "Hello, please introduce yourself"}],
     "tool_choice": "none"
   }'
 ```
 
 ---
 
-### 场景 9：多轮对话中的工具调用
+### Scenario 9: Restrict to Specific Tools
 
 ```bash
-#!/bin/bash
-
-SESSION_ID=$(cat /proc/sys/kernel/random/uuid)
-
-# 第 1 轮：查询天气
-echo "=== 第 1 轮：查询天气 ==="
-curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-session-key: $SESSION_ID" \
+# Only expose a subset of tools for this request
+curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
   -d '{
     "model": "",
-    "messages": [{"role": "user", "content": "北京今天天气怎么样？"}],
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
     "tools": [
       {
         "type": "function",
         "function": {
           "name": "weather_query",
-          "description": "查询天气",
+          "description": "Query weather for a city",
           "parameters": {
             "type": "object",
             "properties": {"city": {"type": "string"}},
@@ -1010,188 +800,217 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
         }
       }
     ]
-  }' | jq '.choices[0].message.content'
+  }'
+# Only "weather_query" is available (must match agent's configured tools)
+# Tools not in the agent's configuration are silently ignored
+```
 
-# 第 2 轮：基于天气继续对话（禁用工具，单条 message + session 自动加载历史）
-echo "=== 第 2 轮：基于天气继续对话 ==="
-curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-session-key: $SESSION_ID" \
+---
+
+### Scenario 10: Force a Specific Tool
+
+```bash
+# tool_choice with specific function restricts to that single tool
+curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
   -d '{
     "model": "",
-    "messages": [{"role": "user", "content": "那适合穿什么衣服呢？"}],
-    "tool_choice": "none"
-  }' | jq '.choices[0].message.content'
+    "messages": [{"role": "user", "content": "Check Beijing weather"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather_query",
+          "description": "Query weather",
+          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+        }
+      }
+    ],
+    "tool_choice": {"type": "function", "function": {"name": "weather_query"}}
+  }'
+# Only "weather_query" is available. If the function name is not in the
+# agent's configured tools, tool_choice is silently ignored.
 ```
 
 ---
 
-## 八、常见问题（FAQ）
+## 8. FAQ
 
-### Q1: ZeroClaw 的 tool_calls 为什么在非流式模式下有时为 null？
+### Q1: Why are tool_calls sometimes null in non-streaming mode?
 
-**答**：ZeroClaw 采用**透明执行模式**——工具调用由后端自动执行，客户端只会收到最终的文本响应。非流式模式下，如果 agent 在内部执行了工具调用，会从 agent history 中提取工具调用信息填充 `tool_calls` 字段；无工具调用时为 `null`。
+**Answer**: ZeroClaw uses **transparent tool execution** — tool calls are executed automatically by the backend, and the client only receives the final text response. In non-streaming mode, `tool_calls` is populated from agent history when tool calls occurred; it is `null` when no tools were called.
 
-- **非流式模式**：`finish_reason` 始终为 `"stop"`
-- **流式模式**：会通过 SSE delta 返回 `tool_calls`（用于实时展示调用过程）
-
----
-
-### Q2: finish_reason 为什么总是返回 "stop"？
-
-**答**：ZeroClaw 自动执行所有工具调用直到模型给出最终文本响应。客户端收到的是完整的、经过工具增强后的回答，因此 `finish_reason` 始终为 `"stop"`。
-
-**对比 OpenAI API**：
-- OpenAI：如果模型返回 `tool_calls`，`finish_reason` 会是 `"tool_calls"`，需要客户端自行执行工具
-- ZeroClaw：自动执行工具，客户端只需关注最终结果
+- **Non-streaming**: `finish_reason` is `"stop"` for text-only or `"tool_calls"` when tool calls present
+- **Streaming**: Tool calls are emitted via SSE delta `tool_calls` (for real-time display)
 
 ---
 
-### Q3: model 参数的具体路由逻辑是什么？
+### Q2: Why does finish_reason sometimes return "tool_calls"?
 
-**答**：`model` 字段是 **agent 路由目标**，不是 provider 模型名称：
+**Answer**: When the agent internally executes tool calls during the request, `finish_reason` is `"tool_calls"` and `message.tool_calls` contains the tool call details. For pure text responses, `finish_reason` is `"stop"`.
+
+**Comparison with OpenAI API**:
+- OpenAI: `finish_reason: "tool_calls"` means the client must execute tools and call back
+- ZeroClaw: Tools are auto-executed; `tool_calls` is informational only
+
+---
+
+### Q3: What is the model parameter routing logic?
+
+**Answer**: The `model` field is an **agent routing target**, not a provider model name:
 
 ```
-model = "zeroclaw/<alias>"  → 路由到指定 agent
-model = "" / "zeroclaw" / 普通 label（如 "gpt-4"） → 路由到默认 agent
-model = "zeroclaw/"（空 alias） → 400 错误
+model = "zeroclaw/<alias>"  → Routes to specified agent
+model = "" / "zeroclaw" / plain label (e.g. "gpt-4") → Routes to default agent
+model = "zeroclaw/" (empty alias) → 400 error
 ```
 
-如果需要覆盖后端实际调用的模型名称，使用 `x-zeroclaw-model` header（不切换 provider）。
+To override the backend model name, use the `x-zeroclaw-model` header (does not switch provider).
 
 ---
 
-### Q4: x-agent-id header 还能用吗？
+### Q4: Is the x-agent-id header still supported?
 
-**答**：v0.8.0-beta P0 对齐后，`x-agent-id` header **已移除**。Agent 路由统一通过 `model` 字段完成。如需指定 agent，请使用 `"zeroclaw/<alias>"` 格式。
-
----
-
-### Q5: 多轮对话的 system prompt 会被持久化吗？
-
-**答**：不会。`system` 和 `developer` 消息会被提取为当前轮的前缀（拼接到当前 user 消息前发送给模型），但**不会持久化到 session backend**。这避免了后续轮次被重复的 system prompt 污染。
+**Answer**: No. `x-agent-id` was **removed** in v0.8.0. Agent routing is done exclusively through the `model` field using the `"zeroclaw/<alias>"` format.
 
 ---
 
-### Q6: 请求中带多条 messages 和带 x-session-key 有什么区别？
+### Q5: Are system prompts persisted in multi-turn conversations?
 
-**答**：
-
-| 方式 | 行为 |
-|------|------|
-| `messages` 长度 > 1 | 请求 messages 作为**权威上下文**，不加载 backend 历史；非 system/developer 的历史消息通过 `seed_history()` 注入 agent |
-| `messages` 长度 == 1 + `x-session-key` | 自动加载 backend session 历史，适合逐轮追加的对话模式 |
-
-两种方式可以混合使用：客户端可以根据场景选择"提供完整历史"或"依赖 session 自动加载"。
+**Answer**: No. `system` and `developer` messages are extracted as a prefix for the current turn (prepended to the user message), but are **not persisted to the session backend**. This prevents subsequent turns from being polluted by repeated system prompts.
 
 ---
 
-### Q7: usage 统计为什么有时全是 0？
+### Q6: What is the difference between providing multiple messages vs using x-session-key?
 
-**答**：token 使用统计通过 **cost tracking** 机制采集。如果：
-- 未配置 cost tracker（`cost_tracker` 为空）
-- Provider 未返回 token 计数
+**Answer**:
 
-则 `usage` 中所有字段为 0。这不影响对话功能，只是缺少统计信息。
+| Approach | Behavior |
+|----------|----------|
+| `messages` length > 1 | Request messages are **authoritative context**; backend history is not loaded; non-system/developer history injected via `seed_history()` |
+| `messages` length == 1 + `x-session-key` | Backend session history is auto-loaded; suitable for turn-by-turn conversation |
+
+Both approaches can be mixed depending on the use case.
 
 ---
 
-### Q8: 速率限制的配置在哪里？
+### Q7: Why are usage stats sometimes all zeros?
 
-**答**：在 ZeroClaw 配置文件中：
+**Answer**: Token usage is collected via **cost tracking**. If:
+- No cost tracker is configured (`cost_tracker` is empty)
+- The provider did not return token counts
+
+Then all `usage` fields will be 0. This does not affect conversation functionality.
+
+---
+
+### Q8: Why do max_tokens, top_p, stop, presence_penalty, frequency_penalty return 400?
+
+**Answer**: These parameters are not supported per-request by the ZeroClaw runtime. Rather than silently ignoring them (which would mislead callers into thinking they take effect), the endpoint returns an explicit 400 error with `error.type: "unsupported_parameter"`.
+
+**Alternative**: Configure `max_tokens` in your ZeroClaw provider settings (e.g. `[providers.<type>.<alias>]`).
+
+---
+
+### Q9: How does tool_choice: "none" work?
+
+**Answer**: `tool_choice: "none"` takes effect at multiple levels:
+1. **System prompt**: Tool protocol descriptions are excluded from the system prompt
+2. **LLM request**: No tool definitions are sent to the model (`use_native_tools = false`)
+3. **Response parsing**: Any tool calls in the model response are discarded (three-layer guard: native tool calls dropped, text-protocol parsing skipped, empty `known_tool_names` filters all call names)
+
+This ensures the LLM behaves as a pure text model with no tool capability for that request.
+
+---
+
+### Q10: How does the tools parameter filter work?
+
+**Answer**: The `tools` parameter filters against the agent's currently configured tools:
+- Only tool names present in `agent.get_configured_tool_names()` are activated
+- Tools excluded by the agent's risk profile are automatically blocked (they are removed from `configured_tools` at agent build time)
+- Unknown tool names (not in the agent's configuration) are silently ignored
+
+---
+
+### Q11: Where is the rate limit configured?
+
+**Answer**: In the ZeroClaw config file:
 
 ```toml
 [gateway]
-chat_rate_limit_per_minute = 10  # 每分钟最大请求数，默认 60
+chat_rate_limit_per_minute = 10  # Max requests per minute, default 60
 ```
 
-超过限制后返回 429，`Retry-After` Header 指示等待时间（60 秒窗口）。
+Exceeding the limit returns 429 with a `Retry-After` header indicating the wait time (60-second window).
 
 ---
 
-### Q9: 如何处理 503 Agent 未配置错误？
+## 9. Best Practices
 
-**答**：此错误表示指定 agent 缺少模型配置。需要：
+### 1. Session Management
+- **Client-generated session_key**: Especially for streaming, generate a UUID and send `x-session-key`
+- **Reuse sessions**: Use the same `x-session-key` for multi-turn conversations (with single-message mode)
+- **Full history for stateless clients**: Provide complete message history in `messages` (> 1 entry), no session needed
+- **Avoid excessive history**: Long histories increase token consumption and response latency
 
-1. 确认 `[agents.<alias>]` 段存在且 `model_provider` 已配置
-2. 确认 `model_provider` 指向的 provider 段有 `model` 字段
-3. 或访问 `/onboard` 完成 onboarding 流程
+### 2. Agent and Model Usage
+- **Route via model**: Use `"zeroclaw/<alias>"` format to specify target agent
+- **Standard client compatibility**: Front-ends like Open WebUI / LobeChat can pass any model name (auto-routes to default agent)
+- **Backend model override**: Use `x-zeroclaw-model` header for temporary model switches
+- **No need to know provider model names**: Clients only need agent aliases
 
----
+### 3. Streaming vs Non-streaming
+- **Long text / real-time**: Use `stream: true` for live output
+- **Short Q&A / API integration**: Use `stream: false` for complete responses
+- **Need usage stats**: Set `stream_options.include_usage: true` in streaming mode
 
-## 九、最佳实践建议
+### 4. Multi-turn Conversation Options
+- **Simple conversations**: Use `x-session-key` + single message, rely on backend auto-load
+- **Precise context control**: Provide full `messages` array (> 1 entry) for consistent context
+- **System prompts**: Pass via `system` role messages; they don't affect session persistence
 
-### 1. 会话管理
-- **客户端生成 session_key**：尤其在流式模式下，客户端应主动生成 UUID 并携带 `x-session-key`
-- **复用 session**：多轮对话使用同一 `x-session-key` 保持上下文（配合单条 message 模式）
-- **请求完整历史**：对于无状态客户端，可直接在 `messages` 中提供完整对话历史（> 1 条），无需 session
-- **避免过长的会话历史**：过长的历史会影响 token 消耗和响应速度
+### 5. Tool Control
+- **Disable tools**: Use `tool_choice: "none"` for pure text conversations
+- **Restrict tools**: Use `tools` array to limit available tools for a request
+- **Force specific tool**: Use `tool_choice: {"type":"function","function":{"name":"..."}}` to require a specific tool
+- **Security**: Tools excluded by the agent's risk profile are automatically blocked
 
-### 2. Agent 和 Model 使用
-- **通过 model 路由**：使用 `"zeroclaw/<alias>"` 格式指定目标 agent
-- **标准客户端兼容**：Open WebUI/LobeChat 等前端传入任意 model 名称也能正常工作（自动路由到默认 agent）
-- **后端模型覆盖**：需要临时切换模型时使用 `x-zeroclaw-model` header
-- **无需关心 provider 模型名**：客户端只需关心 agent 别名，不需要知道后端实际使用的 provider 模型
+### 6. Performance Optimization
+- **Limit tool count**: Only provide necessary tools per request (reduces token consumption)
+- **Set temperature appropriately**: `0.7` for general chat, `1.0` for creative writing, `0.2` for code generation
+- **Respect rate limits**: Control request frequency per `chat_rate_limit_per_minute`
 
-### 3. 流式 vs 非流式
-- **长文本/实时场景**：使用 `stream: true`，实时显示生成内容
-- **短问答/API 集成**：使用 `stream: false`，一次性获取完整响应
-- **需要 usage 统计**：流式模式下设置 `stream_options.include_usage: true`
-
-### 4. 多轮对话选择
-- **简单对话**：使用 `x-session-key` + 单条 message，依赖 backend 自动加载历史
-- **精确控制上下文**：在请求中直接提供完整 `messages` 数组（> 1 条），确保上下文一致
-- **system prompt**：通过 `system` role 消息传递，不影响 session 持久化
-
-### 5. 性能优化
-- **限制工具数量**：每次请求只提供必要的工具（减少 token 消耗）
-- **合理设置 temperature**：日常对话 `0.7`，创意写作 `1.0`，代码生成 `0.2`
-- **注意速率限制**：根据 `chat_rate_limit_per_minute` 控制请求频率
-
-### 6. 安全建议
-- **认证**：生产环境务必开启 `require_pairing=true`
-- **最小权限原则**：只启用必要的工具
-- **审计日志**：启用 observability 记录工具调用历史
+### 7. Security
+- **Authentication**: Enable `require_pairing=true` in production
+- **Principle of least privilege**: Only enable necessary tools
+- **Audit logging**: Enable observability to record tool call history
+- **Unsupported parameters**: Do not send `max_tokens`, `top_p`, etc. — they will cause 400 errors
 
 ---
 
-## 十、版本更新说明
+## 10. Changelog
 
-### v3.0（2026-06-26）— P0 对齐版
+### v1.0 (2026-06-30) — Initial Stable Release
 
-**核心变化 — model 语义修正**：
-- ✅ `model` 字段现在是 **agent 路由目标**（`"zeroclaw/<alias>"`），不再是 provider 模型名
-- ✅ 普通 label（如 `"gpt-4"`）自动路由到默认 agent，不再返回 400 错误
-- ✅ 新增 `x-zeroclaw-model` header 用于后端 wire model 覆盖
-- ❌ `x-agent-id` header **已移除**，agent 路由统一通过 `model` 字段
+**Core features**:
+- ✅ OpenAI Chat Completions API compatible endpoint (`POST /v1/chat/completions`)
+- ✅ `model` field as **agent routing target** (`"zeroclaw/<alias>"`), not provider model name
+- ✅ Plain label model names auto-route to default agent (standard client compatibility)
+- ✅ `x-zeroclaw-model` header for backend wire model override
+- ✅ Multi-turn message splitting (system/developer prefix, history injection, active turn extraction)
+- ✅ Session management via `x-session-key` with auto-load for single-message requests
+- ✅ Streaming (SSE) and non-streaming (JSON) response modes
+- ✅ `temperature` parameter supported per-request
 
-**核心变化 — 多轮 messages 还原**：
-- ✅ `messages` 按 role 自动分流：system/developer 提取为前缀，历史消息作为 conversation history，末条 user 为当前轮
-- ✅ 当 `messages.len() > 1` 时，请求 messages 作为权威上下文（不加载 backend 历史）
-- ✅ 当 `messages.len() == 1` 时，自动加载 backend session 历史
-- ✅ `system`/`developer` 前缀不持久化到 session backend
-- ✅ `function` role 自动归一化为 `tool`
+**Tool control** (newly effective in v1.0):
+- ✅ `tool_choice: "none"` — Fully disables tools: system prompt excludes tool protocol, LLM request omits tool definitions, model tool calls discarded
+- ✅ `tools: [...]` — Restricts available tools to the requested subset (filtered against agent's configured tools; security policy enforced)
+- ✅ `tool_choice: {"type":"function",...}` — Restricts to a single named function (validated against agent's configured tools)
+- ✅ `tool_choice: "auto"` / `"required"` — Standard OpenAI semantics
 
-**其他改进**：
-- ✅ `x-session-key` 在流式和非流式响应 Header 中**始终返回**
-- ✅ 错误响应新增 `status` 字段
-- ✅ `tool_calls` 在非流式模式下从 agent history 提取
+**Unsupported parameter rejection** (new in v1.0):
+- ⛔ `max_tokens`, `top_p`, `stop`, `presence_penalty`, `frequency_penalty` now return **400 `unsupported_parameter`** errors
+- Previously these were silently ignored; explicit rejection prevents caller confusion
 
-### v2.0（2026-06-10）— v0.8.0 迁移版
-
-**架构变化**：
-- ✅ 新增 **onboarding 检查**（未配置 agent 返回 503）
-- ✅ 新增 **agent 校验**（未知 agent 返回 400）
-- ✅ 新增 **rate limiting**（`chat_rate_limit_per_minute` 配置项）
-- ✅ 新增 **cost tracking**（token 使用统计通过 cost tracking 采集）
-- ✅ 新增 `stream_options.include_usage` 支持
-- ✅ 新增 `temperature`、`max_tokens`、`top_p`、`stop`、`presence_penalty`、`frequency_penalty` 参数支持
-- ✅ `X-Request-ID` 使用 UUID 格式
-- ✅ 500 错误 `error.type` 为 `internal_error`（非 `internal_server_error`）
-- ✅ 请求超时使用长运行超时（600s），与 cron 任务共享子路由
-
-### v1.2（2026-05-19）
-
-- 支持 `tools` 和 `tool_choice` 参数
-- 工具透明执行模式
-- 增强的会话管理
+**Removed**:
+- ❌ `x-agent-id` header removed; use `model` field instead

@@ -444,6 +444,9 @@ pub async fn handle_chat_completions(
     if let Err(e) = validate_request(&request) {
         return add_request_id_header(e, &request_id);
     }
+    if let Err(e) = validate_unsupported_params(&request) {
+        return add_request_id_header(e, &request_id);
+    }
 
     let session_key_from_header = extract_session_key(&headers);
     let session_id = session_key_from_header
@@ -578,15 +581,14 @@ pub async fn handle_chat_completions(
     }
 
     let tool_choice_mode = parse_tool_choice(&request.tool_choice);
+    let configured_tools: std::collections::HashSet<String> =
+        agent.get_configured_tool_names().into_iter().collect();
     match tool_choice_mode {
         ToolChoiceMode::None => {
             agent.disable_tools();
         }
         ToolChoiceMode::Auto | ToolChoiceMode::Required => {
             if let Some(ref requested_tools) = request.tools {
-                let configured_tools: std::collections::HashSet<String> =
-                    agent.get_configured_tool_names().into_iter().collect();
-
                 let filtered_tools: Vec<_> = requested_tools
                     .iter()
                     .filter(|t| configured_tools.contains(&t.function.name))
@@ -600,14 +602,16 @@ pub async fn handle_chat_completions(
             }
         }
         ToolChoiceMode::SpecificFunction { ref name } => {
-            if let Some(ref requested_tools) = request.tools {
-                if let Some(tool) = requested_tools.iter().find(|t| t.function.name == *name) {
-                    let tool_specs = vec![zeroclaw_runtime::tools::ToolSpec {
-                        name: tool.function.name.clone(),
-                        description: tool.function.description.clone().unwrap_or_default(),
-                        parameters: tool.function.parameters.clone(),
-                    }];
-                    agent.set_tool_specs(tool_specs);
+            if configured_tools.contains(name) {
+                if let Some(ref requested_tools) = request.tools {
+                    if let Some(tool) = requested_tools.iter().find(|t| t.function.name == *name) {
+                        let tool_specs = vec![zeroclaw_runtime::tools::ToolSpec {
+                            name: tool.function.name.clone(),
+                            description: tool.function.description.clone().unwrap_or_default(),
+                            parameters: tool.function.parameters.clone(),
+                        }];
+                        agent.set_tool_specs(tool_specs);
+                    }
                 }
             }
         }
@@ -1079,6 +1083,51 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     Ok(())
 }
 
+/// Reject unsupported per-request generation parameters with a clear error.
+///
+/// These fields are parsed from the request body but silently ignored by the
+/// current runtime. Returning a 400 instead avoids surprising callers who
+/// expect them to take effect.
+#[allow(clippy::result_large_err)]
+fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Response> {
+    if req.max_tokens.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "max_tokens is not supported per-request; configure it in provider settings",
+        ));
+    }
+    if req.top_p.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "top_p is not supported per-request",
+        ));
+    }
+    if req.stop.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "stop is not supported per-request",
+        ));
+    }
+    if req.presence_penalty.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "presence_penalty is not supported per-request",
+        ));
+    }
+    if req.frequency_penalty.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "frequency_penalty is not supported per-request",
+        ));
+    }
+    Ok(())
+}
+
 // Tool Choice Helpers
 
 enum ToolChoiceMode {
@@ -1507,6 +1556,86 @@ mod tests {
             stream_options: None,
         };
         let result = validate_request(&req);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_max_tokens_rejected() {
+        let req = ChatCompletionRequest {
+            model: "test".into(),
+            messages: vec![chat_message("user", "hi")],
+            stream: false,
+            temperature: 0.7,
+            max_tokens: Some(100),
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            stream_options: None,
+        };
+        let result = validate_unsupported_params(&req);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_top_p_rejected() {
+        let req = ChatCompletionRequest {
+            model: "test".into(),
+            messages: vec![chat_message("user", "hi")],
+            stream: false,
+            temperature: 0.7,
+            max_tokens: None,
+            top_p: Some(0.9),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            stream_options: None,
+        };
+        let result = validate_unsupported_params(&req);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_all_rejected() {
+        let req = ChatCompletionRequest {
+            model: "test".into(),
+            messages: vec![chat_message("user", "hi")],
+            stream: false,
+            temperature: 0.7,
+            max_tokens: Some(100),
+            top_p: Some(0.9),
+            stop: Some(serde_json::json!("stop")),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(0.5),
+            tools: None,
+            tool_choice: None,
+            stream_options: None,
+        };
+        let result = validate_unsupported_params(&req);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_none_accepted() {
+        let req = ChatCompletionRequest {
+            model: "test".into(),
+            messages: vec![chat_message("user", "hi")],
+            stream: false,
+            temperature: 0.7,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            stream_options: None,
+        };
+        let result = validate_unsupported_params(&req);
         assert!(result.is_ok());
     }
 }

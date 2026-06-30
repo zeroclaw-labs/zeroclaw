@@ -18,6 +18,33 @@ impl IterationToolSpecs {
         self.use_native_tools =
             model_provider.supports_native_tools() && !self.tool_specs.is_empty();
     }
+
+    /// Construct iteration tool specs from a per-request override, bypassing
+    /// the normal `tools_registry` → `tool.spec()` rebuild.
+    ///
+    /// Applies `excluded_tools` filtering to honour security policy — tools
+    /// excluded by policy are removed even if present in the override.
+    pub(crate) fn from_override(
+        model_provider: &dyn ModelProvider,
+        override_specs: &[ToolSpec],
+        excluded_tools: &[String],
+    ) -> Self {
+        let tool_specs: Vec<ToolSpec> = override_specs
+            .iter()
+            .filter(|s| !excluded_tools.iter().any(|ex| ex == &s.name))
+            .cloned()
+            .collect();
+        let known_tool_names: HashSet<String> = tool_specs
+            .iter()
+            .map(|s| s.name.to_ascii_lowercase())
+            .collect();
+        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+        IterationToolSpecs {
+            tool_specs,
+            known_tool_names,
+            use_native_tools,
+        }
+    }
 }
 
 pub(crate) fn build_iteration_tool_specs(
