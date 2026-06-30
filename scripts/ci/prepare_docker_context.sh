@@ -75,5 +75,5 @@ printf '%s\n' \
   'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
   > "$context_dir/zeroclaw-data/.zeroclaw/config.toml"
 
+rm -f "$context_dir/Dockerfile.debian"
 cp Dockerfile.ci "$context_dir/Dockerfile"
-cp Dockerfile.debian.ci "$context_dir/Dockerfile.debian"

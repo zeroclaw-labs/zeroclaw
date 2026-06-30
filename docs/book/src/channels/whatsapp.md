@@ -45,8 +45,11 @@ For Web mode, `mode = "personal"` applies separate DM, group, and self-chat poli
 | `group_policy` | `allowlist`, `ignore`, `all` | Controls group chats |
 | `self_chat_mode` | `true`, `false` | Controls the user's self-chat |
 | `mention_only` | `true`, `false` | Requires group messages to mention the bot |
+| `passive_group_context` | `true`, `false` | Records allowed unaddressed group messages as context only |
 
 The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+
+`passive_group_context = true` is opt-in and applies only to WhatsApp Web group chats. Allowed unaddressed group messages are stored in the room-scoped conversation history without starting an agent turn, sending reactions, downloading media, or calling the model. Later addressed messages in the same group can use that passive context.
 
 ## Restricting which groups (`allowed_groups`)
 
