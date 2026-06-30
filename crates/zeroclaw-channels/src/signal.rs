@@ -123,15 +123,13 @@ struct GroupInfo {
 
 /// Inbound poll-vote payload.
 ///
-/// signal-cli's JSON wraps the answer as the indices and, in some
-/// builds, the option titles. We accept both because we want the title
-/// for round-tripping the option's identifier back to the agent layer,
-/// but indices are a fallback when titles aren't materialized.
+/// Real signal-cli `pollVote` payloads carry selected option indexes.
+/// We also accept older/alternate `pollAnswer` title fields when present,
+/// but callers should treat the index path as the reliable Signal shape.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PollAnswer {
-    /// Server-assigned poll id this answer is for. Useful when the
-    /// agent layer needs to correlate this vote with the specific
-    /// poll it sent (multiple polls may be in flight per chat).
+    /// Server-assigned poll id this answer is for, when the upstream
+    /// payload supplies one. Real `pollVote` payloads usually omit it.
     #[serde(rename = "pollId", default)]
     pub poll_id: Option<u64>,
     /// 0-based indices of the options the user selected. Single-choice
@@ -139,10 +137,10 @@ pub struct PollAnswer {
     /// vec; multi-select would yield more.
     #[serde(rename = "selectedIndices", alias = "optionIndexes", default)]
     pub selected_indices: Vec<u32>,
-    /// Display titles of the selected options, if signal-cli expanded
-    /// them. May be empty in older signal-cli builds; consumers should
-    /// fall back to `selected_indices` against the original poll's
-    /// option list.
+    /// Display titles of the selected options, if an older/alternate
+    /// payload supplies them. Real `pollVote` payloads normally omit
+    /// titles; consumers should resolve `selected_indices` against the
+    /// original poll's option list.
     #[serde(rename = "selectedTitles", default)]
     pub selected_titles: Vec<String>,
 }
@@ -291,11 +289,10 @@ impl SignalChannel {
     /// Build the JSON-RPC params for signal-cli's native `sendPollCreate`
     /// method.
     ///
-    /// Signal poll answers correlate by rendered option title when the daemon
-    /// supplies one, or by option index otherwise, so callback ids are
-    /// intentionally not represented in this wire shape. `Channel::send_choice`
-    /// documents that callers needing stable callback ids must maintain that
-    /// mapping above the channel layer.
+    /// Signal poll answers correlate by option index in real `pollVote`
+    /// payloads. Callback ids are intentionally not represented in this wire
+    /// shape; `Channel::send_choice` documents that callers needing stable
+    /// callback ids must maintain that mapping above the channel layer.
     fn build_poll_params(
         &self,
         recipient: &str,
@@ -308,15 +305,15 @@ impl SignalChannel {
                 "recipient": [number],
                 "account": &self.account,
                 "question": question,
-                "options": options,
-                "multi": multiple_choice,
+                "option": options,
+                "no-multi": !multiple_choice,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
+                "group-id": group_id,
                 "account": &self.account,
                 "question": question,
-                "options": options,
-                "multi": multiple_choice,
+                "option": options,
+                "no-multi": !multiple_choice,
             }),
         }
     }
@@ -413,10 +410,11 @@ impl SignalChannel {
     /// multi-select poll vote produces N (one per selected option).
     ///
     /// Inbound shape may be plain text (`dataMessage.message`) OR a
-    /// poll-vote (`dataMessage.pollAnswer`). For poll-votes we emit a
-    /// synthetic message per selected option whose `content` is a
-    /// documented sentinel: `"[choice]<selected-title>"` (or
-    /// `"[choice-index]N"` when only the index is available). Consumers
+    /// poll-vote (`dataMessage.pollAnswer` or `dataMessage.pollVote`). For
+    /// poll-votes we emit a synthetic message per selected option whose `content` is a
+    /// documented sentinel: `"[choice-index]N"` for real signal-cli
+    /// `pollVote` payloads, or `"[choice]<selected-title>"` when an
+    /// alternate payload supplies titles. Consumers
     /// can match this prefix to correlate the vote with their original
     /// option set, or ignore it if they don't handle poll votes.
     ///
@@ -556,8 +554,8 @@ impl SignalChannel {
     /// poll renders as native UI in modern Signal clients and emits a
     /// poll-vote event (`pollAnswer` or `pollVote`, depending on signal-cli
     /// version) back through the SSE stream when the user votes — see
-    /// `process_envelope` for how that flows back to consumers as a synthetic
-    /// `[choice]<title>` or `[choice-index]N` `ChannelMessage`.
+    /// `process_envelope` for how that flows back to consumers, normally as
+    /// a synthetic `[choice-index]N` `ChannelMessage`.
     ///
     /// `multiple_choice = false` → single-select poll (the common case
     /// for "pick one of N" agent prompts). Pass `true` to allow
@@ -621,7 +619,7 @@ impl Channel for SignalChannel {
         options: &[(String, String)],
     ) -> anyhow::Result<()> {
         // Signal supports native polls via signal-cli JSON-RPC
-        // sendPollCreate. Single-select (multi=false) is the right default
+        // sendPollCreate. Single-select (`no-multi=true`) is the right default
         // for "pick one of N" prompts; consumers needing multi-select
         // should call SignalChannel::send_poll directly.
         //
@@ -641,10 +639,10 @@ impl Channel for SignalChannel {
         // Polls require ≥2 options per Signal protocol; for exactly
         // 1 option, fall back to text — a 1-option poll is a UX
         // anti-pattern. The callback ids passed in here are dropped
-        // on the wire because Signal polls correlate by label —
-        // pollAnswer.selectedTitles round-trips. Per the trait's
-        // docs, callers needing a stable id round-trip should encode
-        // it INTO the label or maintain a side-map.
+        // on the wire because real Signal poll votes correlate by
+        // option index. Per the trait's docs, callers needing stable
+        // callback ids should maintain a side map keyed by poll option
+        // index.
         if options.len() >= 2 {
             let labels: Vec<String> = options.iter().map(|(_, l)| l.clone()).collect();
             return self.send_poll(recipient, prompt, &labels, false).await;
@@ -1973,11 +1971,13 @@ mod tests {
             params["recipient"],
             serde_json::json!(["+1111111111".to_string()])
         );
-        assert!(params.get("groupId").is_none());
+        assert!(params.get("group-id").is_none());
         assert_eq!(params["account"], "+1234567890");
         assert_eq!(params["question"], "Pick one");
-        assert_eq!(params["options"], serde_json::json!(["Alpha", "Beta"]));
-        assert_eq!(params["multi"], false);
+        assert_eq!(params["option"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["no-multi"], true);
+        assert!(params.get("options").is_none());
+        assert!(params.get("multi").is_none());
     }
 
     #[test]
@@ -1986,12 +1986,15 @@ mod tests {
         let options = vec!["Alpha".to_string(), "Beta".to_string()];
         let params = ch.build_poll_params("group:abc", "Pick any", &options, true);
 
-        assert_eq!(params["groupId"], "abc");
+        assert_eq!(params["group-id"], "abc");
         assert!(params.get("recipient").is_none());
         assert_eq!(params["account"], "+1234567890");
         assert_eq!(params["question"], "Pick any");
-        assert_eq!(params["options"], serde_json::json!(["Alpha", "Beta"]));
-        assert_eq!(params["multi"], true);
+        assert_eq!(params["option"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["no-multi"], false);
+        assert!(params.get("groupId").is_none());
+        assert!(params.get("options").is_none());
+        assert!(params.get("multi").is_none());
     }
 
     fn poll_envelope(
