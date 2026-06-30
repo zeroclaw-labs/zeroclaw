@@ -79,7 +79,7 @@ pub fn resolve_gate(
             // approval. Keeps the live counters in lockstep with the ledger-sourced
             // `rebuild_from_persistence`.
             engine.record_approval_metric(run_id, principal.is_system());
-            ResolveOutcome::Resumed(action)
+            ResolveOutcome::Resumed(Box::new(action))
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
@@ -199,6 +199,7 @@ mod tests {
                     requires_confirmation: true,
                     kind: SopStepKind::Execute,
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -208,6 +209,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::Execute,
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,

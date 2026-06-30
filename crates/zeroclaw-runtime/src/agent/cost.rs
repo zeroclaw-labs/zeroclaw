@@ -282,9 +282,32 @@ pub fn record_tool_loop_cost_usage(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let (input_rate, output_rate, cached_rate) = pricing
+    let (mut input_rate, mut output_rate, mut cached_rate) = pricing
         .map(|map| resolve_rates(map, model))
         .unwrap_or((0.0, 0.0, 0.0));
+
+    // Global catalog fallback: when the operator never hand-priced this model
+    // in config, consult the daemon-wide pricing catalog
+    // (`<data_dir>/pricing.json`, fed by the public LiteLLM/OpenRouter feed).
+    // Exact id matching keeps provider-qualified self-hosted ids — absent from
+    // the public catalog — at $0, so only billed cloud models get a non-zero
+    // rate here.
+    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
+        if let Some((cat_in, cat_out, cat_cached)) =
+            crate::agent::pricing_catalog::global_pricing_rates(model)
+        {
+            input_rate = cat_in;
+            output_rate = cat_out;
+            if cached_rate == 0.0 {
+                cached_rate = cat_cached;
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     let cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -302,7 +325,10 @@ pub fn record_tool_loop_cost_usage(
     // stream doesn't get spammy. Missing pricing means either the
     // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
-    if ctx.tracker.is_some() && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0)) {
+    if ctx.tracker.is_some()
+        && !priced_from_catalog
+        && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0))
+    {
         warn_once_missing_pricing(model_provider_name, model);
     }
 

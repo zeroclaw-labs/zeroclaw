@@ -107,4 +107,29 @@ mod tests {
         // Should remain unchanged since there's no drive letter at position 5
         assert_eq!(cleaned.to_string_lossy(), r"\\?\UNC\server\share");
     }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_or_exact_strings() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+        // Exactly at the char budget is not truncated.
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+        assert_eq!(truncate_with_ellipsis("", 3), "");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_truncates_and_appends() {
+        assert_eq!(truncate_with_ellipsis("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_trims_trailing_space_before_ellipsis() {
+        // The kept slice "ab " is trimmed before the ellipsis is appended.
+        assert_eq!(truncate_with_ellipsis("ab cd", 3), "ab...");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_counts_unicode_chars_not_bytes() {
+        // "héllo" cut after 2 chars keeps "hé" (3 bytes), not 2 bytes.
+        assert_eq!(truncate_with_ellipsis("héllo", 2), "hé...");
+    }
 }
