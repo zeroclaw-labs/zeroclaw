@@ -299,13 +299,12 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     ///   appears as `interactive.button_reply.id` /
     ///   `interactive.list_reply.id`, surfaced as
     ///   `[choice]<callback_id>` in the inbound `ChannelMessage.content`.
-    /// - **Signal** uses native polls, which only round-trip the
-    ///   selected option's *label* (signal-cli emits
-    ///   `pollAnswer.selectedTitles`). The inbound surfaces as
-    ///   `[choice]<label>`. Callers needing a stable id should pass
-    ///   the id IN the label, or maintain a side map keyed by label.
-    ///   Avoid duplicate labels: identical labels are
-    ///   indistinguishable on the inbound side.
+    /// - **Signal** uses native polls. Real signal-cli `pollVote`
+    ///   payloads round-trip selected option indexes, surfaced as
+    ///   `[choice-index]N` with a 1-based index. Some alternate
+    ///   `pollAnswer` payloads may include selected titles and surface
+    ///   as `[choice]<label>`, but callers needing stable callback ids
+    ///   should maintain a side map keyed by poll option index.
     /// - **Default text fallback** (Matrix, SMS, IRC, mock) renders a
     ///   numbered list with a "reply with name or number" hint and
     ///   relies on the consumer's own matcher to resolve the user's

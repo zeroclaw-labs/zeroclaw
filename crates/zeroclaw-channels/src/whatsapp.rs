@@ -696,7 +696,7 @@ impl Channel for WhatsAppChannel {
                     let title = if options.len() <= MAX_ROWS_PER_SECTION {
                         "Options".to_string()
                     } else {
-                        format!("Options {start}–{end}")
+                        format!("Options {start} to {end}")
                     };
                     InteractiveListSection {
                         title,
