@@ -131,6 +131,11 @@ pub enum SopTrigger {
         calendar_ids: Vec<String>,
     },
     Manual,
+    Amqp {
+        routing_key: String,
+        #[serde(default)]
+        condition: Option<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -145,6 +150,7 @@ impl fmt::Display for SopTrigger {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
         }
     }
 }
@@ -329,6 +335,7 @@ pub enum SopTriggerSource {
     Filesystem,
     Calendar,
     Manual,
+    Amqp,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -341,6 +348,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp => write!(f, "amqp"),
         }
     }
 }

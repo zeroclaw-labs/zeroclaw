@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use futures_util::StreamExt;
@@ -12,6 +12,11 @@ use lapin::{
     types::FieldTable,
 };
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::AmqpDispatch;
+use zeroclaw_runtime::sop::audit::SopAuditLogger;
+use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
+use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
+use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -20,6 +25,8 @@ static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Binds a queue to an exchange, consumes deliveries, and lifts each JSON
 /// body into a `ChannelMessage` driving the agent loop. The body-to-message
 /// mapping is config-driven so a new publisher is onboarded by configuration.
+/// When `dispatch` selects a SOP mode, each delivery also (or instead) becomes
+/// an `amqp` `SopEvent` routed to the SOP engine by routing key.
 pub struct AmqpChannel {
     amqp_url: String,
     exchange: String,
@@ -32,6 +39,9 @@ pub struct AmqpChannel {
     content_template: String,
     thread_id_field: String,
     durable_ack: bool,
+    dispatch: AmqpDispatch,
+    engine: Option<Arc<Mutex<SopEngine>>>,
+    audit: Option<Arc<SopAuditLogger>>,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -49,6 +59,9 @@ pub struct AmqpChannelConfig {
     pub content_template: String,
     pub thread_id_field: String,
     pub durable_ack: bool,
+    pub dispatch: AmqpDispatch,
+    pub engine: Option<Arc<Mutex<SopEngine>>>,
+    pub audit: Option<Arc<SopAuditLogger>>,
     pub alias: String,
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -67,6 +80,9 @@ impl AmqpChannel {
             content_template: cfg.content_template,
             thread_id_field: cfg.thread_id_field,
             durable_ack: cfg.durable_ack,
+            dispatch: cfg.dispatch,
+            engine: cfg.engine,
+            audit: cfg.audit,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
         }
@@ -308,30 +324,54 @@ impl Channel for AmqpChannel {
                 continue;
             };
 
-            let (content, thread_ts) = self.map_delivery(&delivery.data);
-            let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let routes_sop = matches!(
+                self.dispatch,
+                AmqpDispatch::Sop | AmqpDispatch::SopAndAgentLoop
+            );
+            let routes_agent = matches!(
+                self.dispatch,
+                AmqpDispatch::AgentLoop | AmqpDispatch::SopAndAgentLoop
+            );
 
-            let channel_msg = ChannelMessage {
-                id: format!("amqp_{}_{seq}", chrono::Utc::now().timestamp_millis()),
-                sender: self.sender_label.clone(),
-                reply_target: self.sender_label.clone(),
-                content,
-                channel: "amqp".to_string(),
-                channel_alias: Some(self.alias.clone()),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                thread_ts,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
+            if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
+                let routing_key = delivery.routing_key.as_str().to_string();
+                let payload = String::from_utf8_lossy(&delivery.data).to_string();
+                let event = SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some(routing_key),
+                    payload: Some(payload),
+                    timestamp: now_iso8601(),
+                };
+                let results = dispatch_sop_event(engine, audit, event).await;
+                process_headless_results(&results);
+            }
 
-                ..Default::default()
-            };
+            if routes_agent {
+                let (content, thread_ts) = self.map_delivery(&delivery.data);
+                let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
 
-            if tx.send(channel_msg).await.is_err() {
-                return Ok(());
+                let channel_msg = ChannelMessage {
+                    id: format!("amqp_{}_{seq}", chrono::Utc::now().timestamp_millis()),
+                    sender: self.sender_label.clone(),
+                    reply_target: self.sender_label.clone(),
+                    content,
+                    channel: "amqp".to_string(),
+                    channel_alias: Some(self.alias.clone()),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                    subject: None,
+
+                    ..Default::default()
+                };
+
+                if tx.send(channel_msg).await.is_err() {
+                    return Ok(());
+                }
             }
 
             if self.durable_ack {
@@ -431,6 +471,9 @@ mod tests {
             content_template: content_template.into(),
             thread_id_field: thread_id_field.into(),
             durable_ack: true,
+            dispatch: AmqpDispatch::AgentLoop,
+            engine: None,
+            audit: None,
             alias: "stagex".into(),
             peer_resolver: Arc::new(Vec::new),
         })
