@@ -136,7 +136,8 @@ pub fn build_spec_scoped(
             prop: write_prop_for(field, section_prefix),
             optional,
             prompt: Prompt::new(prompt_text(field), response_type_for(field))
-                .with_message(Localizable::new(&field.name).with_arg("text", prompt_text(field))),
+                .with_message(Localizable::new(&field.name).with_arg("text", prompt_text(field)))
+                .with_optional(optional),
             on_success,
             on_failure: Step::Node(id.clone()),
             branches: Vec::new(),
@@ -402,7 +403,8 @@ fn new_group_field_chain(
             prop: write_prop_for(field, &prefix),
             optional,
             prompt: Prompt::new(prompt_text(field), response_type_for(field))
-                .with_message(Localizable::new(&field.name).with_arg("text", prompt_text(field))),
+                .with_message(Localizable::new(&field.name).with_arg("text", prompt_text(field)))
+                .with_optional(optional),
             on_success,
             on_failure: Step::Node(id.clone()),
             branches: Vec::new(),

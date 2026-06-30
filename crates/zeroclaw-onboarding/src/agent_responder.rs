@@ -34,6 +34,7 @@ pub struct AgentResponder<T: AgentTurn> {
     turn: T,
     last_follow_on: FollowOn,
     locale: String,
+    briefed: bool,
 }
 
 impl<T: AgentTurn> AgentResponder<T> {
@@ -42,6 +43,7 @@ impl<T: AgentTurn> AgentResponder<T> {
             turn,
             last_follow_on: FollowOn::BackToLlm,
             locale: default_locale(),
+            briefed: false,
         }
     }
 
@@ -67,6 +69,18 @@ impl<T: AgentTurn> AgentResponder<T> {
 
 const DEFAULT_LOCALE: &str = "en";
 
+/// Briefing sent once at the start of the conversation. After this turn the
+/// guide answers from conversation history, so later prompts carry only the
+/// field text. This is what makes the walk a single `zeroclaw agent` exchange
+/// with memory rather than a sequence of stateless one-shot questions.
+const GUIDE_BRIEFING: &str = "You are guiding an operator through ZeroClaw setup, one field at a time. \
+I will send each field in turn. Reply with ONLY the value for that field and nothing else: \
+no explanation, no preamble, no tool use, no file lookups. \
+For a yes/no field reply `yes` or `no`. For a number reply only the number. \
+For a choice reply exactly one offered option. For free text reply the value on one line. \
+If a field is optional and has no sensible value, reply `none`. \
+Use what you already chose for earlier fields to stay consistent. Answer the first field now.\n\n";
+
 pub(crate) fn default_locale() -> String {
     DEFAULT_LOCALE.to_string()
 }
@@ -89,8 +103,10 @@ pub(crate) fn locale_directive(locale: &str) -> String {
 #[async_trait]
 impl<T: AgentTurn> LlmResponder for AgentResponder<T> {
     async fn respond(&mut self, prompt_text: &str) -> TransportResult<String> {
+        let briefing = if self.briefed { "" } else { GUIDE_BRIEFING };
+        self.briefed = true;
         let directive = locale_directive(&self.locale);
-        let message = format!("{directive}{prompt_text}");
+        let message = format!("{briefing}{directive}{prompt_text}");
         let reply = self.turn.run_single(&message).await?;
         self.last_follow_on = Self::classify(&reply);
         Ok(reply)
@@ -149,13 +165,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responder_adds_no_directive_for_the_english_default() {
-        let mut responder = AgentResponder::new(ScriptedTurn::new(vec!["yes"]));
-        responder.respond("Enable telemetry?").await.unwrap();
-        let seen = responder.turn.seen.last().expect("a prompt was sent");
+    async fn responder_briefs_once_then_sends_only_the_field() {
+        let mut responder = AgentResponder::new(ScriptedTurn::new(vec!["yes", "no"]));
+        responder.respond("First field?").await.unwrap();
+        responder.respond("Second field?").await.unwrap();
+        let seen = &responder.turn.seen;
+        assert!(
+            seen[0].contains("ZeroClaw setup") && seen[0].ends_with("First field?"),
+            "the first turn carries the briefing, got: {}",
+            seen[0]
+        );
         assert_eq!(
-            seen, "Enable telemetry?",
-            "English default must not alter the prompt"
+            seen[1], "Second field?",
+            "later turns carry only the field; continuity comes from conversation history"
         );
     }
 

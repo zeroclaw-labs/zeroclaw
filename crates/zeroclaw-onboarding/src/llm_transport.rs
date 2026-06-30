@@ -86,6 +86,34 @@ fn parse_yes_no(raw: &str) -> Option<bool> {
     }
 }
 
+/// The agent's way of declining to set an optional field. Returned for an
+/// optional prompt only; the walk's `response_is_empty` skip-path then leaves
+/// the property unwritten. Without this an optional `Option<_>` or optional
+/// list field re-prompts forever, because no concrete value means "no value".
+fn is_skip_sentinel(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("skip")
+}
+
+/// An empty response carrier matching the prompt's type, so the walk recognizes
+/// it as "no value" via `response_is_empty`.
+fn empty_response_for(prompt: &Prompt) -> ResponseValue {
+    match &prompt.response_type {
+        ResponseType::Number => ResponseValue::Number(String::new()),
+        ResponseType::Choice { .. } => ResponseValue::Choice(String::new()),
+        ResponseType::Secret => ResponseValue::Secret(SecretValue::new(String::new())),
+        ResponseType::FreeformText | ResponseType::YesNo => {
+            ResponseValue::FreeformText(String::new())
+        }
+    }
+}
+
+/// Upper bound on agent turns for a single prompt. A non-progressing walk
+/// (model never produces a parseable value) fails fast instead of hanging.
+const MAX_REASK_PER_PROMPT: usize = 6;
+
 #[async_trait]
 impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
     async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
@@ -98,12 +126,20 @@ impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
                 }
             }
         }
-        loop {
+        for _ in 0..MAX_REASK_PER_PROMPT {
             let raw = self.responder.respond(&prompt_text).await?;
+            if prompt.optional && is_skip_sentinel(&raw) {
+                return Ok(empty_response_for(prompt));
+            }
             if let Some(value) = Self::parse_non_secret(prompt, &raw) {
                 return Ok(value);
             }
         }
+        Err(zeroclaw_runtime::flow::TransportError::Agent {
+            reason: format!(
+                "guide produced no parseable value for prompt after {MAX_REASK_PER_PROMPT} turns"
+            ),
+        })
     }
 
     async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()> {
@@ -249,5 +285,50 @@ mod tests {
         );
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::Choice("partial".into()));
+    }
+
+    #[tokio::test]
+    async fn optional_field_skips_on_a_none_reply_instead_of_looping() {
+        let mut transport =
+            LlmTransport::new(ScriptedResponder::new(vec!["none"]), PanicSecretReader);
+        let prompt = Prompt::new("Display name", ResponseType::FreeformText).with_optional(true);
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(
+            value,
+            ResponseValue::FreeformText(String::new()),
+            "an optional none reply must yield an empty response the walk treats as skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_choice_skip_yields_an_empty_choice() {
+        let mut transport =
+            LlmTransport::new(ScriptedResponder::new(vec!["skip"]), PanicSecretReader);
+        let prompt = Prompt::new(
+            "Mode",
+            ResponseType::Choice {
+                options: vec![ChoiceOption {
+                    value: "partial".into(),
+                    label: "Partial".into(),
+                }],
+            },
+        )
+        .with_optional(true);
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::Choice(String::new()));
+    }
+
+    #[tokio::test]
+    async fn a_required_field_that_never_parses_fails_fast_rather_than_hanging() {
+        let mut transport = LlmTransport::new(
+            ScriptedResponder::new(vec!["x", "x", "x", "x", "x", "x", "x", "x"]),
+            PanicSecretReader,
+        );
+        let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
+        let error = transport.ask(&prompt).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::Agent { .. }),
+            "a non-progressing walk must surface a bounded Agent error, got {error:?}"
+        );
     }
 }

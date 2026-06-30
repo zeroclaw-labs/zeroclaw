@@ -34,6 +34,12 @@ pub struct Prompt {
     /// text instead of reading a single line, so an operator can author a
     /// multi-line personality file. `None` keeps the plain line-read behavior.
     pub editor_seed: Option<String>,
+    /// Whether the field may be left unset. When true, a transport may answer
+    /// with a skip sentinel (empty / `none` / `skip`) and the walk leaves the
+    /// property unwritten instead of looping to re-ask. Optional `Option<_>`
+    /// and optional-list fields would otherwise re-prompt forever in a
+    /// non-interactive walk because there is no value that means "no value".
+    pub optional: bool,
 }
 
 impl Prompt {
@@ -44,6 +50,7 @@ impl Prompt {
             response_type,
             message: None,
             editor_seed: None,
+            optional: false,
         }
     }
 
@@ -56,6 +63,12 @@ impl Prompt {
     #[must_use]
     pub fn with_editor_seed(mut self, seed: impl Into<String>) -> Self {
         self.editor_seed = Some(seed.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_optional(mut self, optional: bool) -> Self {
+        self.optional = optional;
         self
     }
 
