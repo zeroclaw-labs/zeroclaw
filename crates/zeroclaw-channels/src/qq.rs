@@ -1638,7 +1638,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
@@ -1710,7 +1711,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
