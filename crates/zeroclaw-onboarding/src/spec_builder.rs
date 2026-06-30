@@ -471,7 +471,13 @@ pub fn append_personality_branch(
         let author_id = NodeId::new(format!("{PERSONALITY_AUTHOR_NODE_PREFIX}.{filename}"));
         spec.nodes.insert(
             author_id.clone(),
-            personality_author_node(author_id.clone(), agent_alias, filename, next_step.clone()),
+            personality_author_node(
+                author_id.clone(),
+                agent_alias,
+                filename,
+                rendered.clone(),
+                next_step.clone(),
+            ),
         );
 
         let mut branches: Vec<(ResponseValue, Step)> = vec![
@@ -543,17 +549,27 @@ fn repoint_personality_entry(spec: &mut Spec, base_ids: &[NodeId], target: &Node
     }
 }
 
-fn personality_author_node(id: NodeId, agent_alias: &str, filename: &str, next: Step) -> Node {
+fn personality_author_node(
+    id: NodeId,
+    agent_alias: &str,
+    filename: &str,
+    seed: Option<String>,
+    next: Step,
+) -> Node {
+    let mut prompt = Prompt::new(
+        format!("Write the contents of {filename}"),
+        ResponseType::FreeformText,
+    );
+    if let Some(seed) = seed {
+        prompt = prompt.with_editor_seed(seed);
+    }
     Node {
         id: id.clone(),
         layer: "agent".to_string(),
         instance: agent_alias.to_string(),
         prop: String::new(),
         optional: false,
-        prompt: Prompt::new(
-            format!("Write the contents of {filename}"),
-            ResponseType::FreeformText,
-        ),
+        prompt,
         on_success: next,
         on_failure: Step::Node(id),
         branches: Vec::new(),

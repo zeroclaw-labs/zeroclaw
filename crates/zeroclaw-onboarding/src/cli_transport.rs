@@ -8,6 +8,32 @@ pub trait CliSecretSource: Send {
     async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String>;
 }
 
+/// Interactive multi-line authoring seam. A freeform prompt carrying an
+/// `editor_seed` routes here so an operator can edit a pre-filled buffer in
+/// `$EDITOR` instead of typing a single line. The default spawns the system
+/// editor on a temp file; tests inject a scripted session.
+pub trait CliEditorSession: Send {
+    fn edit(&mut self, seed: &str) -> TransportResult<String>;
+}
+
+pub struct SystemEditorSession;
+
+impl CliEditorSession for SystemEditorSession {
+    fn edit(&mut self, seed: &str) -> TransportResult<String> {
+        let mut file = tempfile::Builder::new()
+            .suffix(".md")
+            .tempfile()
+            .map_err(|_| TransportError::Closed)?;
+        use std::io::Write as _;
+        file.write_all(seed.as_bytes())
+            .map_err(|_| TransportError::Closed)?;
+        file.flush().map_err(|_| TransportError::Closed)?;
+        zeroclaw_runtime::editor::open_in_editor(file.path())
+            .map_err(|_| TransportError::Closed)?;
+        std::fs::read_to_string(file.path()).map_err(|_| TransportError::Closed)
+    }
+}
+
 pub struct NoSecretSource;
 
 #[async_trait]
@@ -38,6 +64,8 @@ pub struct CliTransport<R: BufRead + Send, W: Write + Send, S: CliSecretSource> 
     reader: R,
     writer: W,
     secret_source: S,
+    editor: Box<dyn CliEditorSession>,
+    editor_enabled: bool,
 }
 
 impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, S> {
@@ -46,7 +74,25 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
             reader,
             writer,
             secret_source,
+            editor: Box::new(SystemEditorSession),
+            editor_enabled: false,
         }
+    }
+
+    /// Enable interactive `$EDITOR` authoring for freeform prompts that carry an
+    /// editor seed. Off by default so scripted/non-tty runs read a line; the CLI
+    /// path turns it on only when stdin is an interactive terminal.
+    #[must_use]
+    pub fn with_interactive_editor(mut self, enabled: bool) -> Self {
+        self.editor_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_editor(mut self, editor: Box<dyn CliEditorSession>) -> Self {
+        self.editor = editor;
+        self.editor_enabled = true;
+        self
     }
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
@@ -55,6 +101,16 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
             crate::i18n::resolve_prompt_text(prompt),
             prompt.sigil().as_str()
         )
+    }
+
+    fn editor_target(&self, prompt: &Prompt) -> Option<String> {
+        if !self.editor_enabled {
+            return None;
+        }
+        match prompt.response_type {
+            ResponseType::FreeformText => prompt.editor_seed.clone(),
+            _ => None,
+        }
     }
 
     fn read_line(&mut self) -> TransportResult<String> {
@@ -122,6 +178,8 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
             let raw = if prompt.routes_secret() {
                 let secret_prompt = crate::i18n::resolve_prompt_text(prompt);
                 self.secret_source.read_secret(&secret_prompt).await?
+            } else if let Some(seed) = self.editor_target(prompt) {
+                self.editor.edit(&seed)?
             } else {
                 self.read_line()?
             };
@@ -249,6 +307,49 @@ mod tests {
         );
         let value = transport.ask(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::Choice("partial".into()));
+    }
+
+    struct ScriptedEditor {
+        seen_seed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        returns: String,
+    }
+
+    impl CliEditorSession for ScriptedEditor {
+        fn edit(&mut self, seed: &str) -> TransportResult<String> {
+            *self.seen_seed.lock().unwrap() = Some(seed.to_string());
+            Ok(self.returns.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn freeform_with_seed_routes_through_editor_when_enabled() {
+        let mut output: Vec<u8> = Vec::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let editor = ScriptedEditor {
+            seen_seed: seen.clone(),
+            returns: "edited body".to_string(),
+        };
+        let mut transport = CliTransport::with_secret_source(
+            Cursor::new(Vec::new()),
+            &mut output,
+            ScriptedSecretSource::new(Vec::new()),
+        )
+        .with_editor(Box::new(editor));
+        let prompt = Prompt::new("Write SOUL.md", ResponseType::FreeformText)
+            .with_editor_seed("template seed");
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::FreeformText("edited body".into()));
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("template seed"));
+    }
+
+    #[tokio::test]
+    async fn freeform_with_seed_reads_line_when_editor_disabled() {
+        let mut output: Vec<u8> = Vec::new();
+        let mut transport = visible_only(Cursor::new(b"typed inline\n".to_vec()), &mut output);
+        let prompt = Prompt::new("Write SOUL.md", ResponseType::FreeformText)
+            .with_editor_seed("template seed");
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::FreeformText("typed inline".into()));
     }
 
     #[tokio::test]

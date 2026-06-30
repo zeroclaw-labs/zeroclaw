@@ -29,6 +29,11 @@ pub struct Prompt {
     pub text: String,
     pub response_type: ResponseType,
     pub message: Option<Localizable>,
+    /// Seed content for an interactive editor session. When set on a freeform
+    /// prompt, an interactive transport may open `$EDITOR` pre-filled with this
+    /// text instead of reading a single line, so an operator can author a
+    /// multi-line personality file. `None` keeps the plain line-read behavior.
+    pub editor_seed: Option<String>,
 }
 
 impl Prompt {
@@ -38,12 +43,19 @@ impl Prompt {
             text: text.into(),
             response_type,
             message: None,
+            editor_seed: None,
         }
     }
 
     #[must_use]
     pub fn with_message(mut self, message: Localizable) -> Self {
         self.message = Some(message);
+        self
+    }
+
+    #[must_use]
+    pub fn with_editor_seed(mut self, seed: impl Into<String>) -> Self {
+        self.editor_seed = Some(seed.into());
         self
     }
 

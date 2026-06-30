@@ -1481,7 +1481,9 @@ async fn run_onboard_flow(
 
     let reader = std::io::BufReader::new(std::io::stdin());
     let writer = std::io::stdout();
-    let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource);
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource)
+        .with_interactive_editor(interactive);
     let request = FlowRequest {
         section_prefix: section,
         layer,
