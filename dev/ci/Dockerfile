@@ -5,6 +5,7 @@ FROM rust:1.92-slim@sha256:bf3368a992915f128293ac76917ab6e561e4dda883273c8f5c9f6
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
+    ripgrep \
     pkg-config \
     libssl-dev \
     curl \

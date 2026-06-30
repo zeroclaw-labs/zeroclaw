@@ -32,14 +32,16 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
+// Zerocode is an RPC-only surface and must not link ZeroClaw backend crates.
+// Until command discovery is delivered over the RPC boundary, this local list
+// only drives TUI autocomplete for commands handled locally by `parse_slash_command`.
+const LOCAL_TUI_SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
-    "/clear-queue",
+    "/clear-queue [index]",
     "/detach",
-    "/model",
-    "/model-provider",
+    "/model [model]",
+    "/model-provider [provider]",
     "/new",
     "/new-session",
     "/restart-session",
@@ -612,10 +614,11 @@ impl InputBarState {
         if text.starts_with('/') && !text.contains(' ') {
             let prefix = text.as_str();
             self.autocomplete_target = AutocompleteTarget::Command;
-            self.autocomplete_matches = SLASH_COMMANDS
+            self.autocomplete_matches = LOCAL_TUI_SLASH_COMMANDS
                 .iter()
-                .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .map(|c| (*c).to_string())
+                .copied()
+                .filter(|cmd| cmd.starts_with(prefix) && *cmd != prefix)
+                .map(str::to_string)
                 .collect();
             self.finalize_autocomplete();
             return;

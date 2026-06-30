@@ -11,6 +11,7 @@
 //! or a trait impl, never by re-opening the supervision logic.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Discriminates which producer registered a unit of work. EXTEND, don't fork:
 /// EPIC E adds `RemoteTurn`; EPIC B treats a paused task as a supervised *status*,
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub enum TaskKind {
     Delegate,
     Subagent,
+    Goal,
     PeerInbox,
     // EPIC E: RemoteTurn
 }
@@ -32,6 +34,7 @@ pub enum TaskKind {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Running,
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -40,6 +43,70 @@ pub enum TaskStatus {
     Lost,
     /// Heartbeat exceeded its grace window / the task passed `max_runtime`.
     TimedOut,
+}
+
+/// Goal-specific extension record keyed by the canonical task id.
+///
+/// Lifecycle, ownership, route, principal, timestamps, and terminal state stay on
+/// [`TaskRecord`]. This record owns only goal-specific state that has no meaning
+/// for delegates/subagents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalTaskRecord {
+    pub task_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub effective_token_limit: Option<u64>,
+    #[serde(default)]
+    pub effective_cost_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub pause_reason: Option<GoalPauseReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<GoalBlocker>,
+}
+
+/// Typed policy input for why a goal is paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPauseReason {
+    NeedsUserInput,
+    HumanEscalation,
+    ExternalDependency,
+    ProviderUnavailable,
+    VerifierBlocked,
+    DaemonRestart,
+}
+
+/// Structured blocker packet attached to a paused goal.
+///
+/// Free-form text is only explanatory. Policy branches on `kind` and payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalBlocker {
+    pub kind: GoalBlockerKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalBlockerKind {
+    NeedsUserInput,
+    HumanEscalation,
+    ExternalDependency,
+    Provider,
+    Verifier,
+    RestartRecovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPauseState {
+    pub reason: GoalPauseReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<GoalBlocker>,
 }
 
 impl TaskStatus {
@@ -109,6 +176,12 @@ pub struct TaskRecord {
 pub trait TaskRegistry: Send + Sync {
     /// Register a new unit of work. Idempotent on `rec.id`.
     async fn create(&self, rec: TaskRecord) -> anyhow::Result<()>;
+    /// Register a goal task and its goal-specific extension atomically.
+    ///
+    /// `TaskRecord` remains the canonical lifecycle/route/principal record;
+    /// `GoalTaskRecord` remains the goal-only extension. This method only owns
+    /// the transaction boundary between those two source-of-truth rows.
+    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> anyhow::Result<()>;
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;
     /// Transition `id` to `status`, optionally recording terminal output/error.
@@ -122,6 +195,38 @@ pub trait TaskRegistry: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>>;
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
+    /// Resolve the latest non-terminal goal task for `agent` directly from the
+    /// canonical task table. This is a read-only resolver, not cached state.
+    async fn latest_active_goal_for_agent(&self, agent: &str)
+    -> anyhow::Result<Option<TaskRecord>>;
+    /// Resolve the latest non-terminal goal for the trusted runtime context.
+    ///
+    /// Route and principal filters are matched against canonical `TaskRecord`
+    /// fields when present. Callers that have no route/principal context pass
+    /// `None` and intentionally fall back to agent-scoped resolution.
+    async fn latest_active_goal_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> anyhow::Result<Option<TaskRecord>>;
+    async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
+    async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
+    /// Replace the persisted effective budget limits for a goal.
+    ///
+    /// These are creation/update-time policy limits only. Consumed and
+    /// remaining usage stay derived from canonical usage ledger rows.
+    async fn update_goal_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<()>;
+    async fn update_goal_pause(
+        &self,
+        task_id: &str,
+        pause: Option<GoalPauseState>,
+    ) -> anyhow::Result<()>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is
     /// authoritative for it. Returns `false` (no write) when another live daemon
     /// owns it. See [`crate::control_plane::authority::is_authoritative`].
@@ -137,6 +242,7 @@ mod tests {
         // Backward-compat: pre-EPIC-A on-disk values must deserialize unchanged.
         for (json, want) in [
             ("\"running\"", TaskStatus::Running),
+            ("\"paused\"", TaskStatus::Paused),
             ("\"completed\"", TaskStatus::Completed),
             ("\"failed\"", TaskStatus::Failed),
             ("\"cancelled\"", TaskStatus::Cancelled),
@@ -144,6 +250,14 @@ mod tests {
             let got: TaskStatus = serde_json::from_str(json).unwrap();
             assert_eq!(got, want, "legacy status {json} must parse");
         }
+    }
+
+    #[test]
+    fn goal_kind_roundtrips_snake_case() {
+        let s = serde_json::to_string(&TaskKind::Goal).unwrap();
+        assert_eq!(s, "\"goal\"");
+        let back: TaskKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, TaskKind::Goal);
     }
 
     #[test]
@@ -155,6 +269,11 @@ mod tests {
             assert_eq!(back, st);
             assert!(st.is_terminal());
         }
+    }
+
+    #[test]
+    fn paused_status_is_non_terminal() {
+        assert!(!TaskStatus::Paused.is_terminal());
     }
 
     #[test]
@@ -175,5 +294,20 @@ mod tests {
         assert!(rec.parent_id.is_none());
         assert!(rec.originator_route.is_none());
         assert!(rec.principal_id.is_none()); // EPIC-D attribution not yet stamped; absent
+    }
+
+    #[test]
+    fn goal_task_loads_without_effective_limits() {
+        let legacy = r#"{
+            "task_id": "goal-1",
+            "objective": "ship goal mode"
+        }"#;
+        let rec: GoalTaskRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.task_id, "goal-1");
+        assert!(rec.effective_token_limit.is_none());
+        assert!(rec.effective_cost_limit_usd.is_none());
+        assert!(rec.pause_reason.is_none());
+        assert!(rec.pause_description.is_none());
+        assert!(rec.blockers.is_empty());
     }
 }

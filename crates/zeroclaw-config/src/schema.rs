@@ -209,6 +209,12 @@ pub struct Config {
     #[group = "Agent"]
     pub reliability: ReliabilityConfig,
 
+    /// Durable goal-mode configuration (`[goal]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: GoalConfig,
+
     /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     #[nested]
@@ -3628,6 +3634,13 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub identity: IdentityConfig,
 
+    /// Per-agent goal-mode policy (`[agents.<alias>.goal]`).
+    /// This is the canonical agent-level gate for accepting durable goals.
+    #[tab(General)]
+    #[serde(default)]
+    #[nested]
+    pub goal: AgentGoalConfig,
+
     /// Per-agent A2A publication block (`[agents.<alias>.a2a]`). Gates
     /// whether this alias is discoverable as a spec-conforming A2A agent
     /// and which resolved skills appear on its card. Default-closed
@@ -3662,6 +3675,7 @@ impl Default for AliasedAgentConfig {
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            goal: AgentGoalConfig::default(),
             a2a: crate::multi_agent::AgentA2aConfig::default(),
         }
     }
@@ -3678,6 +3692,167 @@ impl AliasedAgentConfig {
             && !self.model_provider.is_empty()
             && !self.risk_profile.trim().is_empty()
             && !self.runtime_profile.trim().is_empty()
+    }
+}
+
+/// Per-agent goal-mode policy (`[agents.<alias>.goal]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agents.goal"]
+pub struct AgentGoalConfig {
+    /// Enable durable goal mode for this agent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AgentGoalConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Durable goal-mode runtime policy (`[goal]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal"]
+pub struct GoalConfig {
+    /// Enable durable goal mode.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Command surfaces allowed to start or manage durable goals.
+    #[serde(default = "default_goal_allowed_command_surfaces")]
+    pub allowed_command_surfaces: Vec<String>,
+    /// Channel types allowed to accept goal commands or model-initiated starts.
+    #[serde(default = "default_goal_allowed_channel_types")]
+    pub allowed_channel_types: Vec<String>,
+    /// Default token budget for newly created goals. Omit for unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// Default cost budget in USD for newly created goals. Omit for unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_usd: Option<f64>,
+    /// Completion verifier policy. The verifier is global goal-mode policy,
+    /// not an agent-local provider copy.
+    #[serde(default)]
+    #[nested]
+    pub verifier: GoalVerifierConfig,
+}
+
+impl Default for GoalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_command_surfaces: default_goal_allowed_command_surfaces(),
+            allowed_channel_types: default_goal_allowed_channel_types(),
+            token_budget: None,
+            cost_budget_usd: None,
+            verifier: GoalVerifierConfig::default(),
+        }
+    }
+}
+
+fn default_goal_allowed_command_surfaces() -> Vec<String> {
+    ["web", "tui", "channel"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_goal_allowed_channel_types() -> Vec<String> {
+    ["matrix", "telegram"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_goal_config(goal: &GoalConfig) -> Result<()> {
+    for (idx, surface) in goal.allowed_command_surfaces.iter().enumerate() {
+        let trimmed = surface.trim();
+        if trimmed.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("goal.allowed_command_surfaces[{idx}]"),
+                "goal.allowed_command_surfaces[{idx}] must not be empty"
+            );
+        }
+        if !matches!(trimmed, "web" | "tui" | "channel") {
+            validation_bail!(
+                InvalidFormat,
+                format!("goal.allowed_command_surfaces[{idx}]"),
+                "goal.allowed_command_surfaces[{idx}] = {surface:?} must be one of: web, tui, channel"
+            );
+        }
+    }
+    for (idx, channel_type) in goal.allowed_channel_types.iter().enumerate() {
+        let trimmed = channel_type.trim();
+        if trimmed.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("goal.allowed_channel_types[{idx}]"),
+                "goal.allowed_channel_types[{idx}] must not be empty"
+            );
+        }
+        if trimmed.contains('.') || trimmed.contains(char::is_whitespace) {
+            validation_bail!(
+                InvalidFormat,
+                format!("goal.allowed_channel_types[{idx}]"),
+                "goal.allowed_channel_types[{idx}] = {channel_type:?} must be a bare channel type such as matrix or telegram"
+            );
+        }
+    }
+    if matches!(goal.token_budget, Some(0)) {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.token_budget",
+            "goal.token_budget must be greater than 0 when set"
+        );
+    }
+    if let Some(cost) = goal.cost_budget_usd
+        && (!cost.is_finite() || cost <= 0.0)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.cost_budget_usd",
+            "goal.cost_budget_usd must be a finite positive value when set"
+        );
+    }
+    Ok(())
+}
+
+/// Goal completion verifier policy (`[goal.verifier]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal.verifier"]
+pub struct GoalVerifierConfig {
+    /// Enable explicit verifier checks before a goal can complete.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional verifier model provider reference (`<family>.<alias>`).
+    /// Empty = reuse the goal owner's configured model provider.
+    #[serde(default)]
+    pub model_provider: crate::providers::ModelProviderRef,
+    /// Optional verifier model override. Empty = use the provider profile's
+    /// configured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional verifier temperature. `None` means provider/runtime default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Optional reasoning-effort request for providers that support it.
+    /// Uses the same normalized vocabulary as `runtime.reasoning_effort`.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for GoalVerifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_provider: crate::providers::ModelProviderRef::default(),
+            model: None,
+            temperature: None,
+            reasoning_effort: None,
+        }
     }
 }
 
@@ -15916,6 +16091,7 @@ impl Default for Config {
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
@@ -18455,6 +18631,45 @@ impl Config {
             );
         }
 
+        validate_goal_config(&self.goal)?;
+
+        if let Some(temperature) = self.goal.verifier.temperature
+            && let Err(msg) = validate_temperature(temperature)
+        {
+            anyhow::bail!("goal.verifier.temperature: {msg}");
+        }
+        if let Some(model) = self.goal.verifier.model.as_deref()
+            && model.trim().is_empty()
+        {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "goal.verifier.model",
+                "goal.verifier.model must be non-empty when set"
+            );
+        }
+        let verifier_provider = self.goal.verifier.model_provider.trim();
+        if !verifier_provider.is_empty() {
+            match verifier_provider.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            "goal.verifier.model_provider",
+                            "goal.verifier.model_provider = {verifier_provider:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    "goal.verifier.model_provider",
+                    "goal.verifier.model_provider must be dotted form `<type>.<alias>` (got {verifier_provider:?})",
+                ),
+            }
+        }
+
         // Per-profile validation: the context-compression summarizer provider
         // ref (#7964) must resolve to a configured `[providers.models.*]` alias.
         // Empty = inherit (valid). A shared profile fails loud at config time
@@ -20990,6 +21205,69 @@ enabled = true
         assert!(c.skills.install_suggestions.enabled);
     }
 
+    #[test]
+    async fn goal_config_deserializes_rfc_policy_shape() {
+        let c = parse_test_config(
+            r#"
+[goal]
+enabled = true
+allowed_command_surfaces = ["web", "tui", "channel"]
+allowed_channel_types = ["matrix", "telegram"]
+token_budget = 50000
+cost_budget_usd = 2.50
+
+[agents.researcher]
+
+[agents.researcher.goal]
+enabled = false
+"#,
+        );
+
+        assert!(c.goal.enabled);
+        assert_eq!(
+            c.goal.allowed_command_surfaces,
+            vec!["web".to_string(), "tui".to_string(), "channel".to_string()]
+        );
+        assert_eq!(
+            c.goal.allowed_channel_types,
+            vec!["matrix".to_string(), "telegram".to_string()]
+        );
+        assert_eq!(c.goal.token_budget, Some(50_000));
+        assert_eq!(c.goal.cost_budget_usd, Some(2.50));
+        assert!(!c.agents["researcher"].goal.enabled);
+        assert!(validate_goal_config(&c.goal).is_ok());
+    }
+
+    #[test]
+    async fn goal_config_rejects_invalid_policy_values() {
+        let mut c = Config::default();
+        c.goal.allowed_command_surfaces = vec!["chanenl".into()];
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.allowed_command_surfaces")
+        );
+
+        let mut c = Config::default();
+        c.goal.allowed_channel_types = vec!["matrix.default".into()];
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.allowed_channel_types")
+        );
+
+        let mut c = Config::default();
+        c.goal.token_budget = Some(0);
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("goal.token_budget")
+        );
+    }
+
     fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
         ::zeroclaw_log::try_install_capture_subscriber();
         ::zeroclaw_log::subscribe_or_install()
@@ -21843,6 +22121,7 @@ auto_save = true
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -22576,6 +22855,7 @@ default_temperature = 0.7
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -30764,6 +31044,65 @@ allowed_users = []
                 && msg.contains("providers.models.custom.does-not-exist is not configured"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn config_validate_rejects_goal_verifier_provider_pointing_at_missing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+
+            [goal.verifier]
+            model_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("missing verifier alias must fail")
+        );
+        assert!(
+            msg.contains("goal.verifier.model_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for goal verifier provider, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_empty_goal_verifier_provider_as_agent_inheritance() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+
+            [goal.verifier]
+            enabled = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("empty verifier provider means inherit agent provider");
+        assert!(cfg.goal.verifier.model_provider.is_empty());
     }
 
     // #7964: agent-level summary_provider validated like classifier_provider.

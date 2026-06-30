@@ -1296,6 +1296,7 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -2385,7 +2386,6 @@ pub async fn run(
                     &agent.resolved.tool_filter_groups,
                     &effective_input,
                 );
-
                 let runtime_capability_names = tools_registry
                     .iter()
                     .map(|tool| tool.name())
@@ -2956,6 +2956,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;

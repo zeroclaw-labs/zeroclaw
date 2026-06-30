@@ -151,6 +151,18 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
     ) -> Result<()> {
+        self.record_usage_with_attribution(usage, agent_alias, None)
+    }
+
+    /// Record a usage event attributed to a specific agent alias and/or active
+    /// goal task. Agent attribution still follows `[cost].track_per_agent`;
+    /// goal attribution is independent because it is the goal ledger key.
+    pub fn record_usage_with_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        goal_task_id: Option<&str>,
+    ) -> Result<()> {
         let config = self.config_snapshot();
         if !config.enabled {
             return Ok(());
@@ -174,7 +186,12 @@ impl CostTracker {
         };
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
-        let record = CostRecord::with_agent(&self.session_id, effective_alias.clone(), usage);
+        let record = CostRecord::with_attribution(
+            &self.session_id,
+            effective_alias.clone(),
+            goal_task_id.map(str::to_string),
+            usage,
+        );
 
         {
             let mut storage = self.lock_storage();
@@ -241,6 +258,19 @@ impl CostTracker {
     /// caller already chose the dimension.
     pub fn get_summary_for_agent(&self, agent_alias: &str) -> Result<CostSummary> {
         self.get_summary_filtered(Some(agent_alias))
+    }
+
+    /// Get usage summary for a durable goal task. Totals are derived from
+    /// persisted ledger rows carrying `goal_task_id`; no consumed counters are
+    /// stored on the goal record.
+    pub fn get_summary_for_goal(&self, goal_task_id: &str) -> Result<CostSummary> {
+        let records = {
+            let mut storage = self.lock_storage();
+            storage.records_in_bounds(None, None)?
+        };
+        Ok(summary_for_records(records.iter().filter(|record| {
+            record.goal_task_id.as_deref() == Some(goal_task_id)
+        })))
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -329,6 +359,27 @@ impl CostTracker {
     pub fn get_monthly_cost(&self, year: i32, month: u32) -> Result<f64> {
         let storage = self.lock_storage();
         storage.get_cost_for_month(year, month)
+    }
+}
+
+fn summary_for_records<'a, I>(records: I) -> CostSummary
+where
+    I: IntoIterator<Item = &'a CostRecord>,
+{
+    let records: Vec<&CostRecord> = records.into_iter().collect();
+    let total_cost: f64 = records.iter().map(|r| r.usage.cost_usd).sum();
+    let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
+    let by_model = build_model_stats(records.iter().copied());
+    let by_agent_records: Vec<CostRecord> =
+        records.iter().map(|record| (*record).clone()).collect();
+    CostSummary {
+        session_cost_usd: total_cost,
+        daily_cost_usd: total_cost,
+        monthly_cost_usd: total_cost,
+        total_tokens,
+        request_count: records.len(),
+        by_model,
+        by_agent: build_agent_stats(&by_agent_records),
     }
 }
 
@@ -836,6 +887,42 @@ mod tests {
         assert_eq!(summary.request_count, 1);
         assert!(summary.session_cost_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    #[test]
+    fn record_usage_with_goal_attribution_summarizes_from_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = enabled_config();
+        config.track_per_agent = true;
+        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_attribution(
+                TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_attribution(
+                TokenUsage::new("test/model", 2000, 500, 0, 1.0, 2.0, 0.0),
+                Some("agent-a"),
+                Some("goal-b"),
+            )
+            .unwrap();
+
+        let summary = tracker.get_summary_for_goal("goal-a").unwrap();
+
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1500);
+        assert!(summary.session_cost_usd > 0.0);
+        assert_eq!(
+            summary
+                .by_agent
+                .get("agent-a")
+                .map(|stats| stats.request_count),
+            Some(1)
+        );
     }
 
     #[test]

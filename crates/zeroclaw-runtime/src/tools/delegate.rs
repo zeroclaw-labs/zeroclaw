@@ -1,3 +1,4 @@
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, record_tool_loop_cost_usage};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
@@ -21,7 +22,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{self, ChatMessage, ChatRequest, ModelProvider, ProviderDispatch};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -30,6 +31,26 @@ use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
+}
+
+async fn active_goal_task_id_from_cost_context() -> Option<String> {
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let agent_alias = ctx.agent_alias.as_deref()?;
+    let control_plane = crate::control_plane::control_plane()?;
+    control_plane
+        .store
+        .latest_active_goal_for_context(
+            agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|goal| goal.id)
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -726,6 +747,7 @@ impl DelegateTool {
             None,
             None,
             None,
+            crate::tools::GoalAdmissionToolPolicy::Omit,
         )
         .tools;
 
@@ -1128,6 +1150,15 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
+            if active_goal_task_id_from_cost_context().await.is_some() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-delegate-error-background-goal-context",
+                    )),
+                });
+            }
             return self.execute_background(agent_name, prompt, &args).await;
         }
 
@@ -1289,9 +1320,22 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = system_prompt_ref {
+            messages.push(ChatMessage::system(system_prompt.to_string()));
+        }
+        messages.push(ChatMessage::user(full_prompt.clone()));
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &model,
+                temperature,
+            ),
         )
         .await;
 
@@ -1310,7 +1354,10 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                let mut rendered = response;
+                if let Some(usage) = &response.usage {
+                    record_tool_loop_cost_usage(&provider_type, &model, usage).await;
+                }
+                let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
                 }
@@ -1738,6 +1785,10 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_goal_cost_context = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1767,6 +1818,7 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let goal_cost_context = parent_goal_cost_context.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1802,7 +1854,15 @@ impl DelegateTool {
                                 // so the target policy is rebuilt for its own
                                 // agentic loop; the preflight above only
                                 // prevents partial fan-out.
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                TOOL_LOOP_COST_TRACKING_CONTEXT
+                                    .scope(
+                                        goal_cost_context,
+                                        Box::pin(inner.execute_sync(
+                                            &agent_name,
+                                            &prompt,
+                                            &args_clone,
+                                        )),
+                                    )
                                     .await
                             })
                             .await
@@ -3523,6 +3583,69 @@ mod tests {
         assert_eq!(schema["additionalProperties"], json!(false));
         assert_eq!(schema["properties"]["agent"]["minLength"], json!(1));
         assert_eq!(schema["properties"]["prompt"]["minLength"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn background_delegation_rejected_when_goal_context_active() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            boot_id: "test-boot".into(),
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let goal_context =
+            crate::agent::cost::ToolLoopCostTrackingContext::usage_only().with_agent_alias(agent);
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(goal_context),
+                tool.execute(json!({
+                    "agent": "researcher",
+                    "prompt": "do detached work",
+                    "background": true
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Background delegation is disabled")
+        );
     }
 
     #[test]

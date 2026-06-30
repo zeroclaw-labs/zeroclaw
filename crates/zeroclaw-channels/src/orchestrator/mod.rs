@@ -118,6 +118,7 @@ use tokio_util::sync::CancellationToken;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::{BuiltinCommandId, CommandSurface, parse_command_token};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
@@ -314,7 +315,7 @@ impl OverrideScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ChannelRuntimeCommand {
     ShowProviders,
     SetProvider(String),
@@ -326,6 +327,15 @@ enum ChannelRuntimeCommand {
     NewSession,
     SetThinking(Option<ThinkingLevel>),
     InvalidThinking(String),
+    Goal(zeroclaw_runtime::control_plane::GoalCommand),
+    InvalidGoal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeCommandOutcome {
+    NotCommand,
+    Handled,
+    ContinueGoalStart { task_id: String, objective: String },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -614,6 +624,18 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         }
     };
     sanitize_session_key(&raw)
+}
+
+fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
+    Some(sanitize_session_key(&format!(
+        "{}_{}",
+        channel_scope(msg),
+        sender
+    )))
 }
 
 /// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
@@ -1330,6 +1352,13 @@ fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
+fn goal_channel_type(channel_name: &str) -> String {
+    channel_name
+        .split_once(':')
+        .map_or(channel_name, |(channel_type, _)| channel_type)
+        .to_string()
+}
+
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -1394,23 +1423,19 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
 
     let mut parts = trimmed.split_whitespace();
     let command_token = parts.next()?;
-    let base_command = command_token
-        .split('@')
-        .next()
-        .unwrap_or(command_token)
-        .to_ascii_lowercase();
+    let command = parse_command_token(command_token, CommandSurface::Channel)?.command;
 
-    match base_command.as_str() {
+    match command.id {
         // `/new` and bare `/clear` are available on every channel — no model-switch gate.
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
-        "/clear" => {
+        BuiltinCommandId::New => Some(ChannelRuntimeCommand::NewSession),
+        BuiltinCommandId::Clear => {
             if parts.next().is_none() {
                 Some(ChannelRuntimeCommand::NewSession)
             } else {
                 None
             }
         }
-        "/thinking" => {
+        BuiltinCommandId::Thinking => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -1424,7 +1449,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         // Model/model_provider switching is channel-gated.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Models if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     model_provider.trim().to_string(),
@@ -1433,7 +1458,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Model if supports_runtime_model_switch(channel_name) => {
             let rest: Vec<&str> = parts.collect();
             // An optional leading `--user|--agent` flag selects the override
             // scope; without it, bare `/model <ref>` keeps its existing
@@ -1454,8 +1479,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 (Some(scope), false) => Some(ChannelRuntimeCommand::SetModelScoped(scope, model)),
             }
         }
-        "/config" if supports_runtime_model_switch(channel_name) => {
+        BuiltinCommandId::Config if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
+        }
+        BuiltinCommandId::Goal => {
+            match zeroclaw_runtime::control_plane::goal::parse_goal_command(trimmed) {
+                Ok(command) => Some(ChannelRuntimeCommand::Goal(command)),
+                Err(error) => Some(ChannelRuntimeCommand::InvalidGoal(error.to_string())),
+            }
         }
         _ => None,
     }
@@ -2665,19 +2696,20 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> bool {
+) -> RuntimeCommandOutcome {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
-        return false;
+        return RuntimeCommandOutcome::NotCommand;
     };
 
     let Some(channel) = target_channel else {
-        return true;
+        return RuntimeCommandOutcome::Handled;
     };
 
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
+    let mut outcome = RuntimeCommandOutcome::Handled;
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
@@ -2858,6 +2890,48 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::InvalidThinking(raw) => format!(
             "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
         ),
+        ChannelRuntimeCommand::Goal(command) => {
+            let start_objective = matches!(
+                command.action,
+                zeroclaw_runtime::control_plane::GoalCommandAction::Start
+            )
+            .then(|| command.objective.clone())
+            .flatten();
+            let defaults_snapshot = runtime_defaults_snapshot(ctx);
+            match zeroclaw_runtime::control_plane::admit_goal_command(
+                zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+                    ctx.agent_alias.as_ref().clone(),
+                )
+                .with_command_surface(CommandSurface::Channel)
+                .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
+                .with_originator_route(Some(sender_key.clone()))
+                .with_principal_id(goal_principal_id(msg)),
+                command,
+                defaults_snapshot.config.as_ref(),
+                Some(ctx.agent_cfg.as_ref()),
+            )
+            .await
+            {
+                Ok(admission) => {
+                    if let (Some(task_id), Some(objective)) =
+                        (admission.task_id.clone(), start_objective)
+                    {
+                        outcome = RuntimeCommandOutcome::ContinueGoalStart { task_id, objective };
+                    }
+                    admission.message
+                }
+                Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-goal-command-failed",
+                    &[("error", &error.to_string())],
+                ),
+            }
+        }
+        ChannelRuntimeCommand::InvalidGoal(raw) => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-command-invalid",
+                &[("raw", &raw)],
+            )
+        }
     };
 
     if let Err(err) = channel
@@ -2888,7 +2962,7 @@ async fn handle_runtime_command_if_needed(
         );
     }
 
-    true
+    outcome
 }
 
 async fn build_memory_context(
@@ -4487,16 +4561,25 @@ async fn process_channel_message_body(
             "Failed to apply runtime config update"
         );
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
-        reconcile_early_ack(
-            ctx.as_ref(),
-            &msg,
-            target_channel.as_ref(),
-            early_ack_task,
-            Some("\u{2705}"),
-        )
-        .await;
-        return;
+    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        RuntimeCommandOutcome::NotCommand => {}
+        RuntimeCommandOutcome::Handled => {
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{2705}"),
+            )
+            .await;
+            return;
+        }
+        RuntimeCommandOutcome::ContinueGoalStart { task_id, objective } => {
+            msg.content = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-start-work-prompt",
+                &[("task_id", &task_id), ("objective", &objective)],
+            );
+        }
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
@@ -5054,12 +5137,25 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
+    let goal_admission_context = Some(
+        zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
+            ctx.agent_alias.as_ref().clone(),
+        )
+        .with_command_surface(CommandSurface::Channel)
+        .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
+        .with_originator_route(Some(history_key.clone()))
+        .with_principal_id(goal_principal_id(&msg)),
+    );
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+        let mut context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
             state.model_provider_pricing,
         )
-        .with_agent_alias(state.agent_alias.as_str())
+        .with_agent_alias(state.agent_alias.as_str());
+        if let Some(goal_ctx) = &goal_admission_context {
+            context = context.with_goal_admission_context(goal_ctx);
+        }
+        context
     });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
@@ -5162,8 +5258,16 @@ async fn process_channel_message_body(
                 .scope(receipt_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
+            let tool_loop = zeroclaw_runtime::control_plane::scope_goal_admission_context(
+                goal_admission_context.clone(),
+                tool_loop,
+            );
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            // This future captures the full channel turn, provider dispatch,
+            // and scoped runtime contexts. Keep it off the test thread stack so
+            // nextest/Linux does not abort in provider-error recovery tests.
+            let tool_loop = Box::pin(tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -9249,6 +9353,7 @@ pub async fn start_channels(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            tools::GoalAdmissionToolPolicy::Include,
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -17863,6 +17968,47 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::NewSession)
         );
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
+    #[test]
+    fn goal_principal_includes_sender_even_when_wecom_route_groups_room() {
+        let mut alice = zeroclaw_api::channel::ChannelMessage {
+            channel: "wecom_ws".into(),
+            channel_alias: Some("bot".into()),
+            reply_target: "group--room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let mut bob = alice.clone();
+        bob.sender = "bob".into();
+
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        assert_ne!(goal_principal_id(&alice), goal_principal_id(&bob));
+
+        alice.sender = " ".into();
+        assert!(goal_principal_id(&alice).is_none());
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_goal_admission() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/goal start ship goal mode"),
+            Some(ChannelRuntimeCommand::Goal(
+                zeroclaw_runtime::control_plane::GoalCommand {
+                    action: zeroclaw_runtime::control_plane::GoalCommandAction::Start,
+                    objective: Some("ship goal mode".into()),
+                    task_id: None,
+                    budgets: Default::default(),
+                }
+            ))
+        );
+        assert!(matches!(
+            parse_runtime_command("telegram", "/goal"),
+            Some(ChannelRuntimeCommand::InvalidGoal(_))
+        ));
     }
 
     #[test]

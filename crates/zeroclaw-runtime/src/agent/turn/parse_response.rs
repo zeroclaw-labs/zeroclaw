@@ -145,11 +145,12 @@ pub(crate) async fn interpret_chat_response(
     // can carry it. `None` = untracked (no cost scope or no usage);
     // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
     // inside record_tool_loop_cost_usage in that case).
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    let call_cost_usd = match resp.usage.as_ref() {
+        Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
+            .await
+            .map(|(_total_tokens, cost_usd)| cost_usd),
+        None => None,
+    };
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).

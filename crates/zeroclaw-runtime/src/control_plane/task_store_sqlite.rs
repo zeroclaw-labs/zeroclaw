@@ -16,7 +16,12 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
-use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{
+    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind, TaskRecord,
+    TaskRegistry, TaskStatus,
+};
+
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 4;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -45,7 +50,8 @@ impl SqliteTaskStore {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )
         .context("set control-plane PRAGMAs")?;
         conn.execute_batch(
@@ -69,9 +75,12 @@ impl SqliteTaskStore {
                  error           TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);",
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
+                ON tasks(agent, kind, started_at DESC);",
         )
-        .context("create control-plane schema")?;
+        .context("create control-plane base schema")?;
+        migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -101,6 +110,108 @@ impl SqliteTaskStore {
     }
 }
 
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read control-plane schema version")?;
+    if version < 1 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS goal_tasks (
+                 task_id        TEXT PRIMARY KEY
+                                REFERENCES tasks(id) ON DELETE CASCADE,
+                 objective      TEXT NOT NULL
+             );
+             PRAGMA user_version = 1;",
+        )
+        .context("apply control-plane schema v1")?;
+    }
+    if version < 2 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "effective_token_limit",
+            "ALTER TABLE goal_tasks ADD COLUMN effective_token_limit INTEGER",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "effective_cost_limit_usd",
+            "ALTER TABLE goal_tasks ADD COLUMN effective_cost_limit_usd REAL",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 2;")
+            .context("mark control-plane schema v2")?;
+    }
+    if version < 3 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pause_reason",
+            "ALTER TABLE goal_tasks ADD COLUMN pause_reason TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pause_description",
+            "ALTER TABLE goal_tasks ADD COLUMN pause_description TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "blockers_json",
+            "ALTER TABLE goal_tasks ADD COLUMN blockers_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 3;")
+            .context("mark control-plane schema v3")?;
+    }
+    if version < 4 {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_goal_context
+                ON tasks(
+                    agent,
+                    COALESCE(originator_route, ''),
+                    COALESCE(principal_id, '')
+                )
+                WHERE kind = 'goal'
+                  AND status NOT IN ('completed','failed','cancelled','lost','timed_out');
+             PRAGMA user_version = 4;",
+        )
+        .context("apply control-plane schema v4")?;
+    }
+    if version > CONTROL_PLANE_SCHEMA_VERSION {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "db_version": version,
+                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
+                })
+            ),
+            "control-plane DB was created by a newer schema version"
+        );
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("inspect {table} columns"))?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("query {table} columns"))?;
+    let exists = rows.any(|name| matches!(name, Ok(name) if name == column));
+    if !exists {
+        conn.execute_batch(alter_sql)
+            .with_context(|| format!("add {table}.{column}"))?;
+    }
+    Ok(())
+}
+
 // ── serde<->TEXT helpers (reuse the snake_case derive, no hand-kept string tables) ──
 
 fn kind_to_db(k: TaskKind) -> String {
@@ -125,6 +236,32 @@ fn kind_from_db(s: &str) -> Result<TaskKind> {
 fn status_from_db(s: &str) -> Result<TaskStatus> {
     serde_json::from_value(serde_json::Value::String(s.to_owned()))
         .with_context(|| format!("unknown task status {s:?}"))
+}
+
+fn pause_reason_to_db(reason: GoalPauseReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "needs_user_input".into())
+}
+
+fn pause_reason_from_db(value: Option<String>) -> Result<Option<GoalPauseReason>> {
+    value
+        .map(|value| {
+            serde_json::from_value(serde_json::Value::String(value.clone()))
+                .with_context(|| format!("unknown goal pause reason {value:?}"))
+        })
+        .transpose()
+}
+
+fn blockers_to_db(blockers: &[GoalBlocker]) -> Result<String> {
+    serde_json::to_string(blockers).context("serialize goal blockers")
+}
+
+fn blockers_from_db(value: String) -> rusqlite::Result<Vec<GoalBlocker>> {
+    serde_json::from_str(&value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+    })
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
@@ -159,6 +296,23 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     })
 }
 
+fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord> {
+    let pause_reason = pause_reason_from_db(row.get("pause_reason")?).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+    })?;
+    Ok(GoalTaskRecord {
+        task_id: row.get("task_id")?,
+        objective: row.get("objective")?,
+        effective_token_limit: row
+            .get::<_, Option<i64>>("effective_token_limit")?
+            .map(|value| value as u64),
+        effective_cost_limit_usd: row.get("effective_cost_limit_usd")?,
+        pause_reason,
+        pause_description: row.get("pause_description")?,
+        blockers: blockers_from_db(row.get("blockers_json")?)?,
+    })
+}
+
 /// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
 /// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
 /// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
@@ -170,51 +324,92 @@ where
     for r in rows {
         match r {
             Ok(rec) => out.push(rec),
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
-                "control-plane: skipping unreadable task row"
-            ),
+            Err(e) => log_unreadable_task_row(e),
         }
     }
     out
+}
+
+fn log_unreadable_task_row(error: rusqlite::Error) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+        "control-plane: skipping unreadable task row"
+    );
+}
+
+fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+    // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
+    // must be a true no-op, never clobber an already-recorded output/error/terminal
+    // status back to NULL/running (review finding #11 — the documented idempotency).
+    conn.execute(
+        "INSERT INTO tasks
+            (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
+             parent_id, originator_route, delivered, idem_key, principal_id,
+             started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            rec.id,
+            kind_to_db(rec.kind),
+            rec.agent,
+            status_to_db(rec.status),
+            rec.owner_pid as i64,
+            rec.owner_boot_id,
+            rec.heartbeat_at,
+            rec.depth as i64,
+            rec.parent_id,
+            rec.originator_route,
+            rec.delivered as i64,
+            rec.idem_key,
+            rec.principal_id,
+            rec.started_at,
+            rec.finished_at,
+        ],
+    )
+    .context("insert task record")?;
+    Ok(())
+}
+
+fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO goal_tasks
+            (task_id, objective, effective_token_limit, effective_cost_limit_usd,
+             pause_reason, pause_description, blockers_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(task_id) DO NOTHING",
+        params![
+            rec.task_id,
+            rec.objective,
+            rec.effective_token_limit.map(|value| value as i64),
+            rec.effective_cost_limit_usd,
+            rec.pause_reason.map(pause_reason_to_db),
+            rec.pause_description,
+            blockers_to_db(&rec.blockers)?,
+        ],
+    )
+    .context("insert goal task record")?;
+    Ok(())
 }
 
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
         let conn = self.conn.lock();
-        // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
-        // must be a true no-op, never clobber an already-recorded output/error/terminal
-        // status back to NULL/running (review finding #11 — the documented idempotency).
-        conn.execute(
-            "INSERT INTO tasks
-                (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-                 parent_id, originator_route, delivered, idem_key, principal_id,
-                 started_at, finished_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                rec.id,
-                kind_to_db(rec.kind),
-                rec.agent,
-                status_to_db(rec.status),
-                rec.owner_pid as i64,
-                rec.owner_boot_id,
-                rec.heartbeat_at,
-                rec.depth as i64,
-                rec.parent_id,
-                rec.originator_route,
-                rec.delivered as i64,
-                rec.idem_key,
-                rec.principal_id,
-                rec.started_at,
-                rec.finished_at,
-            ],
-        )
-        .context("insert task record")?;
+        insert_task_record(&conn, rec)?;
+        Ok(())
+    }
+
+    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start create goal transaction")?;
+        insert_task_record(&tx, task)?;
+        insert_goal_task_record(&tx, goal)?;
+        tx.commit().context("commit create goal transaction")?;
         Ok(())
     }
 
@@ -297,6 +492,125 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(collect_skipping_bad_rows(rows))
     }
 
+    async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM tasks
+              WHERE agent = ?1
+                AND kind = 'goal'
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+              ORDER BY started_at DESC",
+            )
+            .context("prepare latest active goal by agent")?;
+        let rows = stmt
+            .query_map(params![agent], row_to_record)
+            .context("query latest active goal by agent")?;
+        for row in rows {
+            match row {
+                Ok(task) => return Ok(Some(task)),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(None)
+    }
+
+    async fn latest_active_goal_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> Result<Option<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM tasks
+              WHERE agent = ?1
+                AND kind = 'goal'
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+                AND (?2 IS NULL OR originator_route = ?2)
+                AND (?3 IS NULL OR principal_id = ?3)
+              ORDER BY started_at DESC",
+            )
+            .context("prepare latest active goal by context")?;
+        let rows = stmt
+            .query_map(
+                params![agent, originator_route, principal_id],
+                row_to_record,
+            )
+            .context("query latest active goal by context")?;
+        for row in rows {
+            match row {
+                Ok(task) => return Ok(Some(task)),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(None)
+    }
+
+    async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
+        let conn = self.conn.lock();
+        insert_goal_task_record(&conn, rec)?;
+        Ok(())
+    }
+
+    async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
+                    pause_reason, pause_description, blockers_json
+             FROM goal_tasks WHERE task_id = ?1",
+            params![task_id],
+            row_to_goal_task,
+        )
+        .optional()
+        .context("get goal task")
+    }
+
+    async fn update_goal_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE goal_tasks
+                SET effective_token_limit = ?1,
+                    effective_cost_limit_usd = ?2
+              WHERE task_id = ?3",
+            params![
+                token_limit.map(|value| value as i64),
+                cost_limit_usd,
+                task_id
+            ],
+        )
+        .context("update goal effective limits")?;
+        Ok(())
+    }
+
+    async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
+        let conn = self.conn.lock();
+        let (reason, description, blockers_json) = match pause {
+            Some(pause) => (
+                Some(pause_reason_to_db(pause.reason)),
+                pause.description,
+                blockers_to_db(&pause.blockers)?,
+            ),
+            None => (None, None, blockers_to_db(&[])?),
+        };
+        conn.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = ?1,
+                    pause_description = ?2,
+                    blockers_json = ?3
+              WHERE task_id = ?4",
+            params![reason, description, blockers_json, task_id],
+        )
+        .context("update goal pause state")?;
+        Ok(())
+    }
+
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let rec = conn
@@ -326,6 +640,7 @@ impl TaskRegistry for SqliteTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::task_registry::GoalBlockerKind;
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
         TaskRecord {
@@ -382,6 +697,210 @@ mod tests {
         assert_eq!(s.list_running().await.unwrap().len(), 2); // a + c
         assert_eq!(s.list_by_agent("main").await.unwrap().len(), 2); // a + b
         assert_eq!(s.count_by_agent("main").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_agent_resolves_in_sql() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut old_goal = rec("old-goal", "main", 1, "boot-1");
+        old_goal.kind = TaskKind::Goal;
+        old_goal.started_at = "2026-06-18T00:00:00Z".into();
+        s.create(old_goal).await.unwrap();
+
+        let mut newer_terminal_goal = rec("done-goal", "main", 1, "boot-1");
+        newer_terminal_goal.kind = TaskKind::Goal;
+        newer_terminal_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(newer_terminal_goal).await.unwrap();
+        s.update_status("done-goal", TaskStatus::Completed, None, None)
+            .await
+            .unwrap();
+
+        let mut newest_delegate = rec("newest-delegate", "main", 1, "boot-1");
+        newest_delegate.started_at = "2026-06-21T00:00:00Z".into();
+        s.create(newest_delegate).await.unwrap();
+
+        let mut latest_active_goal = rec("latest-goal", "main", 1, "boot-1");
+        latest_active_goal.kind = TaskKind::Goal;
+        latest_active_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(latest_active_goal).await.unwrap();
+
+        let got = s
+            .latest_active_goal_for_agent("main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "latest-goal");
+        assert!(
+            s.latest_active_goal_for_agent("other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_context_filters_route_and_principal() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut other_route_goal = rec("other-route", "main", 1, "boot-1");
+        other_route_goal.kind = TaskKind::Goal;
+        other_route_goal.originator_route = Some("route-b".into());
+        other_route_goal.principal_id = Some("principal-a".into());
+        other_route_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(other_route_goal).await.unwrap();
+
+        let mut other_principal_goal = rec("other-principal", "main", 1, "boot-1");
+        other_principal_goal.kind = TaskKind::Goal;
+        other_principal_goal.originator_route = Some("route-a".into());
+        other_principal_goal.principal_id = Some("principal-b".into());
+        other_principal_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(other_principal_goal).await.unwrap();
+
+        let mut wanted_goal = rec("wanted", "main", 1, "boot-1");
+        wanted_goal.kind = TaskKind::Goal;
+        wanted_goal.originator_route = Some("route-a".into());
+        wanted_goal.principal_id = Some("principal-a".into());
+        wanted_goal.started_at = "2026-06-18T00:00:00Z".into();
+        s.create(wanted_goal).await.unwrap();
+
+        let got = s
+            .latest_active_goal_for_context("main", Some("route-a"), Some("principal-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "wanted");
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_for_agent_skips_unreadable_latest_candidate() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut older_valid_goal = rec("older-valid-goal", "main", 1, "boot-1");
+        older_valid_goal.kind = TaskKind::Goal;
+        older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(older_valid_goal).await.unwrap();
+
+        let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
+        unreadable_newer_goal.kind = TaskKind::Goal;
+        unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(unreadable_newer_goal).await.unwrap();
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET status = 'future_paused' WHERE id = ?1",
+                params!["unreadable-newer-goal"],
+            )
+            .unwrap();
+        }
+
+        let got = s
+            .latest_active_goal_for_agent("main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "older-valid-goal");
+    }
+
+    #[tokio::test]
+    async fn goal_task_extension_roundtrips_without_duplicating_lifecycle() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-1", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create(task).await.unwrap();
+        s.create_goal_task(GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship goal mode".into(),
+            effective_token_limit: Some(10_000),
+            effective_cost_limit_usd: Some(1.25),
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            pause_description: Some("waiting for operator".into()),
+            blockers: vec![GoalBlocker {
+                kind: GoalBlockerKind::NeedsUserInput,
+                message: "Need operator answer".into(),
+                payload: Some(serde_json::json!({"question": "continue?"})),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let task = s.get("goal-1").await.unwrap().unwrap();
+        let goal = s.get_goal_task("goal-1").await.unwrap().unwrap();
+
+        assert_eq!(task.kind, TaskKind::Goal);
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(goal.task_id, task.id);
+        assert_eq!(goal.objective, "ship goal mode");
+        assert_eq!(goal.effective_token_limit, Some(10_000));
+        assert_eq!(goal.effective_cost_limit_usd, Some(1.25));
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(
+            goal.pause_description.as_deref(),
+            Some("waiting for operator")
+        );
+        assert_eq!(goal.blockers.len(), 1);
+
+        s.update_goal_limits("goal-1", Some(20_000), None)
+            .await
+            .unwrap();
+        let limited = s.get_goal_task("goal-1").await.unwrap().unwrap();
+        assert_eq!(limited.effective_token_limit, Some(20_000));
+        assert_eq!(limited.effective_cost_limit_usd, None);
+
+        s.update_goal_pause("goal-1", None).await.unwrap();
+        let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();
+        assert!(resumed.pause_reason.is_none());
+        assert!(resumed.pause_description.is_none());
+        assert!(resumed.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_task_requires_canonical_task_record() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let err = s
+            .create_goal_task(GoalTaskRecord {
+                task_id: "missing".into(),
+                objective: "orphan objective".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("FOREIGN KEY"));
+    }
+
+    #[tokio::test]
+    async fn create_goal_rolls_back_task_when_goal_extension_fails() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-task", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+
+        let err = s
+            .create_goal(
+                task,
+                GoalTaskRecord {
+                    task_id: "missing-extension-parent".into(),
+                    objective: "should roll back".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("goal extension FK failure should abort transaction");
+
+        assert!(format!("{err:#}").contains("FOREIGN KEY"));
+        assert!(
+            s.get("goal-task").await.unwrap().is_none(),
+            "task row must not survive a failed goal extension insert"
+        );
     }
 
     #[tokio::test]

@@ -1438,6 +1438,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;

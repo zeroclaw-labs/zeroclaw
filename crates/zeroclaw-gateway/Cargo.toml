@@ -10,6 +10,7 @@ publish = false
 # Internal workspace crates
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
+zeroclaw-commands.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true

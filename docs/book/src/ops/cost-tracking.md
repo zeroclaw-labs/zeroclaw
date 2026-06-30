@@ -134,6 +134,19 @@ this field. Setting `track_per_agent = false` is an optimization for
 high-volume installs where the extra HashMap aggregation shows up in
 profiles; the trade-off is losing the per-agent dimension everywhere.
 
+## Goal attribution
+
+Goal mode adds an independent `goal_task_id` ledger field. When a turn runs
+under trusted goal context, the runtime resolves the active goal from the
+canonical task table at record time and stamps the usage row. Verifier calls
+and synchronous child work inherit that attribution when they run under the
+goal context.
+
+Goal summaries are derived from persisted cost records whose `goal_task_id`
+matches the goal task id. The goal task row stores effective limits only; it
+does not store consumed or remaining tokens/cost. Remaining budget is always
+derived from the limit and the ledger.
+
 ## Operator surfaces
 
 ### Config UI

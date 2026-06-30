@@ -19,7 +19,12 @@ run_in_ci() {
 }
 
 build_smoke_image() {
+  local buildx_driver=""
   if docker buildx version >/dev/null 2>&1; then
+    buildx_driver="$(docker buildx inspect 2>/dev/null | awk -F': *' '$1 == "Driver" { print $2; exit }')"
+  fi
+
+  if [ -n "$buildx_driver" ] && [ "$buildx_driver" != "docker" ]; then
     mkdir -p "$SMOKE_CACHE_DIR"
     local build_args=(
       --load

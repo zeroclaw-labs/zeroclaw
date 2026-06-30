@@ -1011,6 +1011,7 @@ pub async fn run_gateway(
                 None,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                tools::GoalAdmissionToolPolicy::Omit,
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -1145,6 +1146,7 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut agent_tools = agent_tools_result.tools;
         let agent_delegate = agent_tools_result.delegate_handle;
@@ -1780,6 +1782,7 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/commands", get(api::handle_api_commands))
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",
