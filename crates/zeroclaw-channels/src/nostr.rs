@@ -318,6 +318,8 @@ impl Channel for NostrChannel {
                             interruption_scope_id: None,
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
                         if tx.send(msg).await.is_err() {
                             ::zeroclaw_log::record!(

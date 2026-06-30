@@ -1484,7 +1484,11 @@ impl Agent {
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
+        // `mcp_bundles` (omission is not a grant). Regression-covered by
+        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
+        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
+        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
+        // If you change the call below, update those tests.
         let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
