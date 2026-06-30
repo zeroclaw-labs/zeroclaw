@@ -3493,7 +3493,7 @@ mod tests {
         assert_eq!(labels[0], "openrouter.default");
         assert_eq!(labels[1], "openai.gpt5");
         assert!(
-            labels.iter().any(|label| *label == "OpenRouter"),
+            labels.contains(&"OpenRouter"),
             "create-new provider rows must remain visible"
         );
     }
