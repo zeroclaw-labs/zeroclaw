@@ -168,6 +168,12 @@ mod tests {
             PathBuf::from("/tmp/plugin.wasm"),
             Vec::new(),
             HashMap::new(),
+            PluginLimits {
+                call_fuel: 0,
+                max_memory_bytes: 256 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 64,
+            },
         );
         assert_eq!(tool.name(), "my_tool");
         assert_eq!(tool.description(), "does things");
