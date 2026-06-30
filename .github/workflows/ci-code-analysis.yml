@@ -56,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      contents: read
       security-events: write
     if: |
       github.repository == 'zeroclaw-labs/zeroclaw' &&
