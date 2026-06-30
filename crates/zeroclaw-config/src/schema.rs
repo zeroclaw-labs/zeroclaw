@@ -11091,6 +11091,37 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
+    /// Shell binary the native runtime uses for command execution.
+    ///
+    /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
+    /// When unset or `null`, the system default `sh` is used. The shell is
+    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
+    /// shell binary.
+    ///
+    /// Accepted forms (Unix):
+    /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
+    /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// The value is validated when the native runtime is constructed, so a bad
+    /// value is reported up front rather than failing on the first shell
+    /// command. Rejected: empty/whitespace; a relative path with separators
+    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
+    /// instead); a bare name not found on `PATH`; and a path that does not
+    /// exist or is not executable.
+    ///
+    /// **Ignored on Windows and Android** (and not validated there): Windows
+    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
+    /// (its shell is not on `PATH` for spawned processes).
+    ///
+    /// **Examples:**
+    /// ```toml
+    /// [runtime]
+    /// shell = "bash"           # resolves via PATH
+    /// shell = "/bin/zsh"       # absolute path
+    /// ```
+    #[serde(default)]
+    pub shell: Option<String>,
+
     /// Global reasoning override for model_providers that expose explicit controls.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
@@ -12055,6 +12086,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub amqp: HashMap<String, AmqpConfig>,
+    /// Filesystem SOP listener instances (`[channels.filesystem.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub filesystem: HashMap<String, FilesystemConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -12305,6 +12340,12 @@ impl ChannelsConfig {
                 configured: !self.amqp.is_empty(),
             },
             ChannelInfo {
+                kind: "filesystem",
+                name: "Filesystem",
+                desc: "filesystem change SOP listener",
+                configured: !self.filesystem.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -12353,6 +12394,7 @@ impl ChannelsConfig {
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
+            || self.filesystem.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -12362,7 +12404,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12398,6 +12440,7 @@ impl ChannelsConfig {
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
+            ("filesystem", !self.filesystem.is_empty(), false),
         ]
     }
 
@@ -12482,6 +12525,7 @@ impl Default for ChannelsConfig {
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -13969,6 +14013,168 @@ fn default_mqtt_qos() -> u8 {
 
 fn default_mqtt_keep_alive_secs() -> u64 {
     30
+}
+
+/// Filesystem SOP listener configuration.
+///
+/// Watches configured paths and dispatches file create/modify/delete/rename
+/// events to the SOP engine. This is a fan-in listener, not a chat channel:
+/// its `Channel::send` has no outbound surface.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.filesystem"]
+pub struct FilesystemConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Root paths to watch. At least one is required.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Watch nested paths beneath each root.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub recursive: bool,
+    /// Glob patterns to include. Empty matches all paths under the roots.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Glob patterns to exclude. Applied after `include`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Event kinds to emit (`created`, `modified`, `deleted`, `renamed`).
+    #[tab(Behavior)]
+    #[serde(default = "default_filesystem_events")]
+    pub events: Vec<String>,
+    /// Collapse rapid repeated events per path/kind within this window.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Wait this long after the last event before reading metadata or content,
+    /// giving atomic writes and slow copies time to finish.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_settle_ms")]
+    pub settle_ms: u64,
+    /// Read file content into the event payload. Opt-in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub read_content: bool,
+    /// Follow symlinks when reading event-path metadata, hash, and content.
+    /// Off by default: a symlink under a watched root is rejected before any
+    /// metadata/hash/content handling so its target cannot escape the root. When
+    /// on, the canonical target must still resolve inside a configured root.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    /// Maximum file content bytes admitted into a payload when `read_content`,
+    /// and the size ceiling for hashing. `Some(n)` caps reads and hashing at
+    /// `n` bytes; oversize files are skipped rather than truncated. `None`
+    /// removes the ceiling entirely (unbounded reads). Defaults to
+    /// `Some(65536)` (64 KiB), so the cap applies by default whenever
+    /// `read_content` or hashing runs.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_max_content_bytes")]
+    pub max_content_bytes: Option<usize>,
+    /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
+    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
+    /// paths in SOP payloads and flood the watcher with events. Off unless
+    /// explicitly enabled.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allow_broad_roots: bool,
+    /// Tools excluded from this channel's tool spec.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: Vec::new(),
+            recursive: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            events: default_filesystem_events(),
+            debounce_ms: default_filesystem_debounce_ms(),
+            settle_ms: default_filesystem_settle_ms(),
+            read_content: false,
+            follow_symlinks: false,
+            max_content_bytes: default_filesystem_max_content_bytes(),
+            allow_broad_roots: false,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
+    "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
+];
+
+impl FilesystemConfig {
+    /// Validate the filesystem listener configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.paths.is_empty() {
+            anyhow::bail!("at least one path must be configured");
+        }
+        for path in &self.paths {
+            let trimmed = path.trim_end_matches('/');
+            let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+            if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
+                anyhow::bail!(
+                    "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+        }
+        for kind in &self.events {
+            if !matches!(
+                kind.as_str(),
+                "created" | "modified" | "deleted" | "renamed"
+            ) {
+                anyhow::bail!(
+                    "event '{kind}' is invalid; expected created, modified, deleted, or renamed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChannelConfig for FilesystemConfig {
+    fn name() -> &'static str {
+        "Filesystem"
+    }
+    fn desc() -> &'static str {
+        "Filesystem SOP Listener"
+    }
+}
+
+fn default_filesystem_events() -> Vec<String> {
+    vec![
+        "created".to_string(),
+        "modified".to_string(),
+        "deleted".to_string(),
+        "renamed".to_string(),
+    ]
+}
+
+fn default_filesystem_debounce_ms() -> u64 {
+    500
+}
+
+fn default_filesystem_settle_ms() -> u64 {
+    250
+}
+
+fn default_filesystem_max_content_bytes() -> Option<usize> {
+    Some(65536)
 }
 
 /// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
@@ -20431,6 +20637,79 @@ mod tests {
         };
         assert!(both.validate().is_ok());
     }
+
+    #[test]
+    async fn filesystem_validate_requires_path() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("at least one path"));
+    }
+
+    #[test]
+    async fn filesystem_validate_rejects_broad_root_by_default() {
+        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+        }
+    }
+
+    #[test]
+    async fn filesystem_validate_allows_broad_root_with_escape_hatch() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/var".into()],
+            allow_broad_roots: true,
+            ..FilesystemConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn filesystem_validate_rejects_unknown_event() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/srv/inbox".into()],
+            events: vec!["created".into(), "exploded".into()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("exploded"));
+    }
+
+    #[test]
+    async fn filesystem_validate_accepts_scoped_path() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/srv/inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn filesystem_defaults_are_safe() {
+        let cfg = FilesystemConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.recursive);
+        assert!(!cfg.read_content);
+        assert!(!cfg.follow_symlinks);
+        assert!(!cfg.allow_broad_roots);
+        assert_eq!(cfg.debounce_ms, 500);
+        assert_eq!(cfg.settle_ms, 250);
+        assert_eq!(cfg.max_content_bytes, Some(65536));
+        assert_eq!(cfg.events.len(), 4);
+    }
     use super::*;
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -21932,6 +22211,7 @@ auto_save = true
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
+                filesystem: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -23467,6 +23747,7 @@ allowed_users = ["@u:matrix.org"]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -23987,6 +24268,7 @@ allowed_numbers = ["+1", "+2"]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -31754,7 +32036,7 @@ model_provider = \"ollama.default\"
         undeliverable.sort_unstable();
         assert_eq!(
             undeliverable,
-            ["amqp", "mqtt", "voice_duplex", "voice_wake"],
+            ["amqp", "filesystem", "mqtt", "voice_duplex", "voice_wake"],
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }
