@@ -5816,6 +5816,35 @@ async fn process_channel_message_body(
         }
     }
 
+    // Emit AgentEnd so downstream observability (langfuse, dashboard, per-turn
+    // cost reconciliation) can identify the turn boundary and pull `tokens_used`
+    // + `cost_usd` from the same cost tracking context that the tool-call loop
+    // ran under. Mirrors the loop_::run path. Inserted after every
+    // LlmExecutionResult branch rejoin so success / error / cancel / timeout
+    // paths all reach it exactly once.
+    let turn_usage = cost_tracking_context
+        .as_ref()
+        .map(|c| c.snapshot_turn_usage());
+    ctx.observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        duration: started_at.elapsed(),
+        tokens_used: turn_usage.as_ref().and_then(|u| {
+            (u.input_tokens > 0 || u.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                },
+            )
+        }),
+        cost_usd: turn_usage
+            .as_ref()
+            .and_then(|u| (u.input_tokens > 0 || u.output_tokens > 0).then_some(u.cost_usd)),
+        channel: Some(msg.channel.clone()),
+        agent_alias: Some(ctx.agent_alias.as_ref().clone()),
+        turn_id: Some(msg.id.clone()),
+    });
+
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
     // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
@@ -18725,6 +18754,266 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][2].1.contains("response-1"));
         assert!(calls[1][3].1.starts_with('['));
         assert!(calls[1][3].1.contains("follow up"));
+    }
+
+    /// Captures observer events for assertion; no-op for metrics.
+    /// Lives in the test module alongside other test-only types.
+    struct CapturingObserver {
+        events: std::sync::Mutex<Vec<zeroclaw_runtime::observability::traits::ObserverEvent>>,
+    }
+
+    impl Default for CapturingObserver {
+        fn default() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl zeroclaw_runtime::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_runtime::observability::traits::ObserverEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        }
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    /// Mock model provider that returns a `ChatResponse` with `usage`, so the
+    /// cost-tracking path exercises `record_tool_loop_cost_usage` → non-zero
+    /// `cost_usd` → `AgentEnd.cost_usd: Some(...)`.
+    struct UsageReportingModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for UsageReportingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("cost ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some("cost ok".to_string()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(500),
+                    cached_input_tokens: None,
+                    output_tokens: Some(100),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for UsageReportingModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "usage-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_agent_end_reports_cost_usd_when_pricing_is_configured() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(UsageReportingModelProvider);
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = capturing.clone();
+
+        let workspace = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            zeroclaw_runtime::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing: HashMap<String, HashMap<String, f64>> = HashMap::from([(
+            "test-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]);
+        let cost_tracking = Some(ChannelCostTrackingState {
+            tracker: Arc::clone(&tracker),
+            model_provider_pricing: Arc::new(pricing),
+            agent_alias: Arc::new("test-agent".to_string()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer,
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: false,
+            show_tool_calls: false,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                std::time::Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-cost-test".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-2".to_string(),
+                content: "hello cost".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = capturing.events.lock().unwrap_or_else(|e| e.into_inner());
+        let (tokens, cost_usd) = events
+            .iter()
+            .find_map(|event| match event {
+                zeroclaw_runtime::observability::traits::ObserverEvent::AgentEnd {
+                    tokens_used,
+                    cost_usd,
+                    ..
+                } => Some((tokens_used.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("AgentEnd must be recorded after channel message processing");
+
+        let tokens = tokens.expect("AgentEnd must carry tokens_used when usage is reported");
+        assert_eq!(
+            tokens.input_tokens, 500,
+            "input tokens must be reported on AgentEnd"
+        );
+        assert_eq!(
+            tokens.output_tokens, 100,
+            "output tokens must be reported on AgentEnd"
+        );
+
+        let cost = cost_usd.expect("AgentEnd must carry cost_usd when pricing is configured");
+        assert!(
+            cost > 0.0,
+            "cost_usd should be non-zero with configured pricing"
+        );
+
+        // Verify exact cost: input 500 * $3/1M + output 100 * $15/1M
+        let expected_cost = (500.0 * 3.0 + 100.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected_cost).abs() < 1e-12,
+            "cost_usd should match pricing calculation; expected {expected_cost}, got {cost}"
+        );
+
+        // Verify that the cost tracker also recorded the session usage.
+        let summary = tracker
+            .get_summary()
+            .expect("cost tracker should have a summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 600);
+        assert!(
+            summary.session_cost_usd > 0.0,
+            "session cost should be non-zero"
+        );
     }
 
     #[tokio::test]
