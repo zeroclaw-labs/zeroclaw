@@ -1,0 +1,12 @@
+{
+  "wacore-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "wacore-appstate-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "wacore-binary-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "wacore-derive-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "wacore-libsignal-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "wacore-noise-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "waproto-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "whatsapp-rust-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "whatsapp-rust-tokio-transport-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM=",
+  "whatsapp-rust-ureq-http-client-0.6.0": "sha256-Zio0PnHVkXRhfqk/d0ezmhOqzcqQCm6VyuiiluKeAyM="
+}

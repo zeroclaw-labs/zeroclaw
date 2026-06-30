@@ -87,6 +87,7 @@ context.
 | `manual` | none | Triggered by tool `sop_execute` (not a `zeroclaw sop run` CLI command). |
 | `webhook` | `path` | Exact match against the event `path`. Defined and matched, but no live event source is wired (see [Connectivity](./connectivity.md)). |
 | `mqtt` | `topic`, optional `condition` | MQTT topic supports `+` and `#` wildcards. |
+| `filesystem` | `path`, optional `events`, optional `condition` | `path` supports `*`/`**`/`?` globs; a bare directory matches changes at or under it. `events` narrows by kind (`created`, `modified`, `deleted`, `renamed`); empty matches all. |
 | `cron` | `expression` | Supports 5, 6, or 7 fields (5-field gets seconds prepended internally). |
 | `peripheral` | `board`, `signal`, optional `condition` | Matches `"{board}/{signal}"`. |
 
