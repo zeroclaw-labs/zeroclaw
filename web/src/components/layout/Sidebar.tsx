@@ -403,6 +403,22 @@ function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
               style={{ color: 'var(--pc-accent)' }}
             />
           )}
+          {/* Red badge dot — an unmistakable attention-grabber layered atop the
+              pulsing arrow so an available update is never missed at a glance. */}
+          {hasUpdate && (
+            <span
+              aria-hidden="true"
+              className="absolute rounded-full"
+              style={{
+                top: '2px',
+                right: '2px',
+                width: '7px',
+                height: '7px',
+                backgroundColor: 'var(--color-status-error)',
+                boxShadow: '0 0 0 1.5px var(--pc-bg-surface)',
+              }}
+            />
+          )}
           <span
             style={{
               fontSize: '9px',
