@@ -28,6 +28,7 @@ pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
+pub mod api_sop_author;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -1795,6 +1796,11 @@ pub async fn run_gateway(
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/sops", get(api_sop_author::handle_sops_list))
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
