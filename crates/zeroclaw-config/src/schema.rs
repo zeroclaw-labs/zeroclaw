@@ -4743,7 +4743,7 @@ pub struct McpServerConfig {
     /// prompt as untrusted, server-origin context. Each is read via
     /// `resources/read` on this server; pins on a server that does not advertise
     /// resources, or that the agent's tool policy denies, are skipped with a
-    /// warning. Read once per run — not refreshed (no subscriptions).
+    /// warning. Read once per run (not refreshed; no subscriptions).
     #[serde(default)]
     pub pinned_resources: Vec<String>,
 }

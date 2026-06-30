@@ -153,7 +153,7 @@ mod tests {
             ..Default::default()
         }];
         let section = build_pinned_resources_section(&registry, &configs, None).await;
-        // Nothing injected — the read fails/non-existent server is skipped.
+        // Nothing injected: the read fails/non-existent server is skipped.
         assert!(section.is_empty());
     }
 
