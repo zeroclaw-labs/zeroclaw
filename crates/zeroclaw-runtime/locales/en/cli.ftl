@@ -27,8 +27,6 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
-cli-desktop-about = Launch the ZeroClaw companion desktop app
-
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
 cli-config-get-about = Get a config property value
@@ -329,9 +327,6 @@ cli-completions-long-about =
       source <(zeroclaw completions bash)
       zeroclaw completions zsh > ~/.zfunc/_zeroclaw
       zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
-
-cli-desktop-long-about =
-    Launch the ZeroClaw companion desktop app.
 
     The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
 
@@ -667,11 +662,6 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
-cli-desktop-download = Download the ZeroClaw companion app:
-cli-desktop-homebrew = Or install via Homebrew (coming soon):
-cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
-cli-desktop-launching = Launching ZeroClaw companion app...
-
 # ── status fields ──
 cli-status-version = Version:     {$v}
 cli-status-workspace = Workspace:   {$v}
@@ -713,9 +703,6 @@ cli-status-word-not-configured = not configured
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
-cli-desktop-not-installed = ZeroClaw companion app is not installed.
-cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
-cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
@@ -744,7 +731,6 @@ cli-warn-crypto-provider = Warning: Failed to install default crypto provider: {
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ Could not load cost usage: {$err}
 cli-warn-cost-tracker = {"  "}⚠ Could not init cost tracker: {$err}
-cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
