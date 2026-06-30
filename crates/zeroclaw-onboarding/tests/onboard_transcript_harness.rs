@@ -492,19 +492,24 @@ impl<S: SecretReader> SecretReader for RecordingSecretReader<S> {
     }
 }
 
-/// A scripted stand-in for the guide, driven positionally by the same spec the
-/// walk uses so every answer parses for its field's type. It is genuinely
-/// conversational: for the first field it emits an unparseable clarification
-/// turn before the real answer, so the recorded transcript proves the
-/// back-and-forth loop is captured. Offline, no live provider needed, and it can
-/// never loop forever because each served answer parses.
-struct ConversationalScript {
+/// A scripted stand-in for the live agent that implements the real `AgentTurn`
+/// seam, so the offline guided cell runs the exact
+/// `AgentResponder -> LlmTransport -> spec.walk` stack the live agent drives,
+/// with no parallel responder. It holds conversation memory: every message it
+/// receives is appended to `history`, proving the walk is one continuous
+/// exchange rather than isolated one-shot questions. Answers are served
+/// positionally from the spec so each parses for its field's type, and the
+/// first field gets a mid-field clarification turn before its real answer so the
+/// recorded transcript captures genuine back-and-forth. It can never loop
+/// forever because each served answer parses.
+struct MemoryScriptedTurn {
     answers: std::collections::VecDeque<String>,
     pending: std::collections::VecDeque<String>,
+    history: Vec<String>,
     injected_clarification: bool,
 }
 
-impl ConversationalScript {
+impl MemoryScriptedTurn {
     fn new(config: &Config) -> Self {
         let spec = build_spec(
             config.prop_fields(),
@@ -538,20 +543,22 @@ impl ConversationalScript {
         Self {
             answers,
             pending: std::collections::VecDeque::new(),
+            history: Vec::new(),
             injected_clarification: false,
         }
     }
 }
 
 #[async_trait]
-impl LlmResponder for ConversationalScript {
-    async fn respond(&mut self, _prompt_text: &str) -> TransportResult<String> {
+impl zeroclaw_onboarding::AgentTurn for MemoryScriptedTurn {
+    async fn run_single(&mut self, message: &str) -> TransportResult<String> {
+        self.history.push(message.to_string());
         if let Some(queued) = self.pending.pop_front() {
             return Ok(queued);
         }
         let Some(answer) = self.answers.pop_front() else {
             return Err(TransportError::Agent {
-                reason: "conversational script exhausted: walk visited more non-secret \
+                reason: "scripted turn exhausted: walk visited more non-secret \
                          fields than the spec chain predicted"
                     .to_string(),
             });
@@ -581,7 +588,7 @@ async fn run_guided_offline_cell(base: &Path) {
 
     let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let responder = RecordingResponder {
-        inner: ConversationalScript::new(&config),
+        inner: zeroclaw_onboarding::AgentResponder::new(MemoryScriptedTurn::new(&config)),
         log: std::sync::Arc::clone(&log),
         turn: 0,
     };
