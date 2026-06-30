@@ -1561,9 +1561,10 @@ mod tests {
         cron_dir(config).join("jobs.db")
     }
 
-    async fn recv_log_event(
+    async fn recv_log_event_for(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
+        job_id: Option<&str>,
     ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -1574,7 +1575,14 @@ mod tests {
                     if value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|candidate| candidate == message) =>
+                        .is_some_and(|candidate| candidate == message)
+                        && job_id.is_none_or(|expected| {
+                            value
+                                .get("attributes")
+                                .and_then(|a| a.get("job_id"))
+                                .and_then(|v| v.as_str())
+                                == Some(expected)
+                        }) =>
                 {
                     return value;
                 }
@@ -1980,7 +1988,7 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
 
-        let value = recv_log_event(&mut rx, "Removed cron job").await;
+        let value = recv_log_event_for(&mut rx, "Removed cron job", Some(&job.id)).await;
         assert_eq!(value["event"]["category"], "cron");
         assert_eq!(value["event"]["action"], "delete");
         assert_eq!(value["event"]["outcome"], "success");

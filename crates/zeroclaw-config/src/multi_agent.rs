@@ -20,7 +20,9 @@ crate::define_provider_ref!(PeerUsername, "channels.peers");
 /// Used as the value type in `[agents.<alias>.workspace.access]` maps.
 /// A missing entry means no cross-agent access at all (jailed). The enum
 /// only encodes the granted modes; absence is the safe default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
@@ -42,7 +44,18 @@ pub enum AccessMode {
 /// An agent's backend is locked at agent creation and immutable on
 /// subsequent loads. `Config::validate()` enforces immutability against
 /// the persisted on-disk state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryBackendKind {
@@ -127,7 +140,9 @@ pub struct AgentMemoryConfig {
 /// Controls how the agent delivers replies to peers in this group when no
 /// stronger per-turn signal is present. `Mirror` (default) preserves the
 /// existing input-driven behaviour: voice in → voice out, text in → text out.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OutputModality {

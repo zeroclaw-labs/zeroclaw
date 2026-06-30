@@ -3332,7 +3332,9 @@ impl Default for ResolvedRuntime {
 }
 
 /// Execution semantics for one explicit delegate target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DelegateExecutionMode {
@@ -16304,6 +16306,11 @@ pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
         "tools",
         "crates/zeroclaw-runtime/locales/{locale}/tools.ftl",
         "tools.ftl",
+    ),
+    (
+        "onboard",
+        "crates/zeroclaw-runtime/locales/{locale}/onboard.ftl",
+        "onboard.ftl",
     ),
     (
         "zerocode",

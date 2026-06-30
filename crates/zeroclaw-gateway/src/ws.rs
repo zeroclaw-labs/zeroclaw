@@ -285,15 +285,7 @@ where
         return false;
     }
     let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
-    let decision = match parsed["decision"].as_str().unwrap_or("") {
-        "approve" => Some(SopApprovalDecision::Approve),
-        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
-        // the ledger records it.
-        "deny" => Some(SopApprovalDecision::Deny {
-            reason: parsed["reason"].as_str().map(str::to_string),
-        }),
-        _ => None,
-    };
+    let decision = SopApprovalDecision::from_ws_frame(parsed);
     // run_id + a valid decision are both required; the let-else avoids an expect()
     // on the downstream resolve (codebase rule: no expect/unwrap in production).
     let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
@@ -1160,12 +1152,8 @@ async fn process_chat_message(
                                 continue;
                             }
                             let request_id = parsed["request_id"].as_str().unwrap_or("");
-                            let decision = match parsed["decision"].as_str().unwrap_or("") {
-                                "approve" => Some(ChannelApprovalResponse::Approve),
-                                "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                                "deny" => Some(ChannelApprovalResponse::Deny),
-                                _ => None,
-                            };
+                            let decision: Option<ChannelApprovalResponse> =
+                                serde_json::from_value(parsed["decision"].clone()).ok();
                             if request_id.is_empty() || decision.is_none() {
                                 continue;
                             }

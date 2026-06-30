@@ -443,6 +443,42 @@ enum Commands {
         agent: Option<String>,
     },
 
+    /// Run the spec-driven section flow over a chosen transport. The section
+    /// prefix is a dotted config path such as `channels.matrix.home`.
+    #[command(hide = true)]
+    OnboardFlow {
+        /// Dotted config section prefix, e.g. `channels.matrix.home`.
+        #[arg(long)]
+        section: String,
+
+        /// Layer label for the completion outcome (e.g. `channel`).
+        #[arg(long, default_value = "section")]
+        layer: String,
+
+        /// Instance label for the completion outcome (e.g. `home`).
+        #[arg(long, default_value = "default")]
+        instance: String,
+
+        /// Drive the flow with the in-process agent instead of the CLI.
+        #[arg(long)]
+        llm: bool,
+
+        /// Agent alias used when --llm is set.
+        #[arg(long, default_value = "default")]
+        agent: String,
+
+        /// Create the alias instance under its family before walking it,
+        /// onboarding a brand-new section instance rather than editing an
+        /// existing one.
+        #[arg(long)]
+        create: bool,
+
+        /// Ask only for required (non-Option) fields, leaving optional fields
+        /// at their defaults. Useful for a fast brand-new alias setup.
+        #[arg(long)]
+        required_only: bool,
+    },
+
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
     Onboard {
         /// Configure a specific section only. Omit to run the full flow.
@@ -1134,6 +1170,136 @@ fn apply_homebrew_onboard_config_dir() {
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
 /// still open that selector and overwrite it.
 #[cfg(feature = "agent-runtime")]
+async fn run_onboard_flow(
+    mut config: zeroclaw_config::schema::Config,
+    section: &str,
+    layer: &str,
+    instance: &str,
+    use_llm: bool,
+    agent_alias: &str,
+    create: bool,
+    required_only: bool,
+) -> anyhow::Result<()> {
+    use zeroclaw_onboarding::{
+        AgentPhraser, AgentResponder, CliTransport, FieldScope, FlowRequest, InProcessAgentTurn,
+        LlmTransport, TtyPasswordSource, TtySecretReader, build_spec_scoped, phrase_spec, run_flow,
+    };
+    use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
+
+    let emit_outcome = |outcome: &Outcome| {
+        let descriptor = zeroclaw_onboarding::outcome_message::outcome_message(outcome);
+        let args: Vec<(&str, &str)> = descriptor
+            .args
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let localized = zeroclaw_onboarding::i18n::get_required_onboard_string_with_args(
+            &descriptor.message_id,
+            &args,
+        );
+        println!("{localized}");
+        println!("[{}]", outcome.label());
+    };
+
+    let scope = if required_only {
+        FieldScope::RequiredOnly
+    } else {
+        FieldScope::All
+    };
+
+    let selected_locale = {
+        let locale_reader = std::io::BufReader::new(std::io::stdin());
+        let locale_writer = std::io::stdout();
+        let mut locale_transport =
+            CliTransport::with_secret_source(locale_reader, locale_writer, TtyPasswordSource);
+        zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?
+    };
+
+    if create && use_llm {
+        let family = section
+            .strip_suffix(&format!(".{instance}"))
+            .unwrap_or(section);
+        config
+            .create_map_key(family, instance)
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let success = Outcome::Completed {
+        configured: vec![ConfiguredItem {
+            layer: layer.to_string(),
+            instance: instance.to_string(),
+        }],
+    };
+
+    if use_llm {
+        let phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+            &config,
+            agent_alias,
+        ))
+        .await?;
+        let mut spec = build_spec_scoped(
+            config.prop_fields(),
+            section,
+            layer,
+            instance,
+            success.clone(),
+            scope,
+        )
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
+        })?;
+        if create && section.starts_with("channels.") {
+            spec = zeroclaw_onboarding::append_peer_group_branch(
+                spec,
+                section,
+                instance,
+                &config,
+                success.clone(),
+            );
+        }
+        if section.starts_with("agents.") {
+            let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
+                agent: instance.to_string(),
+                ..Default::default()
+            };
+            spec = zeroclaw_onboarding::append_personality_branch(spec, instance, &ctx, success);
+        }
+        let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
+            .with_locale(selected_locale.clone());
+        phrase_spec(&mut spec, &mut phraser).await?;
+
+        let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+            &config,
+            agent_alias,
+        ))
+        .await?;
+        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent))
+            .with_locale(selected_locale.clone());
+        let mut transport = LlmTransport::new(responder, TtySecretReader);
+        let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;
+        Box::pin(config.save()).await?;
+        emit_outcome(&outcome);
+        return Ok(());
+    }
+
+    let reader = std::io::BufReader::new(std::io::stdin());
+    let writer = std::io::stdout();
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource)
+        .with_interactive_editor(interactive);
+    let request = FlowRequest {
+        section_prefix: section,
+        layer,
+        instance,
+        create,
+        scope,
+    };
+    let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
+    Box::pin(config.save()).await?;
+    emit_outcome(&outcome);
+    Ok(())
+}
+
 async fn run_quickstart_cli(
     model_provider: Option<String>,
     model: Option<String>,
@@ -3461,6 +3627,29 @@ async fn main() -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
+            return Ok(());
+        }
+
+        Commands::OnboardFlow {
+            section,
+            layer,
+            instance,
+            llm,
+            agent,
+            create,
+            required_only,
+        } => {
+            Box::pin(run_onboard_flow(
+                config,
+                &section,
+                &layer,
+                &instance,
+                llm,
+                &agent,
+                create,
+                required_only,
+            ))
+            .await?;
             return Ok(());
         }
 
