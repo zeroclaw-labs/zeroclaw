@@ -40,6 +40,45 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  repo-structure:
+    name: Repository Structure
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Guard declared submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gitlinks="$(mktemp)"
+          declared="$(mktemp)"
+          allowed="$(mktemp)"
+
+          git ls-files -s | awk '$1 == "160000" { print $4 }' | sort > "$gitlinks"
+          { git config --file .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null || true; } \
+            | awk '{ print $2 }' | sort > "$declared"
+          printf '%s\n' 'docs/book/po' > "$allowed"
+
+          if ! cmp -s "$gitlinks" "$declared"; then
+            echo "::error::Gitlink paths must exactly match .gitmodules paths."
+            echo "Index gitlinks:"
+            sed 's/^/  /' "$gitlinks"
+            echo ".gitmodules paths:"
+            sed 's/^/  /' "$declared"
+            exit 1
+          fi
+
+          if ! cmp -s "$gitlinks" "$allowed"; then
+            echo "::error::Unexpected submodule path. Update this guard when adding an intentional submodule."
+            echo "Allowed submodule paths:"
+            sed 's/^/  /' "$allowed"
+            echo "Actual gitlink paths:"
+            sed 's/^/  /' "$gitlinks"
+            exit 1
+          fi
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
@@ -608,7 +647,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
