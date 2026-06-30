@@ -279,6 +279,14 @@ keyactions! {
 }
 
 keyactions! {
+    pub enum SopTabAction ("sop") {
+        Up    [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down  [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        Enter [Chord::key(KeyCode::Enter)] => "load graph",
+    }
+}
+
+keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
         Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",

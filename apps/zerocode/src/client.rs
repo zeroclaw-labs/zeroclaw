@@ -109,6 +109,9 @@ pub mod method {
     pub const QUICKSTART_VALIDATE: &str = "quickstart/validate";
     pub const QUICKSTART_APPLY: &str = "quickstart/apply";
     pub const QUICKSTART_DISMISS: &str = "quickstart/dismiss";
+    // SOP authoring
+    pub const SOPS_LIST: &str = "sops/list";
+    pub const SOPS_GRAPH: &str = "sops/graph";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1180,6 +1183,17 @@ impl RpcClient {
             }),
         )
         .await
+    }
+
+    // ── SOP authoring methods ────────────────────────────────────
+
+    pub async fn sops_list(&self) -> Result<Value> {
+        self.call(method::SOPS_LIST, serde_json::json!({})).await
+    }
+
+    pub async fn sops_graph(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_GRAPH, serde_json::json!({ "name": name }))
+            .await
     }
 
     // ── Session methods ──────────────────────────────────────────
