@@ -1536,3 +1536,257 @@ rpc_type! {
         pub recorded: bool,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Lock the wire shape down to what callers actually depend on:
+    //! - `#[serde(rename_all = "snake_case")]` on enums renames *variants*
+    //!   (and fields, when present). Changing the case convention would
+    //!   break every JSON-RPC client silently — these tests catch that.
+    //! - `#[serde(tag = "kind", ...)]` on tagged enums (`Quickstart*Result`)
+    //!   decides whether the discriminant is adjacent or inline; drift
+    //!   here breaks the web quickstart surface that consumes them.
+    //! - `#[serde(default, skip_serializing_if = "Option::is_none")]` on
+    //!   request/result optionals must stay symmetric so the dispatcher
+    //!   never sends an explicit `null` that older clients can't parse.
+
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn chat_mode_serializes_as_snake_case() {
+        assert_eq!(serde_json::to_value(ChatMode::Chat).unwrap(), json!("chat"));
+        assert_eq!(serde_json::to_value(ChatMode::Acp).unwrap(), json!("acp"));
+    }
+
+    #[test]
+    fn chat_mode_deserializes_from_snake_case() {
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("chat")).unwrap(),
+            ChatMode::Chat
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
+            ChatMode::Acp
+        );
+    }
+
+    #[test]
+    fn file_source_default_is_file() {
+        // `FileSource` does not derive `PartialEq`; assert via the wire
+        // spelling instead. Default is `File` per the `#[default]`
+        // attribute — drift here would change file-attach defaults for
+        // every caller.
+        assert_eq!(
+            serde_json::to_value(FileSource::default()).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::File).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::Clipboard).unwrap(),
+            json!("clipboard")
+        );
+    }
+
+    #[test]
+    fn turn_completion_outcome_round_trips_each_variant() {
+        for variant in [
+            TurnCompletionOutcome::Completed,
+            TurnCompletionOutcome::Cancelled,
+            TurnCompletionOutcome::Failed,
+        ] {
+            let s = serde_json::to_value(variant).unwrap();
+            let back: TurnCompletionOutcome = serde_json::from_value(s.clone()).unwrap();
+            assert_eq!(back, variant, "round-trip failed for {s:?}");
+        }
+        // Lock the wire spelling — older clients string-match on these.
+        assert_eq!(
+            serde_json::to_value(TurnCompletionOutcome::Completed).unwrap(),
+            json!("completed")
+        );
+    }
+
+    #[test]
+    fn session_update_event_uses_snake_case_variants() {
+        // Variants stay PascalCase → wire is snake_case, including the
+        // multi-word ones that historically drifted when serde flattened
+        // them. The discriminant lives under `"type"` (adjacent tagging)
+        // — a change here would break every TUI that subscribes.
+        let evt = SessionUpdateEvent::AgentMessageChunk {
+            session_id: "s".into(),
+            text: "t".into(),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("agent_message_chunk"));
+        assert_eq!(v["session_id"], json!("s"));
+        assert_eq!(v["text"], json!("t"));
+
+        let evt = SessionUpdateEvent::ApprovalRequest {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            timeout_secs: 30,
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("approval_request"));
+        assert!(v.get("tool_name").is_some(), "got: {v}");
+    }
+
+    #[test]
+    fn quickstart_validate_result_ok_variant_uses_kind_tag() {
+        let v = serde_json::to_value(QuickstartValidateResult::Ok).unwrap();
+        assert_eq!(v, json!({"kind": "ok"}));
+    }
+
+    #[test]
+    fn quickstart_validate_result_errors_variant_carries_payload() {
+        // Just smoke-test the field structure — `QuickstartError` is owned
+        // by `quickstart` and has its own coverage there.
+        let v =
+            serde_json::to_value(QuickstartValidateResult::Errors { errors: Vec::new() }).unwrap();
+        assert_eq!(v["kind"], json!("errors"));
+        assert!(v["errors"].is_array(), "got: {v}");
+    }
+
+    #[test]
+    fn quickstart_apply_result_applied_variant_carries_daemon_flag() {
+        // `daemon_restarted: false` is the test-harness contract — the web
+        // surface reads this to decide whether to tell the user to restart
+        // manually. Lock it. The variant is tagged (`"kind": "applied"`),
+        // and the agent payload is snake_case.
+        let v = serde_json::to_value(QuickstartApplyResult::Applied {
+            agent: AppliedAgent {
+                alias: "primary".into(),
+                model_provider: "anthropic.claude".into(),
+                risk_profile: "standard".into(),
+                runtime_profile: "default".into(),
+                channels: vec!["telegram.main".into()],
+                memory_backend: "sqlite".into(),
+            },
+            daemon_restarted: false,
+        })
+        .unwrap();
+        assert_eq!(v["kind"], json!("applied"));
+        assert_eq!(v["daemon_restarted"], json!(false));
+        assert_eq!(v["agent"]["alias"], json!("primary"));
+    }
+
+    #[test]
+    fn initialize_params_defaults_protocol_version_to_one() {
+        // Older clients omit `protocol_version`; the runtime must default
+        // to `1` so the handshake succeeds without an explicit version.
+        let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn initialize_params_accepts_snake_case_field_names() {
+        let p: InitializeParams = serde_json::from_value(json!({
+            "protocol_version": 2,
+            "tui_id": "abc",
+            "tui_sig": "sig",
+            "env": {"PATH": "/bin"}
+        }))
+        .unwrap();
+        assert_eq!(p.protocol_version, 2);
+        assert_eq!(p.tui_id.as_deref(), Some("abc"));
+        assert_eq!(p.env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn initialize_params_renames_client_capabilities_field() {
+        // The ACP elicitation RFD uses camelCase on the wire; the rename
+        // is a one-shot field-level override — losing it would silently
+        // break elicitation handshake for every TUI that speaks it.
+        let p: InitializeParams = serde_json::from_value(json!({
+            "clientCapabilities": {"elicitation": {"form": true}}
+        }))
+        .unwrap();
+        let caps = p.client_capabilities.expect("rename lost the field");
+        assert_eq!(caps["elicitation"]["form"], json!(true));
+    }
+
+    #[test]
+    fn file_entry_skips_none_optional_fields_in_output() {
+        // `skip_serializing_if = "Option::is_none"` is what keeps the
+        // wire format tight for older clients that don't understand the
+        // `data_b64` field. Symmetric with the deserialize side.
+        let entry = FileEntry {
+            path: Some("/tmp/x".into()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let v = serde_json::to_value(entry).unwrap();
+        assert_eq!(v["path"], json!("/tmp/x"));
+        assert_eq!(v["source"], json!("file"));
+        assert!(
+            v.as_object().unwrap().get("data_b64").is_none(),
+            "None data_b64 leaked into wire: {v}"
+        );
+        assert!(
+            v.as_object().unwrap().get("filename").is_none(),
+            "None filename leaked into wire: {v}"
+        );
+    }
+
+    #[test]
+    fn file_entry_deserializes_when_only_path_is_present() {
+        // The contract is "path OR data_b64"; the schema must accept
+        // path-only entries without forcing the caller to send nulls.
+        let entry: FileEntry = serde_json::from_value(json!({"path": "/tmp/a"})).unwrap();
+        assert_eq!(entry.path.as_deref(), Some("/tmp/a"));
+        assert!(entry.data_b64.is_none());
+        assert_eq!(serde_json::to_value(entry.source).unwrap(), json!("file"));
+    }
+
+    #[test]
+    fn tui_list_entry_round_trip_preserves_all_fields() {
+        let entry = TuiListEntry {
+            tui_id: "tui-1".into(),
+            connected_at: "2026-06-29T10:00:00Z".into(),
+            connected_at_unix: 1_750_000_000,
+            peer_label: "desktop".into(),
+            transport: "wss".into(),
+        };
+        let v: Value = serde_json::to_value(&entry).unwrap();
+        let back: TuiListEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.tui_id, entry.tui_id);
+        assert_eq!(back.connected_at_unix, entry.connected_at_unix);
+        assert_eq!(back.transport, entry.transport);
+    }
+
+    #[test]
+    fn quickstart_type_option_round_trip() {
+        let opt = QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+        };
+        let v = serde_json::to_value(&opt).unwrap();
+        assert_eq!(v["kind"], json!("anthropic"));
+        assert_eq!(v["local"], json!(false));
+        let back: QuickstartTypeOption = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind, opt.kind);
+        assert_eq!(back.local, opt.local);
+    }
+
+    #[test]
+    fn quickstart_dismiss_params_deserializes_with_optional_last_step() {
+        // `last_step` is `#[serde(default)] Option<QuickstartStep>` — older
+        // dismiss payloads omit it. Must default to `None` without error.
+        let params: QuickstartDismissParams = serde_json::from_value(json!({
+            "run_id": "r1",
+            "surface": "tui"
+        }))
+        .unwrap();
+        assert_eq!(params.run_id, "r1");
+        assert_eq!(params.surface, Surface::Tui);
+        assert!(params.last_step.is_none());
+    }
+}

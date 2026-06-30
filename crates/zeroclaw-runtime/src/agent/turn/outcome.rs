@@ -103,3 +103,47 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
         .map(|e| (e.model_provider.clone(), e.model.clone()))
         .next()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_loop_cancelled_display() {
+        let err = ToolLoopCancelled;
+        assert_eq!(err.to_string(), "tool loop cancelled");
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_direct() {
+        let err = anyhow::Error::new(ToolLoopCancelled);
+        assert!(is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_unrelated_error_returns_false() {
+        let err = anyhow::Error::msg("some other error");
+        assert!(!is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn stream_cancelled_after_output_display() {
+        let e = StreamCancelledAfterOutput::new("partial text".to_string());
+        assert_eq!(e.to_string(), "tool loop cancelled after streamed output");
+        assert_eq!(e.partial_text, "partial text");
+    }
+
+    #[test]
+    fn stream_cancelled_after_output_source_chains_to_tool_loop_cancelled() {
+        use std::error::Error;
+        let e = StreamCancelledAfterOutput::new(String::new());
+        let source = e.source().expect("must have source");
+        assert!(source.is::<ToolLoopCancelled>());
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_recognizes_stream_cancelled_after_output() {
+        let e = anyhow::Error::new(StreamCancelledAfterOutput::new("txt".to_string()));
+        assert!(is_tool_loop_cancelled(&e));
+    }
+}

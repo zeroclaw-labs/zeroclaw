@@ -1182,8 +1182,7 @@ impl Chat {
 
         // Any key press clears the mouse-click highlight — the user is done
         // with visual selection and is interacting via keyboard.
-        state.highlighted_entry = None;
-        state.mouse_down_entry = None;
+        state.clear_mouse_highlight();
 
         // ── Auto-exit browse mode on typing keys ─────────────────
         // If the user pressed a printable key that isn't a browse-mode
@@ -1893,6 +1892,7 @@ impl Chat {
         if let ChatPhase::Active(ref mut state) = self.phase {
             // Let the file explorer handle mouse events first when open.
             if state.input_bar.handle_mouse(mouse) {
+                state.clear_mouse_highlight();
                 return;
             }
 
@@ -4540,6 +4540,14 @@ impl ChatState {
         self.dirty = LinesDirty::Full;
     }
 
+    fn clear_mouse_highlight(&mut self) {
+        if self.highlighted_entry.is_some() || self.mouse_down_entry.is_some() {
+            self.highlighted_entry = None;
+            self.mouse_down_entry = None;
+            self.mark_dirty_full();
+        }
+    }
+
     // ── Browse-mode helpers ───────────────────────────────────────
 
     /// True when browse mode is active (cursor is set).
@@ -6125,6 +6133,55 @@ mod tests {
         } else {
             panic!("expected PickAgent phase");
         }
+    }
+
+    #[tokio::test]
+    async fn input_bar_click_clears_transcript_mouse_highlight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.highlighted_entry = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: area.height.saturating_sub(2),
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.dirty,
+            LinesDirty::Full,
+            "clearing the highlight must invalidate rendered transcript lines"
+        );
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {

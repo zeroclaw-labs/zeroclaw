@@ -103,6 +103,12 @@ impl SopMetricsCollector {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_for_test(&self) {
+        let mut state = self.inner.write().expect("metrics collector lock poisoned");
+        *state = CollectorState::default();
+    }
+
     // ── Push methods (sync, write lock) ────────────────────────
 
     /// Record a terminal run (Completed/Failed/Cancelled).
@@ -702,6 +708,7 @@ mod tests {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
             trigger_event: make_event(),
+            frame_marker_id: format!("marker-{run_id}"),
             status,
             current_step: total_steps,
             total_steps,
@@ -1271,6 +1278,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
             trigger_event: make_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,
@@ -1382,6 +1390,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
             trigger_event: make_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,

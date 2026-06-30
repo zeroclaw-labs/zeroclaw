@@ -34,6 +34,16 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// Conversation history scope for an inbound channel message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelConversationScope {
+    /// Isolate history by channel, room/reply target, thread, and sender.
+    #[default]
+    Sender,
+    /// Share history for everyone in the room/reply target.
+    ReplyTarget,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
@@ -63,6 +73,11 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// When true, the orchestrator records this as context only and must not
+    /// start an agent turn or emit visible channel side effects.
+    pub passive_context: bool,
+    /// Controls whether conversation history is sender-scoped or room-scoped.
+    pub conversation_scope: ChannelConversationScope,
 }
 
 /// Message to send through a channel
@@ -612,6 +627,8 @@ mod tests {
         assert!(msg.interruption_scope_id.is_none());
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
+        assert!(!msg.passive_context);
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 
     #[test]
