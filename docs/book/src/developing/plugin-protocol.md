@@ -376,18 +376,38 @@ loaded depends on the build's execution backend:
 Both backend features pull in `plugins-wasmtime`; the load path keys off whether
 the cranelift compiler is in the build, not off pulley.
 
+### Per-call execution limits
+
+Every plugin call runs under per-call resource limits the host applies to the
+store. The engine enables fuel metering, and each call is given a fresh fuel
+budget so a runaway or malicious component traps instead of hanging the host. A
+`StoreLimits` ceiling bounds linear memory, table elements, and instance count.
+The tool world gets a fresh store per execute; the warm channel and memory
+stores are refueled before each call so a long-lived plugin gets a fresh budget
+rather than draining over its lifetime.
+
+The four bounds are operator-tunable and every value is validated as non-zero:
+`plugins.limits.call_fuel` (default 1,000,000,000 instruction units),
+`plugins.limits.max_memory_mb` (default 256), `plugins.limits.max_table_elements`
+(default 100,000), and `plugins.limits.max_instances` (default 64). A store can
+only be built with explicit limits, so no load path can construct an
+unsandboxed plugin. The canonical fields and defaults live in the
+[Config reference](../reference/index.md).
+
 ### 32-bit address space (wasip2 is wasm32)
 
-The plugin target is `wasm32-wasip2`, and the host engine is built with
-`Config::new()` without `wasm_memory64`. Both facts mean the plugin boundary is
-a fixed 32-bit format, and that has consequences worth stating plainly:
+The plugin target is `wasm32-wasip2`, and the host engine is built with fuel
+metering enabled (`Config::consume_fuel(true)`) without `wasm_memory64`. The
+plugin boundary is a fixed 32-bit format, and that has consequences worth
+stating plainly:
 
 - **The guest address space is 32-bit.** A plugin runs in a wasm32 linear
   memory. Large values cross the boundary by value: a channel plugin's
   `media-attachment` carries its full bytes as a `list<u8>`, and `wit/v0/channel.wit`
   already notes this can be several megabytes and leaves a resource-handle model
-  to a future revision. The host sets no explicit store memory limit, so a guest
-  is bounded by the wasm32 address space and whatever the engine grants, not by a
+  to a future revision. Within that 32-bit space the host applies an explicit
+  per-store memory ceiling from `plugins.limits.max_memory_mb` (default 256),
+  so a guest is bounded by the smaller of the wasm32 address space and that
   ZeroClaw-configured cap.
 - **The component ABI lowers offsets as 32-bit regardless of host word size.**
   Even on a 64-bit host, list and string offsets in the canonical ABI are
