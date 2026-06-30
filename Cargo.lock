@@ -13018,6 +13018,7 @@ dependencies = [
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-providers",
+ "zeroclaw-runtime",
  "zerocode",
 ]
 

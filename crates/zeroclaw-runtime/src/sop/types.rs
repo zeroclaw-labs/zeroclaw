@@ -68,6 +68,7 @@ impl fmt::Display for SopExecutionMode {
 
 /// A normalized filesystem change kind reported by the watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FilesystemEventKind {
     Created,
@@ -99,40 +100,65 @@ impl std::str::FromStr for FilesystemEventKind {
 
 /// What event can activate an SOP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SopTrigger {
+    /// MQTT message arrival. Live: delivered by the MQTT listener.
     Mqtt {
+        /// Topic filter. `+` matches one level, `#` matches the remaining levels.
         topic: String,
+        /// Optional expression evaluated against the message payload; the run
+        /// starts only when it holds.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
     Webhook {
+        /// Request path matched exactly against the event path.
         path: String,
     },
+    /// Time-based firing. Defined and matched, but no scheduler feeds it.
     Cron {
+        /// Cron expression evaluated over the run window.
         expression: String,
     },
+    /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
     Peripheral {
+        /// Board identifier the signal originates from.
         board: String,
+        /// Signal name on the board; matched as `board/signal`.
         signal: String,
+        /// Optional expression evaluated against the signal payload.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Filesystem change. Live: delivered by the filesystem watcher.
     Filesystem {
+        /// Path glob (`*`, `**`, `?`); a bare directory matches anything under it.
         path: String,
+        /// Change kinds to match; empty matches every kind.
         #[serde(default)]
         events: Vec<FilesystemEventKind>,
+        /// Optional expression evaluated against the change payload.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Calendar event state. Defined and matched, but no poller feeds it live.
     Calendar {
+        /// Calendar source identifier the event originates from.
         calendar_source: String,
+        /// Calendar IDs to scope to; empty matches all of the source's calendars.
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
+    /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
     Amqp {
+        /// Routing-key filter (topic-exchange semantics): `.`-delimited words,
+        /// `*` matches one word, `#` matches zero or more words.
         routing_key: String,
+        /// Optional expression evaluated against the delivery body.
         #[serde(default)]
         condition: Option<String>,
     },

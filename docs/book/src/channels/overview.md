@@ -81,6 +81,18 @@ See [Voice & telephony](./voice.md).
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
+### Event sources
+
+Input-only transports that feed events into the agent loop or the SOP engine. They have no outbound reply; each one is also a [SOP fan-in](../sop/fan-in/overview.md).
+
+| Channel | Feature flag | Shape |
+|---|---|---|
+| MQTT | `channel-mqtt` | Broker messages → agent or SOP |
+| AMQP | `channel-amqp` | Broker deliveries → agent or SOP |
+| Filesystem | `channel-filesystem` | Path changes → agent or SOP |
+
+See [MQTT](./mqtt.md), [AMQP](./amqp.md), and [Filesystem](./filesystem.md).
+
 ## Configuration
 
 Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias. Set them through any config surface:
