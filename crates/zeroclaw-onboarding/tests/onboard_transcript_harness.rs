@@ -783,6 +783,135 @@ fn run_pty_manual_cell(base: &Path) {
     );
 }
 
+/// Records a personality-branch walk. Decision nodes resolve to the configured
+/// personality choice (author or template); freeform author prompts return the
+/// seeded template if present, else a marker, so the workspace write is real.
+struct PersonalityRecordingTransport {
+    choice: String,
+    transcript: String,
+    outcome_token: Option<String>,
+}
+
+impl PersonalityRecordingTransport {
+    fn new(choice: &str) -> Self {
+        Self {
+            choice: choice.to_string(),
+            transcript: String::new(),
+            outcome_token: None,
+        }
+    }
+}
+
+#[async_trait]
+impl FlowTransport for PersonalityRecordingTransport {
+    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        let _ = writeln!(
+            self.transcript,
+            "ASK [{}] {}",
+            prompt.response_type.ask_kind(),
+            prompt.text
+        );
+        let answer = match &prompt.response_type {
+            ResponseType::Choice { options } => {
+                let chosen = options
+                    .iter()
+                    .find(|option| option.value == self.choice)
+                    .map(|option| option.value.clone())
+                    .unwrap_or_else(|| options[0].value.clone());
+                ResponseValue::Choice(chosen)
+            }
+            ResponseType::FreeformText => {
+                let body = prompt
+                    .editor_seed
+                    .clone()
+                    .unwrap_or_else(|| "authored content".to_string());
+                ResponseValue::FreeformText(body)
+            }
+            ResponseType::YesNo => ResponseValue::YesNo(true),
+            ResponseType::Number => ResponseValue::Number("1".into()),
+            ResponseType::Secret => ResponseValue::Secret(SecretValue::new("sk-token".into())),
+        };
+        let _ = writeln!(self.transcript, "  <- {answer:?}");
+        Ok(answer)
+    }
+
+    async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()> {
+        let token = outcome_token(outcome);
+        let _ = writeln!(self.transcript, "EMIT [{token}] {outcome:?}");
+        self.outcome_token = Some(token);
+        Ok(())
+    }
+}
+
+fn personality_agent_spec() -> zeroclaw_runtime::flow::Spec {
+    use zeroclaw_runtime::agent::personality_templates::TemplateContext;
+    let base = zeroclaw_runtime::flow::Spec {
+        start: zeroclaw_runtime::flow::NodeId::new("personality.decision"),
+        nodes: BTreeMap::new(),
+    };
+    let ctx = TemplateContext {
+        agent: "scout".to_string(),
+        ..Default::default()
+    };
+    zeroclaw_onboarding::append_personality_branch(
+        base,
+        "scout",
+        &ctx,
+        Outcome::Completed {
+            configured: vec![zeroclaw_runtime::flow::ConfiguredItem {
+                layer: "agent".to_string(),
+                instance: "scout".to_string(),
+            }],
+        },
+    )
+}
+
+async fn run_personality_cell(base: &Path, choice: &str, folder: &str) {
+    let run_root = base.join("inproc").join("personality").join(folder);
+    std::fs::create_dir_all(&run_root).expect("seed dir");
+    let mut config = Config {
+        config_path: run_root.join("config.toml"),
+        data_dir: run_root.clone(),
+        ..Default::default()
+    };
+
+    let spec = personality_agent_spec();
+    let mut transport = PersonalityRecordingTransport::new(choice);
+    let walk = Box::pin(spec.walk(&mut transport, &mut config)).await;
+
+    let outcome_token = match &walk {
+        Ok(outcome) => outcome_token(outcome),
+        Err(error) => match error {
+            WalkError::Transport(_) => "transport-error".to_string(),
+            WalkError::Write(_) => "write-error".to_string(),
+            WalkError::UnknownNode(_) => "unknown-node".to_string(),
+        },
+    };
+
+    let dir = base.join("inproc").join("personality").join(folder);
+    std::fs::create_dir_all(&dir).expect("create personality cell folder");
+    std::fs::write(dir.join("transcript.txt"), &transport.transcript).expect("write transcript");
+    let mut meta = BTreeMap::new();
+    meta.insert("transport", "inproc".to_string());
+    meta.insert("mode", "personality".to_string());
+    meta.insert("path", folder.to_string());
+    meta.insert("choice", choice.to_string());
+    meta.insert("model_provider", "n/a (manual)".to_string());
+    meta.insert("outcome", outcome_token.clone());
+    write_meta(&dir, &meta);
+
+    assert_eq!(
+        outcome_token, "completed",
+        "the personality walk for choice {choice} must complete"
+    );
+    let written = std::fs::read_to_string(config.agent_workspace_dir("scout").join("SOUL.md"))
+        .expect("SOUL.md must be written by the personality walk");
+    assert!(
+        !written.is_empty(),
+        "the chosen personality branch must write file content"
+    );
+}
+
 fn manual_node_count() -> usize {
     let mut config = Config::default();
     config
@@ -823,6 +952,9 @@ async fn onboard_transcript_matrix() {
     run_pty_manual_cell(&base);
 
     run_guided_offline_cell(&base).await;
+
+    run_personality_cell(&base, "author", "author").await;
+    run_personality_cell(&base, "template", "template").await;
 
     if std::env::var("ZEROCLAW_ONBOARD_GUIDED").is_ok() {
         run_guided_live_cell(&base).await;
