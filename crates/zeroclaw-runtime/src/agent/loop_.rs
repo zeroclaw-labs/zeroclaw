@@ -191,14 +191,12 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
     let truncated = raw.len() > cap;
     if truncated {
         raw.truncate(cap);
-        // Drain the remainder of this physical line from the
-        // underlying reader so the next `read_capped_line` call
-        // starts at the next line instead of continuing to read
-        // chunks from this one. Bounded to `cap` bytes to prevent
-        // unbounded reads from a pipe with no newline.
-        let inner = limited.into_inner();
-        let mut discard = Vec::new();
-        std::io::BufRead::read_until(&mut inner.take(cap as u64), b'\n', &mut discard)?;
+        // Drain the rest of the physical line from the underlying
+        // reader so the next call starts at the next line instead of
+        // chunking the same oversized line into repeated prompts
+        // (Audacity88 review #8463).
+        let mut inner = limited.into_inner();
+        let _ = std::io::BufRead::read_until(&mut inner, b'\n', &mut Vec::new())?;
     } else if raw.last() == Some(&b'\n') {
         // Strip the trailing `\n` that `read_until` leaves behind. The
         // lossy decode runs after the strip so the result has no
@@ -2238,18 +2236,15 @@ pub async fn run(
                     MAX_INTERACTIVE_INPUT_BYTES,
                 ) {
                     Ok((s, false)) if s.is_empty() => break,
-                    Ok((_s, true)) => {
-                        // Truncated line: warn once and skip. Sending a
-                        // chunked fragment into the agent loop would
-                        // appear as multiple prompts, causing repeated
-                        // model calls per oversized physical line.
-                        eprintln!(
-                            "\nWarning: input line truncated to {} bytes (no newline within cap).",
-                            MAX_INTERACTIVE_INPUT_BYTES
-                        );
-                        continue;
+                    Ok((s, t)) => {
+                        if t {
+                            eprintln!(
+                                "\nWarning: input line truncated to {} bytes (no newline within cap).",
+                                MAX_INTERACTIVE_INPUT_BYTES
+                            );
+                        }
+                        (s, t)
                     }
-                    Ok((s, _)) => (s, false),
                     Err(e) => {
                         eprintln!("\nError reading input: {e}\n");
                         break;
@@ -14692,5 +14687,63 @@ Let me check the result."#;
         let (line, truncated) = read_capped_line(std::io::Cursor::new(input), cap).unwrap();
         assert_eq!(line.len(), cap);
         assert!(!truncated);
+    }
+
+    /// Regression for #8463 (Audacity88 review): after truncating an
+    /// oversized line, the rest of the line is drained so the next call
+    /// starts at the next line instead of chunking the same oversized
+    /// line into repeated prompts.
+    #[test]
+    fn read_capped_line_drains_truncated_line_remainder() {
+        let cap = 8usize;
+        // One oversized line + one normal line.
+        let expected_cap_content: Vec<u8> = vec![b'a'; cap];
+        let oversized_line = vec![b'a'; cap * 3];
+        let second_line = b"short\n";
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized_line);
+        input.push(b'\n');
+        input.extend_from_slice(second_line);
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        // First call: should cap at 8 bytes and drain the rest of the line.
+        let (line1, truncated1) = read_capped_line(&mut cursor, cap).unwrap();
+        assert!(truncated1);
+        assert_eq!(line1.len(), cap);
+        assert_eq!(line1.as_bytes(), &expected_cap_content);
+
+        // Second call: should see the second line, not more 'a's.
+        let (line2, truncated2) = read_capped_line(&mut cursor, cap).unwrap();
+        assert!(!truncated2);
+        assert_eq!(line2, "short");
+    }
+
+    /// After truncation, the next line is still readable even when it
+    /// is close to the cap (boundary condition on the drain).
+    #[test]
+    fn read_capped_line_drain_does_not_eat_next_line() {
+        let cap = 8usize;
+        // Oversized line (no trailing \n in mid-data), then a line
+        // right up to the cap.
+        let oversized = vec![b'x'; cap * 2];
+        let second: Vec<u8> = vec![b'y'; cap]; // exactly 'cap' bytes, no \n
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(&second);
+        // The second line has no trailing \n — it is the last line
+        // before EOF.
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        let (line1, truncated1) = read_capped_line(&mut cursor, cap).unwrap();
+        assert!(truncated1);
+        assert_eq!(line1.len(), cap);
+
+        let (line2, truncated2) = read_capped_line(&mut cursor, cap).unwrap();
+        assert!(!truncated2);
+        assert_eq!(line2.len(), second.len());
+        assert_eq!(line2.as_bytes(), &second);
     }
 }

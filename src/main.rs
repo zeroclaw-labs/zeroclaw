@@ -3663,45 +3663,42 @@ async fn main() -> Result<()> {
                         // under some feature combinations, so wrap the
                         // read in `lock()` to keep the `no-default-features`
                         // build (and 32-bit / Windows) green. The lock
-                        // is released at the end of each iteration so the
-                        // `Take` wrapper is **per-line** — unlike the
-                        // cumulative-Take bug on this branch's prior
-                        // commit — ensuring the cap resets each prompt.
+                        // is held for the duration of the REPL loop and
+                        // dropped at scope exit, restoring the original
+                        // behavior of stdin.
+                        let mut stdin = std::io::stdin().lock();
                         loop {
                             eprint!("> ");
-                            let mut buf = Vec::new();
-                            {
-                                let mut stdin =
-                                    std::io::stdin().lock().take((STDIN_LINE_CAP + 1) as u64);
-                                std::io::BufRead::read_until(&mut stdin, b'\n', &mut buf)?;
-                            }
-                            if buf.is_empty() {
+                            // Per-line Take: limit THIS line only, then
+                            // drain the tail if truncated. Using a
+                            // cumulative Take across the whole REPL loop
+                            // (the previous approach) meant that after
+                            // STDIN_LINE_CAP + 1 total bytes all later
+                            // read_line calls returned EOF (Audacity88
+                            // review #8463).
+                            let mut raw = Vec::new();
+                            std::io::BufRead::read_until(
+                                &mut stdin.by_ref().take((STDIN_LINE_CAP + 1) as u64),
+                                b'\n',
+                                &mut raw,
+                            )?;
+                            if raw.is_empty() {
                                 break;
                             }
-                            let truncated = buf.len() > STDIN_LINE_CAP;
-                            if truncated {
-                                buf.truncate(STDIN_LINE_CAP);
-                                // Drain remainder so the next read starts
-                                // at the next line.
-                                let mut discard = Vec::new();
-                                std::io::BufRead::read_until(
-                                    &mut std::io::stdin().lock().take(STDIN_LINE_CAP as u64),
+                            if raw.len() > STDIN_LINE_CAP {
+                                raw.truncate(STDIN_LINE_CAP);
+                                // Drain the rest of the line from stdin
+                                // so oversized input doesn't become
+                                // repeated prompts.
+                                let _ = std::io::BufRead::read_until(
+                                    &mut stdin,
                                     b'\n',
-                                    &mut discard,
+                                    &mut Vec::new(),
                                 )?;
-                                eprintln!(
-                                    "\nWarning: input line truncated to {} bytes (no newline within cap).",
-                                    STDIN_LINE_CAP
-                                );
-                                continue;
+                            } else if raw.last() == Some(&b'\n') {
+                                raw.pop();
                             }
-                            if buf.last() == Some(&b'\n') {
-                                buf.pop();
-                            }
-                            let line = String::from_utf8_lossy(&buf).into_owned();
-                            if line.trim().is_empty() {
-                                continue;
-                            }
+                            let line = String::from_utf8_lossy(&raw).into_owned();
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
                                     .simple_chat(line.trim(), model_name, Some(final_temperature))
