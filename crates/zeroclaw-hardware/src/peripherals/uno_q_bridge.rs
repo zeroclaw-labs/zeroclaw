@@ -22,15 +22,15 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
     let addr = format!("{}:{}", BRIDGE_HOST, BRIDGE_PORT);
     let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"addr": addr, "phase": "connect"})),
+                    .with_attrs(::serde_json::json!({"addr": addr, "phase": "connect", "error": e.to_string()})),
                 "uno-q bridge connect timed out"
             );
-            anyhow::Error::msg("Bridge connection timed out")
+            anyhow::Error::msg(format!("Bridge connection timed out: {e}"))
         })??;
 
     let msg = format!("{} {}\n", cmd, args.join(" "));
@@ -39,7 +39,7 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
     let mut buf = vec![0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
@@ -47,10 +47,11 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
                     .with_attrs(::serde_json::json!({
                         "command": cmd,
                         "phase": "response",
+                        "error": e.to_string(),
                     })),
                 "uno-q bridge response timed out"
             );
-            anyhow::Error::msg("Bridge response timed out")
+            anyhow::Error::msg(format!("Bridge response timed out: {e}"))
         })??;
     let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
     Ok(resp)
