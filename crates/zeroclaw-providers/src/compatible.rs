@@ -2,6 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+use crate::auth::AuthService;
 use crate::multimodal;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
@@ -30,6 +31,9 @@ pub struct OpenAiCompatibleModelProvider {
     pub name: String,
     pub base_url: String,
     pub credential: Option<String>,
+    auth_service: Option<AuthService>,
+    auth_model_provider: Option<String>,
+    auth_profile_override: Option<String>,
     pub auth_header: AuthStyle,
     supports_vision: bool,
     user_agent: Option<String>,
@@ -317,6 +321,9 @@ impl OpenAiCompatibleModelProvider {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
+            auth_service: None,
+            auth_model_provider: None,
+            auth_profile_override: None,
             auth_header: auth_style,
             supports_vision,
             user_agent: user_agent.map(ToString::to_string),
@@ -341,6 +348,20 @@ impl OpenAiCompatibleModelProvider {
     /// `thinking: "off"` (Qwen3.5 on hipfire) or routing transforms.
     pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
         self.extra_body = Some(extra);
+        self
+    }
+
+    /// Use a stored auth profile as a bearer credential when no explicit
+    /// `api_key` was configured on this provider entry.
+    pub fn with_auth_profile(
+        mut self,
+        model_provider: &str,
+        auth_service: AuthService,
+        profile_override: Option<String>,
+    ) -> Self {
+        self.auth_model_provider = Some(model_provider.to_string());
+        self.auth_service = Some(auth_service);
+        self.auth_profile_override = profile_override;
         self
     }
 
@@ -739,6 +760,28 @@ impl OpenAiCompatibleModelProvider {
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
+    }
+
+    async fn resolve_credential(&self) -> anyhow::Result<Option<String>> {
+        if self
+            .credential
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Ok(self.credential.clone());
+        }
+        let (Some(auth), Some(model_provider)) = (&self.auth_service, &self.auth_model_provider)
+        else {
+            return Ok(None);
+        };
+        if model_provider == "xai" {
+            return auth
+                .get_valid_xai_access_token(self.auth_profile_override.as_deref())
+                .await;
+        }
+        auth.get_provider_bearer_token(model_provider, self.auth_profile_override.as_deref())
+            .await
     }
 
     fn assistant_reasoning_value(value: &serde_json::Value) -> Option<&str> {
@@ -1908,7 +1951,13 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+        // Omit tool_choice when there are no tool entries. vLLM 0.19+ and
+        // spec-compliant validators reject `tool_choice` without a non-empty
+        // `tools` field ("When using `tool_choice`, `tools` must be set."),
+        // which breaks bots running with max_tool_iterations = 0 or no MCP
+        // servers. Gate on `has_tool_entries` (Some AND non-empty), not on
+        // `tools.is_some()`.
+        let tool_choice = has_tool_entries.then(|| "auto".to_string());
 
         NativeChatRequest {
             model: model.to_string(),
@@ -1959,7 +2008,21 @@ impl OpenAiCompatibleModelProvider {
         if role != "user" || !allow_user_image_parts {
             return MessageContent::Text(content.to_string());
         }
+        Self::content_with_image_parts(content)
+    }
 
+    /// Promote inline `[IMAGE:…]` markers in `content` to OpenAI-compatible
+    /// content parts (a text part, when non-empty, plus one `image_url` part
+    /// per marker), or return plain `Text` when the content carries no
+    /// markers.
+    ///
+    /// Callers must gate this on whether the target model accepts structured
+    /// image parts (`allow_user_image_parts`). By the time content reaches
+    /// here the markers have already been normalized to safe `data:`/`http`
+    /// URIs upstream (`multimodal::prepare_messages_for_provider`, which also
+    /// rewrites native tool-result JSON via `normalize_native_tool_result_json`),
+    /// so the host-local file-path hazard of #6399 does not apply.
+    fn content_with_image_parts(content: &str) -> MessageContent {
         let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
         if image_refs.is_empty() {
             return MessageContent::Text(content.to_string());
@@ -1990,6 +2053,7 @@ impl OpenAiCompatibleModelProvider {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
+        let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
 
         messages
             .iter()
@@ -2025,6 +2089,9 @@ impl OpenAiCompatibleModelProvider {
                             extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
+
+                    last_assistant_tool_call_ids =
+                        tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
                     let content = value
                         .get("content")
@@ -2088,7 +2155,7 @@ impl OpenAiCompatibleModelProvider {
                 if message.role == "tool"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                 {
-                    let tool_call_id = value
+                    let mut tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
                         .map(|raw_id| {
@@ -2102,10 +2169,31 @@ impl OpenAiCompatibleModelProvider {
                                 normalized_id
                             })
                         });
+                    // Fallback: if the tool result JSON dropped the tool_call_id,
+                    // borrow the first id from the most recent assistant message.
+                    // Some multi-turn reconstruction paths strip this field, and
+                    // strict backends (Groq, Mistral) reject null/missing ids.
+                    if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
+                        tool_call_id = last_assistant_tool_call_ids.first().cloned();
+                    }
+                    // Tool results can carry inline `[IMAGE:…]` markers (e.g. a
+                    // snapshot tool returning a base64 image). Route them through
+                    // the same marker→`image_url` promotion as user messages,
+                    // gated on the model accepting structured image parts. Without
+                    // this the markers ship as one large text blob, so vision
+                    // backends count base64 bytes as text tokens and reject the
+                    // request as over-context (#8327). Mirrors the Anthropic-side
+                    // fix in #1626.
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()))
+                        .map(|value| {
+                            if allow_user_image_parts {
+                                Self::content_with_image_parts(value)
+                            } else {
+                                MessageContent::Text(value.to_string())
+                            }
+                        })
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
                     return NativeMessage {
@@ -2336,11 +2424,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
         // servers with a public catalog use the same path without an Authorization header.
-        let list_credential = self.credential.as_deref();
+        let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
                 .await
                 .map_err(|e| {
@@ -2408,11 +2496,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         // When a credential is present, hit the provider's native /models
         // endpoint — this returns pricing data that we can capture.
-        let list_credential = self.credential.as_deref();
+        let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
                 .await
                 .map_err(|e| {
@@ -2485,7 +2573,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_deref();
+        let credential = self.resolve_credential().await?;
 
         // Normalize image markers (e.g. local file paths from channel
         // attachments) into base64 data URIs before this message reaches the
@@ -2542,7 +2630,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
 
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            )
             .send()
             .await
         {
@@ -2597,7 +2688,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_deref();
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
@@ -2627,7 +2718,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            )
             .send()
             .await
         {
@@ -2678,7 +2772,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_deref();
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
@@ -2703,7 +2797,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            )
             .send()
             .await
         {
@@ -2781,7 +2878,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_deref();
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
         let merge = self.effective_merge_system(model);
@@ -2823,7 +2920,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
-                credential,
+                credential.as_deref(),
             )
             .send()
             .await
@@ -2965,7 +3062,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         include_usage: true,
                     }),
                     tools: tools.clone(),
-                    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                    // Guard on the converted tools being non-empty (not just
+                    // `has_tools`): convert_tool_specs_for_model can sanitize a
+                    // non-empty input down to None, and tool_choice without a
+                    // tools field is an HTTP 400 on vLLM 0.19+.
+                    tool_choice: tools
+                        .as_ref()
+                        .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
                     max_tokens: provider.max_tokens,
                     extra_body: provider.extra_body.clone(),
                 })
@@ -3009,7 +3112,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = provider.credential.clone();
+            let credential = match provider.resolve_credential().await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
             let mut req_builder = client.post(&url).json(&payload);
@@ -3143,7 +3254,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = provider.credential.clone();
+            let credential = match provider.resolve_credential().await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
@@ -3253,7 +3372,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = provider.credential.clone();
+            let credential = match provider.resolve_credential().await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             let mut req_builder = client.post(&url).json(&request);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
@@ -3303,8 +3430,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Hit the appropriate URL with a GET to prime the connection pool.
         // The server will likely return 405 Method Not Allowed, which is fine.
         let url = self.chat_completions_url();
+        let credential = self.resolve_credential().await?;
         let _ = self
-            .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
+            .apply_auth_header(self.http_client().get(&url), credential.as_deref())
             .send()
             .await?;
         Ok(())
@@ -3352,6 +3480,56 @@ mod tests {
     fn creates_without_key() {
         let p = make_model_provider("test", "https://example.com", None);
         assert!(p.credential.is_none());
+    }
+
+    // Regression: vLLM 0.19+ and spec-compliant validators reject
+    // `tool_choice` when `tools` is absent or empty (HTTP 400:
+    // "When using `tool_choice`, `tools` must be set."). The request builders
+    // must omit `tool_choice` whenever the converted tool list is empty.
+    #[test]
+    fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+
+        // Assert on the structured value rather than substring-matching the
+        // serialized string: a JSON-shape or escaping change could otherwise
+        // flip these assertions silently. Inspect the `tool_choice` key
+        // directly.
+
+        // None tools → no tool_choice key.
+        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is None; got: {value}"
+        );
+
+        // Empty tools vec → still no tool_choice key.
+        let req_empty =
+            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let value_empty = serde_json::to_value(&req_empty).unwrap();
+        assert!(
+            value_empty.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value_empty}"
+        );
+    }
+
+    #[test]
+    fn build_native_tool_chat_request_sets_tool_choice_when_tools_present() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "description": "", "parameters": {} }
+        })];
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "tool_choice must be 'auto' when tools are present; got: {value}"
+        );
     }
 
     #[test]
@@ -4092,6 +4270,62 @@ mod tests {
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_promotes_tool_result_image_markers() {
+        // A tool result carrying an inline base64 image marker (e.g. a snapshot
+        // tool) must serialize as structured `image_url` parts, not one large
+        // text blob — vision backends count base64 bytes as text tokens and
+        // reject the request as over-context otherwise (#8327).
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+        )];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
+
+        let value = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("tool message should carry content"),
+        )
+        .unwrap();
+        let parts = value
+            .as_array()
+            .expect("tool image content should serialize as a parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "snapshot captured");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/jpeg;base64,/9j/4AAQ"
+        );
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_tool_result_image_markers_as_text_when_disabled() {
+        // Models that don't accept structured image parts (the same gate that
+        // keeps user image markers as text) must keep tool-result markers
+        // verbatim — preserving prior behavior and the #6399 safety posture.
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+        )];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, false);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value))
+                if value == "snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
         ));
     }
 
@@ -6518,5 +6752,53 @@ mod tests {
         assert_eq!(out.input_tokens, Some(1000));
         assert_eq!(out.output_tokens, Some(200));
         assert_eq!(out.cached_input_tokens, Some(400));
+    }
+
+    #[test]
+    fn convert_messages_for_native_strips_reasoning_when_replay_disabled() {
+        let provider = make_model_provider("test", "https://example.com", None)
+            .without_assistant_reasoning_replay();
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"ok","reasoning_content":"step 1"}"#.to_string(),
+        )];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert_eq!(native[0].reasoning_content, None);
+        assert_eq!(native[0].reasoning, None);
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_fallbacks_to_last_assistant_tool_call_id() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ),
+            ChatMessage::tool(
+                r#"{"content":"result"}"#.to_string(), // missing tool_call_id
+            ),
+        ];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[1].role, "tool");
+        assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_123"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_uses_explicit_id_when_present() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"fc_456","content":"result"}"#.to_string(),
+            ),
+        ];
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[1].role, "tool");
+        assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
     }
 }

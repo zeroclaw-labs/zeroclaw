@@ -72,7 +72,7 @@ pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
-pub(crate) use context::TurnCtx;
+pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
@@ -109,7 +109,8 @@ pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
 use crate::agent::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
+    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -119,7 +120,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -190,6 +190,10 @@ pub struct ToolLoop<'a> {
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// Observer metadata: agent alias and turn id, stamped onto every
+    /// turn-level observer event so OTel spans correlate across the loop.
+    pub agent_alias: Option<&'a str>,
+    pub turn_id: &'a str,
 }
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
@@ -208,6 +212,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         mut image_cache,
         ingress,
+        agent_alias,
+        turn_id,
     } = p;
     let ResolvedAgentExecution {
         model_access:
@@ -277,7 +283,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         max_tool_iterations
     };
 
-    let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
     let loop_ignore_tools: HashSet<&str> = pacing
         .loop_ignore_tools
@@ -319,7 +324,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
-        turn_id: &turn_id,
+        turn_id,
+        agent_alias,
     };
 
     for iteration in 0..max_iterations {
@@ -591,6 +597,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let interpreted = interpret_chat_response(
                     &ctx,
                     resp,
+                    &prepared_messages.messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -610,15 +617,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(
-                    observer,
-                    provider_name,
-                    model,
-                    llm_started_at,
-                    iteration,
-                    &turn_id,
-                    &e,
-                );
+                record_llm_failure(&ctx, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     history,
                     &e,
@@ -840,29 +839,46 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        };
+        let live_sop_queue = crate::sop::executor::new_live_action_queue();
+        let execution_result =
+            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+                if allow_parallel_execution && executable_calls.len() > 1 {
+                    let meta = ctx.meta();
+                    let dispatch = ToolDispatchContext {
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_parallel(
+                        &executable_calls,
+                        dispatch,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                } else {
+                    let meta = ctx.meta();
+                    let dispatch = ToolDispatchContext {
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_sequential(
+                        &executable_calls,
+                        dispatch,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                }
+            })
+            .await;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -956,7 +972,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             collected_receipts,
             model,
             iteration,
-            &turn_id,
+            turn_id,
         )?;
 
         if !cancelled_mid_batch {
@@ -968,7 +984,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &mut last_tool_output_hash,
                 model,
                 iteration,
-                &turn_id,
+                turn_id,
             )?;
         }
 
@@ -988,6 +1004,48 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
+
+        let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
+        if !queued_sop_actions.is_empty() {
+            drive_live_sop_actions(
+                queued_sop_actions,
+                history,
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+                tools_registry,
+                observer,
+                silent,
+                approval,
+                multimodal_config,
+                max_tool_iterations,
+                hooks,
+                excluded_tools,
+                dedup_exempt_tools,
+                activated_tools,
+                model_switch_callback.clone(),
+                pacing,
+                strict_tool_parsing,
+                parallel_tools,
+                max_tool_result_chars,
+                context_token_budget,
+                receipt_generator,
+                knobs,
+                channel_name,
+                channel_reply_target,
+                cancellation_token.clone(),
+                on_delta.clone(),
+                shared_budget.clone(),
+                channel,
+                collected_receipts,
+                event_tx.clone(),
+                new_messages_out.as_deref_mut(),
+                image_cache.as_deref_mut(),
+                agent_alias,
+            )
+            .await?;
+        }
     }
 
     finish_after_max_iterations(
@@ -1000,9 +1058,330 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         cancellation_token.as_ref(),
         max_iterations,
         accumulated_display_text,
-        &turn_id,
+        turn_id,
         knobs,
         new_messages_out,
     )
     .await
+}
+
+fn collect_callable_tool_names(
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Vec<String> {
+    let mut names = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    if let Some(activated) = activated_tools {
+        let activated = match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "activated-tool lock poisoned while resolving SOP step scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        names.extend(activated.tool_names().into_iter().map(String::from));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn push_excluded_tool(excluded_tools: &mut Vec<String>, tool: impl Into<String>) {
+    let tool = tool.into();
+    if !excluded_tools
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&tool))
+    {
+        excluded_tools.push(tool);
+    }
+}
+
+fn sop_step_excluded_tools(
+    queued: &crate::sop::executor::QueuedSopAction,
+    run_id: &str,
+    step: &crate::sop::SopStep,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
+) -> Vec<String> {
+    let mut scoped = excluded_tools.to_vec();
+    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+        push_excluded_tool(&mut scoped, tool);
+    }
+
+    let registry_names = collect_callable_tool_names(tools_registry, activated_tools);
+    let active_scope = {
+        let engine = match queued.engine.lock() {
+            Ok(engine) => engine,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+                    "SOP engine lock poisoned while resolving step tool scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        crate::sop::active_scope::resolve_active_step_scope(
+            run_id,
+            step,
+            engine.config(),
+            &registry_names,
+        )
+    };
+
+    if let Some(active_scope) = active_scope {
+        for tool in active_scope.excluded {
+            push_excluded_tool(&mut scoped, tool);
+        }
+    }
+    scoped.sort();
+    scoped
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_live_sop_actions(
+    queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
+    history: &mut Vec<ChatMessage>,
+    model_provider: &dyn ModelProvider,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    observer: &dyn crate::observability::Observer,
+    silent: bool,
+    approval: Option<&crate::approval::ApprovalManager>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    pacing: &zeroclaw_config::schema::PacingConfig,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    knobs: &LoopKnobs,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
+    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    channel: Option<&dyn Channel>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    agent_alias: Option<&str>,
+) -> Result<()> {
+    let mut pending = std::collections::VecDeque::from(queued_actions);
+    while let Some(queued) = pending.pop_front() {
+        let mut action = queued.action.clone();
+        loop {
+            match action {
+                crate::sop::SopRunAction::ExecuteStep {
+                    run_id,
+                    step,
+                    context,
+                } => {
+                    let started_at = crate::sop::engine::now_iso8601();
+                    let user_message = ChatMessage::user(context.clone());
+                    history.push(user_message.clone());
+                    if let Some(out) = new_messages_out.as_deref_mut() {
+                        out.push(user_message);
+                    }
+
+                    let sop_excluded_tools = sop_step_excluded_tools(
+                        &queued,
+                        &run_id,
+                        &step,
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    );
+
+                    let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
+                    let step_output = Box::pin(run_tool_call_loop(ToolLoop {
+                        exec: ResolvedAgentExecution::resolve(
+                            ResolvedModelAccess {
+                                model_provider,
+                                provider_name,
+                                model,
+                                temperature,
+                            },
+                            ResolvedIo {
+                                tools_registry,
+                                observer,
+                                silent,
+                                approval,
+                                multimodal_config,
+                                hooks,
+                                activated_tools,
+                                model_switch_callback: model_switch_callback.clone(),
+                                receipt_generator,
+                            },
+                            ResolvedRuntimeKnobs {
+                                max_tool_iterations,
+                                excluded_tools: &sop_excluded_tools,
+                                dedup_exempt_tools,
+                                pacing,
+                                strict_tool_parsing,
+                                parallel_tools,
+                                max_tool_result_chars,
+                                context_token_budget,
+                                knobs,
+                            },
+                        ),
+                        history,
+                        channel_name,
+                        channel_reply_target,
+                        cancellation_token: cancellation_token.clone(),
+                        on_delta: on_delta.clone(),
+                        shared_budget: shared_budget.clone(),
+                        channel,
+                        collected_receipts,
+                        event_tx: event_tx.clone(),
+                        steering: None,
+                        new_messages_out: new_messages_out.as_deref_mut(),
+                        image_cache: image_cache.as_deref_mut(),
+                        ingress: IngressContext::internal(),
+                        agent_alias,
+                        turn_id: &nested_turn_id,
+                    }))
+                    .await;
+
+                    let completed_at = crate::sop::engine::now_iso8601();
+                    let step_result = match step_output {
+                        Ok(output) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Completed,
+                            output,
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                        Err(e) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Failed,
+                            output: e.to_string(),
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                    };
+
+                    let (next_action, finished_run) = crate::sop::executor::advance_sop_step(
+                        &queued.engine,
+                        &run_id,
+                        step_result.clone(),
+                    )?;
+                    crate::sop::executor::audit_sop_step(
+                        queued.audit.as_deref(),
+                        &run_id,
+                        &step_result,
+                        finished_run.as_ref(),
+                    )
+                    .await;
+                    action = next_action;
+                }
+                crate::sop::SopRunAction::WaitApproval { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused for approval"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor yielded deterministic step"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused at checkpoint"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Pending {
+                    run_id,
+                    step,
+                    reason,
+                    ..
+                } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step,
+                                "reason": reason,
+                            })),
+                        "SOP live executor pending on step dependencies"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Completed { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Failed {
+                    run_id,
+                    sop_name,
+                    reason,
+                } => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                                "reason": reason,
+                            })),
+                        "SOP live executor failed run"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

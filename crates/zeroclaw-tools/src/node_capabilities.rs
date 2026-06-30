@@ -263,4 +263,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn requires_approval_only_for_sensitive_prefixes() {
+        // Non-sensitive and unknown names never require approval.
+        assert!(!requires_approval("notification.notify"));
+        assert!(!requires_approval("unknown.capability"));
+        assert!(!requires_approval(""));
+        // The match is on the "camera."/"screen."/"location." prefix (with the
+        // trailing dot), so a bare word that merely starts the same misses.
+        assert!(!requires_approval("camerafoo"));
+        assert!(requires_approval("camera.snap"));
+        assert!(requires_approval("screen.capture"));
+        assert!(requires_approval("location.get"));
+    }
+
+    #[test]
+    fn all_standard_includes_every_capability_group() {
+        let caps = all_standard_capabilities();
+        let has = |name: &str| caps.iter().any(|c| c.name == name);
+        // One representative capability from each contributing group: camera,
+        // screen, location, and notifications (registered as "system.notify").
+        assert!(has("camera.snap"));
+        assert!(has("screen.capture"));
+        assert!(has("location.get"));
+        assert!(has("system.notify"));
+    }
 }

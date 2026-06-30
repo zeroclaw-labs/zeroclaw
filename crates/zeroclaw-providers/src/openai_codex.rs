@@ -226,6 +226,23 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+/// Single source of truth for "does the per-turn tool list contain at least
+/// one entry?" — used by both `send_responses_request` and `stream_chat`
+/// to gate `tool_choice` and `parallel_tool_calls` on the request body.
+///
+/// Returns `true` only when `tools` is `Some(non_empty)`. Returns `false`
+/// for `Some(vec![])` and for `None`. This is the wire-format contract that
+/// vLLM 0.19+ and other spec-compliant validators enforce: when
+/// `tool_choice` is present, `tools` must also be present and non-empty
+/// (issue #7862, surface left out of #7864).
+///
+/// Factored out so the gate is tested in one place rather than mirrored
+/// inside the regression test. Both production call sites now call this
+/// helper, so the test that exercises it covers both paths.
+pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
+    tools.as_ref().is_some_and(|t| !t.is_empty())
+}
+
 pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
     let items = tools?;
     if items.is_empty() {
@@ -1175,6 +1192,11 @@ impl OpenAiCodexModelProvider {
             Err(err) => return Err(err),
         };
 
+        // Distinguish "no credentials at all" from "credentials present but
+        // unusable" (expired / could not be refreshed) so the call-time error
+        // stops blaming a missing profile when the real fix is re-authentication.
+        let had_profile = profile.is_some();
+
         let account_id = profile.and_then(|p| p.account_id).or_else(|| {
             oauth_access_token
                 .as_deref()
@@ -1185,16 +1207,35 @@ impl OpenAiCodexModelProvider {
             oauth_access_token
         } else {
             Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
+                if had_profile {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": true,
+                            })),
+                        "openai_codex: auth profile present but no usable access token"
+                    );
+                    anyhow::Error::msg(
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --provider openai-codex` to sign in again.",
+                    )
+                } else {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": false,
+                            })),
+                        "openai_codex: no auth profile found"
+                    );
+                    anyhow::Error::msg(
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --provider openai-codex` to sign in.",
+                    )
+                }
             })?)
         };
 
@@ -1276,7 +1317,7 @@ impl OpenAiCodexModelProvider {
         let normalized_model = normalize_model_id(model);
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let has_tools = tools.is_some();
+        let has_tools = has_turn_tools(tools.as_ref());
         let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
@@ -1522,7 +1563,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = has_turn_tools(tools.as_ref());
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
                 input,
@@ -1699,6 +1740,84 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn has_turn_tools_returns_false_for_empty_and_none() {
+        // Pure unit test on the gate helper, complementing the end-to-end
+        // `chat()`-based regression below. Asserts the four boundary
+        // cases of the `is_some_and(!is_empty())` invariant.
+        assert!(!has_turn_tools(None));
+        assert!(!has_turn_tools(Some(&vec![])));
+        assert!(has_turn_tools(Some(&vec![make_test_tool_spec("echo")])));
+        // A non-empty list still passes even when all entries are
+        // syntactically distinct from each other; the helper does not
+        // dedupe.
+        let two = vec![make_test_tool_spec("a"), make_test_tool_spec("b")];
+        assert!(has_turn_tools(Some(&two)));
+    }
+
+    fn make_test_tool_spec(name: &str) -> ResponsesToolSpec {
+        ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+            strict: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
+        // End-to-end regression for #7862 (vLLM HTTP 400). The test
+        // drives the production `chat()` path against the mock Codex
+        // transport, then asserts the **captured** request body
+        // (the actual JSON the provider sent over the wire) does not
+        // contain `tool_choice` or `parallel_tool_calls` when the
+        // converted tool list is empty. This proves the gate is wired
+        // into the production request builder, not just a struct field
+        // shape that happens to omit the keys.
+        let (provider, captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": []
+            }))])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let empty_tools: Vec<zeroclaw_api::tool::ToolSpec> = vec![];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&empty_tools),
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("chat() should succeed with an empty tool list");
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one captured request");
+        let body = &requests[0];
+        assert!(
+            body.get("tool_choice").is_none(),
+            "empty tools list must produce a request body without `tool_choice`; got: {body}"
+        );
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "empty tools list must produce a request body without `parallel_tool_calls`; got: {body}"
+        );
+        // Sanity: a non-empty tool list still produces both fields.
+        assert!(
+            body.get("tools").is_none() || body["tools"].as_array().is_none_or(|a| a.is_empty()),
+            "empty input list should produce a no-tools request; got: {body}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]

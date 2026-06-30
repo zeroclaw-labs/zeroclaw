@@ -284,6 +284,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
+#[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
@@ -2577,10 +2579,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search an installable plugin registry
+    Search {
+        /// Query to match against plugin names and descriptions
+        query: String,
+        /// Registry JSON URL to search
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory/manifest or registry name
     Install {
-        /// Path to plugin directory or manifest
+        /// Path to plugin directory/manifest, or registry name/version
         source: String,
+        /// Registry JSON URL used for install-by-name
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2594,6 +2607,23 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_host_with_configured_security(
+    config: &crate::config::schema::Config,
+) -> Result<zeroclaw::plugins::host::PluginHost> {
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted = config.plugins.security.trusted_publisher_keys.clone();
+    Ok(
+        zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            &config.plugins.resolved_plugins_dir(),
+            mode,
+            trusted,
+        )?,
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -2730,9 +2760,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2742,13 +2772,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2782,9 +2812,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -2813,6 +2843,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3901,6 +3940,14 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // EPIC A1 + SOP cron: drive periodic maintenance and cron
+                // triggers against the shared engine for this daemon iteration.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
@@ -4022,7 +4069,11 @@ async fn main() -> Result<()> {
                     registry,
                     ephemeral,
                 ))
-                .await?;
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -4513,16 +4564,28 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match &model_command {
-            ModelCommands::List {
-                model_provider,
-                check,
-            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
-            ModelCommands::Refresh { model_provider, .. } => {
-                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+        Commands::Models { model_command } => {
+            #[cfg(feature = "agent-runtime")]
+            {
+                dispatch_models_command(model_command, &mut config).await
             }
-            _ => doctor::run_models(&config, None, false, false).await,
-        },
+            #[cfg(not(feature = "agent-runtime"))]
+            {
+                match model_command {
+                    ModelCommands::List {
+                        model_provider,
+                        check,
+                    } => {
+                        doctor::run_configured_models(&config, model_provider.as_deref(), check)
+                            .await
+                    }
+                    ModelCommands::Refresh { model_provider, .. } => {
+                        doctor::run_models(&config, model_provider.as_deref(), false, false).await
+                    }
+                    _ => doctor::run_models(&config, None, false, false).await,
+                }
+            }
+        }
 
         Commands::Providers {
             providers_command: None,
@@ -4619,10 +4682,20 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None)
                 };
-                Box::pin(channels::start_channels(
+                // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
+                let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
-                .await
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                result
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -4643,7 +4716,15 @@ async fn main() -> Result<()> {
 
         Commands::Browse { path } => browse::handle_browse(path, &config),
 
-        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+        Commands::Sop { sop_command } => match sop_command {
+            // Out-of-band approval verbs talk to the running daemon over the
+            // gateway (they must see the daemon's runs, not a throwaway local
+            // engine). List/Validate/Show stay local + synchronous.
+            cmd @ (SopCommands::Approve { .. }
+            | SopCommands::Deny { .. }
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            other => sop::handle_command(other, &config),
+        },
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -5700,9 +5781,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5731,25 +5810,100 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
-                    )
-                );
+            PluginCommands::Search { query, registry } => {
+                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                let matches = plugin_registry::search_entries(&index, &query);
+                if matches.is_empty() {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-none",
+                            &[("query", &query)],
+                            "No matching plugins."
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-results",
+                            &[("query", &query), ("count", &matches.len().to_string())],
+                            "Plugins matching query:"
+                        )
+                    );
+                    for plugin in &matches {
+                        let missing_description;
+                        let description = if let Some(description) = plugin.description.as_deref() {
+                            description
+                        } else {
+                            missing_description =
+                                t("cli-plugin-no-description", "(no description)");
+                            &missing_description
+                        };
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-search-result",
+                                &[
+                                    ("name", &plugin.name),
+                                    ("version", &plugin.version),
+                                    ("description", description),
+                                ],
+                                "Plugin search result"
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source, registry } => {
+                if plugin_registry::looks_like_url(&source) {
+                    bail!(
+                        "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
+                    );
+                }
+                let mut host = plugin_host_with_configured_security(&config)?;
+                if plugin_registry::is_local_plugin_source(&source) {
+                    host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                } else {
+                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-install-resolving",
+                            &[("source", &source)],
+                            "Resolving plugin from registry..."
+                        )
+                    );
+                    let downloaded =
+                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    host.install(&plugin_dir)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-name-version",
+                            &[
+                                ("name", &downloaded.manifest().name),
+                                ("version", &downloaded.manifest().version),
+                            ],
+                            "Plugin installed"
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let mut host = plugin_host_with_configured_security(&config)?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5758,9 +5912,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
-                    &config.plugins.resolved_plugins_dir(),
-                )?;
+                let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -6194,6 +6346,148 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
+/// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
+/// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
+/// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    let host = config.gateway.host.clone();
+    let port = config.gateway.port;
+    let prefix = config.gateway.path_prefix.as_deref();
+    let client = reqwest::Client::new();
+    match cmd {
+        SopCommands::Pending => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            let pending = body
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
+            } else {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
+                for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
+                    );
+                }
+            }
+            Ok(())
+        }
+        SopCommands::Approve { run_id } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
+        }
+        SopCommands::Deny { run_id, reason } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            sop_admin_post(
+                &client,
+                &url,
+                serde_json::json!({ "run_id": run_id, "reason": reason }),
+            )
+            .await
+        }
+        // List/Validate/Show are dispatched on the local synchronous path.
+        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+    }
+}
+
+/// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+    let status = resp.status();
+    let out: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        println!(
+            "{}",
+            out.get("outcome").and_then(|v| v.as_str()).unwrap_or("ok")
+        );
+        Ok(())
+    } else {
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("request failed");
+        anyhow::bail!("Gateway responded {status}: {detail}");
+    }
+}
+
 /// What the `get-paircode` CLI command should do against the running gateway.
 ///
 /// Keeps the "add another client" path distinct from the destructive
@@ -6517,6 +6811,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6531,6 +6827,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6549,6 +6846,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6645,6 +6943,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
@@ -6769,6 +7068,51 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
+            }
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
+            Ok(())
+        }
     }
 }
 
@@ -6825,6 +7169,139 @@ fn gate_security_posture(
         }
     });
     Ok(Some(handle))
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    let audit = sop_audit.cloned();
+    let cron_cache = audit
+        .as_ref()
+        .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cron_check = chrono::Utc::now();
+        loop {
+            ticker.tick().await;
+            let Some(report) = run_sop_maintenance_tick(
+                &engine,
+                audit.as_ref(),
+                cron_cache.as_ref(),
+                &mut last_cron_check,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !report.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": report.maintenance.timed_out,
+                            "reaped_claims": report.maintenance.reaped_claims,
+                            "pruned_runs": report.maintenance.pruned_runs,
+                            "cron_started": report.cron_started,
+                            "cron_skipped": report.cron_skipped,
+                            "cron_no_match": report.cron_no_match,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Default)]
+struct SopMaintenanceTickReport {
+    maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
+    cron_started: usize,
+    cron_skipped: usize,
+    cron_blocked_unsafe: usize,
+    cron_no_match: usize,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenanceTickReport {
+    fn is_empty(&self) -> bool {
+        self.maintenance.is_empty()
+            && self.cron_started == 0
+            && self.cron_skipped == 0
+            && self.cron_blocked_unsafe == 0
+            && self.cron_no_match == 0
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_sop_maintenance_tick(
+    engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
+    last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<SopMaintenanceTickReport> {
+    let maintenance = match engine.lock() {
+        Ok(mut e) => e.run_maintenance_tick(),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP maintenance tick: engine lock poisoned; skipping this pass"
+            );
+            return None;
+        }
+    };
+
+    let mut report = SopMaintenanceTickReport {
+        maintenance,
+        ..SopMaintenanceTickReport::default()
+    };
+
+    if let (Some(audit), Some(cache)) = (audit, cron_cache) {
+        let results = zeroclaw_runtime::sop::dispatch::check_sop_cron_triggers(
+            engine,
+            audit,
+            cache,
+            last_cron_check,
+        )
+        .await;
+        for result in &results {
+            match result {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                    report.cron_started += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                    report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
+                    report.cron_blocked_unsafe += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
+                    report.cron_no_match += 1;
+                }
+            }
+        }
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    }
+
+    Some(report)
 }
 
 #[cfg(feature = "gateway")]
@@ -6961,6 +7438,85 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     }
 
     None
+}
+
+/// Persist `model` as the default for the first configured provider.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let (type_key, alias) = {
+        let entry = config
+            .providers
+            .models
+            .iter_entries()
+            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "No model provider configured. Run `zeroclaw config init` first.",
+                )
+            })?;
+        (entry.0, entry.1.to_string())
+    };
+    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    config.set_prop_persistent(&prop_path, model)?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-models-set-ok",
+            &[
+                ("model", model),
+                ("provider", &format!("{type_key}.{alias}")),
+            ]
+        )
+    );
+    Ok(())
+}
+
+/// Dispatch `ModelCommands` variants to their handlers.
+///
+/// Extracted from `main()` so that the #7087 regression test enters the
+/// same dispatch boundary that `zeroclaw models set <model>` uses.  If
+/// someone changes the `Set` arm back to the read-only doctor path, the
+/// test will fail.
+#[cfg(feature = "agent-runtime")]
+async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
+    match model_command {
+        ModelCommands::List {
+            model_provider,
+            check,
+        } => doctor::run_configured_models(config, model_provider.as_deref(), check).await,
+        ModelCommands::Refresh { model_provider, .. } => {
+            doctor::run_models(config, model_provider.as_deref(), false, false).await
+        }
+        ModelCommands::Set { model } => handle_models_set(config, &model).await,
+        ModelCommands::Status => {
+            match config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            {
+                Some((ty, alias, entry)) => {
+                    let model = entry.model.as_deref().unwrap_or("unknown");
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-models-status-current",
+                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string("cli-models-status-none")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7907,6 +8463,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_memory::traits::Memory;
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "cron-sop".into(),
+            description: "cron regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Supervised,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
+        let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report =
+            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
+                .await
+                .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+    }
+
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
@@ -7960,6 +8573,100 @@ mod tests {
         assert!(
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
+        );
+    }
+
+    /// Regression for #7087: `ModelCommands::Set` must write config, not
+    /// route silently to the read-only `doctor::run_models()` path.
+    /// Covers a normal model ID and a slash-bearing (OpenRouter-style) ID.
+    ///
+    /// Calls `dispatch_models_command` — the same function `main()` uses —
+    /// so changing the `Set` arm back to the read-only doctor path will fail
+    /// this test.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-opus-4-7".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // ── Test 1: Normal model ID persists via the dispatch boundary ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "claude-sonnet-4-6".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("normal model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("claude-sonnet-4-6"),
+            "normal model ID must be persisted to config.toml; got:\n{contents}"
+        );
+
+        // ── Test 2: Slash-bearing model ID preserved as-is ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("slash-bearing model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("anthropic/claude-sonnet-4-20250514"),
+            "slash-bearing model ID must be stored as-is; got:\n{contents}"
+        );
+
+        // ── Test 3: No configured provider → error surfaced by dispatch ──
+        let mut empty_config = Config {
+            config_path: tmp.path().join("empty.toml"),
+            data_dir: tmp.path().join("empty_workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        let err = dispatch_models_command(
+            ModelCommands::Set {
+                model: "any-model".to_string(),
+            },
+            &mut empty_config,
+        )
+        .await
+        .expect_err("empty config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No model provider configured"),
+            "error must mention missing provider; got: {msg}"
         );
     }
 }

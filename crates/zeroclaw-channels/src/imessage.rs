@@ -347,6 +347,8 @@ end tell"#
                             interruption_scope_id: None,
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -377,6 +379,15 @@ end tell"#
             .unwrap_or_default();
 
         db_path.exists()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API for third-party iMessage bots.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

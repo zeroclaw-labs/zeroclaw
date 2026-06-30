@@ -34,7 +34,9 @@ Use assignees for active work. Use issue comments, issue body sections, public f
 
 Use no-space colon spelling for scoped labels: `provider:openai`, `channel:telegram`, `security:policy`, `risk:high`, `size:XS`, `type:docs`, and similar labels. Phrase labels without a namespace stay phrase-like: `good first issue`, `help wanted`, `trusted contributor`, and `stale-candidate`.
 
-Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Live spaced labels such as `risk: high`, `size: XS`, and `type: docs` are migration candidates only after the approved packet creates or confirms the no-space canonical labels. Some legacy labels may remain live during a staged migration; until the migration packet lands, copy the exact live label spelling from the GitHub UI when documenting current labels. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Live spaced labels such as `risk: high`, `size: XS`, and `type: docs` are migration candidates now that the approved packet has created or confirmed the no-space canonical labels.
+
+Some legacy labels may remain live during a staged migration. New or manual applications should use the canonical no-space labels, while existing legacy open refs can remain until the open-reference migration packet handles them. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
 
 ## Automation contract
 
@@ -63,7 +65,7 @@ Every live cleanup batch needs exact maintainer approval for the labels and issu
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
 
-During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
 
 | Label | Purpose |
 |---|---|
@@ -111,12 +113,35 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 
 `ci` is scoped to GitHub automation/config files, not all `.github/**` paths. The root `.github/*.json` matcher is intentional for automation metadata (for example `.github/label-policy.json`), so files like `.github/assets/**`, `.github/ISSUE_TEMPLATE/**`, `.github/CODEOWNERS`, and `.github/pull_request_template.md` do not match `ci`.
 
-### Per-channel labels
+### Additional component labels
 
-Each channel gets a `channel:<name>` label in addition to the base `channel` label.
+Some surfaces have narrower path-owned labels for maintainer routing. These labels are synchronized by `.github/labeler.yml` when the PR diff touches the listed files.
+
+Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-labeler.yml` runs with `sync-labels: true`, maintainers should treat `.github/labeler.yml` as the source of truth for which base and scoped labels a PR receives.
 
 | Label | Matches |
 |---|---|
+| `observability:log` | `crates/zeroclaw-log/src/**`, `crates/zeroclaw-runtime/src/observability/log.rs` |
+| `observability:otel` | `otel.rs`, OTel dependency feature regression coverage |
+| `observability:prometheus` | `prometheus.rs` |
+| `runtime:wasm` | runtime WASM platform and first-party WASM plugin host files |
+| `security:bubblewrap` | `bubblewrap.rs` |
+| `security:docker` | `docker.rs` |
+| `security:pairing` | pairing security, gateway pairing API, Tauri pairing command, and web pairing page |
+| `security:policy` | runtime security policy, IAM policy, and config policy files |
+| `security:secrets` | runtime and config secrets handling |
+
+Do not apply legacy `observability: runtime_trace` to new issues or PRs. Use `observability:otel` when the work is about OpenTelemetry tracing, add base `observability` only when the issue or PR also matches that base surface, and decide any future runtime-trace-specific canonical label in a separate create/migrate packet.
+
+Gateway subarea labels such as `gateway: api`, `gateway: sse`, `gateway:local_bridge`, and `gateway:webhook_ingress` remain live migration holdbacks. New routing should use base `gateway` until a separate packet either creates canonical no-space/hyphenated sublabels and migrates refs, or collapses those labels into base `gateway`.
+
+### Per-channel labels
+
+Each channel gets a `channel:<name>` label in addition to the base `channel` label when the change touches channel crate paths. Cross-surface channel labels such as `channel:acp` may instead pair with the matching base surface label, such as `gateway`, `docs`, or app/web scope labels.
+
+| Label | Matches |
+|---|---|
+| `channel:acp` | `acp_channel.rs`, `acp_server.rs`, `zeroclaw-acp-bridge.rs`, `acp_session_store.rs`, `channels/acp.md`, selected ACP gateway/app/web entrypoints |
 | `channel:bluesky` | `bluesky.rs` |
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
@@ -166,7 +191,10 @@ to one provider.
 | `provider:ollama` | `ollama.rs` |
 | `provider:openai` | `openai.rs`, `openai_codex.rs` |
 | `provider:openrouter` | `openrouter.rs` |
+| `provider:reliable` | `reliable.rs` |
 | `provider:telnyx` | `telnyx.rs` |
+
+Some provider labels describe provider families that currently share the OpenAI-compatible provider implementation instead of a dedicated source file. Maintainers may apply these manually when an issue or PR is truly about that family: `provider:groq`, `provider:kimi`, `provider:minimax`, `provider:moonshot`, and `provider:qwen`. Do not add shared factory or compatible-provider files to these labeler rules; that would over-label unrelated shared changes.
 
 ### Per-tool-group labels
 
@@ -178,21 +206,25 @@ Tools are grouped by logical function rather than one label per file.
 | `tool:cloud` | `cloud_ops.rs`, `cloud_patterns.rs` |
 | `tool:composio` | `composio.rs` |
 | `tool:cron` | `src/tools/cron_add.rs`, `src/tools/cron_list.rs`, `src/tools/cron_remove.rs`, `src/tools/cron_run.rs`, `src/tools/cron_runs.rs`, `src/tools/cron_update.rs`, `crates/zeroclaw-runtime/src/tools/cron_add.rs`, `crates/zeroclaw-runtime/src/tools/cron_common.rs`, `crates/zeroclaw-runtime/src/tools/cron_list.rs`, `crates/zeroclaw-runtime/src/tools/cron_remove.rs`, `crates/zeroclaw-runtime/src/tools/cron_run.rs`, `crates/zeroclaw-runtime/src/tools/cron_runs.rs`, `crates/zeroclaw-runtime/src/tools/cron_update.rs` |
+| `tool:delegate` | `crates/zeroclaw-runtime/src/tools/delegate.rs` |
 | `tool:file` | `src/tools/file_edit.rs`, `src/tools/file_read.rs`, `src/tools/file_write.rs`, `src/tools/glob_search.rs`, `src/tools/content_search.rs`, `crates/zeroclaw-tools/src/file_edit.rs`, `crates/zeroclaw-runtime/src/tools/file_read.rs`, `crates/zeroclaw-tools/src/file_write.rs`, `crates/zeroclaw-tools/src/glob_search.rs`, `crates/zeroclaw-tools/src/content_search.rs` |
 | `tool:google-workspace` | `google_workspace.rs` |
 | `tool:mcp` | `mcp_client.rs`, `mcp_deferred.rs`, `mcp_protocol.rs`, `mcp_tool.rs`, `mcp_transport.rs` |
 | `tool:memory` | `memory_forget.rs`, `memory_recall.rs`, `memory_store.rs` |
 | `tool:microsoft365` | `microsoft365/**` |
+| `tool:pushover` | `pushover.rs` |
 | `tool:security` | `src/tools/security_ops.rs`, `src/tools/verifiable_intent.rs`, `crates/zeroclaw-runtime/src/tools/security_ops.rs`, `crates/zeroclaw-runtime/src/tools/verifiable_intent.rs` |
 | `tool:shell` | `src/tools/shell.rs`, `src/tools/node_tool.rs`, `src/tools/cli_discovery.rs`, `crates/zeroclaw-runtime/src/tools/shell.rs`, `crates/zeroclaw-gateway/src/node_tool.rs`, `crates/zeroclaw-tools/src/cli_discovery.rs` |
 | `tool:sop` | `src/tools/sop_advance.rs`, `src/tools/sop_approve.rs`, `src/tools/sop_execute.rs`, `src/tools/sop_list.rs`, `src/tools/sop_status.rs`, `crates/zeroclaw-runtime/src/tools/sop_advance.rs`, `crates/zeroclaw-runtime/src/tools/sop_approve.rs`, `crates/zeroclaw-runtime/src/tools/sop_execute.rs`, `crates/zeroclaw-runtime/src/tools/sop_list.rs`, `crates/zeroclaw-runtime/src/tools/sop_status.rs` |
 | `tool:web` | `web_fetch.rs`, `web_search_tool.rs`, `web_search_provider_routing.rs`, `http_request.rs` |
 
+`tool:schema` is a manual-only label for tool-schema serialization and cleaning issues. Do not add broad schema files to `.github/labeler.yml`; many schema files are shared config, provider, or API surfaces and would over-label unrelated changes.
+
 ## Size labels
 
 Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
 
-During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
 
 | Label | Threshold |
 |---|---|
@@ -206,7 +238,7 @@ During the label-spelling migration, use the live GitHub UI spelling when applyi
 
 For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**. Future risk automation should follow the [automation contract](#automation-contract).
 
-During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
 
 | Label | Meaning |
 |---|---|

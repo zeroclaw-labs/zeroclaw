@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
           components: rustfmt
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
           components: clippy
@@ -133,7 +133,7 @@ jobs:
             label: Check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
@@ -207,10 +207,11 @@ jobs:
             sys_deps: ""
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -222,6 +223,48 @@ jobs:
       - name: Check
         run: cargo check --locked ${{ matrix.args }}
 
+  check-plugin-backends:
+    name: Check (${{ matrix.name }})
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plugins cranelift backend
+            features: plugins-wasm-cranelift
+          - name: plugins pulley backend
+            features: plugins-wasm-pulley
+          - name: plugins runtime-only backend
+            features: plugins-wasmtime
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect plugin backend changes
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^Cargo\.(toml|lock)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check
+        if: steps.changed.outputs.run == 'true'
+        run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
+
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
@@ -229,11 +272,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -251,10 +295,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -272,10 +317,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -304,17 +350,33 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: |
+          curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
       - name: Check licenses, sources, and advisories
         run: cargo deny check
+      - name: Lockfile integrity
+        run: cargo verify-project && cargo fetch --locked
+
+      - name: Validate YAML workflow syntax
+        run: |
+          pip install pyyaml -q 2>/dev/null || true
+          python3 -c "import sys, yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml: valid')"
+      - name: Install cargo-audit
+        run: |
+          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
+      - name: Run cargo audit (RustSec advisory database)
+        run: cargo audit
 
   nix-eval:
     name: Nix Module Eval
@@ -329,6 +391,47 @@ jobs:
         run: sudo nix --version
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
+
+  nix-hash-drift:
+    name: Nix Hash Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate nix/hashes.json matches Cargo.lock git deps
+        run: |
+          set -euo pipefail
+          if [[ ! -f Cargo.lock ]]; then
+            echo "Cargo.lock not found; nothing to check."
+            exit 0
+          fi
+          # Extract git-dep keys from Cargo.lock using the same Python
+          # logic as refresh-nix-hashes.sh.
+          python3 scripts/ci/list_git_dep_keys.py > /tmp/lock_keys.json
+          LOCK_COUNT=$(jq length /tmp/lock_keys.json)
+          echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
+          if [[ "$LOCK_COUNT" -eq 0 ]]; then
+            echo "No git deps; nothing to check."
+            exit 0
+          fi
+          if [[ ! -f nix/hashes.json ]]; then
+            echo "error: nix/hashes.json not found — git deps present but no hashes file."
+            exit 1
+          fi
+          HASH_KEYS=$(jq 'keys' nix/hashes.json)
+          MISSING=$(jq -n --argjson lock "$(cat /tmp/lock_keys.json)" \
+            --argjson hash "$HASH_KEYS" \
+            '$lock - $hash')
+          MISSING_COUNT=$(echo "$MISSING" | jq length)
+          if [[ "$MISSING_COUNT" -gt 0 ]]; then
+            echo "error: $MISSING_COUNT git-dep hash(es) missing from nix/hashes.json:"
+            echo "$MISSING" | jq -r '.[]'
+            echo ""
+            echo "Run scripts/dev/refresh-nix-hashes.sh and commit the result."
+            exit 1
+          fi
+          echo "All git deps have hashes in nix/hashes.json."
 
   docs-style:
     name: Docs Style
@@ -384,10 +487,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Test installer target detection
+        run: bash scripts/ci/install_target_triple_test.sh
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
 
@@ -398,7 +507,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

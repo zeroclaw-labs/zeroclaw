@@ -64,7 +64,8 @@ examples, then regenerates every spec-driven install surface via
 sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
 feature lists from the canonical install spec (`Cargo.toml` plus
 `[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
-never hand-edit a generated region.
+never hand-edit a generated region. This script also refreshes the Nix git
+dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
 
 Then refresh the docs translation catalogues and pin them to the matching tag:
 
@@ -342,6 +343,10 @@ release cycle overwrites it, so no manual cleanup is required.
 You do not need to manually verify Docker or the distribution channels
 unless a job in the workflow run shows red. Check the workflow run summary; if
 all jobs are green, you are done.
+
+Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
+published artifacts can follow
+[Release artifact verification](./release-verification.md).
 
 ---
 
