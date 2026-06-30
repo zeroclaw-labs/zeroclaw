@@ -81,7 +81,6 @@ tool-memory-store = 在长期记忆中存储事实、偏好或备注。使用类
 tool-microsoft365 = Microsoft 365 集成：通过 Microsoft Graph API 管理 Outlook 邮件、Teams 消息、Calendar 事件、OneDrive 文件和 SharePoint 搜索
 tool-model-routing-config = 管理默认模型设置、基于场景的提供商/模型路由、分类规则和别名 agent 配置
 tool-notion = 与 Notion 交互：查询数据库、读取/创建/更新页面，以及搜索工作区。
-tool-pdf-read = 从工作区中的 PDF 文件提取纯文本。返回所有可读文本。仅含图像或加密的 PDF 返回空结果。需要 'rag-pdf' 构建功能。
 tool-project-intel = 项目交付智能：生成状态报告、检测风险、起草客户更新、总结冲刺，以及估算工作量。只读分析工具。
 tool-proxy-config = 管理 ZeroClaw 代理设置（范围：environment | zeroclaw | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。

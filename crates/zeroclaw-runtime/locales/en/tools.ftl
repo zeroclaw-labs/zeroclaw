@@ -127,7 +127,6 @@ tool-model-routing-config = Manage default model settings, scenario-based provid
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
-tool-pdf-read = Extract plain text from a PDF file in the workspace. Returns all readable text. Image-only or encrypted PDFs return an empty result. Requires the 'rag-pdf' build feature.
 
 tool-project-intel = Project delivery intelligence: generate status reports, detect risks, draft client updates, summarize sprints, and estimate effort. Read-only analysis tool.
 

@@ -81,7 +81,6 @@ tool-memory-store = Almacenar un hecho, preferencia o nota en la memoria a largo
 tool-microsoft365 = Integración de Microsoft 365: gestionar correo de Outlook, mensajes de Teams, eventos de Calendar, archivos de OneDrive y búsqueda en SharePoint a través de la API de Microsoft Graph
 tool-model-routing-config = Gestionar la configuración del modelo predeterminado, rutas de proveedor/modelo basadas en escenarios, reglas de clasificación y perfiles de agente con alias
 tool-notion = Interactuar con Notion: consultar bases de datos, leer/crear/actualizar páginas y buscar en el espacio de trabajo.
-tool-pdf-read = Extraer texto plano de un archivo PDF en el espacio de trabajo. Devuelve todo el texto legible. Los PDF solo de imágenes o cifrados devuelven un resultado vacío. Requiere la función de compilación 'rag-pdf'.
 tool-project-intel = Inteligencia de entrega de proyectos: generar informes de estado, detectar riesgos, redactar actualizaciones para clientes, resumir sprints y estimar esfuerzo. Herramienta de análisis de solo lectura.
 tool-proxy-config = Gestionar la configuración del proxy de ZeroClaw (scope: environment | zeroclaw | services), incluida la aplicación del entorno de tiempo de ejecución y de proceso
 tool-pushover = Enviar una notificación de Pushover a tu dispositivo. Requiere PUSHOVER_TOKEN y PUSHOVER_USER_KEY en el archivo .env.
