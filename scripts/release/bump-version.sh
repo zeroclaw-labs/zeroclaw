@@ -193,6 +193,24 @@ else
   changed=$((changed + 1))
 fi
 
+# ── Nix git-dep hashes ──────────────────────────────────────────
+# Refresh NAR hashes for git-sourced dependencies so the flake can
+# resolve them.  Skips gracefully if the script or its prerequisites
+# (nix-prefetch-git, jq) are missing.
+echo "Nix git-dep hashes..."
+REFRESH_SCRIPT="$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh"
+if [[ -x "$REFRESH_SCRIPT" ]]; then
+  if command -v nix-prefetch-git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ) \
+      && echo "  refreshed nix/hashes.json" \
+      || echo "  warn: refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+  else
+    echo "  skip: nix-prefetch-git or jq not on PATH"
+  fi
+else
+  echo "  skip: scripts/dev/refresh-nix-hashes.sh not found"
+fi
+
 # ── Generated install surfaces (single source of truth) ───────────
 # After the workspace version is bumped, regenerate every spec-driven install
 # surface so version and feature sets stay canonical. This OWNS the version and

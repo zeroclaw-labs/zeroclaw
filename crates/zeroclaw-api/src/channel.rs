@@ -34,6 +34,16 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// Conversation history scope for an inbound channel message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelConversationScope {
+    /// Isolate history by channel, room/reply target, thread, and sender.
+    #[default]
+    Sender,
+    /// Share history for everyone in the room/reply target.
+    ReplyTarget,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
@@ -63,6 +73,11 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// When true, the orchestrator records this as context only and must not
+    /// start an agent turn or emit visible channel side effects.
+    pub passive_context: bool,
+    /// Controls whether conversation history is sender-scoped or room-scoped.
+    pub conversation_scope: ChannelConversationScope,
 }
 
 /// Message to send through a channel
@@ -80,6 +95,10 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// When `true`, channels that support TTS must not synthesise this
+    /// message as a voice note. Use for error notices, system alerts, and
+    /// other non-conversational content that should never be voiced.
+    pub suppress_voice: bool,
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -143,7 +162,14 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
+    }
+
+    /// Prevent TTS channels from voicing this message.
+    pub fn suppress_voice(mut self) -> Self {
+        self.suppress_voice = true;
+        self
     }
 
     /// Create a new message with content, recipient, and subject
@@ -160,6 +186,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
     }
 
@@ -490,12 +517,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Ask the user a multiple-choice question and return the chosen option's text.
     ///
     /// Returns `Ok(Some(answer))` if the channel handled the question natively
-    /// (e.g. ACP `session/request_permission`, Telegram inline keyboard).
-    /// Returns `Ok(None)` to signal the caller should fall back to the
-    /// generic `send` + `listen` flow. Default impl returns `None`.
+    /// (e.g. ACP `elicitation/create` with a single-select enum schema, or
+    /// the legacy `session/request_permission` fallback for older ACP clients;
+    /// Telegram inline keyboard; etc.). Returns `Ok(None)` to signal the
+    /// caller should fall back to the generic `send` + `listen` flow.
+    /// Default impl returns `None`.
     ///
-    /// Free-form questions (no choices) are not modeled here yet — they
-    /// require the ACP elicitation RFD to land for a clean cross-channel API.
+    /// Free-form (no-choices) questions are not modeled by this method.
+    /// Multiple-choice support landed via ACP `elicitation/create` (see
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation);
+    /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
         _question: &str,
@@ -505,12 +536,36 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Ask the user a multi-select multiple-choice question and return the
+    /// chosen options' text.
+    ///
+    /// Returns `Ok(Some(answers))` if the channel handled it natively (e.g.
+    /// ACP `elicitation/create` with a `type: array` schema). Returns
+    /// `Ok(None)` to signal the caller should fall back to a non-native
+    /// path (formatted text + reactions, etc.). Default impl returns `None`.
+    ///
+    /// `min_items` and `max_items` map to JSON Schema's `minItems` /
+    /// `maxItems` — clients enforce the bound before submitting.
+    async fn request_multi_choice(
+        &self,
+        _question: &str,
+        _choices: &[String],
+        _min_items: usize,
+        _max_items: usize,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow.
     ///
-    /// Channels that can only handle structured choices (e.g. ACP today, until
-    /// the elicitation RFD lands) should return `false` so callers can fail
-    /// fast with a useful error instead of timing out on `listen`.
+    /// Channels that can only handle structured choices (e.g. ACP in Phase 1
+    /// of the elicitation rollout — see
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
+    /// should return `false` so callers can fail fast with a useful error
+    /// instead of timing out on `listen`. Free-form text support flips this
+    /// to `true` in Phase 2.
     fn supports_free_form_ask(&self) -> bool {
         true
     }
@@ -572,6 +627,8 @@ mod tests {
         assert!(msg.interruption_scope_id.is_none());
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
+        assert!(!msg.passive_context);
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 
     #[test]

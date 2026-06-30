@@ -5,6 +5,10 @@ name: Docker Publish
 # dev/ci/docker-tags.toml; this workflow consumes it so published tags can never
 # drift from the spec. Each entry produces an immutable version-pinned tag
 # (Alpine-style `<stem>-v<version>`) and a floating tag (`<stem>`).
+#
+# Images are pushed with the canonical platform matrix first, signed by digest,
+# then the pinned tag is scanned in report-only mode (exit-code: 0). Enforcement
+# flips in a follow-up after the baseline is triaged.
 
 on:
   push:
@@ -18,7 +22,8 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
+  # OIDC, package write, and security-events permissions are granted only to
+  # the jobs that need them.
 
 env:
   REGISTRY: ghcr.io
@@ -42,9 +47,14 @@ jobs:
 
   publish:
     name: Build & push ${{ matrix.stem }}
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     needs: [matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for keyless cosign OIDC signing of container images
     strategy:
       fail-fast: false
       matrix:
@@ -59,17 +69,101 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build and push pinned + floating tags
+        id: build-push
         uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          # Platforms are resolved per tag from the generated matrix: Dockerfile
+          # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
+          # native amd64 builder), Containerfile tags stay amd64-only.
+          platforms: ${{ matrix.platforms }}
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+
+      - name: Sign container image (keyless / Rekor)
+        # Signs by digest so the signature is immutable regardless of tag mutations.
+        # Consumers verify with:
+        #   cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
+        #     ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build-push.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
+
+  scan:
+    name: Scan ${{ matrix.stem }}
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    needs: [matrix, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan pinned tag with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      - name: Upload Trivy SARIF artifact
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-results-${{ matrix.stem }}
+          path: trivy-results.sarif
+          if-no-files-found: error
+          retention-days: 14
+
+  upload-sarif:
+    name: Upload SARIF ${{ matrix.stem }}
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    needs: [matrix, scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    steps:
+      - name: Download Trivy SARIF artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: trivy-results-${{ matrix.stem }}
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          sarif_file: trivy-results.sarif

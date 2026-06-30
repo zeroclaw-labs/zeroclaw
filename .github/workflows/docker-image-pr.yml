@@ -7,8 +7,8 @@ on:
       - Dockerfile
       - Dockerfile.debian
       - Dockerfile.ci
-      - Dockerfile.debian.ci
       - .dockerignore
+      - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
       - .github/workflows/release-stable-manual.yml
       - scripts/ci/prepare_docker_context.sh
@@ -31,12 +31,48 @@ jobs:
       - name: Prepare Docker smoke context
         run: bash scripts/ci/prepare_docker_context.sh smoke docker-ctx
 
+      - name: Cache Trivy vulnerability database
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ hashFiles('.github/workflows/docker-image-pr.yml') }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
+
       - name: Build default image
         run: docker build -f docker-ctx/Dockerfile -t zeroclaw-pr-default:smoke docker-ctx
 
-      - name: Build Debian compatibility image
-        run: docker build -f docker-ctx/Dockerfile.debian -t zeroclaw-pr-debian:smoke docker-ctx
+      # Scans the CI smoke image, not the production source Dockerfile. Trivy is
+      # report-only during baseline rollout, so findings are logged but do not
+      # fail the PR workflow yet.
+      - name: Scan default image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: zeroclaw-pr-default:smoke
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
 
+      - name: Build Debian compatibility image
+        run: docker build -f docker-ctx/Dockerfile --build-arg VARIANT=debian -t zeroclaw-pr-debian:smoke docker-ctx
+
+      - name: Scan Debian image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: zeroclaw-pr-debian:smoke
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+  # Compiles the real source Dockerfiles (not the pre-built-binary `*.ci`
+  # variants above). The default `Dockerfile` is built for both published
+  # platforms, proving the arm64 cross-compilation path before a tag triggers
+  # docker-publish.yml; `Dockerfile.debian` stays amd64-only until the same
+  # cross-build support lands there. `push: false` and `contents: read` only —
+  # this never publishes. Split per matrix entry so the slow arm64 cross-build
+  # does not serialize behind the others.
   source-images:
     name: Dockerfile Source Build (no push)
     runs-on: ubuntu-latest
@@ -46,9 +82,15 @@ jobs:
       matrix:
         include:
           - dockerfile: Dockerfile
+            platform: linux/amd64
             tag: zeroclaw-pr-source-default:build
-            cache-scope: docker-source-default
+            cache-scope: docker-source-default-amd64
+          - dockerfile: Dockerfile
+            platform: linux/arm64
+            tag: zeroclaw-pr-source-default:build
+            cache-scope: docker-source-default-arm64
           - dockerfile: Dockerfile.debian
+            platform: linux/amd64
             tag: zeroclaw-pr-source-debian:build
             cache-scope: docker-source-debian
     steps:
@@ -57,13 +99,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
-      - name: Build ${{ matrix.dockerfile }} from source
+      - name: Build ${{ matrix.dockerfile }} (${{ matrix.platform }}) from source
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
           load: false
+          platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max

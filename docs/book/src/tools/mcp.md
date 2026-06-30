@@ -32,6 +32,8 @@ servers = ["filesystem"]
 mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets no MCP servers
 ```
 
+- Bundle changes take effect on **session restart**. The resolver (`Config::mcp_servers_for_agent`) runs at session/agent construction time; editing `[mcp_bundles.*]` or `agents.<alias>.mcp_bundles` while a session is live does not change that session's connected servers. End and restart the affected sessions to pick up new grants.
+
 This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
 ## Transports

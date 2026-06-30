@@ -101,7 +101,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 
 browser-native = []
 rag-pdf = ["dep:pdf-extract"]
-plugins-wasm = ["dep:zeroclaw-plugins"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
 
