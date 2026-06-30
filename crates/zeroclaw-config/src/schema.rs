@@ -11084,6 +11084,37 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
+    /// Shell binary the native runtime uses for command execution.
+    ///
+    /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
+    /// When unset or `null`, the system default `sh` is used. The shell is
+    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
+    /// shell binary.
+    ///
+    /// Accepted forms (Unix):
+    /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
+    /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// The value is validated when the native runtime is constructed, so a bad
+    /// value is reported up front rather than failing on the first shell
+    /// command. Rejected: empty/whitespace; a relative path with separators
+    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
+    /// instead); a bare name not found on `PATH`; and a path that does not
+    /// exist or is not executable.
+    ///
+    /// **Ignored on Windows and Android** (and not validated there): Windows
+    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
+    /// (its shell is not on `PATH` for spawned processes).
+    ///
+    /// **Examples:**
+    /// ```toml
+    /// [runtime]
+    /// shell = "bash"           # resolves via PATH
+    /// shell = "/bin/zsh"       # absolute path
+    /// ```
+    #[serde(default)]
+    pub shell: Option<String>,
+
     /// Global reasoning override for model_providers that expose explicit controls.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported

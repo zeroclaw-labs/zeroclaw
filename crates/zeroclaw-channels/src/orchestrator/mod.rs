@@ -152,9 +152,19 @@ static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::Sender<String>,
     tools_used: AtomicBool,
 }
+
+/// Maximum characters of a tool-argument detail included in a notify
+/// message. Caps the per-message body so a user-controlled `path` or
+/// `url` argument cannot inflate the mpsc payload or the platform
+/// channel post. Matches the size class of the other per-message caps
+/// already in use by the observer (200 / 200 / 120 chars) but raised to
+/// 4 KiB so realistic absolute paths (e.g. workspace-prefixed paths
+/// under `/var/lib/zeroclaw/workspaces/<uuid>/channels/...`) are not
+/// truncated in normal operation.
+const NOTIFY_DETAIL_MAX_CHARS: usize = 4096;
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
@@ -171,9 +181,9 @@ impl Observer for ChannelNotifyObserver {
                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
                             format!(": {}", truncate_with_ellipsis(q, 200))
                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
-                            format!(": {p}")
+                            format!(": {}", truncate_with_ellipsis(p, NOTIFY_DETAIL_MAX_CHARS))
                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
-                            format!(": {u}")
+                            format!(": {}", truncate_with_ellipsis(u, NOTIFY_DETAIL_MAX_CHARS))
                         } else {
                             let s = args.to_string();
                             format!(": {}", truncate_with_ellipsis(&s, 120))
@@ -185,7 +195,12 @@ impl Observer for ChannelNotifyObserver {
                 }
                 _ => String::new(),
             };
-            let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+            // Bounded channel: drop on full so a slow downstream
+            // channel (e.g. a stalled Discord / Slack API call) cannot
+            // wedge the observer hook. Live-typing notifications are
+            // best-effort UX; a dropped message degrades the indicator
+            // briefly but does not lose any real state.
+            let _ = self.tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
         }
         self.inner.record_event(event);
     }
@@ -1280,7 +1295,8 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// output is never presented to the LLM without the corresponding `<tool_call>`.
 fn strip_tool_result_content(text: &str) -> String {
     static TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
+        regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>")
+            .expect("TOOL_RESULT_RE regex must compile")
     });
 
     let cleaned = TOOL_RESULT_RE.replace_all(text, "");
@@ -5011,7 +5027,10 @@ async fn process_channel_message_body(
     };
 
     // Wrap observer to forward tool events as live thread messages
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Bounded so a slow downstream channel cannot grow this queue
+    // without bound. See `ChannelNotifyObserver::record_event` for the
+    // drop-on-full contract.
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
@@ -17474,7 +17493,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn channel_notify_observer_truncates_utf8_arguments_safely() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
             tx,
@@ -17501,6 +17520,103 @@ BTC is currently around $65,000 based on latest tool output."#
         let emitted = rx.try_recv().expect("observer should emit notify message");
         assert!(emitted.contains("`file_write`"));
         assert!(emitted.is_char_boundary(emitted.len()));
+    }
+
+    /// Regression: the `path` argument branch must route through
+    /// `truncate_with_ellipsis` so a user-controlled path cannot inflate
+    /// the mpsc payload or the platform channel post. Previously the
+    /// branch was `format!(": {p}")` with no cap — a 10 MB path would
+    /// pass through verbatim. The cap constant is `NOTIFY_DETAIL_MAX_CHARS`
+    /// (4096); the ellipsis suffix is one character added by the helper.
+    #[test]
+    fn channel_notify_observer_caps_long_path_argument() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(NoopObserver),
+            tx,
+            tools_used: AtomicBool::new(false),
+        };
+
+        // 64 KiB path — 16x the per-message cap.
+        let long_path = "a".repeat(64 * 1024);
+        let payload = serde_json::json!({ "path": &long_path }).to_string();
+
+        observer.record_event(
+            &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                tool: "file_read".to_string(),
+                tool_call_id: None,
+                arguments: Some(payload),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        );
+
+        let emitted = rx.try_recv().expect("observer should emit notify message");
+        // The full input was 64 KiB; the emitted message must be capped
+        // to NOTIFY_DETAIL_MAX_CHARS + the literal prefix/suffix chars
+        // ("\u{1F527} `file_read`: " = 17 chars + "…" = 1 char).
+        let max_len = NOTIFY_DETAIL_MAX_CHARS + 17 + 1;
+        assert!(
+            emitted.chars().count() <= max_len,
+            "emitted notify message must be capped (got {} chars, max {})",
+            emitted.chars().count(),
+            max_len
+        );
+        assert!(
+            emitted.contains("`file_read`"),
+            "emitted message must still identify the tool"
+        );
+        assert!(
+            emitted.is_char_boundary(emitted.len()),
+            "truncation must preserve a valid char boundary"
+        );
+    }
+
+    /// Regression: the bounded mpsc must drop on full rather than
+    /// block. A slow downstream channel (e.g. a stalled Discord /
+    /// Slack API call) must not wedge the observer hook. With a
+    /// capacity-1 channel and two events pushed back-to-back without
+    /// draining, the second push must be silently dropped.
+    #[tokio::test]
+    async fn channel_notify_observer_drops_on_full_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(NoopObserver),
+            tx,
+            tools_used: AtomicBool::new(false),
+        };
+
+        let mk_event = || zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+            tool: "file_read".to_string(),
+            tool_call_id: None,
+            arguments: Some(r#"{"path":"/a"}"#.to_string()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        };
+
+        // First push lands in the bounded buffer (capacity 1).
+        observer.record_event(&mk_event());
+        // Second push must drop: the consumer has not drained yet, so
+        // the buffer is full and `try_send` returns `Full`.
+        observer.record_event(&mk_event());
+
+        // Exactly one message arrived.
+        let first = rx
+            .recv()
+            .await
+            .expect("at least one notify should land before drop");
+        assert!(first.contains("`file_read`"));
+        // No second message; the channel is empty because the second
+        // push was dropped (not queued behind the first).
+        assert!(
+            rx.try_recv().is_err(),
+            "second push must be dropped when the channel is full"
+        );
+        // tools_used must reflect that both events were observed
+        // (the drop is on the notify side, not the observer side).
+        assert!(observer.tools_used.load(Ordering::Relaxed));
     }
 
     #[test]
