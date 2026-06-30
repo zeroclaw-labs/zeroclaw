@@ -9,7 +9,7 @@
 //! through the same `elicitation/create` outbound JSON-RPC method as
 //! `AcpChannel`, gated on the TUI advertising
 //! `clientCapabilities.elicitation.form` during `initialize`. See the ACP
-//! elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
+//! elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>
 //! for the wire protocol.
 
 use std::sync::Arc;
