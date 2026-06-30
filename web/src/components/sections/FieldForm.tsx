@@ -742,7 +742,11 @@ function SecretField({
   value: string;
   onChange: (next: string) => void;
 }) {
-  const [changing, setChanging] = useState(false);
+  // Start in change mode when a populated field already carries a staged draft
+  // value (operator typed a replacement, navigated away, came back). Otherwise
+  // the pending edit would hide behind the "set" indicator and the operator
+  // could not see or read back their own unsaved change.
+  const [changing, setChanging] = useState(populated && value.length > 0);
   const [revealed, setRevealed] = useState(false);
 
   const editing = !populated || changing;
