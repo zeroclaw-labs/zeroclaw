@@ -25,7 +25,7 @@ const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90)
 use crate::stream_guard::AbortOnDrop;
 
 pub struct AnthropicModelProvider {
-    /// `[model_providers.anthropic.<alias>]` config-key alias.
+    /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     base_url: String,
@@ -67,7 +67,7 @@ struct ContentBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest<'a> {
+struct NativeChatRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,7 +76,7 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec<'a>>>,
+    tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,10 +154,10 @@ enum NativeContentOut {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a serde_json::Value,
+struct NativeToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -351,17 +351,19 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
-        let mut native_tools: Vec<NativeToolSpec<'a>> = items
+        let mut native_tools: Vec<NativeToolSpec> = items
             .iter()
             .map(|tool| NativeToolSpec {
-                name: &tool.name,
-                description: &tool.description,
-                input_schema: &tool.parameters,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic(
+                    tool.parameters.clone(),
+                ),
                 cache_control: None,
             })
             .collect();
@@ -460,7 +462,10 @@ impl AnthropicModelProvider {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+                continue;
+            }
             match msg.role.as_str() {
                 "system" => {
                     if system_text.is_none() {
@@ -838,7 +843,7 @@ impl AnthropicModelProvider {
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
+    fn build_streaming_request(request: &NativeChatRequest) -> serde_json::Value {
         let mut body =
             serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
         body["stream"] = serde_json::Value::Bool(true);
@@ -1252,6 +1257,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1268,13 +1274,24 @@ impl ModelProvider for AnthropicModelProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "non-streaming API request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": thinking_config.is_some(),
+                    })),
+                "anthropic provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -1435,6 +1452,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1463,7 +1481,15 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"model": model})),
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                    })),
                 "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
@@ -1478,9 +1504,7 @@ impl ModelProvider for AnthropicModelProvider {
                 thinking: thinking_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
-            // across the async boundary — `NativeToolSpec<'a>` borrows from
-            // `request.tools`, which prevents moving `native_request` into
-            // the spawned future otherwise.
+            // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
             let client = self.http_client();
@@ -1555,13 +1579,24 @@ impl ModelProvider for AnthropicModelProvider {
             .boxed();
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "stream_chat request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": true,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": false,
+                    })),
+                "anthropic streaming provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -2333,9 +2368,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_without_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2347,9 +2382,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_with_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2522,6 +2557,87 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn convert_tools_cleans_ref_from_input_schema() {
+        let tools = vec![ToolSpec {
+            name: "query".to_string(),
+            description: "Search with a ref".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/$defs/FilterSpec"
+                    }
+                },
+                "$defs": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        }];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert_eq!(filter["properties"]["field"]["type"], "string");
+        assert!(schema.get("$defs").is_none(), "$defs was not stripped");
+    }
+
+    #[test]
+    fn convert_tools_cleans_definitions_from_input_schema() {
+        let tools = vec![ToolSpec {
+            name: "query".to_string(),
+            description: "Search with a definitions ref".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/definitions/FilterSpec"
+                    }
+                },
+                "definitions": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        }];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert!(
+            schema.get("definitions").is_none(),
+            "definitions was not stripped"
+        );
+    }
+
+    #[test]
+    fn convert_tools_empty_tools_returns_none() {
+        let tools: Vec<ToolSpec> = vec![];
+        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn convert_tools_none_returns_none() {
+        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        assert!(result.is_none());
     }
 
     #[test]

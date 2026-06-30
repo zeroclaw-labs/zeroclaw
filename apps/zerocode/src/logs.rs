@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 
 use crate::client::{LogsQueryParams, RpcClient, RpcNotification};
@@ -457,8 +459,8 @@ impl LogDetail {
 
 // ── Logs pane ────────────────────────────────────────────────────
 
-pub(crate) struct Logs<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Logs {
+    rpc: Arc<RpcClient>,
     notif_rx: broadcast::Receiver<RpcNotification>,
     events: Vec<LogEntry>,
     list_state: ListState,
@@ -482,8 +484,14 @@ pub(crate) struct Logs<'a> {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
-    // Pagination
-    next_cursor: Option<(String, String)>,
+    // Pagination — prefer the byte-offset cursor (`next_cursor_line_offset`)
+    // because it is independent of event id ordering and avoids the
+    // legacy `(until_ts, until_id)` tie-break that can drop
+    // earlier-written events when ids are written in non-lexicographic
+    // order (UUID v4 in practice). The legacy cursor stays as a fallback
+    // for daemons that haven't been upgraded to expose the byte offset.
+    next_cursor_offset: Option<u64>,
+    next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
     loading: bool,
     // Viewport
@@ -493,11 +501,12 @@ pub(crate) struct Logs<'a> {
     double_click: crate::mouse::DoubleClickTracker,
 }
 
-impl<'a> Logs<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient) -> Self {
+impl Logs {
+    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        let notif_rx = rpc.subscribe_notifications();
         Self {
             rpc,
-            notif_rx: rpc.subscribe_notifications(),
+            notif_rx,
             events: Vec::new(),
             list_state: ListState::default(),
             follow: true,
@@ -511,7 +520,8 @@ impl<'a> Logs<'a> {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
-            next_cursor: None,
+            next_cursor_offset: None,
+            next_cursor_legacy: None,
             at_end: false,
             loading: false,
             list_height: 0,
@@ -525,16 +535,21 @@ impl<'a> Logs<'a> {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None).await;
+        self.load_page(None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
-    async fn load_page(&mut self, cursor: Option<(String, String)>) {
+    async fn load_page(
+        &mut self,
+        cursor_offset: Option<u64>,
+        cursor_legacy: Option<(String, String)>,
+    ) {
         self.loading = true;
         let params = LogsQueryParams {
-            until_ts: cursor.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor.as_ref().map(|(_, id)| id.clone()),
+            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
+            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
+            until_line_offset: cursor_offset,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
@@ -542,13 +557,14 @@ impl<'a> Logs<'a> {
                 Some(self.search_query.clone())
             },
             hide_internal: true,
-            limit: Some(if cursor.is_none() {
+            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
                 INITIAL_LOAD
             } else {
                 PAGE_SIZE
             }),
             ..Default::default()
         };
+        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 // Events come newest-first from the daemon; reverse to chronological
@@ -559,7 +575,7 @@ impl<'a> Logs<'a> {
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
-                if cursor.is_some() && prepended > 0 {
+                if has_cursor && prepended > 0 {
                     // Prepend older events before the existing buffer
                     let mut combined = new_entries;
                     combined.append(&mut self.events);
@@ -568,10 +584,14 @@ impl<'a> Logs<'a> {
                     if let Some(sel) = self.list_state.selected() {
                         self.list_state.select(Some(sel + prepended));
                     }
-                } else if cursor.is_none() {
+                } else if !has_cursor {
                     self.events = new_entries;
                 }
-                self.next_cursor = result.next_cursor;
+                // Prefer the byte-offset cursor (independent of id ordering);
+                // fall back to the legacy `[timestamp, id]` pair when the
+                // daemon has not been upgraded to expose it.
+                self.next_cursor_offset = result.next_cursor_line_offset;
+                self.next_cursor_legacy = result.next_cursor;
                 self.at_end = result.at_end;
             }
             Err(_) => {
@@ -598,7 +618,8 @@ impl<'a> Logs<'a> {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
-        self.next_cursor = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
         self.at_end = false;
 
         let filtered = self.filtered_indices();
@@ -789,7 +810,7 @@ impl<'a> Logs<'a> {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
@@ -1054,9 +1075,10 @@ impl<'a> Logs<'a> {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && let Some(cursor) = self.next_cursor.clone()
+            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
         {
-            self.load_page(Some(cursor)).await;
+            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
+                .await;
         }
     }
 
@@ -1203,61 +1225,53 @@ impl<'a> Logs<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Logs<'_> {
+impl crate::widgets::HelpContext for Logs {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::help::entries_for;
+        use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {
-            HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-logs-help-apply-search")),
-                E::key("Esc", crate::i18n::t("zc-logs-help-cancel-search")),
-            ])
+            HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]))
         } else if self.detail_open {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["Esc", "Enter"],
-                    crate::i18n::t("zc-logs-help-close-detail"),
-                ),
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor"),
-                ),
-                E::new(
-                    vec!["J", "K", "Shift+↑↓"],
-                    crate::i18n::t("zc-logs-help-scroll-detail"),
-                ),
-                E::key("Shift+←→", crate::i18n::t("zc-logs-help-resize-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("y", crate::i18n::t("zc-logs-help-yank-detail")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-            ])
+            HelpNode::entries(entries_for([
+                L::CloseDetail,
+                L::Up,
+                L::Down,
+                L::DetailScrollUp,
+                L::DetailScrollDown,
+                L::DetailWidenLeft,
+                L::DetailWidenRight,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+                L::CopyDetail,
+            ]))
         } else {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor-list"),
-                ),
-                E::new(vec!["G", "End"], crate::i18n::t("zc-logs-help-jump-bottom")),
-                E::new(vec!["g", "Home"], crate::i18n::t("zc-logs-help-jump-top")),
-                E::key("PgDn / PgUp", crate::i18n::t("zc-logs-help-page")),
-                E::key("Enter", crate::i18n::t("zc-logs-help-open-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-                E::spacer(),
-                E::new(
-                    vec![],
-                    format!(
-                        "{}: {}",
-                        crate::i18n::t("zc-logs-help-mouse-label"),
-                        crate::i18n::t("zc-logs-help-mouse-desc"),
-                    ),
-                ),
-            ])
+            let mut entries = entries_for([
+                L::Up,
+                L::Down,
+                L::JumpEnd,
+                L::JumpStart,
+                L::PageDown,
+                L::OpenDetail,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+            ]);
+            entries.push(E::spacer());
+            entries.push(E::desc(format!(
+                "{}: {}",
+                crate::i18n::t("zc-logs-help-mouse-label"),
+                crate::i18n::t("zc-logs-help-mouse-desc"),
+            )));
+            HelpNode::entries(entries)
         }
     }
 }

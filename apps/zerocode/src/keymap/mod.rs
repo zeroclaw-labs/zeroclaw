@@ -9,6 +9,7 @@
 
 pub mod actions;
 mod chord;
+mod guard;
 pub mod overrides;
 
 pub use actions::*;
@@ -57,6 +58,13 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
     table
         .iter()
         .find_map(|(c, a)| c.matches(event).then_some(*a))
+}
+
+/// Rendered, OS-aware key labels for an action's currently-resolved
+/// chords (e.g. `["Tab"]`, `["⌘K"]`). Help surfaces use this so the keys
+/// they advertise track the live keybinding registry instead of literals.
+pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
+    action.resolved().iter().map(Chord::display).collect()
 }
 
 #[cfg(test)]
@@ -119,19 +127,79 @@ mod tests {
                 }
             }
         }
-        check("global", GlobalAction::bindings());
-        check("chat", ChatTabAction::bindings());
-        check("logs", LogsTabAction::bindings());
-        check("dashboard", DashboardTabAction::bindings());
-        check("config", ConfigTabAction::bindings());
-        check("quickstart", QuickstartTabAction::bindings());
-        check("input_bar", InputBarAction::bindings());
-        check("modal", ModalAction::bindings());
-        check("file_explorer", FileExplorerAction::bindings());
-        check("file_explorer_search", FileExplorerSearchAction::bindings());
-        check("search_box", SearchBoxAction::bindings());
-        check("config_editor", ConfigEditorAction::bindings());
-        check("quickstart_modal", QuickstartModalAction::bindings());
+        check(GlobalAction::TAG, GlobalAction::bindings());
+        check(ChatTabAction::TAG, ChatTabAction::bindings());
+        check(LogsTabAction::TAG, LogsTabAction::bindings());
+        check(DashboardTabAction::TAG, DashboardTabAction::bindings());
+        check(ConfigTabAction::TAG, ConfigTabAction::bindings());
+        check(DoctorTabAction::TAG, DoctorTabAction::bindings());
+        check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(InputBarAction::TAG, InputBarAction::bindings());
+        check(ModalAction::TAG, ModalAction::bindings());
+        check(CaptureAction::TAG, CaptureAction::bindings());
+        check(FileExplorerAction::TAG, FileExplorerAction::bindings());
+        check(
+            FileExplorerSearchAction::TAG,
+            FileExplorerSearchAction::bindings(),
+        );
+        check(SearchBoxAction::TAG, SearchBoxAction::bindings());
+        check(ConfigEditorAction::TAG, ConfigEditorAction::bindings());
+        check(
+            QuickstartModalAction::TAG,
+            QuickstartModalAction::bindings(),
+        );
+    }
+
+    #[test]
+    fn no_cross_enum_global_shadow() {
+        let global = GlobalAction::bindings();
+        let panes: &[(&str, Vec<Chord>)] = &[
+            (
+                "chat",
+                ChatTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "logs",
+                LogsTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "dashboard",
+                DashboardTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "config",
+                ConfigTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "quickstart",
+                QuickstartTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+        ];
+        for (gc, ga) in &global {
+            for (label, chords) in panes {
+                for pc in chords {
+                    assert!(
+                        gc != pc,
+                        "global {ga:?} chord {gc:?} shadows a {label} action sharing it"
+                    );
+                }
+            }
+        }
     }
 
     /// Every rebindable enum's TAG and serialized variant names must be

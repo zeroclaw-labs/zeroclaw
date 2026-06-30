@@ -50,9 +50,9 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug: Onboard",
+      "name": "Debug: Quickstart",
       "program": "${workspaceFolder}/target/debug/zeroclaw",
-      "args": ["onboard"],
+      "args": ["quickstart"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
     },

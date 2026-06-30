@@ -9,9 +9,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// A single keystroke pattern.
 ///
-/// On darwin, `CONTROL` in a chord is silently translated to `SUPER`
-/// at match time so Linux's `Ctrl+K` and macOS's `⌘K` resolve to the
-/// same chord.
+/// On darwin, most `CONTROL` chords are translated to `SUPER` at match time so
+/// Linux's `Ctrl+K` and macOS's `⌘K` resolve to the same chord. `Ctrl+C` stays
+/// distinct so the system copy chord (`⌘C`) does not trigger Quit.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Chord {
     pub code: KeyCode,
@@ -49,15 +49,10 @@ impl Chord {
     }
 
     /// `Ctrl+K` on most platforms; `⌘K` on darwin.
-    #[allow(dead_code)]
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if self.modifiers.contains(KeyModifiers::CONTROL) {
-            parts.push(if cfg!(target_os = "macos") {
-                "⌘"
-            } else {
-                "Ctrl"
-            });
+            parts.push(control_display_label(&self.code));
         }
         if self.modifiers.contains(KeyModifiers::ALT) {
             parts.push(if cfg!(target_os = "macos") {
@@ -235,11 +230,30 @@ impl<'de> Deserialize<'de> for Chord {
 
 #[cfg(target_os = "macos")]
 fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
-    if m.contains(KeyModifiers::CONTROL) {
+    if m.contains(KeyModifiers::CONTROL) && !is_copy_quit_chord(&code) {
         m.remove(KeyModifiers::CONTROL);
         m.insert(KeyModifiers::SUPER);
     }
     strip_redundant_shift(code, m)
+}
+
+#[cfg(target_os = "macos")]
+fn is_copy_quit_chord(code: &KeyCode) -> bool {
+    matches!(code, KeyCode::Char('c' | 'C'))
+}
+
+#[cfg(target_os = "macos")]
+fn control_display_label(code: &KeyCode) -> &'static str {
+    if is_copy_quit_chord(code) {
+        "Ctrl"
+    } else {
+        "⌘"
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn control_display_label(_code: &KeyCode) -> &'static str {
+    "Ctrl"
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -265,7 +279,7 @@ fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 #[allow(dead_code)]
 fn render_keycode(code: &KeyCode) -> String {
     match code {
-        KeyCode::Char(c) => c.to_uppercase().to_string(),
+        KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Esc".into(),
         KeyCode::Tab => "Tab".into(),
@@ -362,21 +376,33 @@ mod tests {
         assert!(chord.matches(&event));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn display_bare_letter_uppercases() {
-        assert_eq!(Chord::char('k').display(), "K");
+    fn ctrl_c_quit_does_not_match_super_c_copy_on_darwin() {
+        let chord = Chord::ctrl('c');
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let quit = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(!chord.matches(&copy));
+        assert!(chord.matches(&quit));
+    }
+
+    #[test]
+    fn display_bare_letter_preserves_case() {
+        assert_eq!(Chord::char('k').display(), "k");
+        assert_eq!(Chord::char('K').display(), "K");
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn display_ctrl_on_non_darwin() {
-        assert_eq!(Chord::ctrl('k').display(), "Ctrl+K");
+        assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn display_ctrl_on_darwin() {
-        assert_eq!(Chord::ctrl('k').display(), "⌘K");
+        assert_eq!(Chord::ctrl('k').display(), "⌘k");
     }
 
     #[test]

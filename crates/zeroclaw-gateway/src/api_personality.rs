@@ -150,7 +150,7 @@ fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/personality?agent=<alias> — index of all allowlist files in the
+/// GET /api/personality?agent=`<alias>` — index of all allowlist files in the
 /// named agent's workspace.
 pub async fn handle_index(
     State(state): State<AppState>,

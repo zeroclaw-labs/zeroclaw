@@ -1,4 +1,7 @@
-use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
+};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -13,12 +16,17 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, DelegateToolConfig, ModelProviderConfig, RiskProfileConfig,
-    RuntimeProfileConfig, SkillBundleConfig,
+    AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ModelProviderConfig,
+    ResolvedRuntime, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_tools::memory_export::MemoryExportTool;
+use zeroclaw_tools::memory_forget::MemoryForgetTool;
+use zeroclaw_tools::memory_purge::MemoryPurgeTool;
+use zeroclaw_tools::memory_recall::MemoryRecallTool;
+use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -78,6 +86,9 @@ pub struct DelegateTool {
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
+    /// Runtime adapter used to build target-owned registries for independent
+    /// agentic delegation.
+    runtime: Option<Arc<dyn crate::platform::RuntimeAdapter>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     /// Global delegate tool config providing default timeout values.
@@ -96,14 +107,10 @@ pub struct DelegateTool {
     runtime_profiles: Arc<HashMap<String, RuntimeProfileConfig>>,
     /// named skill bundles for skills-directory resolution.
     skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
-    /// Optional handle to the loaded root config used to resolve a
-    /// per-target `SecurityPolicy` at delegate time. When set, every
-    /// delegation validates the target agent's policy as a subset of
-    /// the calling agent's via `ensure_no_escalation_beyond` and
-    /// inherits the caller's `PerSenderTracker` so action / cost
-    /// budgets are shared between caller and delegated runs. When
-    /// unset (legacy unit-test constructors), DelegateTool falls back
-    /// to using `self.security` for the spawned inner DelegateTool.
+    /// Optional handle to the loaded root config used to resolve delegate
+    /// reachability, target mode, and per-target `SecurityPolicy` at delegate
+    /// time. When unset (legacy unit-test constructors), DelegateTool falls
+    /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
@@ -111,7 +118,27 @@ pub struct DelegateTool {
     caller_alias: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateAdmission {
+    /// This call entered through the user-visible `delegate` tool and must run
+    /// caller-side tool authorization plus target reachability checks.
+    Required,
+    /// The parent path already admitted the request before spawning work.
+    ///
+    /// Background workers use this after the parent has returned a task id with
+    /// a resolved target policy. Re-running the full admission inside that
+    /// worker would ask whether the child target can delegate to itself, which
+    /// is not the authorization question being answered.
+    Prevalidated,
+}
+
 impl DelegateTool {
+    /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
+    /// rename cannot desync the two.
+    pub const NAME: &'static str = "delegate";
+    const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
+        "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
+
     pub fn new(
         agents: HashMap<String, AliasedAgentConfig>,
         global_credential: Option<String>,
@@ -138,6 +165,7 @@ impl DelegateTool {
             provider_runtime_options,
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
+            runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
@@ -184,6 +212,7 @@ impl DelegateTool {
             provider_runtime_options,
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
+            runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
@@ -201,6 +230,13 @@ impl DelegateTool {
     /// Attach parent tools used to build sub-agent allowlist registries.
     pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
         self.parent_tools = parent_tools;
+        self
+    }
+
+    /// Attach the runtime adapter used to build target-owned tools for
+    /// independent agentic delegation.
+    pub fn with_runtime(mut self, runtime: Arc<dyn crate::platform::RuntimeAdapter>) -> Self {
+        self.runtime = Some(runtime);
         self
     }
 
@@ -287,10 +323,9 @@ impl DelegateTool {
         self
     }
 
-    /// Attach the loaded root config so DelegateTool can resolve a
-    /// per-target `SecurityPolicy` at delegate time, validate it as a
-    /// subset of the caller's policy, and share the caller's
-    /// `PerSenderTracker` with the delegated run.
+    /// Attach the loaded root config so DelegateTool can resolve delegate
+    /// reachability, target mode, and per-target `SecurityPolicy` from the
+    /// canonical agent config at delegate time.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
         self
@@ -304,39 +339,80 @@ impl DelegateTool {
         self
     }
 
-    /// Build a `SecurityPolicy` for the delegated target agent
-    /// validated as **mutually equivalent** to the caller's policy
-    /// (neither escalates nor narrows), with the caller's action /
-    /// cost tracker shared into the returned policy.
+    /// Resolve the target's `SecurityPolicy` for delegation.
     ///
-    /// Returns:
-    /// - `Ok(target_policy)` when `root_config` is set, the target
-    ///   resolves, and the target's policy is equivalent to the
-    ///   caller's under [`SecurityPolicy::ensure_no_escalation_beyond`]
-    ///   in both directions. The returned policy's `tracker` field is
-    ///   the caller's `Arc`-shared tracker so delegated actions count
-    ///   against the caller's `max_actions_per_hour` /
-    ///   `max_cost_per_day_cents`.
-    /// - `Err(_)` on escalation: the target's risk profile or
-    ///   workspace.access map would widen permissions beyond the
-    ///   caller. The originating `EscalationViolation` is chained.
-    /// - `Err(_)` on narrowing: the target's policy is strictly
-    ///   tighter than the caller's. `DelegateTool` reuses the
-    ///   caller's `parent_tools` registry whose tools each hold the
-    ///   caller's `Arc<SecurityPolicy>` from registration time, so a
-    ///   narrower target would silently inherit the caller's broader
-    ///   allowlist — an over-grant the validator catches loudly here
-    ///   instead of letting it ship as an enforcement gap. The error
-    ///   message names `spawn_subagent` as the supported path for
-    ///   narrowed runs (it re-enters `agent::run`, which rebuilds the
-    ///   tool registry under the validated child policy).
-    /// - `Ok(self.security)` (caller's policy) when `root_config`
-    ///   is `None`. This branch only fires for the legacy unit-test
-    ///   constructors that don't plumb root config.
+    /// Refuses when the caller's `delegation_policy` forbids delegation
+    /// or the target is outside the caller's reachable set. Bounded
+    /// targets share the caller's action/cost tracker and, for same-profile
+    /// targets, inherit the caller's session workspace boundary (issue
+    /// #7263). Cross-profile bounded targets still run under the target's
+    /// configured policy; the bounded ceiling is enforced by drawing
+    /// agentic tools from the caller's registry and intersecting with the
+    /// target risk profile. Independent targets run under their own
+    /// configured policy and tool registry. Falls back to the caller's
+    /// policy when no `root_config` is attached (legacy unit-test
+    /// constructors).
     fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
+        if !self.security.delegation_policy.permits() {
+            let remediation = if self.security.risk_profile_name.trim().is_empty() {
+                "set the caller risk profile's delegation_policy mode = \"allow\"".to_string()
+            } else {
+                format!(
+                    "set [risk_profiles.{}].delegation_policy mode = \"allow\"",
+                    self.security.risk_profile_name
+                )
+            };
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
+                        "caller_risk_profile": self.security.risk_profile_name,
+                    })),
+                "delegate refused: caller delegation_policy forbids delegation"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "delegation is forbidden for caller {:?} by risk profile {:?} \
+                 delegation_policy; {remediation}",
+                self.caller_alias, self.security.risk_profile_name
+            )));
+        }
+
+        // Resolve reachability and execution mode through `Config` so
+        // admission follows the same canonical roster advertised to callers.
+        let Some(target_mode) = config.delegate_target_mode(&self.caller_alias, target_alias)
+        else {
+            let error = self.unreachable_target_error(config, target_alias);
+            let caller_profile = config
+                .agents
+                .get(&self.caller_alias)
+                .map(|agent| agent.risk_profile.trim())
+                .unwrap_or_default();
+            let target_profile = config
+                .agents
+                .get(target_alias)
+                .map(|agent| agent.risk_profile.trim())
+                .unwrap_or_default();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
+                        "caller_risk_profile": caller_profile,
+                        "target_risk_profile": target_profile,
+                    })),
+                "delegate refused: target not in caller's reachable set"
+            );
+            return Err(anyhow::Error::msg(error));
+        };
+
         let mut target_policy = SecurityPolicy::for_agent(config, target_alias).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -344,6 +420,7 @@ impl DelegateTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
                         "error": format!("{}", e),
                     })),
                 "delegate: could not resolve target's security policy"
@@ -352,43 +429,313 @@ impl DelegateTool {
                 "could not resolve security policy for delegate target {target_alias:?}: {e}"
             ))
         })?;
-        if !self.security.delegation_policy.permits() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "target_agent": target_alias,
-                        "caller_risk_profile": self.security.risk_profile_name,
-                    })),
-                "delegate refused: caller delegation_policy forbids delegation"
-            );
-            return Err(anyhow::Error::msg(format!(
-                "delegation is forbidden by the caller's delegation_policy; set \
-                 [risk_profiles.{}].delegation_policy mode = \"allow\"",
-                self.security.risk_profile_name
-            )));
+
+        if target_mode == DelegateExecutionMode::Bounded {
+            target_policy.tracker = self.security.tracker.clone();
+
+            if self.security.risk_profile_name == target_policy.risk_profile_name {
+                target_policy.workspace_dir = self.security.workspace_dir.clone();
+            }
         }
-        if self.security.risk_profile_name != target_policy.risk_profile_name {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "target_agent": target_alias,
-                        "caller_risk_profile": self.security.risk_profile_name,
-                        "target_risk_profile": target_policy.risk_profile_name,
-                    })),
-                "delegate refused: target risk profile differs from caller"
-            );
-            return Err(anyhow::Error::msg(format!(
-                "delegate target {target_alias:?} uses risk profile \
-                 {:?}, but delegation requires the same risk profile as the caller ({:?})",
-                target_policy.risk_profile_name, self.security.risk_profile_name
-            )));
-        }
-        target_policy.tracker = self.security.tracker.clone();
+
         Ok(Arc::new(target_policy))
+    }
+
+    /// Build the user-facing refusal for a target outside the caller's roster.
+    ///
+    /// The reachability resolver intentionally returns only `None` for "not
+    /// reachable"; this helper re-reads canonical config to explain which
+    /// branch failed without duplicating the admission decision itself.
+    fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
+        let Some(caller) = config.agents.get(&self.caller_alias) else {
+            return format!(
+                "delegate target {target_alias:?} is not reachable because caller {:?} \
+                 is not present in the loaded agents config",
+                self.caller_alias
+            );
+        };
+
+        let Some(target) = config.agents.get(target_alias) else {
+            return format!(
+                "delegate target {target_alias:?} is not reachable from {:?}: \
+                 no agent with that alias exists in the loaded config",
+                self.caller_alias
+            );
+        };
+
+        let explicitly_configured = caller
+            .delegates
+            .iter()
+            .any(|target| target.agent().trim() == target_alias);
+
+        if !target.enabled {
+            return format!(
+                "delegate target {target_alias:?} is not reachable from {:?}: \
+                 the target agent is disabled",
+                self.caller_alias
+            );
+        }
+
+        let caller_profile = caller.risk_profile.trim();
+        let target_profile = target.risk_profile.trim();
+        if caller.delegate_same_risk_profile
+            && !explicitly_configured
+            && !caller_profile.is_empty()
+            && !target_profile.is_empty()
+            && caller_profile != target_profile
+        {
+            return format!(
+                "delegate target {target_alias:?} is not reachable from {:?}: \
+                 different risk profile (caller uses {caller_profile:?}, target uses \
+                 {target_profile:?}). delegate_same_risk_profile only reaches agents \
+                 with the same risk profile; add an explicit [agents.{}].delegates \
+                 entry with the intended mode, or change one agent's risk_profile.",
+                self.caller_alias, self.caller_alias
+            );
+        }
+
+        if !caller.delegate_same_risk_profile && !explicitly_configured {
+            return format!(
+                "delegate target {target_alias:?} is not reachable from {:?}: \
+                 delegate_same_risk_profile is disabled and the target is not listed \
+                 in [agents.{}].delegates",
+                self.caller_alias, self.caller_alias
+            );
+        }
+
+        format!(
+            "delegate target {target_alias:?} is not reachable from {:?}; \
+             add it to [agents.{}].delegates or share a risk profile with \
+             delegate_same_risk_profile enabled",
+            self.caller_alias, self.caller_alias
+        )
+    }
+
+    /// Resolve the target mode for execution paths that already admitted it.
+    ///
+    /// Legacy unit-test constructors have no root config, so they keep the old
+    /// bounded behavior. Production instances always carry `root_config` and
+    /// therefore resolve through the canonical roster.
+    fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
+        self.root_config
+            .as_ref()
+            .and_then(|config| config.delegate_target_mode(&self.caller_alias, target_alias))
+            .unwrap_or(DelegateExecutionMode::Bounded)
+    }
+
+    /// Runtime-only guard for independent targets whose risk profile still
+    /// declares `always_ask`.
+    ///
+    /// Independent delegation deliberately runs under the target agent's own
+    /// policy and tool registry (#8238, related to the broader delegation ask
+    /// in #7743). That is fine for target-owned authorization, but
+    /// `always_ask` is a runtime approval contract: starting an independent
+    /// child that can later ask for approval would require an approval
+    /// forwarding channel back through the parent. That channel is explicitly
+    /// out of scope for independent-delegates PR #8239, so fail closed
+    /// here before any target run, task id, or parallel spawn is created.
+    ///
+    /// Keep this centralized. Sync, background, and parallel paths all call
+    /// the same helper so the refusal string and structured diagnostics do not
+    /// drift, and so a future approval-forwarding implementation has one
+    /// temporary guard to remove.
+    ///
+    /// References:
+    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/8238
+    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/7743
+    /// - https://github.com/zeroclaw-labs/zeroclaw/pull/8239
+    fn independent_always_ask_refusal(&self, target_alias: &str) -> Option<ToolResult> {
+        let config = self.root_config.as_ref()?;
+        if config.delegate_target_mode(&self.caller_alias, target_alias)
+            != Some(DelegateExecutionMode::Independent)
+        {
+            return None;
+        }
+
+        let target_agent = config.agents.get(target_alias)?;
+        let target_risk_profile = target_agent.risk_profile.trim();
+        if target_risk_profile.is_empty() {
+            return None;
+        }
+
+        let profile = config.risk_profiles.get(target_risk_profile)?;
+        let always_ask_entries: Vec<String> = profile
+            .always_ask
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        if always_ask_entries.is_empty() {
+            return None;
+        }
+        let always_ask_label = always_ask_entries.join(", ");
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "delegate.independent_always_ask_unsupported",
+                    "caller_alias": self.caller_alias,
+                    "target_agent": target_alias,
+                    "target_risk_profile": target_risk_profile,
+                    "always_ask": always_ask_entries.clone(),
+                })),
+            "delegate refused: independent target has always_ask entries"
+        );
+
+        Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "delegate target {target_alias:?} cannot run in independent mode from {:?}: \
+                 risk profile {target_risk_profile:?} has always_ask entries ({}). \
+                 See {}.",
+                self.caller_alias,
+                always_ask_label,
+                Self::INDEPENDENT_ALWAYS_ASK_DOC_REF
+            )),
+        })
+    }
+
+    fn build_target_provider(
+        &self,
+        model_provider: &str,
+        provider_type: &str,
+        credential: Option<&str>,
+    ) -> anyhow::Result<Box<dyn ModelProvider>> {
+        if let Some(config) = self.root_config.as_deref()
+            && let Some((family, alias)) = model_provider.split_once('.')
+        {
+            let mut options =
+                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
+            if options.zeroclaw_dir.is_none() {
+                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
+            }
+            return zeroclaw_providers::create_model_provider_for_alias(
+                config, family, alias, credential, &options,
+            );
+        }
+        zeroclaw_providers::create_model_provider_with_options(
+            provider_type,
+            credential,
+            &self.provider_runtime_options,
+        )
+    }
+
+    async fn memory_for_target_agent(
+        &self,
+        agent_name: &str,
+    ) -> anyhow::Result<Option<Arc<dyn Memory>>> {
+        let Some(config) = self.root_config.as_deref() else {
+            return Ok(self.memory.clone());
+        };
+
+        let api_key = config
+            .resolved_model_provider_for_agent(agent_name)
+            .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
+        zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
+            .await
+            .map(Some)
+    }
+
+    fn memory_tools_for_target(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryRecallTool::new(memory.clone())),
+            Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryExportTool::new(memory.clone())),
+            Box::new(MemoryPurgeTool::new(memory, security)),
+        ]
+    }
+
+    /// Build the full target-owned registry for an independent agentic child.
+    ///
+    /// Bounded agentic delegation starts from the caller's already-filtered
+    /// `parent_tools`. Independent delegation is intentionally different: it is
+    /// equivalent to starting a fresh target-agent turn, so the registry comes
+    /// from `all_tools_with_runtime()` using the target risk profile, target
+    /// workspace, target memory, and target provider credentials. The only
+    /// cross-cutting restriction retained here is stripping `delegate` itself,
+    /// because recursive agentic delegation is still not supported.
+    async fn independent_agentic_tools_for_target(
+        &self,
+        agent_name: &str,
+        target_policy: Arc<SecurityPolicy>,
+    ) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+        let config = self
+            .root_config
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::msg("independent delegation requires root config"))?;
+        let runtime =
+            self.runtime.as_ref().cloned().ok_or_else(|| {
+                anyhow::Error::msg("independent delegation requires runtime adapter")
+            })?;
+        let risk_profile = config
+            .risk_profile_for_agent(agent_name)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Agent '{agent_name}' is agentic but its risk profile is not configured"
+                ))
+            })?;
+        let memory = self
+            .memory_for_target_agent(agent_name)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Failed to initialize memory for independent delegate target '{agent_name}'"
+                ))
+            })?;
+        let composio_key = if config.composio.enabled {
+            config.composio.api_key.as_deref()
+        } else {
+            None
+        };
+        let composio_entity_id = if config.composio.enabled {
+            Some(config.composio.entity_id.as_str())
+        } else {
+            None
+        };
+        let target_api_key = config
+            .resolved_model_provider_for_agent(agent_name)
+            .and_then(|(_, _, provider)| provider.api_key.as_deref());
+
+        let mut tools = crate::tools::all_tools_with_runtime(
+            Arc::clone(config),
+            &target_policy,
+            &risk_profile,
+            agent_name,
+            runtime,
+            memory,
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &target_policy.workspace_dir,
+            &config.agents,
+            target_api_key,
+            config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        crate::agent::loop_::apply_policy_tool_filter(
+            &mut tools,
+            Some(target_policy.as_ref()),
+            None,
+        );
+        tools.retain(|tool| tool.name() != Self::NAME);
+        Ok(tools)
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -460,27 +807,112 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
-    /// Resolve max tool iterations from the named runtime profile (default: 10).
-    fn resolve_max_iterations(&self, runtime_profile: &str) -> usize {
-        if runtime_profile.is_empty() {
-            return 10;
+    /// Resolve the runtime-profile knobs the delegate sub-loop consumes.
+    ///
+    /// Production DelegateTool instances carry `root_config`, so use the
+    /// canonical config resolver there. The fallback only serves legacy unit
+    /// constructors that build DelegateTool from raw maps without a full Config.
+    fn resolve_loop_runtime(
+        &self,
+        agent_alias: &str,
+        agent_config: &AliasedAgentConfig,
+    ) -> ResolvedRuntime {
+        if let Some(root_config) = self.root_config.as_ref()
+            && let Some(resolved_config) = root_config.resolved_agent_config(agent_alias)
+        {
+            return resolved_config.resolved;
         }
-        self.runtime_profiles
-            .get(runtime_profile)
-            .map(|p| p.max_tool_iterations)
-            .filter(|&i| i > 0)
-            .unwrap_or(10)
+
+        let mut resolved = agent_config.resolved.clone();
+
+        if let Some(profile) = self
+            .runtime_profiles
+            .get(agent_config.runtime_profile.as_str())
+        {
+            if profile.max_tool_iterations > 0 {
+                resolved.max_tool_iterations = profile.max_tool_iterations;
+            }
+            if let Some(max_context_tokens) = profile.max_context_tokens {
+                resolved.max_context_tokens = max_context_tokens;
+            }
+            if let Some(parallel_tools) = profile.parallel_tools {
+                resolved.parallel_tools = parallel_tools;
+            }
+            if let Some(max_tool_result_chars) = profile.max_tool_result_chars {
+                resolved.max_tool_result_chars = max_tool_result_chars;
+            }
+            resolved.strict_tool_parsing = profile.strict_tool_parsing;
+        }
+
+        resolved
     }
 
-    /// Resolve allowed tools list from the named risk profile (authorization).
-    fn resolve_allowed_tools(&self, risk_profile: &str) -> Vec<String> {
+    /// Materialize the tool gate from the named risk profile (authorization).
+    ///
+    /// Returns `None` when the risk profile is unnamed or not configured.
+    /// `allowed_tools = Some(vec![])` means "deny all" and is preserved as
+    /// `Some(empty)` so the caller can distinguish it from "no risk profile."
+    ///
+    /// The resulting `SecurityPolicy` only carries the tool authorization
+    /// fields (`allowed_tools` and `excluded_tools`). Callers in
+    /// `execute_agentic` must use [`Self::delegate_admits_with_mcp`] — not the
+    /// raw `SecurityPolicy::is_tool_allowed` — to filter `parent_tools`,
+    /// because the delegate path applies the MCP `<server>__<tool>`
+    /// auto-admit exception described on `RiskProfileConfig::allowed_tools`.
+    /// The exception is intentionally scoped to the risk-profile gate; it
+    /// does not apply to caller-supplied per-run allow-lists (cron jobs and
+    /// other narrowers) — see PR #7547 review.
+    fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
-            return Vec::new();
+            return None;
         }
-        self.risk_profiles
-            .get(risk_profile)
-            .map(|p| p.allowed_tools.clone())
-            .unwrap_or_default()
+
+        let profile = self.risk_profiles.get(risk_profile)?;
+        Some(SecurityPolicy {
+            allowed_tools: if profile.allowed_tools.is_empty() {
+                None
+            } else {
+                Some(profile.allowed_tools.clone())
+            },
+            excluded_tools: if profile.excluded_tools.is_empty() {
+                None
+            } else {
+                Some(profile.excluded_tools.clone())
+            },
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// MCP-aware admission check used to filter `parent_tools` in
+    /// `execute_agentic`.
+    ///
+    /// Same contract as `SecurityPolicy::is_tool_allowed`, with one
+    /// addition that the delegate path needs: when the risk profile's
+    /// `allowed_tools` is `Some(non-empty)`, any name containing `__`
+    /// (the `<server>__<tool>` MCP wrapper convention) is auto-admitted
+    /// even if it is not explicitly listed in `allowed_tools`. The
+    /// `excluded_tools` deny-list always applies last, so destructive
+    /// MCP capabilities like `filesystem__write_file` can be blocked
+    /// individually.
+    ///
+    /// This auto-admit applies only to the risk-profile gate. Callers
+    /// that need a per-run narrowing (cron jobs, narrowed delegate
+    /// invocations) intersect their own allow-list against this result
+    /// with a strict `list.contains(name)` check — see
+    /// `ToolAccessPolicy::is_tool_allowed` and PR #7547.
+    fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
+        let denied = policy
+            .excluded_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == name));
+        if denied {
+            return false;
+        }
+        match policy.allowed_tools.as_ref() {
+            None => true,
+            Some(list) if list.is_empty() => false,
+            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+        }
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -498,6 +930,20 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
+    /// Persist a background result atomically: write to a sibling temp file then
+    /// rename onto the final path, so a concurrent reader never observes a
+    /// half-written (or zero-length) JSON document.
+    async fn write_result_atomic(
+        result_path: &Path,
+        result: &BackgroundDelegateResult,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(result)?;
+        let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::rename(&tmp_path, result_path).await?;
+        Ok(())
+    }
+
     /// Validate that a user-provided task_id is a valid UUID to prevent
     /// path traversal attacks (e.g. `../../etc/passwd`).
     fn validate_task_id(task_id: &str) -> Result<(), String> {
@@ -511,7 +957,7 @@ impl DelegateTool {
 #[async_trait]
 impl Tool for DelegateTool {
     fn name(&self) -> &str {
-        "delegate"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
@@ -526,18 +972,23 @@ impl Tool for DelegateTool {
     fn parameters_schema(&self) -> serde_json::Value {
         let delegation_permitted = self.security.delegation_policy.permits();
         let caller_profile = self.security.risk_profile_name.as_str();
-        // Advertise only agents the caller can actually reach: delegation must
-        // be permitted, the target shares the caller's risk profile, and the
-        // delegator never lists itself.
-        let mut agent_names: Vec<&str> = self
-            .agents
-            .iter()
-            .filter(|_| delegation_permitted)
-            .filter(|(name, _)| name.as_str() != self.caller_alias.as_str())
-            .filter(|(_, cfg)| cfg.risk_profile.trim() == caller_profile)
-            .map(|(name, _)| name.as_str())
-            .collect();
+        let mut agent_names: Vec<String> = if !delegation_permitted {
+            Vec::new()
+        } else if let Some(config) = self.root_config.as_ref() {
+            config.reachable_delegate_targets(&self.caller_alias)
+        } else {
+            let mut names: Vec<String> = self
+                .agents
+                .iter()
+                .filter(|(name, _)| name.as_str() != self.caller_alias.as_str())
+                .filter(|(_, cfg)| cfg.risk_profile.trim() == caller_profile)
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort_unstable();
+            names
+        };
         agent_names.sort_unstable();
+        agent_names.dedup();
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -693,6 +1144,23 @@ impl DelegateTool {
         prompt: &str,
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
+        self.execute_sync_with_admission(agent_name, prompt, args, DelegateAdmission::Required)
+            .await
+    }
+
+    /// Execute one foreground delegate call after selecting the admission mode.
+    ///
+    /// `Required` is the public tool entry path. `Prevalidated` is reserved for
+    /// detached background workers that already performed caller-side admission
+    /// before returning a task id. Keeping the switch at this boundary prevents
+    /// sync/background/agentic variants from each inventing a different bypass.
+    async fn execute_sync_with_admission(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -740,43 +1208,47 @@ impl DelegateTool {
             });
         }
 
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "delegate")
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            });
-        }
+        if admission == DelegateAdmission::Required {
+            if let Err(error) = self
+                .security
+                .enforce_tool_operation(ToolOperation::Act, "delegate")
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
 
-        if let Err(e) = self.policy_for_target(agent_name) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("{e:#}")),
-            });
+            if let Err(e) = self.policy_for_target(agent_name) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+            if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
+                return Ok(refusal);
+            }
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> =
-            match zeroclaw_providers::create_model_provider_with_options(
-                &provider_type,
-                credential.as_deref(),
-                &self.provider_runtime_options,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
-                        )),
-                    });
-                }
-            };
+        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+            &agent_config.model_provider,
+            &provider_type,
+            credential.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                    )),
+                });
+            }
+        };
 
         // Build the message
         let full_prompt = if context.is_empty() {
@@ -788,7 +1260,7 @@ impl DelegateTool {
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
             return self
-                .execute_agentic(
+                .execute_agentic_with_admission(
                     agent_name,
                     agent_config,
                     &provider_type,
@@ -796,6 +1268,7 @@ impl DelegateTool {
                     &*model_provider,
                     &full_prompt,
                     temperature,
+                    admission,
                 )
                 .await;
         }
@@ -815,9 +1288,10 @@ impl DelegateTool {
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
+        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            model_provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
 
@@ -922,6 +1396,26 @@ impl DelegateTool {
                 });
             }
         };
+        if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
+            return Ok(refusal);
+        }
+
+        // Runaway backstop: refuse a new background delegation once too many are already in
+        // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
+        if Self::at_background_capacity(
+            Self::background_task_cancels().lock().len(),
+            Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS,
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Too many background delegations in flight (limit {}). Wait for some to \
+                     finish (check_result) or cancel one (cancel_task) before starting more.",
+                    Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS
+                )),
+            });
+        }
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let results_dir = self.results_dir();
@@ -952,19 +1446,54 @@ impl DelegateTool {
             finished_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
-        let json_bytes = serde_json::to_vec_pretty(&initial_result)?;
-        tokio::fs::write(&result_path, &json_bytes).await?;
+        Self::write_result_atomic(&result_path, &initial_result).await?;
+
+        // EPIC-A supervision: register the task in the durable control-plane BEFORE the
+        // spawn, so a crash between here and the spawn is recoverable by the reaper. A
+        // no-op when not running under a booted daemon (the plane is absent).
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .create(crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Delegate,
+                    agent: agent_name_owned.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: cp.boot_id.clone(),
+                    heartbeat_at: None,
+                    depth: self.depth,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: started_at.clone(),
+                    finished_at: None,
+                })
+                .await;
+        }
 
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        let depth = self.depth;
+        // Monotonic descent: was `self.depth` (verbatim copy), which left the
+        // `self.depth >= max_depth` check inert — a chain of background delegations never
+        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
+        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
+        let depth = self.depth + 1;
         let parent_tools = Arc::clone(&self.parent_tools);
+        let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
+        // Register the live token so `cancel_task` can actually abort THIS task (removed
+        // when it settles, in the spawned closure below).
+        Self::background_task_cancels()
+            .lock()
+            .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
         let providers_models = Arc::clone(&self.providers_models);
         let risk_profiles = Arc::clone(&self.risk_profiles);
@@ -972,6 +1501,7 @@ impl DelegateTool {
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
         let caller_alias = self.caller_alias.clone();
+        let memory = self.memory.clone();
         // Capture the parent loop's session-key task-local so the
         // detached background task scopes its tool calls under the
         // same key — channel tools (sessions_send, etc.) need the
@@ -990,11 +1520,12 @@ impl DelegateTool {
                     provider_runtime_options,
                     depth,
                     parent_tools,
+                    runtime,
                     multimodal_config,
                     delegate_config,
                     workspace_dir: workspace_dir.clone(),
                     cancellation_token: child_token.clone(),
-                    memory: None,
+                    memory,
                     providers_models,
                     risk_profiles,
                     runtime_profiles,
@@ -1013,7 +1544,12 @@ impl DelegateTool {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
-                    result = Box::pin(inner.execute_sync(&agent_name_owned, &full_prompt, &args_inner)) => {
+                    result = Box::pin(inner.execute_sync_with_admission(
+                        &agent_name_owned,
+                        &full_prompt,
+                        &args_inner,
+                        DelegateAdmission::Prevalidated,
+                    )) => {
                         match result {
                             Ok(tool_result) => {
                                 if tool_result.success {
@@ -1057,9 +1593,39 @@ impl DelegateTool {
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                if let Ok(bytes) = serde_json::to_vec_pretty(&final_result) {
-                    let _ = tokio::fs::write(&result_path, &bytes).await;
+                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                // EPIC-A supervision: mirror the terminal state into the control-plane so
+                // the registry reflects the real outcome (and the reaper never reclaims a
+                // finished task). No-op when the plane is absent. The store's
+                // terminal-state guard makes a late write after a reaper TimedOut a safe
+                // no-op.
+                if let Some(cp) = crate::control_plane::control_plane() {
+                    let cp_status = match final_result.status {
+                        BackgroundTaskStatus::Completed => {
+                            crate::control_plane::TaskStatus::Completed
+                        }
+                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
+                        BackgroundTaskStatus::Cancelled => {
+                            crate::control_plane::TaskStatus::Cancelled
+                        }
+                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+                    };
+                    let _ = cp
+                        .store
+                        .update_status(
+                            &task_id_clone,
+                            cp_status,
+                            final_result.output.clone(),
+                            final_result.error.clone(),
+                        )
+                        .await;
                 }
+
+                // Drop the live cancel token now the task has settled.
+                Self::background_task_cancels()
+                    .lock()
+                    .remove(&task_id_clone);
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1143,20 +1709,20 @@ impl DelegateTool {
             }
         }
 
-        let mut target_policies: HashMap<String, Arc<SecurityPolicy>> =
-            HashMap::with_capacity(agent_names.len());
         for name in &agent_names {
-            match self.policy_for_target(name) {
-                Ok(p) => {
-                    target_policies.insert(name.clone(), p);
-                }
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("{e:#}")),
-                    });
-                }
+            // Validate the whole fan-out before any spawn. A single blocked
+            // target should fail the entire parallel request rather than
+            // launching a partial set of child agents and then reporting mixed
+            // results.
+            if let Err(e) = self.policy_for_target(name) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+            if let Some(refusal) = self.independent_always_ask_refusal(name) {
+                return Ok(refusal);
             }
         }
 
@@ -1177,14 +1743,15 @@ impl DelegateTool {
         let mut handles = Vec::with_capacity(agent_names.len());
         for agent_name in &agent_names {
             let agents = Arc::clone(&self.agents);
-            let security = target_policies
-                .get(agent_name)
-                .cloned()
-                .unwrap_or_else(|| Arc::clone(&self.security));
+            let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            let depth = self.depth;
+            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
+            // leaving the `>= max_depth` check inert (see the background path above).
+            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
+            let depth = self.depth + 1;
             let parent_tools = Arc::clone(&self.parent_tools);
+            let runtime = self.runtime.clone();
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
@@ -1200,6 +1767,7 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
             handles.push(zeroclaw_spawn::spawn!(
@@ -1211,11 +1779,12 @@ impl DelegateTool {
                         provider_runtime_options,
                         depth,
                         parent_tools,
+                        runtime,
                         multimodal_config,
                         delegate_config,
                         workspace_dir,
                         cancellation_token,
-                        memory: None,
+                        memory,
                         providers_models,
                         risk_profiles,
                         runtime_profiles,
@@ -1227,6 +1796,12 @@ impl DelegateTool {
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
+                                // Parallel workers still carry the caller's
+                                // security policy, not a pre-resolved target
+                                // policy. Let each worker run normal admission
+                                // so the target policy is rebuilt for its own
+                                // agentic loop; the preflight above only
+                                // prevents partial fan-out.
                                 Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
                                     .await
                             })
@@ -1289,6 +1864,37 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
+    /// When a background task's flat-file status still reads `Running` but the durable
+    /// control-plane has reconciled it to a terminal-loss state — the owning daemon died
+    /// (`Lost`) or it exceeded its runtime (`TimedOut`) — return the loss label so result
+    /// readers surface the truth instead of a task that will never finish. `None` when
+    /// there is no loss to report: the control-plane is absent, has no record, or the
+    /// flat file is already authoritative (the task wrote its own terminal state).
+    async fn reconciled_loss_label(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+    ) -> Option<&'static str> {
+        let cp = crate::control_plane::control_plane()?;
+        Self::reconciled_loss_label_with(task_id, file_status, cp.store.as_ref()).await
+    }
+
+    /// Store-injected core of [`Self::reconciled_loss_label`] — kept separate from the
+    /// process-global accessor so it is unit-testable against an in-memory store.
+    async fn reconciled_loss_label_with(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+        store: &dyn crate::control_plane::TaskRegistry,
+    ) -> Option<&'static str> {
+        if *file_status != BackgroundTaskStatus::Running {
+            return None;
+        }
+        match store.get(task_id).await.ok().flatten()?.status {
+            crate::control_plane::TaskStatus::Lost => Some("lost"),
+            crate::control_plane::TaskStatus::TimedOut => Some("timed_out"),
+            _ => None,
+        }
+    }
+
     /// Retrieve the result of a background delegate task by task_id.
     async fn handle_check_result(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1326,6 +1932,24 @@ impl DelegateTool {
         let content = tokio::fs::read_to_string(&result_path).await?;
         let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
+        // Overlay the control-plane's reconciled view: a crashed/timed-out task whose
+        // flat file still says `Running` is surfaced as lost/timed_out, so the agent
+        // stops polling a task that will never complete.
+        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "task_id": task_id,
+                    "agent": result.agent,
+                    "status": label,
+                    "started_at": result.started_at,
+                    "note": "the owning daemon exited or the task exceeded its max runtime; \
+                             reconciled by the supervision reaper",
+                }))?,
+                error: Some(format!("background task is {label} and will not complete")),
+            });
+        }
+
         Ok(ToolResult {
             success: result.status == BackgroundTaskStatus::Completed,
             output: serde_json::to_string_pretty(&result)?,
@@ -1357,10 +1981,17 @@ impl DelegateTool {
                 && let Ok(content) = tokio::fs::read_to_string(&path).await
                 && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
             {
+                // Surface the reconciled loss state (lost/timed_out) for a task whose flat
+                // file still says `Running` but whose owning daemon died / timed out.
+                let status =
+                    match Self::reconciled_loss_label(&result.task_id, &result.status).await {
+                        Some(label) => json!(label),
+                        None => json!(result.status),
+                    };
                 results.push(json!({
                     "task_id": result.task_id,
                     "agent": result.agent,
-                    "status": result.status,
+                    "status": status,
                     "started_at": result.started_at,
                     "finished_at": result.finished_at,
                 }));
@@ -1380,6 +2011,31 @@ impl DelegateTool {
             output: serde_json::to_string_pretty(&results)?,
             error: None,
         })
+    }
+
+    /// Live cancellation tokens for in-flight background delegate tasks, keyed by task_id.
+    /// `execute_background` registers a task's child token here before the detached spawn
+    /// and removes it when the task settles; `cancel_task` looks it up to ACTUALLY abort
+    /// the run. (The prior implementation only marked the result file, so a "cancelled"
+    /// task kept running.) Process-global because a background task outlives the tool
+    /// instance that spawned it.
+    fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
+    {
+        static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// Runaway backstop: the maximum number of background delegations allowed in flight at
+    /// once across the process. Each is a full agent loop, so this guards against a model
+    /// (or a runaway loop) spawning unbounded background agent runs; normal use stays well
+    /// under it.
+    const MAX_CONCURRENT_BACKGROUND_DELEGATIONS: usize = 128;
+
+    /// Pure predicate for the runaway backstop — separated from the live token-map read so
+    /// it is unit-testable. `cap == 0` disables the backstop.
+    fn at_background_capacity(in_flight: usize, cap: usize) -> bool {
+        cap != 0 && in_flight >= cap
     }
 
     /// Cancel a running background task by task_id.
@@ -1431,20 +2087,40 @@ impl DelegateTool {
             });
         }
 
-        // Cancel via the parent token — this will cascade to all child tokens
-        // Note: individual task cancellation uses the shared parent token, which
-        // cancels all background tasks. For per-task cancellation, each background
-        // task uses a child token, and the parent token cancels all.
-        // We update the result file to reflect the cancellation request.
+        // Actually abort the running task by signalling its registered cancel token —
+        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
+        // Falls back to file-marking when the task already settled (token absent).
+        let aborted = Self::background_task_cancels()
+            .lock()
+            .remove(task_id)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+
         result.status = BackgroundTaskStatus::Cancelled;
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        let bytes = serde_json::to_vec_pretty(&result)?;
-        tokio::fs::write(&result_path, &bytes).await?;
+        Self::write_result_atomic(&result_path, &result).await?;
+
+        // Reconcile the durable supervision registry so the supervised view agrees.
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .update_status(
+                    task_id,
+                    crate::control_plane::TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled by user request".into()),
+                )
+                .await;
+        }
 
         Ok(ToolResult {
             success: true,
-            output: format!("Task '{task_id}' cancellation requested."),
+            output: if aborted {
+                format!("Task '{task_id}' cancelled — the running task was aborted.")
+            } else {
+                format!("Task '{task_id}' marked cancelled (it had already settled).")
+            },
             error: None,
         })
     }
@@ -1474,14 +2150,14 @@ impl DelegateTool {
         // bundles, load + concat skills from each. With none, fall back to
         // the workspace default.
         let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
-        let skills = if bundle_dirs.is_empty() {
+        let skills: Vec<_> = if bundle_dirs.is_empty() {
             let default_dir = crate::skills::skills_dir(workspace_dir);
-            crate::skills::load_skills_from_directory(&default_dir, false)
+            crate::skills::load_skills_from_directory(&default_dir, false).0
         } else {
             bundle_dirs
                 .into_iter()
                 .flat_map(|dir| {
-                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false)
+                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false).0
                 })
                 .collect()
         };
@@ -1571,6 +2247,7 @@ impl DelegateTool {
         }
     }
 
+    #[cfg(test)]
     async fn execute_agentic(
         &self,
         agent_name: &str,
@@ -1581,52 +2258,132 @@ impl DelegateTool {
         full_prompt: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ToolResult> {
-        let allowed_tools = self.resolve_allowed_tools(&agent_config.risk_profile);
+        self.execute_agentic_with_admission(
+            agent_name,
+            agent_config,
+            provider_type,
+            model,
+            model_provider,
+            full_prompt,
+            temperature,
+            DelegateAdmission::Required,
+        )
+        .await
+    }
 
-        if allowed_tools.is_empty() {
+    async fn execute_agentic_with_admission(
+        &self,
+        agent_name: &str,
+        agent_config: &AliasedAgentConfig,
+        provider_type: &str,
+        model: &str,
+        model_provider: &dyn ModelProvider,
+        full_prompt: &str,
+        temperature: Option<f64>,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
+        let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' is agentic but risk_profile '{}' has no allowed_tools",
+                    "Agent '{agent_name}' is agentic but risk_profile '{}' is not configured",
                     agent_config.risk_profile
                 )),
             });
-        }
-
-        let allowed = allowed_tools
-            .iter()
-            .map(|name: &String| name.trim())
-            .filter(|name| !name.is_empty())
-            .collect::<std::collections::HashSet<_>>();
-
-        let sub_tools: Vec<Box<dyn Tool>> = {
-            let parent_tools = self.parent_tools.read();
-            parent_tools
-                .iter()
-                .filter(|tool| allowed.contains(tool.name()))
-                .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-                .collect()
         };
 
-        if sub_tools.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
-                    allowed_tools.join(", ")
-                )),
-            });
-        }
+        let target_policy = match admission {
+            DelegateAdmission::Required => match self.policy_for_target(agent_name) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("{e:#}")),
+                    });
+                }
+            },
+            // Background delegation performs the caller-side authorization before it
+            // returns a task id. The detached worker then runs with the resolved target
+            // policy in `self.security`; re-checking `policy_for_target` here would ask
+            // whether the child is allowed to delegate to itself, which is a different
+            // question and rejects legitimate background delegates after acceptance.
+            DelegateAdmission::Prevalidated => Arc::clone(&self.security),
+        };
+        let target_mode = self.mode_for_target(agent_name);
+        let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
+            DelegateExecutionMode::Independent => {
+                match self
+                    .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
+                    .await
+                {
+                    Ok(tools) => tools,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Failed to initialize independent delegate tools for target '{agent_name}': {e:#}"
+                            )),
+                        });
+                    }
+                }
+            }
+            DelegateExecutionMode::Bounded => {
+                let needs_memory_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
+                let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
+                {
+                    match self.memory_for_target_agent(agent_name).await {
+                        Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
+                            .into_iter()
+                            .map(|tool| (tool.name().to_string(), tool))
+                            .collect(),
+                        Ok(None) => HashMap::new(),
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "Failed to initialize memory for delegate target '{agent_name}': {e:#}"
+                                )),
+                            });
+                        }
+                    }
+                } else {
+                    HashMap::new()
+                };
 
-        let max_iterations = self.resolve_max_iterations(&agent_config.runtime_profile);
+                let parent_tools = self.parent_tools.read();
+                parent_tools
+                    .iter()
+                    .filter(|tool| tool.name() != Self::NAME)
+                    .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                    .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                    .map(|tool| {
+                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
+                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                        })
+                    })
+                    .collect()
+            }
+        };
+
+        let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
+        let mut prompt_agent_config = agent_config.clone();
+        prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            agent_config,
+            &prompt_agent_config,
             model,
             &sub_tools,
             &self.workspace_dir,
@@ -1655,39 +2412,62 @@ impl DelegateTool {
             .flatten();
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
-                model_provider,
-                &mut history,
-                &sub_tools,
-                &noop_observer,
-                provider_type,
-                model,
-                temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                max_iterations,
-                Some(self.cancellation_token.child_token()),
-                None,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                agent_config.resolved.strict_tool_parsing,
-                agent_config.resolved.parallel_tools,
-                0,    // max_tool_result_chars: inherit from parent config in future
-                0,    // context_token_budget: 0 = disabled for subagents
-                None, // shared_budget: TODO thread from parent in future
-                None, // channel: delegate subagents don't support approval
-                receipt_generator,
+            run_tool_call_loop(ToolLoop {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
+                        model_provider,
+                        provider_name: provider_type,
+                        model,
+                        temperature,
+                    },
+                    ResolvedIo {
+                        tools_registry: &sub_tools,
+                        observer: &noop_observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &self.multimodal_config,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        // delegate subagents don't support approval
+                        receipt_generator,
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: loop_runtime.max_tool_iterations,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                        parallel_tools: loop_runtime.parallel_tools,
+                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                        // Keep delegate subagent context pruning aligned with top-level
+                        // agents instead of preserving the old disabled-by-zero path.
+                        context_token_budget: loop_runtime.max_context_tokens,
+                        knobs: &LoopKnobs::default(),
+                    },
+                ),
+                history: &mut history,
+                channel_name: "delegate",
+                channel_reply_target: None,
+                cancellation_token: Some(self.cancellation_token.child_token()),
+                on_delta: None,
+                shared_budget: None,
+                // TODO thread from parent in future
+                channel: None,
                 collected_receipts,
-            )
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias: Some(agent_name),
+                turn_id: &turn_id,
+            })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
@@ -1783,15 +2563,184 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use std::path::Path;
+    use crate::tools::{MemoryRecallTool, MemoryStoreTool};
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
     use zeroclaw_config::schema::{
-        DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
+        Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+        DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
+        ModelProviderConfig,
     };
+    use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+
+    #[tokio::test]
+    async fn reconciled_loss_label_surfaces_registry_truth() {
+        use crate::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let rec = |id: &str, status: TaskStatus| TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Delegate,
+            agent: "main".into(),
+            status,
+            owner_pid: 0,
+            owner_boot_id: "b".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            started_at: "2026-06-21T00:00:00Z".into(),
+            finished_at: None,
+        };
+        store.create(rec("lost", TaskStatus::Lost)).await.unwrap();
+        store
+            .create(rec("timed", TaskStatus::TimedOut))
+            .await
+            .unwrap();
+        store
+            .create(rec("alive", TaskStatus::Running))
+            .await
+            .unwrap();
+
+        // Flat file says Running + registry reconciled to a loss state → surface the loss.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("lost")
+        );
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "timed",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("timed_out")
+        );
+        // Registry still Running → nothing to overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "alive",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+        // The flat file already wrote a terminal state → it is authoritative, no overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Completed,
+                &store
+            )
+            .await,
+            None
+        );
+        // Unknown task → None.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "missing",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn background_cancel_token_aborts_and_clears() {
+        let token = CancellationToken::new();
+        let key = "test-cancel-unique-1";
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(key.into(), token.clone());
+        // cancel_task-style lookup: remove + signal the live token
+        let aborted = DelegateTool::background_task_cancels()
+            .lock()
+            .remove(key)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+        assert!(aborted, "a registered task token is found and aborted");
+        assert!(
+            token.is_cancelled(),
+            "the running task's token is signalled"
+        );
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(key)
+                .is_none(),
+            "the token is gone after cancellation"
+        );
+        // An unknown id is a no-op (cancel_task falls back to file-marking).
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove("test-cancel-missing")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn background_capacity_backstop() {
+        assert!(!DelegateTool::at_background_capacity(0, 128));
+        assert!(!DelegateTool::at_background_capacity(127, 128));
+        assert!(DelegateTool::at_background_capacity(128, 128));
+        assert!(DelegateTool::at_background_capacity(200, 128));
+        // cap 0 disables the backstop
+        assert!(!DelegateTool::at_background_capacity(10_000, 0));
+    }
+
+    struct DelegateTestRuntime;
+
+    impl RuntimeAdapter for DelegateTestRuntime {
+        fn name(&self) -> &str {
+            "delegate-test-runtime"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            let mut cmd = tokio::process::Command::new("echo");
+            cmd.arg(command);
+            cmd.current_dir(workspace_dir);
+            Ok(cmd)
+        }
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -1836,8 +2785,9 @@ mod tests {
         let mut last_result = None;
 
         loop {
-            if let Ok(content) = std::fs::read_to_string(&result_path) {
-                let result: BackgroundDelegateResult = serde_json::from_str(&content).unwrap();
+            if let Ok(content) = std::fs::read_to_string(&result_path)
+                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
+            {
                 if result.status != BackgroundTaskStatus::Running {
                     return result;
                 }
@@ -1944,6 +2894,76 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    struct EchoToolResultThenFinalModelProvider {
+        tool_message: std::sync::Mutex<Option<String>>,
+    }
+
+    impl EchoToolResultThenFinalModelProvider {
+        fn new() -> Self {
+            Self {
+                tool_message: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EchoToolResultThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo_tool".to_string(),
+                        arguments: format!("{{\"value\":\"{}\"}}", "tool-result-limit ".repeat(16)),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for EchoToolResultThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EchoToolResultThenFinalModelProvider"
         }
     }
 
@@ -2076,24 +3096,10 @@ mod tests {
     fn agentic_agent_config() -> AliasedAgentConfig {
         AliasedAgentConfig {
             model_provider: "openrouter.agentic".into(),
-            risk_profile: "agentic_test".to_string(),
-            runtime_profile: "agentic_test".to_string(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
             ..Default::default()
         }
-    }
-
-    fn agentic_providers_models() -> HashMap<String, HashMap<String, ModelProviderConfig>> {
-        let mut models: HashMap<String, HashMap<String, ModelProviderConfig>> = HashMap::new();
-        models.entry("openrouter".to_string()).or_default().insert(
-            "agentic".to_string(),
-            ModelProviderConfig {
-                model: Some("model-test".to_string()),
-                temperature: Some(0.2),
-                api_key: Some("delegate-test-credential".to_string()),
-                ..Default::default()
-            },
-        );
-        models
     }
 
     fn agentic_runtime_profiles(max_iterations: usize) -> HashMap<String, RuntimeProfileConfig> {
@@ -2110,15 +3116,393 @@ mod tests {
     }
 
     fn agentic_risk_profiles(allowed_tools: Vec<String>) -> HashMap<String, RiskProfileConfig> {
+        agentic_risk_profiles_with_excluded(allowed_tools, Vec::new())
+    }
+
+    fn agentic_risk_profiles_with_excluded(
+        allowed_tools: Vec<String>,
+        excluded_tools: Vec<String>,
+    ) -> HashMap<String, RiskProfileConfig> {
         let mut profiles = HashMap::new();
         profiles.insert(
             "agentic_test".to_string(),
             RiskProfileConfig {
                 allowed_tools,
+                excluded_tools,
                 ..Default::default()
             },
         );
         profiles
+    }
+
+    struct DelegateMemoryFixture {
+        _tmp: TempDir,
+        inner_memory: Arc<SqliteMemory>,
+        caller_uuid: String,
+        target_uuid: String,
+        workspace_dir: PathBuf,
+        tool: DelegateTool,
+        target_config: AliasedAgentConfig,
+    }
+
+    fn scoped_sqlite_memory(inner: Arc<SqliteMemory>, agent_id: &str) -> Arc<dyn Memory> {
+        let inner_dyn: Arc<dyn Memory> = inner;
+        Arc::new(AgentScopedMemory::new(
+            inner_dyn,
+            agent_id.to_string(),
+            Vec::<String>::new(),
+        ))
+    }
+
+    fn memory_parent_tools(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+            Arc::new(MemoryRecallTool::new(memory)),
+        ]
+    }
+
+    async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let model_provider_config = ModelProviderConfig {
+            uri: model_uri,
+            model: Some("delegate-test-model".to_string()),
+            api_key: Some("delegate-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        root_config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        root_config.risk_profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), target_config.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), target_config.clone());
+
+        let inner_memory = Arc::new(SqliteMemory::new("delegate-test", &data_dir).unwrap());
+        let caller_uuid = inner_memory.ensure_agent_uuid("caller").await.unwrap();
+        let target_uuid = inner_memory.ensure_agent_uuid("target").await.unwrap();
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let caller_memory = scoped_sqlite_memory(inner_memory.clone(), &caller_uuid);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+
+        let tool = DelegateTool::new(
+            root_config.agents.clone(),
+            None,
+            Arc::clone(&caller_security),
+        )
+        .with_root_config(Arc::clone(&root_config))
+        .with_workspace_dir(workspace_dir.clone())
+        .with_memory(Arc::clone(&caller_memory))
+        .with_parent_tools(Arc::new(RwLock::new(memory_parent_tools(
+            caller_memory,
+            caller_security,
+        ))))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_caller_alias("caller");
+
+        DelegateMemoryFixture {
+            _tmp: tmp,
+            inner_memory,
+            caller_uuid,
+            target_uuid,
+            workspace_dir,
+            tool,
+            target_config,
+        }
+    }
+
+    struct MemoryStoreRecallThenFinalModelProvider {
+        key: &'static str,
+        content: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MemoryStoreRecallThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
+            match tool_message_count {
+                0 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_store".to_string(),
+                        name: "memory_store".to_string(),
+                        arguments: serde_json::json!({
+                            "key": self.key,
+                            "content": self.content,
+                            "category": "core"
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                1 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_recall".to_string(),
+                        name: "memory_recall".to_string(),
+                        arguments: serde_json::json!({
+                            "query": self.key,
+                            "limit": 5
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                _ => Ok(ChatResponse {
+                    text: Some("memory workflow done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MemoryStoreRecallThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MemoryStoreRecallThenFinalModelProvider"
+        }
+    }
+
+    fn chat_completion_tool_call(
+        name: &str,
+        id: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+    }
+
+    struct LocalChatServer {
+        uri: String,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buf.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        buf
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responses = vec![
+            chat_completion_tool_call(
+                "memory_store",
+                "call_store",
+                serde_json::json!({
+                    "key": key,
+                    "content": content,
+                    "category": "core"
+                }),
+            ),
+            chat_completion_tool_call(
+                "memory_recall",
+                "call_recall",
+                serde_json::json!({
+                    "query": key,
+                    "limit": 5
+                }),
+            ),
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "memory workflow done"
+                    }
+                }]
+            }),
+        ];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
+    async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
+        // Minimal OpenAI-compatible responder for tests that only need to prove
+        // which delegate path ran. Each expected child turn consumes one final
+        // assistant response in order.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responses: Vec<_> = contents
+            .into_iter()
+            .map(|content| {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": content
+                        }
+                    }]
+                })
+            })
+            .collect();
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
+    async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
+        // The memory backend can store the same key under multiple agent UUIDs.
+        // Scope bugs are therefore silent unless the test checks both the target
+        // positive case and the caller negative case.
+        let target_entry = fixture
+            .inner_memory
+            .get_for_agent(key, &fixture.target_uuid)
+            .await
+            .unwrap();
+        assert!(
+            target_entry.is_some(),
+            "delegated memory tools must write to the target agent scope"
+        );
+        let caller_entry = fixture
+            .inner_memory
+            .get_for_agent(key, &fixture.caller_uuid)
+            .await
+            .unwrap();
+        assert!(
+            caller_entry.is_none(),
+            "delegated memory tools must not write to the caller agent scope"
+        );
     }
 
     #[test]
@@ -2255,6 +3639,102 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(desc.contains("none configured"));
+    }
+
+    fn roster_schema_config() -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-delegate-policy-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "shared".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("lore".to_string(), RiskProfileConfig::default());
+        for (alias, profile) in [
+            ("aaa", "shared"),
+            ("aaatools", "shared"),
+            ("aaalore", "lore"),
+        ] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    risk_profile: profile.into(),
+                    model_provider: "ollama.default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        Arc::new(config)
+    }
+
+    fn roster_tool(config: Arc<zeroclaw_config::schema::Config>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "aaa").expect("caller policy resolves"));
+        DelegateTool::new(
+            config
+                .agents
+                .iter()
+                .map(|(n, a)| (n.clone(), a.clone()))
+                .collect(),
+            None,
+            caller_policy,
+        )
+        .with_root_config(config)
+        .with_caller_alias("aaa")
+    }
+
+    #[test]
+    fn schema_roster_advertises_same_profile_peer() {
+        let tool = roster_tool(roster_schema_config());
+        let desc = tool.parameters_schema()["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(desc.contains("aaatools"), "{desc}");
+        assert!(!desc.contains("aaalore"), "{desc}");
+        assert!(!desc.contains("aaa,") && !desc.ends_with("aaa"), "{desc}");
+    }
+
+    #[test]
+    fn schema_roster_advertises_explicit_cross_profile_target() {
+        let mut config = (*roster_schema_config()).clone();
+        config.agents.get_mut("aaa").unwrap().delegates =
+            vec![DelegateTargetConfig::bounded("aaalore")];
+        let tool = roster_tool(Arc::new(config));
+        let desc = tool.parameters_schema()["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(desc.contains("aaalore"), "{desc}");
+        assert!(desc.contains("aaatools"), "{desc}");
+    }
+
+    #[test]
+    fn schema_roster_opt_out_hides_peers_keeps_explicit() {
+        let mut config = (*roster_schema_config()).clone();
+        let aaa = config.agents.get_mut("aaa").unwrap();
+        aaa.delegate_same_risk_profile = false;
+        aaa.delegates = vec![DelegateTargetConfig::bounded("aaalore")];
+        let tool = roster_tool(Arc::new(config));
+        let desc = tool.parameters_schema()["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(desc.contains("aaalore"), "{desc}");
+        assert!(!desc.contains("aaatools"), "{desc}");
     }
 
     #[tokio::test]
@@ -2501,55 +3981,166 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agentic_mode_rejects_empty_allowed_tools() {
-        let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_agent_config());
-
-        let tool = DelegateTool::new(agents, None, test_security())
-            .with_providers_models(agentic_providers_models())
+    async fn agentic_mode_empty_allowed_tools_inherits_caller_registry() {
+        // Empty allowed_tools now means "inherit": the target runs with the
+        // caller's already-filtered tools instead of being rejected (#7470).
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
-            .with_risk_profiles(agentic_risk_profiles(Vec::new()));
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+            ])));
+
+        let model_provider = ToolCountModelProvider { expected_tools: 1 };
         let result = tool
-            .execute(json!({"agent": "agentic", "prompt": "test"}))
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("has no allowed_tools"),
-            "got: {:?}",
-            result.error
-        );
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("(openrouter/model-test, agentic)"));
     }
 
     #[tokio::test]
-    async fn agentic_mode_rejects_unmatched_allowed_tools() {
-        let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_agent_config());
-
-        let allowed = vec!["missing_tool".to_string()];
-        let tool = DelegateTool::new(agents, None, test_security())
-            .with_providers_models(agentic_providers_models())
+    async fn agentic_mode_empty_allowed_tools_empty_registry_runs_without_tools() {
+        // Empty allowed_tools means "inherit", but an empty inherited registry is
+        // still a valid agentic run. The fallback is a tool-less loop, not a
+        // configuration error.
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
-            .with_risk_profiles(agentic_risk_profiles(allowed))
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()));
         let result = tool
-            .execute(json!({"agent": "agentic", "prompt": "test"}))
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no executable tools")
-        );
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_empty_allowed_tools_respects_excluded_tools_without_aborting() {
+        // `excluded_tools` still applies to the inherited parent registry. If it
+        // filters every candidate out, agentic execution should continue without
+        // tools rather than failing admission.
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_with_excluded(
+                Vec::new(),
+                vec!["echo_tool".to_string()],
+            ))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "echo_tool"
+        ));
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_padded_allowed_tool_name_remains_exact_and_runs_without_match() {
+        // Tool identifiers are exact names, not forgiving user input. Padding an
+        // allowed_tools entry must not accidentally admit a real tool after
+        // trimming; the result is a valid no-tool child loop.
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![" echo_tool ".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "echo_tool"
+        ));
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_unmatched_allowed_tools_runs_without_tools() {
+        // A configured allowlist can name tools absent from the parent registry.
+        // That should produce an empty child registry, not an error, because the
+        // target may still complete without tool calls.
+        let config = agentic_agent_config();
+        let allowed = vec!["missing_tool".to_string()];
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(allowed))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "echo_tool"
+        ));
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
     }
 
     #[tokio::test]
@@ -2563,7 +4154,7 @@ mod tests {
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
             ])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 1 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -2579,23 +4170,355 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
-        assert!(result.output.contains("done"));
+        assert!(result.output.contains("tool count matched: 1"));
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
+        // Memory tools are stateful even when they come from the parent registry.
+        // Agentic delegation must rebind them to the target alias so a child
+        // cannot write into the caller's memory namespace.
+        let fixture = delegate_memory_fixture(None).await;
+        let model_provider = MemoryStoreRecallThenFinalModelProvider {
+            key: "sync-key",
+            content: "sync target memory",
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "target",
+                &fixture.target_config,
+                "custom",
+                "delegate-test-model",
+                &model_provider,
+                "store and recall target memory",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert!(result.output.contains("memory workflow done"));
+        assert_stored_for_target_only(&fixture, "sync-key").await;
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        // Same memory-scope invariant as the sync path, but through the detached
+        // task worker that runs after a task id is returned to the caller.
+        let server =
+            start_memory_tool_chat_server("background-key", "background target memory").await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "store and recall target memory",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("memory workflow done")
+        );
+        assert_stored_for_target_only(&fixture, "background-key").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        // Parallel fan-out gets its own coverage because each spawned worker
+        // rebuilds a delegate tool instance before entering the agentic loop.
+        let server = start_memory_tool_chat_server("parallel-key", "parallel target memory").await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "parallel": ["target"],
+                "prompt": "store and recall target memory"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(result.output.contains("memory workflow done"));
+        assert_stored_for_target_only(&fixture, "parallel-key").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_runs_with_caller_authorization_not_child_authorization() {
+        // Parallel independent fan-out starts with caller admission for the
+        // delegate tool, then each child runs with its own target policy. This
+        // guards the earlier bug where child-side policy blocked valid targets
+        // before the independent mode switch could take effect.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let server = start_final_chat_server(vec!["reviewer-ok", "sysadmin-ok"]).await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("parallel-test-model".to_string()),
+            api_key: Some("parallel-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "reviewer_readonly".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "sysadmin_yolo".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![
+                    DelegateTargetConfig {
+                        agent: "reviewer".to_string(),
+                        mode: DelegateExecutionMode::Independent,
+                    },
+                    DelegateTargetConfig {
+                        agent: "sysadmin".to_string(),
+                        mode: DelegateExecutionMode::Independent,
+                    },
+                ],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        for (alias, risk_profile) in [
+            ("reviewer", "reviewer_readonly"),
+            ("sysadmin", "sysadmin_yolo"),
+        ] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.local".into(),
+                    risk_profile: risk_profile.into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        let result = tool
+            .execute(json!({
+                "parallel": ["reviewer", "sysadmin"],
+                "prompt": "fan out"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(result.output.contains("reviewer-ok"), "{result:?}");
+        assert!(result.output.contains("sysadmin-ok"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_runs_with_caller_authorization_not_child_authorization() {
+        // Background bounded admission happens before the task id is returned;
+        // the detached worker must not reinterpret that request as a child-side
+        // self-delegation decision after it starts.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let server = start_final_chat_server(vec!["background-ok"]).await;
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("background-test-model".to_string()),
+            api_key: Some("background-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(workspace_dir.clone())
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "run in background",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+
+        assert_eq!(
+            bg_result.status,
+            BackgroundTaskStatus::Completed,
+            "{bg_result:?}"
+        );
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("background-ok"),
+            "{bg_result:?}"
+        );
+        assert!(bg_result.error.is_none(), "{bg_result:?}");
     }
 
     #[tokio::test]
     async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
-        let mut config = agentic_agent_config();
-        config.resolved.strict_tool_parsing = true;
+        // Strict parsing is target runtime policy. If the parent path leaked its
+        // own prompt/tool settings, text fallback tool calls could execute in a
+        // child that intentionally disabled them.
+        let config = agentic_agent_config();
+        let mut runtime_profiles = agentic_runtime_profiles(10);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .strict_tool_parsing = true;
         let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_runtime_profiles(runtime_profiles)
             .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let mut prompt_config = config.clone();
+        prompt_config.resolved = tool.resolve_loop_runtime("agentic", &config);
 
         let prompt = tool
             .build_enriched_system_prompt(
                 "agentic",
-                &config,
+                &prompt_config,
                 "model-test",
                 &prompt_tools,
                 Path::new("/tmp"),
@@ -2638,6 +4561,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
+        // Recursive agentic delegation is still unsupported. Even if the target
+        // profile allowlists `delegate`, the child registry must strip it before
+        // the tool loop starts.
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -2662,14 +4588,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no executable tools")
-        );
+        assert!(result.success, "got: {:?}", result.error);
     }
 
     #[tokio::test]
@@ -2701,6 +4620,44 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("maximum tool iterations (2)")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_applies_target_profile_tool_result_limit() {
+        let config = agentic_agent_config();
+        let mut runtime_profiles = agentic_runtime_profiles(10);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .max_tool_result_chars = Some(80);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(runtime_profiles)
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let model_provider = EchoToolResultThenFinalModelProvider::new();
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let tool_message = model_provider
+            .tool_message()
+            .expect("tool message captured");
+        assert!(
+            tool_message.contains("characters truncated"),
+            "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
+            tool_message
         );
     }
 
@@ -2934,6 +4891,101 @@ mod tests {
         }
     }
 
+    struct FinalOnlyModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for FinalOnlyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("delegate saw tool".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("delegate saw tool".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FinalOnlyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FinalOnlyModelProvider"
+        }
+    }
+
+    struct ToolCountModelProvider {
+        expected_tools: usize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolCountModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(format!("tool count matched: {}", self.expected_tools))
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let actual_tools = request.tools.map_or(0, |tools| tools.len());
+            assert_eq!(
+                actual_tools, self.expected_tools,
+                "unexpected delegated tool count"
+            );
+            Ok(ChatResponse {
+                text: Some(format!("tool count matched: {actual_tools}")),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolCountModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolCountModelProvider"
+        }
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -2965,6 +5017,208 @@ mod tests {
         assert!(
             result.output.contains("mcp done"),
             "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
+    /// convention must be auto-admitted by the delegate filter even when
+    /// the risk profile's explicit `allowed_tools` list does not mention
+    /// the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
+    /// fixture uses `mcp_fake` (no double underscore) so it exercises the
+    /// explicit allow-list path, not the new auto-admit branch. This test
+    /// pins the new branch via the resolve_tool_policy + delegate_admits_with_mcp
+    /// pair that replaces the pre-#7608 resolve_allowed_tools helper.
+    #[test]
+    fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        // The explicit allow-list entry is admitted.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "explicit allow-list entry must be admitted"
+        );
+        // A runtime-discovered MCP wrapper (matching `<server>__<tool>`) is
+        // auto-admitted even though it is not in `allowed_tools`. This is
+        // the destructive capability the reviewer called out.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "double-underscore MCP name must be auto-admitted"
+        );
+        // Non-MCP names outside the allow-list still get rejected.
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-MCP names outside allow-list must be rejected"
+        );
+    }
+
+    /// Characterization test for the MCP resource/prompt capability tools'
+    /// subagent-propagation guarantee (issue #4467). `mcp_resources` and
+    /// `mcp_prompts` contain no `__`, so they are NOT auto-admitted the way
+    /// runtime `<server>__<tool>` MCP wrappers are: a narrowed `caller_allowed`
+    /// list that omits them must exclude them. This locks the boundary so a
+    /// narrowed delegate/spawn_subagent cannot reach resources/prompts unless
+    /// explicitly granted.
+    #[test]
+    fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
+        use zeroclaw_tools::tool_search::ToolAccessPolicy;
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string()]),
+        )
+        .expect("policy");
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("mcp_resources"));
+        assert!(!policy.is_tool_allowed("mcp_prompts"));
+    }
+
+    /// PR #7547 review (Audacity88) — blocking comment: the PR body
+    /// claims MCP tools can still be blocked via `excluded_tools`. A
+    /// target profile that allow-lists `shell` and excludes
+    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
+    /// agentic delegate even though it matches the `__` auto-admit
+    /// heuristic.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                excluded_tools: vec!["filesystem__write_file".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "non-excluded allow-list entry must be admitted"
+        );
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "excluded_tools must block auto-admitted MCP name"
+        );
+    }
+
+    /// Companion to the test above: `excluded_tools` must also subtract
+    /// from explicit allow-list entries, not just from the
+    /// double-underscore auto-admit set. delegate.rs previously ignored
+    /// `excluded_tools` entirely on the agentic path; this pins the fix
+    /// so it cannot regress.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "memory_recall".to_string()],
+                excluded_tools: vec!["shell".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "excluded entry must be rejected even when allow-listed"
+        );
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-excluded entry must be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_mcp_activation_updates_delegate_parent_tools() {
+        let config = agentic_agent_config();
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> = Arc::new(RwLock::new(Vec::new()));
+        let delegate = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "mcp_service_a__list_projects".to_string(),
+            ]))
+            .with_parent_tools(Arc::clone(&parent_tools));
+
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let deferred = crate::tools::DeferredMcpToolSet {
+            stubs: vec![{
+                let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+                    name: "list_projects".to_string(),
+                    description: Some("List projects".to_string()),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                };
+                zeroclaw_tools::mcp_deferred::DeferredMcpToolStub::new(
+                    "mcp_service_a__list_projects".to_string(),
+                    def,
+                )
+            }],
+            registry: Arc::new(
+                zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[])
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let handle = Arc::clone(&parent_tools);
+        let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
+            .with_activation_hook(Arc::new(move |tool| {
+                let mut tools = handle.write();
+                if !tools.iter().any(|existing| existing.name() == tool.name()) {
+                    tools.push(tool);
+                }
+            }));
+
+        let search = tool_search
+            .execute(serde_json::json!({"query": "select:mcp_service_a__list_projects"}))
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        {
+            let tools = parent_tools.read();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name(), "mcp_service_a__list_projects");
+        }
+
+        let model_provider = FinalOnlyModelProvider;
+        let result = delegate
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run mcp",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("delegate saw tool"),
+            "Expected final output from delegate loop, got: {}",
             result.output
         );
     }
@@ -3675,10 +5929,17 @@ mod tests {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
         };
-        let mut config = Config::default();
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-delegate-narrowed-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
         // The caller delegates from the `narrow` profile, so that profile must
-        // authorize the target alias; without it the delegation_policy gate
-        // rejects before the escalation/narrowing checks under test are reached.
+        // allow delegation before reachability/mode checks run.
         config.risk_profiles.insert(
             "narrow".to_string(),
             RiskProfileConfig {
@@ -3709,8 +5970,8 @@ mod tests {
         config.agents.insert(
             caller_alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "narrow".to_string(),
-                runtime_profile: "narrow".to_string(),
+                risk_profile: "narrow".into(),
+                runtime_profile: "narrow".into(),
                 model_provider: "ollama.caller".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -3718,8 +5979,8 @@ mod tests {
         config.agents.insert(
             target_alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: pick(target_max_actions > caller_max_actions),
-                runtime_profile: pick(target_max_actions > caller_max_actions),
+                risk_profile: pick(target_max_actions > caller_max_actions).into(),
+                runtime_profile: pick(target_max_actions > caller_max_actions).into(),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -3727,11 +5988,213 @@ mod tests {
         Arc::new(config)
     }
 
+    fn config_with_always_ask_delegate(mode: DelegateExecutionMode) -> Arc<Config> {
+        // Shared fixture for the temporary `always_ask` block: caller can
+        // delegate to both targets, but only `target` carries a trimmed
+        // always_ask entry. `peer` lets parallel tests prove fan-out fails
+        // before spawning any sibling when one target is blocked.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{RiskProfileConfig, RuntimeProfileConfig};
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-delegate-always-ask-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                always_ask: vec![" shell ".to_string(), String::new()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("peer_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "bounded".to_string(),
+            RuntimeProfileConfig {
+                max_delegation_depth: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![
+                    DelegateTargetConfig {
+                        agent: "target".to_string(),
+                        mode,
+                    },
+                    DelegateTargetConfig {
+                        agent: "peer".to_string(),
+                        mode: DelegateExecutionMode::Independent,
+                    },
+                ],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "peer".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "peer_profile".into(),
+                runtime_profile: "bounded".into(),
+                model_provider: "ollama.peer".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    fn delegate_tool_for_config(config: Arc<Config>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+    }
+
     #[tokio::test]
-    async fn delegate_rejects_target_on_a_different_risk_profile() {
-        // caller(narrow) is authorized to delegate to target, but target
-        // resolves onto the wider profile. Delegation requires caller and
-        // target to share a risk profile, so the boundary must refuse.
+    async fn independent_delegate_rejects_target_always_ask() {
+        // Synchronous path: the runtime must refuse an independent child before
+        // the target turn starts, and the refusal must name the operator-facing
+        // cause instead of a generic reachability failure.
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "check the system",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("independent always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains(
+                "delegate target \"target\" cannot run in independent mode from \"caller\""
+            ),
+            "expected target/caller context, got: {error}"
+        );
+        assert!(
+            error.contains("risk profile \"target_profile\" has always_ask entries (shell)"),
+            "expected risk profile and trimmed always_ask entries, got: {error}"
+        );
+        assert!(
+            error.contains("ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\""),
+            "expected docs section reference, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_does_not_trigger_target_always_ask_guard() {
+        // The blocker is scoped to independent mode only. Bounded delegates
+        // still use the normal parent-mediated tool path, so this helper must
+        // stay silent for the same target/profile pair.
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Bounded);
+        let tool = delegate_tool_for_config(config);
+
+        tool.policy_for_target("target")
+            .expect("bounded explicit target remains reachable");
+        assert!(
+            tool.independent_always_ask_refusal("target").is_none(),
+            "bounded mode must leave always_ask handling to the normal approval path"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_independent_delegate_rejects_always_ask_before_task_id() {
+        // Background admission is observable: returning a task id would imply a
+        // child was accepted and may now ask for approval. Refuse before the
+        // result file/task-id surface exists.
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "check the system",
+                "background": true,
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("background always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains("always_ask entries (shell)"),
+            "expected always_ask refusal, got: {error}"
+        );
+        assert!(
+            !result.output.contains("task_id:"),
+            "background refusal must not return a task id, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_independent_delegate_rejects_always_ask_before_spawning() {
+        // Parallel fan-out must be all-or-nothing for admission. If any target
+        // is independently blocked by always_ask, do not start the other
+        // otherwise-valid child.
+        let config = config_with_always_ask_delegate(DelegateExecutionMode::Independent);
+        let tool = delegate_tool_for_config(config);
+
+        let result = tool
+            .execute(json!({
+                "parallel": ["peer", "target"],
+                "prompt": "check both systems",
+            }))
+            .await
+            .unwrap();
+
+        let error = result.error.expect("parallel always_ask must reject");
+        assert!(!result.success);
+        assert!(
+            error.contains(
+                "delegate target \"target\" cannot run in independent mode from \"caller\""
+            ),
+            "expected target/caller refusal, got: {error}"
+        );
+        assert!(
+            result.output.is_empty(),
+            "parallel refusal must happen before fan-out output is built, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_cross_profile_target_not_in_roster() {
+        // This covers the diagnostic branch where delegate_same_risk_profile is
+        // true, but the target differs by profile and lacks an explicit roster
+        // entry. The error must tell operators it is a profile mismatch.
         let config = config_with_two_agents("caller", 5, "target", 50);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3740,20 +6203,195 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
         let tool = DelegateTool::new(delegate_agents, None, caller_policy)
-            .with_root_config(config.clone());
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
 
         let err = tool
             .policy_for_target("target")
-            .expect_err("cross-profile target must be rejected at delegate boundary");
+            .expect_err("cross-profile target outside the roster must be rejected");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("requires the same risk profile as the caller"),
-            "expected same-profile rejection, got: {chain}"
+            chain.contains("not reachable"),
+            "expected not-reachable rejection, got: {chain}"
+        );
+        assert!(
+            chain.contains("different risk profile"),
+            "expected risk-profile mismatch diagnostic, got: {chain}"
+        );
+        assert!(
+            chain.contains("\"narrow\"") && chain.contains("\"wide\""),
+            "expected caller and target risk profiles in diagnostic, got: {chain}"
         );
     }
 
     #[tokio::test]
+    async fn delegate_forbidden_policy_reports_caller_and_profile() {
+        // Top-level delegation_policy remains the first gate. Its diagnostic
+        // should point at the exact risk profile key to edit, before any target
+        // reachability details are considered.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let mut config = (*config_with_two_agents("caller", 5, "target", 5)).clone();
+        config
+            .risk_profiles
+            .get_mut("narrow")
+            .unwrap()
+            .delegation_policy = DelegationPolicy {
+            mode: DelegationMode::Forbidden,
+        };
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller");
+
+        let err = tool
+            .policy_for_target("target")
+            .expect_err("forbidden caller delegation policy must reject before reachability");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("delegation is forbidden for caller \"caller\""),
+            "expected caller alias in forbidden-policy diagnostic, got: {chain}"
+        );
+        assert!(
+            chain.contains("risk profile \"narrow\""),
+            "expected caller risk profile in forbidden-policy diagnostic, got: {chain}"
+        );
+        assert!(
+            chain.contains("[risk_profiles.narrow].delegation_policy mode = \"allow\""),
+            "expected exact remediation path in forbidden-policy diagnostic, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_allows_explicit_cross_profile_target_that_widens_policy() {
+        // Bounded delegation is now tool-bounded rather than policy-bounded:
+        // listing the target clears the reachability gate even when the target
+        // has a wider runtime policy. Bounded agentic execution applies the
+        // parent tool registry ceiling later.
+        let config = config_with_two_agents("caller", 5, "target", 50);
+        let mut config = (*config).clone();
+        config
+            .agents
+            .get_mut("caller")
+            .unwrap()
+            .delegates
+            .push(DelegateTargetConfig::bounded("target"));
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let resolved = tool
+            .policy_for_target("target")
+            .expect("wider cross-profile bounded delegate must resolve");
+        assert_eq!(resolved.risk_profile_name, "wide");
+
+        let bucket_key = "bounded-cross-profile-budget-test";
+        let max = 2u32;
+        for _ in 0..max {
+            assert!(
+                tool.security.tracker.record_within(bucket_key, max),
+                "caller's first {max} actions fit within the shared budget"
+            );
+        }
+        assert!(
+            !resolved.tracker.record_within(bucket_key, max),
+            "bounded cross-profile delegates must still share the caller's action tracker"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_allows_independent_cross_profile_target_that_escalates() {
+        // Independent delegation intentionally bypasses the parent's
+        // non-escalation ceiling. The target still resolves a normal target-owned
+        // policy; it just does not share the caller's exhausted tracker.
+        let config = config_with_two_agents("caller", 5, "target", 50);
+        let mut config = (*config).clone();
+        config
+            .agents
+            .get_mut("caller")
+            .unwrap()
+            .delegates
+            .push(DelegateTargetConfig {
+                agent: "target".to_string(),
+                mode: DelegateExecutionMode::Independent,
+            });
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let bucket_key = "independent-budget-test";
+        let max = 2u32;
+        for _ in 0..max {
+            assert!(
+                caller_policy.tracker.record_within(bucket_key, max),
+                "caller's first {max} actions fit within its own budget"
+            );
+        }
+
+        let resolved = tool
+            .policy_for_target("target")
+            .expect("independent explicit cross-profile delegate must resolve");
+        assert_eq!(resolved.risk_profile_name, "wide");
+        assert!(
+            resolved.tracker.record_within(bucket_key, max),
+            "independent delegate target must not share the caller's exhausted action tracker"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_allows_explicit_cross_profile_target_that_narrows() {
+        // A bounded explicit delegate may use a different, narrower profile;
+        // the caller's filtered tool registry still remains the agentic ceiling.
+        let config = config_with_two_agents("caller", 50, "target", 5);
+        let mut config = (*config).clone();
+        config
+            .agents
+            .get_mut("caller")
+            .unwrap()
+            .delegates
+            .push(DelegateTargetConfig::bounded("target"));
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let resolved = tool
+            .policy_for_target("target")
+            .expect("narrowed explicit cross-profile delegate must resolve");
+        assert_eq!(resolved.risk_profile_name, "narrow");
+    }
+
+    #[tokio::test]
     async fn delegate_target_inherits_caller_action_tracker() {
+        // Baseline bounded behavior: even when caller and target have matching
+        // profiles, delegation must not mint a fresh action budget. Independent
+        // mode has its own test that intentionally differs from this.
         let config = config_with_two_agents("caller", 5, "target", 5);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3762,7 +6400,8 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
         let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
-            .with_root_config(config.clone());
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
 
         let bucket_key = "shared-budget-test";
         let max = 2u32;
@@ -3775,10 +6414,463 @@ mod tests {
 
         let target_policy = tool
             .policy_for_target("target")
-            .expect("non-escalating target resolves");
+            .expect("bounded target resolves");
         assert!(
             !target_policy.tracker.record_within(bucket_key, max),
             "delegated target must consume from the caller's bucket; spawning the target should not reset the budget"
+        );
+    }
+
+    /// Regression for issue #7263: when the caller's policy was built
+    /// with a session cwd (the ACP / gateway path), delegating to a
+    /// sibling agent must carry that cwd into the target's policy.
+    /// Without this, the child run's file/shell tools jail to the
+    /// per-agent install dir declared in config rather than the IDE's
+    /// session cwd, breaking delegate-driven workflows in repos
+    /// outside the install root.
+    #[tokio::test]
+    async fn delegate_target_inherits_caller_session_workspace_dir() {
+        let config = config_with_two_agents("caller", 5, "target", 5);
+
+        // Build the caller's policy the way the interactive builders
+        // do: config-derived, then session_cwd override.
+        let session_cwd = PathBuf::from("/tmp/zeroclaw-test-delegate-session-cwd-7263");
+        let mut caller_policy =
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves");
+        caller_policy.workspace_dir = session_cwd.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        // Sanity: the target's config-derived workspace must differ so
+        // the assertion below is actually exercising the inheritance,
+        // not a coincidental match.
+        let target_config_workspace = config.agent_workspace_dir("target");
+        assert_ne!(
+            session_cwd, target_config_workspace,
+            "test precondition: session cwd must differ from target's config workspace"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("same-profile target resolves");
+        assert_eq!(
+            target_policy.workspace_dir, session_cwd,
+            "delegated target must inherit the caller's session cwd; \
+             regression for issue #7263"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_target_keeps_own_workspace_dir() {
+        // Same-profile bounded delegates inherit the caller's session workspace
+        // for interactive workflows. Independent delegates act like a fresh run
+        // of the target agent, so the target keeps its configured workspace.
+        let config = config_with_two_agents("caller", 5, "target", 5);
+        let mut config = (*config).clone();
+        config
+            .agents
+            .get_mut("caller")
+            .unwrap()
+            .delegates
+            .push(DelegateTargetConfig {
+                agent: "target".to_string(),
+                mode: DelegateExecutionMode::Independent,
+            });
+        let config = Arc::new(config);
+
+        let session_cwd = PathBuf::from("/tmp/zeroclaw-test-independent-delegate-session-cwd");
+        let mut caller_policy =
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves");
+        caller_policy.workspace_dir = session_cwd.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        let target_config_workspace = config.agent_workspace_dir("target");
+        assert_ne!(
+            session_cwd, target_config_workspace,
+            "test precondition: session cwd must differ from target's config workspace"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent same-profile target resolves");
+        assert_eq!(
+            target_policy.workspace_dir, target_config_workspace,
+            "independent delegate target must keep its own configured workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_target_uses_target_risk_profile_restrictions() {
+        // Independent mode should not be confused with unrestricted mode. It
+        // removes the caller ceiling, then applies the target's own policy
+        // fields exactly as a fresh target-agent run would.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let target_extra_root = tmp.path().join("target-extra-root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_commands: vec!["caller-only".to_string()],
+                allowed_roots: vec![tmp.path().join("caller-extra-root").display().to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["target-only".to_string()],
+                allowed_roots: vec![target_extra_root.display().to_string()],
+                forbidden_paths: vec![tmp.path().join("target-forbidden").display().to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller");
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        assert_eq!(target_policy.risk_profile_name, "target");
+        assert_eq!(target_policy.allowed_commands, vec!["target-only"]);
+        assert!(
+            target_policy.allowed_roots.contains(&target_extra_root),
+            "target policy must retain target allowed_roots"
+        );
+        assert!(
+            target_policy
+                .forbidden_paths
+                .iter()
+                .any(|path| path.ends_with("target-forbidden")),
+            "target policy must retain target forbidden_paths"
+        );
+        assert_eq!(
+            target_policy.allowed_tools.as_deref(),
+            Some(&["shell".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_cross_profile_agentic_tools_are_capped_by_parent_registry() {
+        // Target asks for `shell`, caller can delegate but only has EchoTool in
+        // its registry. Bounded mode must not synthesize target-owned tools
+        // just because the target risk profile names them.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string(), DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "run shell",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn bounded_agentic_tools_are_capped_by_caller_policy() {
+        // Stronger ceiling case: EchoTool is present in the parent registry but
+        // the caller policy only admits `delegate`, so bounded child tools are
+        // empty even though the target profile would allow EchoTool.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, caller_policy)),
+            ])));
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "run echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn independent_agentic_tools_use_target_registry_not_parent_registry() {
+        // Parent registry intentionally contains only EchoTool. Independent
+        // agentic delegation must ignore that parent ceiling and build the
+        // child loop from the target agent's own allowed tool registry.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let tools = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds");
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        assert!(
+            tool_names.contains(&"shell"),
+            "independent target must receive tools from its own allowed_tools, got {tool_names:?}"
+        );
+        assert!(
+            !tool_names.contains(&"delegate"),
+            "independent agentic delegates must still strip delegate recursion"
+        );
+        assert!(
+            !tool_names.contains(&"echo_tool"),
+            "independent target must not inherit parent-only tools"
         );
     }
 
@@ -3794,10 +6886,9 @@ mod tests {
         );
     }
 
-    /// Build a config where `caller` (`broad` profile) is authorized to
-    /// delegate to `target`, but `target` sits on a different (`narrow`)
-    /// profile. Delegation requires caller and target to share a risk
-    /// profile, so this exercises the same-profile rejection gate.
+    /// Build a config where `caller` (`broad` profile) can delegate, but
+    /// `target` is a different-profile peer that is not in the explicit
+    /// delegate roster. This exercises the reachable-set rejection path.
     fn config_with_narrowed_target() -> Arc<zeroclaw_config::schema::Config> {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
@@ -3822,7 +6913,7 @@ mod tests {
         config.agents.insert(
             "caller".to_string(),
             AliasedAgentConfig {
-                risk_profile: "broad".to_string(),
+                risk_profile: "broad".into(),
                 model_provider: "ollama.caller".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -3830,7 +6921,7 @@ mod tests {
         config.agents.insert(
             "target".to_string(),
             AliasedAgentConfig {
-                risk_profile: "narrow".to_string(),
+                risk_profile: "narrow".into(),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -3839,12 +6930,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_rejects_target_on_a_different_risk_profile_even_when_authorized() {
-        // DelegateTool's spawned agentic loop reuses the caller's
-        // parent_tools registry, so a target on a different profile would
-        // silently inherit the caller's allowlist. Even with the caller
-        // authorized to delegate to the target, the same-profile gate must
-        // catch the profile mismatch and refuse to dispatch.
+    async fn delegate_rejects_cross_profile_target_absent_from_roster_even_when_authorized() {
+        // Caller is authorized to delegate (delegation_policy = allow) and
+        // the target is on a narrower profile, but it is not listed in the
+        // caller's delegates roster and is not a same-profile peer, so the
+        // reachability gate must refuse.
         let config = config_with_narrowed_target();
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3853,15 +6943,374 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
         let tool = DelegateTool::new(delegate_agents, None, caller_policy)
-            .with_root_config(config.clone());
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
 
         let err = tool
             .policy_for_target("target")
-            .expect_err("cross-profile target must be rejected at delegate boundary");
+            .expect_err("cross-profile target outside the roster must be rejected");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("requires the same risk profile as the caller"),
-            "expected same-profile rejection, got: {chain}"
+            chain.contains("not reachable"),
+            "expected not-reachable rejection, got: {chain}"
+        );
+        assert!(
+            chain.contains("different risk profile"),
+            "expected risk-profile mismatch diagnostic, got: {chain}"
+        );
+        assert!(
+            chain.contains("\"broad\"") && chain.contains("\"narrow\""),
+            "expected caller and target risk profiles in diagnostic, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+        };
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "vllm".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                    model: Some("Qwen3.6-27B".to_string()),
+                    wire_api: Some(WireApi::Responses),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.vllm".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+
+        // Drives the exact build path `run` takes. With root_config + a
+        // dotted model_provider, the alias-aware factory must read the
+        // target's `custom.vllm` entry and honor wire_api = responses.
+        let provider = tool
+            .build_target_provider("custom.vllm", "custom", None)
+            .expect("target provider builds offline");
+        assert_eq!(
+            provider.default_wire_api(),
+            "responses",
+            "delegate must build the target with its declared responses wire API"
+        );
+
+        // Regression guard: the pre-fix path (bare factory, no config/alias
+        // context) cannot see the per-alias config — for the custom family it
+        // errors on the missing uri it can't resolve, which is exactly the
+        // "error in the provider" the bug report described. Either way it does
+        // not yield a working responses provider.
+        let stale = zeroclaw_providers::create_model_provider_with_options(
+            "custom",
+            None,
+            &tool.provider_runtime_options,
+        );
+        let stale_is_responses = stale
+            .map(|p| p.default_wire_api() == "responses")
+            .unwrap_or(false);
+        assert!(
+            !stale_is_responses,
+            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+        );
+    }
+
+    struct FileReadTool;
+    #[async_trait]
+    impl Tool for FileReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+        fn description(&self) -> &str {
+            "Read a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "read".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileReadTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct FileWriteTool;
+    #[async_trait]
+    impl Tool for FileWriteTool {
+        fn name(&self) -> &str {
+            "file_write"
+        }
+        fn description(&self) -> &str {
+            "Write a file."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "written".into(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FileWriteTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct MockShellTool;
+    #[async_trait]
+    impl Tool for MockShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "Execute shell commands."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Shell)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+
+    struct ToolListInspector {
+        forbidden_names: Vec<String>,
+    }
+    #[async_trait]
+    impl ModelProvider for ToolListInspector {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tools) = request.tools {
+                for tool in tools {
+                    if self.forbidden_names.iter().any(|f| f == &tool.name) {
+                        return Ok(ChatResponse {
+                            text: Some(format!("forbidden_tool_seen:{}", tool.name)),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ToolListInspector {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolListInspector"
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_filters_parent_tools_through_parent_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".to_string(), "delegate".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent policy should have filtered out file_write, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_honors_parent_excluded_tools() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "shell".to_string(),
+                "file_read".to_string(),
+            ]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(MockShellTool),
+                Arc::new(FileReadTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["shell".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "parent excluded_tools should have filtered out shell, but got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_parent_none_unrestricted_passes_target_policy() {
+        let config = agentic_agent_config();
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: None,
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["file_read".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(FileReadTool),
+                Arc::new(FileWriteTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["file_write".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "expected output to contain 'done', got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "target policy should have filtered out file_write, but got: {}",
+            result.output
         );
     }
 }

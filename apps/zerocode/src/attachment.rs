@@ -118,6 +118,16 @@ pub(crate) fn build_attachments_json(
     attachments.iter().map(|a| a.to_json(transport)).collect()
 }
 
+/// Remove backing temp files for clipboard-sourced attachments. File-sourced
+/// attachments reference user files and are left untouched.
+pub(crate) fn cleanup_attachment_temps(attachments: &[PendingAttachment]) {
+    for att in attachments {
+        if att.source == AttachmentSource::Clipboard {
+            let _ = std::fs::remove_file(&att.path);
+        }
+    }
+}
+
 /// Detect MIME type from filename extension via `mime_guess`.
 /// Falls back to `application/octet-stream` for unknown extensions.
 pub(crate) fn mime_from_filename(filename: &str) -> String {

@@ -3,6 +3,7 @@
 //!
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
+pub mod catalog;
 pub mod device;
 pub mod gpio;
 pub mod peripherals;

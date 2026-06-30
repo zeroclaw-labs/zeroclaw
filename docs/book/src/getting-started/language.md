@@ -7,24 +7,24 @@ other languages are downloaded on demand.
 ## Set your language
 
 ZeroClaw reads a top-level `locale` key from your config. Set it to a locale
-code such as `ja`, `fr`, or `zh-CN`:
-
-```toml
-# ~/.zeroclaw/config.toml
-locale = "ja"
-```
-
-If `locale` is unset, ZeroClaw uses your operating system's language and falls
-back to English when no translation is available.
+code such as `ja`, `fr`, or `zh-CN`. If `locale` is unset, ZeroClaw uses your
+operating system's language and falls back to English when no translation is
+available.
 
 ## Fetch your language files
 
 English ships inside the binary. For any other language you fetch the
 translated files once:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw locales fetch ja
 ```
+
+</div>
 
 This downloads the Japanese translation files from the ZeroClaw project and
 installs them under `~/.zeroclaw/data/ftl/ja/`, where ZeroClaw looks for them
@@ -32,10 +32,16 @@ at startup. Restart ZeroClaw (and `zerocode`) afterward to pick them up.
 
 Fetch any locale the same way:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw locales fetch fr        # French
 zeroclaw locales fetch zh-CN     # Simplified Chinese
 ```
+
+</div>
 
 ### Fetching only part of a language
 
@@ -48,13 +54,19 @@ some, pass `--catalog` with a comma-separated list:
 | `tools` | Built-in tool descriptions |
 | `zerocode` | The `zerocode` terminal UI |
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw locales fetch ja --catalog cli            # just CLI strings
 zeroclaw locales fetch ja --catalog cli,zerocode   # CLI + the TUI
 ```
 
+</div>
+
 If a catalogue has not been translated for your language yet, `fetch` skips it
-and tells you — the catalogues that do exist are still installed.
+and tells you: the catalogues that do exist are still installed.
 
 ## Where the files live
 

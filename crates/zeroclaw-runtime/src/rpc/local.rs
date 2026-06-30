@@ -8,19 +8,50 @@
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
-use super::session::SESSION_DISCONNECT_GRACE;
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+/// Returns `true` when an error from a stream listener's `accept()` is
+/// transient and the listener itself remains usable, so the serve loop
+/// should log and keep running rather than terminating the daemon. Covers
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
+/// per-connection hiccups.
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
 
 /// Resolve the local-IPC endpoint path.
 ///
@@ -139,13 +170,21 @@ pub async fn run_local_listener(
                 let stream = match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!("local IPC accept error: {e}")
-                        );
-                        continue;
+                        if e.downcast_ref::<std::io::Error>().is_some_and(is_recoverable_accept_error) {
+                            // Transient (e.g. EMFILE under fd pressure):
+                            // the listener is still valid. Back off briefly
+                            // to avoid hot-spinning, then keep serving
+                            // rather than killing the daemon (#7042).
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("local IPC accept() transient error: {e}")
+                            );
+                            tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                            continue;
+                        }
+                        return Err(e).context("local IPC accept error");
                     }
                 };
 
@@ -163,37 +202,23 @@ pub async fn run_local_listener(
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
-                        let orphaned = ctx
-                            .sessions
-                            .mark_orphaned(tui_id, SESSION_DISCONNECT_GRACE)
-                            .await;
-                        for (session_key, agent_alias) in &orphaned {
-                            use ::zeroclaw_log::Instrument as _;
-                            let span = ::zeroclaw_log::info_span!(
-                                target: "zeroclaw_log_internal_scope",
-                                "zeroclaw_scope",
-                                session_key = %session_key,
-                                agent_alias = %agent_alias,
-                                owner_tui_id = %tui_id,
-                                channel = "rpc",
+                        use ::zeroclaw_log::Instrument as _;
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            owner_tui_id = %tui_id,
+                            channel = "rpc",
+                        );
+                        async {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent),
+                                "TUI disconnected; sessions retained (persistent)"
                             );
-                            async {
-                                ::zeroclaw_log::record!(
-                                    INFO,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note,
-                                    )
-                                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                                    .with_attrs(::serde_json::json!({
-                                        "grace_secs": SESSION_DISCONNECT_GRACE.as_secs(),
-                                    })),
-                                    "TUI disconnected; session queued for eviction"
-                                );
-                            }
-                            .instrument(span)
-                            .await;
                         }
+                        .instrument(span)
+                        .await;
                     }
 
                     count.fetch_sub(1, Ordering::Relaxed);
@@ -415,6 +440,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
@@ -461,6 +487,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -705,6 +732,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         write_half
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -723,5 +751,33 @@ mod tests {
         drop(reader);
         drop(client);
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 }

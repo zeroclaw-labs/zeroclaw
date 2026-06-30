@@ -13,7 +13,6 @@ pub mod session_sqlite {
 use crate::config::Config;
 use anyhow::Result;
 use zeroclaw_runtime::i18n::get_required_cli_string;
-#[cfg(feature = "channel-notion")]
 use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
@@ -33,6 +32,25 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                     if entry.configured { "✅" } else { "❌" },
                     entry.name
                 );
+            }
+            let uncompiled =
+                zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string("cli-channels-not-compiled-header")
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-channels-not-compiled-entry",
+                            &[("name", entry.name)]
+                        )
+                    );
+                }
+                println!("{}", get_required_cli_string("cli-channels-build-hint"));
             }
             // Notion is a top-level config section, not part of ChannelsConfig
             #[cfg(feature = "channel-notion")]
@@ -58,7 +76,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `zeroclaw config set channels.{channel_type}.<alias>.<field>=<value>` to configure"
             );
         }
         crate::ChannelCommands::Remove { name } => {

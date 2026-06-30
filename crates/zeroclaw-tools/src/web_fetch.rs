@@ -1,3 +1,4 @@
+use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
@@ -42,15 +43,15 @@ impl WebFetchTool {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(
+            allowed_domains: domain_guard::normalize_allowed_domains(
                 allowed_domains,
                 "web_fetch.allowed_domains",
             )?,
-            blocked_domains: normalize_allowed_domains(
+            blocked_domains: domain_guard::normalize_allowed_domains(
                 blocked_domains,
                 "web_fetch.blocked_domains",
             )?,
-            allowed_private_hosts: normalize_allowed_domains(
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
                 allowed_private_hosts,
                 "web_fetch.allowed_private_hosts",
             )?,
@@ -536,22 +537,34 @@ fn validate_target_url_with_dns_check(
     let host = extract_host(url)?;
 
     // blocked_domains always takes precedence
-    if host_matches_allowlist(&host, blocked_domains) {
+    if domain_guard::host_matches_allowlist(&host, blocked_domains) {
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
-    let host_is_private_or_local = is_private_or_local_host(&host);
-    let private_host_allowed =
-        host_matches_private_allowlist(&host, allowed_private_hosts, host_is_private_or_local);
+    let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
+    let private_match = private_allowlist_match(&host, allowed_private_hosts);
+    // An explicit entry (a specific host/IP or suffix) is a deliberate per-host
+    // carve-out; the "*" wildcard blanket-tolerates a private/internal
+    // resolution for any host. The distinction only affects the WARN below.
+    let private_explicit = matches!(private_match, PrivateAllow::Explicit);
+    // Either an explicit entry or "*" tolerates a private/internal host: it lifts
+    // the literal private-host block and skips the resolved-IP public check.
+    let private_tolerated = !matches!(private_match, PrivateAllow::None);
 
-    if host_is_private_or_local && !private_host_allowed {
+    if host_is_private_or_local && !private_tolerated {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
-             To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
+             To allow this host, add it (or \"*\") to \
+             {tool_name}.allowed_private_hosts in config.toml"
         );
     }
 
-    if private_host_allowed {
+    // Only WARN when a private-host bypass concretely fired here: an explicit
+    // carve-out, or "*" lifting the block for a literally private/local host.
+    // Gating on bare `private_tolerated` would log this SSRF-bypass on *every*
+    // fetch once "*" is set, burying the real signal. (The new "*"-tolerates-a-
+    // resolved-private-IP case is only knowable post-DNS, which this path skips.)
+    if private_explicit || (private_tolerated && host_is_private_or_local) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -561,11 +574,21 @@ fn validate_target_url_with_dns_check(
         );
     }
 
-    if !private_host_allowed && !host_matches_allowlist(&host, allowed_domains) {
+    // The allowed_domains check is skipped only for a host that is *literally*
+    // private/local and covered by the private allowlist (an explicit entry, or
+    // "*"). A non-private host — including an explicit internal DNS name or any
+    // host reached via "*" — still requires allowed_domains approval, so the
+    // private allowlist can never be used to reach an arbitrary public host.
+    let skip_allowed_domains = host_is_private_or_local && private_tolerated;
+
+    if !skip_allowed_domains && !domain_guard::host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    if !private_host_allowed {
+    // Skip the resolved-IP public check only when the host is covered by the
+    // private allowlist (explicit OR "*"). This is what lets a domain that
+    // resolves to a private IP through under allowed_private_hosts = ["*"].
+    if !private_tolerated {
         validate_dns(&host)?;
     }
 
@@ -585,68 +608,6 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
 
     buffer.extend_from_slice(chunk);
     buffer.len() >= hard_cap
-}
-
-fn normalize_allowed_domains(domains: Vec<String>, label: &str) -> anyhow::Result<Vec<String>> {
-    let mut rejected = Vec::new();
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| {
-            normalize_domain(&d).or_else(|| {
-                rejected.push(d.clone());
-                None
-            })
-        })
-        .collect::<Vec<_>>();
-    if !rejected.is_empty() {
-        anyhow::bail!(
-            "Invalid {label} entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
-            rejected.join(", ")
-        );
-    }
-    normalized.sort_unstable();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let input = raw.trim();
-    if input.is_empty() || input.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
-        (true, true) => &input[1..input.len() - 1],
-        (false, false) => input,
-        _ => return None,
-    };
-    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string().to_lowercase());
-    }
-
-    let parsed = reqwest::Url::parse(input)
-        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
-        .ok()?;
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-
-    let host = parsed.host_str()?;
-    let trimmed = host.trim();
-    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
-        (true, true) => &trimmed[1..trimmed.len() - 1],
-        (false, false) => trimmed,
-        _ => return None,
-    };
-    let normalized = host_no_brackets
-        .trim_start_matches('.')
-        .trim_end_matches('.');
-    if normalized.is_empty() {
-        return None;
-    }
-
-    Some(normalized.to_lowercase())
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -702,59 +663,39 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+/// How a host is covered by `allowed_private_hosts`.
+///
+/// The distinction only affects logging: an explicit entry is a deliberate
+/// per-host carve-out, whereas `*` blanket-tolerates a private/internal
+/// resolution. Both lift the literal private-host block and skip the
+/// resolved-IP public check; neither widens `allowed_domains` for a non-private
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateAllow {
+    /// Not covered by the private allowlist.
+    None,
+    /// Covered only by a `*` wildcard entry.
+    Wildcard,
+    /// Covered by a specific host/IP or suffix entry.
+    Explicit,
 }
 
-fn host_matches_private_allowlist(
-    host: &str,
-    allowed_private_hosts: &[String],
-    host_is_private_or_local: bool,
-) -> bool {
-    allowed_private_hosts.iter().any(|domain| {
-        if domain == "*" {
-            host_is_private_or_local
-        } else {
-            host == domain
-                || host
-                    .strip_suffix(domain)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
+fn private_allowlist_match(host: &str, allowed_private_hosts: &[String]) -> PrivateAllow {
+    let mut wildcard = false;
+    for entry in allowed_private_hosts {
+        if entry == "*" {
+            // Record the wildcard but keep scanning: a later explicit entry
+            // should still win, since it is a deliberate per-host carve-out.
+            wildcard = true;
+        } else if domain_guard::host_matches_allowlist(host, std::slice::from_ref(entry)) {
+            return PrivateAllow::Explicit;
         }
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
-        return true;
     }
-
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
+    if wildcard {
+        PrivateAllow::Wildcard
+    } else {
+        PrivateAllow::None
     }
-
-    false
 }
 
 #[cfg(not(test))]
@@ -795,42 +736,19 @@ fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> any
 
     for ip in ips {
         let non_global = match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(*v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
+            std::net::IpAddr::V4(v4) => domain_guard::is_non_global_v4(*v4),
+            std::net::IpAddr::V6(v6) => domain_guard::is_non_global_v6(*v6),
         };
         if non_global {
-            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+            anyhow::bail!(
+                "Blocked host '{host}' resolved to non-global address {ip}. \
+                 To allow hosts that resolve to private/internal IPs, add '{host}' \
+                 (or \"*\") to web_fetch.allowed_private_hosts in config.toml"
+            );
         }
     }
 
     Ok(())
-}
-
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (a == 100 && (64..=127).contains(&b))
-        || a >= 240
-        || (a == 192 && b == 0 && (c == 0 || c == 2))
-        || (a == 198 && b == 51)
-        || (a == 203 && b == 0)
-        || (a == 198 && (18..=19).contains(&b))
-}
-
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00
-        || (segs[0] & 0xffc0) == 0xfe80
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
@@ -1030,19 +948,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn ssrf_blocks_loopback() {
-        assert!(is_private_or_local_host("127.0.0.1"));
-        assert!(is_private_or_local_host("127.0.0.2"));
-    }
-
-    #[test]
-    fn ssrf_blocks_rfc1918() {
-        assert!(is_private_or_local_host("10.0.0.1"));
-        assert!(is_private_or_local_host("172.16.0.1"));
-        assert!(is_private_or_local_host("192.168.1.1"));
     }
 
     #[test]
@@ -1257,43 +1162,6 @@ mod tests {
     }
 
     // ── Domain normalization ─────────────────────────────────────
-
-    #[test]
-    fn normalize_domain_strips_scheme_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
-    }
-
-    #[test]
-    fn normalize_domain_rejects_userinfo() {
-        assert!(normalize_domain("https://user@example.com").is_none());
-        assert!(normalize_domain("user@example.com").is_none());
-        assert!(normalize_domain("https://user:pass@example.com").is_none());
-        assert!(normalize_domain("user:pass@example.com").is_none());
-    }
-
-    #[test]
-    fn normalize_domain_rejects_unmatched_brackets() {
-        assert!(normalize_domain("[::1").is_none());
-        assert!(normalize_domain("::1]").is_none());
-        assert!(normalize_domain("[127.0.0.1").is_none());
-        assert!(normalize_domain("127.0.0.1]").is_none());
-    }
-
-    #[test]
-    fn normalize_deduplicates() {
-        let got = normalize_allowed_domains(
-            vec![
-                "example.com".into(),
-                "EXAMPLE.COM".into(),
-                "https://example.com/".into(),
-            ],
-            "test",
-        )
-        .unwrap();
-        assert_eq!(got, vec!["example.com".to_string()]);
-    }
-
     // ── Blocked domains ──────────────────────────────────────────
 
     #[test]
@@ -1783,6 +1651,100 @@ mod tests {
             result.is_ok(),
             "allowlisted private domain was rejected: {result:?}"
         );
+    }
+
+    #[test]
+    fn private_wildcard_allows_domain_resolving_to_private_ip() {
+        // Regression for #7412: allowed_private_hosts = ["*"] must permit a
+        // regular domain that resolves to a private/internal IP, as long as the
+        // name itself passes allowed_domains. The DNS public check must be
+        // skipped (closure panics if reached).
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://internal.example.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| panic!("DNS public-host validation should be skipped under private wildcard"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "private wildcard should allow subdomain of allowed_domains: {result:?}"
+        );
+    }
+
+    #[test]
+    fn private_wildcard_allows_literal_private_ip_without_allowed_domains_entry() {
+        // The "*" wildcard must keep its historical scope for *literal* private
+        // hosts: an IP literal (or localhost/.local) is allowed even when it is
+        // not listed in allowed_domains. Only ordinary domain names stay gated
+        // on allowed_domains under "*".
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://10.0.0.1/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| panic!("DNS public-host validation should be skipped for a literal private IP"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "private wildcard should allow a literal private IP: {result:?}"
+        );
+    }
+
+    #[test]
+    fn private_allowlist_explicit_entry_must_pass_allowed_domains() {
+        // An explicit (non-private) entry in allowed_private_hosts is NOT a free
+        // pass: a non-private host still has to be in allowed_domains.
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["unrelated.com".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://unrelated.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("allowed_domains"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn private_wildcard_still_requires_allowed_domains() {
+        // The "*" private wildcard must NOT widen the name allowlist: a public
+        // domain that is not in allowed_domains stays blocked.
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://evil.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("allowed_domains"), "unexpected error: {err}");
     }
 
     #[test]

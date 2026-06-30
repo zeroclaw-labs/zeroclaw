@@ -1,11 +1,13 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
+
+mod registry;
+pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -169,87 +171,178 @@ async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::Atom
     }
 }
 
-/// Optional subsystem start functions injected by the binary crate.
-/// This allows the daemon to spawn subsystems without depending on their crates.
-#[allow(clippy::type_complexity)]
-pub struct DaemonSubsystems {
-    /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
-    /// The fifth argument is the reload sender — the gateway hands it to its
-    /// AppState so /admin/reload can signal the daemon to re-init.
-    /// The sixth argument is the TUI registry for the /api/tuis endpoint.
-    pub gateway_start: Option<
-        Box<
-            dyn Fn(
-                    String,
-                    u16,
-                    Config,
-                    Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-                    Option<tokio::sync::watch::Sender<bool>>,
-                    Option<std::sync::Arc<crate::rpc::tui_identity::TuiRegistry>>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start supervised channels. Injected by the binary when channels crate is available.
-    /// The cancellation token is fired on reload so listener tasks drop their channel Arcs
-    /// before the new supervisor starts.
-    pub channels_start: Option<
-        Box<
-            dyn Fn(
-                    Config,
-                    tokio_util::sync::CancellationToken,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the local IPC RPC listener (Unix socket on Unix, Named Pipe on
-    /// Windows). First argument is the shared `RpcContext`; third is the
-    /// client count for `--ephemeral` shutdown.
-    pub socket_start: Option<
-        Box<
-            dyn Fn(
-                    std::sync::Arc<crate::rpc::context::RpcContext>,
-                    tokio_util::sync::CancellationToken,
-                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the WSS (WebSocket Secure) RPC listener for remote TUI connections.
-    /// Same signature as `socket_start`; shares `RpcContext` and `client_count`.
-    pub wss_start: Option<
-        Box<
-            dyn Fn(
-                    std::sync::Arc<crate::rpc::context::RpcContext>,
-                    tokio_util::sync::CancellationToken,
-                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the MQTT SOP listener. Injected by the binary when channels crate is available.
-    pub mqtt_start: Option<
-        Box<
-            dyn Fn(
-                    zeroclaw_config::schema::MqttConfig,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+/// How the daemon should treat the configured gateway address before it starts
+/// its own supervised gateway (#7895).
+///
+/// The daemon's gateway shares an in-process event bus, canvas store, and
+/// reload channel with the daemon's other subsystems. A separately started
+/// `zeroclaw gateway start` is a *different process* that shares none of that —
+/// its `/admin/reload` even returns 503 ("no daemon supervisor"). The daemon
+/// therefore cannot adopt an external gateway as its own without an attachment
+/// / IPC design that is out of scope here. So the actionable outcomes are to
+/// start fresh on a free address or to fail fast on an occupied one — the
+/// issue's "reuse intentionally or fail fast with a clear decision". We take
+/// the fail-fast branch and only vary the *message* by who holds the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayBindMode {
+    /// Address is free (or an ephemeral port): start and supervise our own gateway.
+    StartFresh,
+    /// A ZeroClaw gateway already holds the address (e.g. a standalone
+    /// `zeroclaw gateway start`): fail fast rather than start a second gateway
+    /// on the same port.
+    GatewayAlreadyRunning,
+    /// Address is held by some other process: fail fast rather than degrade into
+    /// a supervisor retry loop on the bind.
+    PortOccupied,
+}
+
+/// Map the configured gateway bind host to a concrete authority reachable for a
+/// local `/health` probe, formatted for a URL. Mirrors the CLI `self_test`
+/// probe: wildcard `0.0.0.0` -> `127.0.0.1`, IPv6 wildcard `::`/`[::]` ->
+/// `[::1]`; a bare concrete IPv6 host is bracketed.
+fn gateway_probe_authority(host: &str) -> String {
+    match host {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "[::1]".to_string(),
+        other if other.contains(':') && !other.starts_with('[') => format!("[{other}]"),
+        other => other.to_string(),
+    }
+}
+
+/// Build the `/health` probe URL for the configured gateway, honouring the
+/// gateway's TLS scheme and `path_prefix` so a prefixed or HTTPS gateway is
+/// probed where it actually serves health.
+fn gateway_health_probe_url(config: &Config, host: &str, port: u16) -> String {
+    let scheme = if config.gateway.tls.as_ref().is_some_and(|tls| tls.enabled) {
+        "https"
+    } else {
+        "http"
+    };
+    // `path_prefix` is validated to start with `/` and not end with `/`.
+    let prefix = config.gateway.path_prefix.as_deref().unwrap_or("");
+    format!(
+        "{scheme}://{}:{port}{prefix}/health",
+        gateway_probe_authority(host)
+    )
+}
+
+/// Best-effort: does a ZeroClaw gateway answer `/health` on the configured
+/// address? Used *only* to choose the fail-fast message — never to decide
+/// whether the port is free (the bind probe owns that). Redirects are disabled
+/// so an occupant cannot bounce the probe elsewhere, and a strong ZeroClaw
+/// identity is required: a bare `{"status":"ok"}` from an unrelated service is
+/// deliberately not enough (the public `/health` contract also carries
+/// `require_pairing` and `runtime` — see `handle_health` in `zeroclaw-gateway`).
+async fn zeroclaw_gateway_responds(config: &Config, host: &str, port: u16) -> bool {
+    let url = gateway_health_probe_url(config, host, port);
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(500))
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    matches!(
+        response.json::<serde_json::Value>().await,
+        Ok(body)
+            if body.get("status").and_then(|s| s.as_str()) == Some("ok")
+                && body
+                    .get("require_pairing")
+                    .is_some_and(serde_json::Value::is_boolean)
+                && body.get("runtime").is_some_and(serde_json::Value::is_object)
+    )
+}
+
+/// Decide how the daemon should handle the configured gateway address before
+/// starting its own supervised gateway (#7895).
+///
+/// The throwaway bind targets the *configured* address through the same parser
+/// the gateway uses (`parse_gateway_bind_socket_addr`), so it is a faithful
+/// dry-run of the real bind: if the probe binds, the gateway will; if it
+/// cannot, the gateway would otherwise have entered a supervisor retry loop.
+/// Only when the bind fails do we probe `/health`, purely to tell an existing
+/// ZeroClaw gateway apart from a foreign occupant in the error message.
+///
+/// Best-effort pre-check: the supervised gateway's own bind stays the authority
+/// on a genuine conflict, covering the narrow TOCTOU window after the probe
+/// bind is dropped.
+pub async fn detect_gateway_bind_mode(config: &Config, host: &str, port: u16) -> GatewayBindMode {
+    // Port 0 is a kernel-assigned ephemeral port: it cannot already be bound,
+    // so always start fresh.
+    if port == 0 {
+        return GatewayBindMode::StartFresh;
+    }
+
+    // Mirror the gateway's own bind exactly. If host:port does not parse as a
+    // socket address, defer to the gateway (it has its own fallback) rather
+    // than pre-judging the address.
+    let Ok(addr) = zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) else {
+        return GatewayBindMode::StartFresh;
+    };
+
+    classify_gateway_bind_outcome(
+        tokio::net::TcpListener::bind(addr).await,
+        config,
+        host,
+        port,
+    )
+    .await
+}
+
+/// Map the throwaway bind result to a `GatewayBindMode`.
+///
+/// Only `AddrInUse` is a genuine conflict worth failing fast over. Any other
+/// bind error — e.g. `EACCES`/`PermissionDenied` on a privileged port (<1024)
+/// when the daemon is not root — is *not* a "port occupied" condition: the
+/// address may well be free. Treating it as occupied would misreport the cause
+/// (and `zeroclaw_gateway_responds` would return `false` since nothing is
+/// listening, yielding the wrong "another process" message). For those we defer
+/// to the supervised gateway's own bind to surface the real error, which
+/// restores the pre-#7895 behaviour for that case.
+///
+/// Split out from `detect_gateway_bind_mode` so the non-`AddrInUse` branch is
+/// unit-testable without having to provoke a real privileged-port bind failure
+/// (which is environment-dependent: it succeeds as root, fails as non-root).
+async fn classify_gateway_bind_outcome(
+    bind: std::io::Result<tokio::net::TcpListener>,
+    config: &Config,
+    host: &str,
+    port: u16,
+) -> GatewayBindMode {
+    match bind {
+        Ok(listener) => {
+            drop(listener);
+            GatewayBindMode::StartFresh
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if zeroclaw_gateway_responds(config, host, port).await {
+                GatewayBindMode::GatewayAlreadyRunning
+            } else {
+                GatewayBindMode::PortOccupied
+            }
+        }
+        Err(_) => GatewayBindMode::StartFresh,
+    }
 }
 
 pub async fn run(
-    config: Config,
+    mut config: Config,
     host: String,
     port: u16,
-    subsystems: DaemonSubsystems,
+    mut registry: DaemonRegistry,
     ephemeral: bool,
 ) -> Result<DaemonExit> {
+    config.gateway.host = host.clone();
+    if port != 0 {
+        config.gateway.port = port;
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -269,27 +362,43 @@ pub async fn run(
     // its own event_tx; the daemon's RPC event_tx must be wired here).
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    if config.heartbeat.enabled {
-        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.data_dir)
-            .await;
+    if config.heartbeat.enabled
+        && let Ok((_, heartbeat_workspace_dir)) = resolve_heartbeat_workspace_dir(&config)
+    {
+        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(
+            &heartbeat_workspace_dir,
+        )
+        .await;
     }
+
+    // Consume the pricing catalog (`<data_dir>/pricing.json`) if present so the
+    // cost engine can price models the operator never hand-priced in config.
+    // This is consumption only and vendor-neutral: a typical build populates the
+    // file from a public price feed, while an air-gapped build may ship no file
+    // (self-hosted/free models then stay $0). Refreshing the file is a CLI +
+    // scheduler concern, never a public-feed fetch inside this shared daemon.
+    crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
-    if let Some(gateway_start) = subsystems.gateway_start {
+    if let Some(gateway_start) = registry.take_gateway_start() {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
-        let gateway_reload_tx = reload_tx.clone();
+        let gateway_reload_controls = GatewayReloadControls {
+            shutdown_tx: gateway_shutdown_tx.clone(),
+            reload_tx: reload_tx.clone(),
+        };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
@@ -300,17 +409,61 @@ pub async fn run(
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
-                let reload = gateway_reload_tx.clone();
+                let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload), Some(tui_reg)).await }
+                async move {
+                    start(
+                        host,
+                        port,
+                        cfg,
+                        Some(tx),
+                        Some(reload_controls),
+                        Some(tui_reg),
+                    )
+                    .await
+                }
             },
         ));
     }
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
 
-    if let Some(channels_start) = subsystems.channels_start {
+    // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
+    // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
+    // before channels so a delegating turn finds the plane live. Best-effort and
+    // additive: on failure the plane stays absent and every producer runs as today.
+    //
+    // `daemon::run` is re-entered on every reload. The handle is installed ONCE (an
+    // OnceLock), so producers and the reaper always agree on one `boot_id`. We therefore
+    // only START on first boot; on reload we reuse the installed handle and just respawn
+    // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
+    // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
+    // would then reap the daemon's OWN live tasks as "prior-boot orphans".
+    if crate::control_plane::control_plane().is_none()
+        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+            .await
+            .map(crate::control_plane::init_control_plane)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+            "control-plane failed to start; supervision disabled for this run"
+        );
+    }
+    // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
+    // boot_id matches what producers stamp via `control_plane()`.
+    if let Some(handle) = crate::control_plane::control_plane() {
+        handle.spawn_reaper(
+            crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            channels_cancel.clone(),
+        );
+        crate::health::mark_component_ok("control-plane");
+    }
+
+    if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
@@ -346,7 +499,10 @@ pub async fn run(
     // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let need_rpc_ctx = subsystems.socket_start.is_some() || subsystems.wss_start.is_some();
+    let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
+
+    // Extract shared SOP engine from registry for RpcContext.
+    let (sop_engine, sop_audit) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -357,40 +513,14 @@ pub async fn run(
         let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue.clone()));
 
         {
-            let reaper_sessions = std::sync::Arc::clone(&sessions);
             let reaper_queue = std::sync::Arc::clone(&session_queue);
             zeroclaw_spawn::spawn!(async move {
-                const TICK: std::time::Duration = std::time::Duration::from_secs(15);
+                const TICK: std::time::Duration = std::time::Duration::from_secs(60);
                 let mut interval = tokio::time::interval(TICK);
                 interval.tick().await;
                 loop {
                     interval.tick().await;
-                    let evicted = reaper_sessions.evict_expired().await;
                     let queue_evicted = reaper_queue.evict_idle().await;
-                    for ev in &evicted {
-                        let span = ::zeroclaw_log::info_span!(
-                            target: "zeroclaw_log_internal_scope",
-                            "zeroclaw_scope",
-                            session_key = %ev.session_key,
-                            agent_alias = %ev.agent_alias,
-                            owner_tui_id = %ev.owner_tui_id.as_deref().unwrap_or(""),
-                            channel = "rpc",
-                        );
-                        let _guard = span.enter();
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "reason": ev.reason,
-                                "idle_secs": ev.idle_secs,
-                            })),
-                            "Session reaper freed agent and conversation history"
-                        );
-                    }
                     if queue_evicted > 0 {
                         let span = ::zeroclaw_log::info_span!(
                             target: "zeroclaw_log_internal_scope",
@@ -408,30 +538,9 @@ pub async fn run(
                             .with_attrs(::serde_json::json!({
                                 "evicted_queue_slots": queue_evicted,
                             })),
-                            "Session reaper released idle actor-queue slots"
+                            "Session queue: released idle actor-queue slots"
                         );
-                    }
-                    if !evicted.is_empty() || queue_evicted > 0 {
                         crate::util::release_freed_heap();
-                        let span = ::zeroclaw_log::info_span!(
-                            target: "zeroclaw_log_internal_scope",
-                            "zeroclaw_scope",
-                            channel = "rpc",
-                        );
-                        let _guard = span.enter();
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "evicted_sessions": evicted.len(),
-                                "evicted_queue_slots": queue_evicted,
-                            })),
-                            "Trimmed glibc arenas after session reaper sweep"
-                        );
                     }
                 }
             });
@@ -456,6 +565,7 @@ pub async fn run(
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
+                Some(&config.providers.models),
             ) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
@@ -493,21 +603,30 @@ pub async fn run(
             sessions,
             session_backend,
             memory: rpc_memory,
-            cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
+            // Process-global tracker shared with the gateway and channel
+            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // tracker to record into and model cost is silently dropped (#5221).
+            cost_tracker: crate::cost::CostTracker::get_or_init_global(
+                config.cost.clone(),
+                &config.data_dir,
+            ),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
+            gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
             tui_registry,
             acp_session_store,
+            sop_engine,
+            sop_audit,
         }))
     } else {
         None
     };
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
-    if let Some(socket_start) = subsystems.socket_start {
+    if let Some(socket_start) = registry.take_socket_start() {
         let rpc_ctx = rpc_ctx
             .clone()
             .expect("rpc_ctx built when socket_start is Some");
@@ -529,7 +648,7 @@ pub async fn run(
     }
 
     // WSS RPC listener (remote TUI connections).
-    if let Some(wss_start) = subsystems.wss_start {
+    if let Some(wss_start) = registry.take_wss_start() {
         let rpc_ctx = rpc_ctx
             .clone()
             .expect("rpc_ctx built when wss_start is Some");
@@ -551,7 +670,7 @@ pub async fn run(
     }
 
     // Wire up MQTT SOP listener if configured and referenced by an enabled agent
-    if let Some(mqtt_start) = subsystems.mqtt_start {
+    if let Some(mqtt_start) = registry.take_mqtt_start() {
         let active_mqtt: std::collections::HashSet<String> = config
             .agents
             .values()
@@ -620,17 +739,7 @@ pub async fn run(
         );
     }
 
-    println!("🧠 ZeroClaw daemon started");
-    println!("   Gateway:  http://{host}:{port}");
-    println!(
-        "   Socket:   {}",
-        crate::rpc::local::socket_path(&config).display()
-    );
-    println!("   Components: gateway, channels, heartbeat, scheduler");
-    if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
-    }
-    println!("   Ctrl+C or SIGTERM to stop");
+    record_daemon_started(&config, &host, port);
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
@@ -666,7 +775,24 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("state")
         .join("daemon_state.json")
+}
+
+fn record_daemon_started(config: &Config, host: &str, port: u16) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "requested_gateway": format!("http://{host}:{port}"),
+                "socket": crate::rpc::local::socket_path(config).display().to_string(),
+                "pairing_enabled": config.gateway.require_pairing,
+                "stop_signal": "Ctrl+C or SIGTERM",
+            })),
+        "ZeroClaw daemon started"
+    );
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
@@ -743,12 +869,7 @@ where
     })
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    use crate::heartbeat::engine::{
-        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
-    };
-    use std::sync::Arc;
-
+fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)> {
     let agent_alias = config.heartbeat.agent.trim().to_string();
     if agent_alias.is_empty() {
         anyhow::bail!(
@@ -760,10 +881,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             "[heartbeat] agent = {agent_alias:?} is not configured ([agents.{agent_alias}] missing)"
         );
     }
+    let workspace_dir = config.agent_workspace_dir(&agent_alias);
+    Ok((agent_alias, workspace_dir))
+}
+
+async fn run_heartbeat_worker(config: Config) -> Result<()> {
+    use crate::heartbeat::engine::{
+        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
+    };
+    use std::sync::Arc;
+
+    let (agent_alias, heartbeat_workspace_dir) = resolve_heartbeat_workspace_dir(&config)?;
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = HeartbeatEngine::new(config.heartbeat.clone(), config.data_dir.clone(), observer);
+    let engine = HeartbeatEngine::new(config.heartbeat.clone(), heartbeat_workspace_dir, observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
@@ -972,14 +1104,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
-        // Create memory once per tick for recall + consolidation.
+        // Create memory once per tick for recall + consolidation. Use the
+        // routes-aware factory with the provider catalog so `[[embedding_routes]]`
+        // (and dotted `model_provider` refs) resolve here exactly as on the
+        // gateway/RPC paths — otherwise heartbeat recall would silently fall
+        // back to keyword-only for hint-routed embeddings.
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
                 &config.data_dir,
                 config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
+                Some(&config.providers.models),
             )
             .ok();
 
@@ -1120,7 +1259,32 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    if let Some((channel, target)) = &delivery {
+                    // Skip delivery when the heartbeat agent signalled "nothing
+                    // to report" via the quiet NO_REPLY sentinel. Without this
+                    // guard the literal sentinel string is announced to the
+                    // channel (zeroclaw-labs/zeroclaw#2128). The empty-output
+                    // branch above never produces the sentinel, so checking the
+                    // final announcement is sufficient. Failure/refusal kinds
+                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
+                    // suppressed — they carry operator-visible meaning.
+                    let suppress_delivery =
+                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                            .should_deliver();
+                    if suppress_delivery {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"task": task.text})),
+                            "Heartbeat task returned NO_REPLY sentinel — skipping delivery"
+                        );
+                    }
+                    if let Some((channel, target)) = &delivery
+                        && !suppress_delivery
+                    {
                         let delivery_result = tokio::time::timeout(
                             Duration::from_secs(30),
                             crate::cron::scheduler::deliver_announcement(
@@ -1480,38 +1644,19 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            if config.channels.telegram.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels.telegram is not configured"
-                );
-            }
-        }
-        "discord" => {
-            if config.channels.discord.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to discord but channels.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels.slack.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels.mattermost.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels.mattermost is not configured"
-                );
-            }
-        }
-        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
+    if !config.channels.is_known_channel(channel) {
+        anyhow::bail!("unsupported heartbeat.target channel: {channel}");
     }
-
+    if !config.channels.is_channel_configured(channel) {
+        anyhow::bail!(
+            "heartbeat.target is set to {channel} but channels.{channel} is not configured"
+        );
+    }
+    if !config.channels.is_channel_deliverable(channel) {
+        anyhow::bail!(
+            "heartbeat.target is set to {channel} but {channel} is an input-only channel that cannot deliver outbound messages"
+        );
+    }
     Ok(())
 }
 
@@ -1525,7 +1670,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
-// The daemon now receives it as a callback via DaemonSubsystems::mqtt_start.
+// The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
 #[cfg(test)]
 mod tests {
@@ -1542,13 +1687,141 @@ mod tests {
         config
     }
 
+    fn add_agent_with_workspace(config: &mut Config, agent_alias: &str, workspace_dir: PathBuf) {
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace_dir),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.agents.insert(agent_alias.to_string(), agent);
+    }
+
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message}");
+    }
+
     #[test]
-    fn state_file_path_uses_config_directory() {
+    fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let path = state_file_path(&config);
-        assert_eq!(path, tmp.path().join("daemon_state.json"));
+        assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_seed_uses_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let agent_alias = "ops";
+        let workspace_dir = tmp
+            .path()
+            .join("agents")
+            .join(agent_alias)
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = agent_alias.to_string();
+        add_agent_with_workspace(&mut config, agent_alias, workspace_dir.clone());
+
+        let (_, resolved_workspace_dir) = resolve_heartbeat_workspace_dir(&config).unwrap();
+        assert_eq!(resolved_workspace_dir, workspace_dir);
+        assert_ne!(resolved_workspace_dir, config.data_dir);
+
+        crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&resolved_workspace_dir)
+            .await
+            .unwrap();
+
+        assert!(workspace_dir.join("HEARTBEAT.md").exists());
+        assert!(!config.data_dir.join("HEARTBEAT.md").exists());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_engine_reads_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let agent_alias = "ops";
+        let workspace_dir = tmp
+            .path()
+            .join("agents")
+            .join(agent_alias)
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = agent_alias.to_string();
+        add_agent_with_workspace(&mut config, agent_alias, workspace_dir.clone());
+
+        std::fs::write(config.data_dir.join("HEARTBEAT.md"), "- Data dir task").unwrap();
+        std::fs::write(workspace_dir.join("HEARTBEAT.md"), "- Workspace task").unwrap();
+
+        let (_, resolved_workspace_dir) = resolve_heartbeat_workspace_dir(&config).unwrap();
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+        let engine = crate::heartbeat::engine::HeartbeatEngine::new(
+            config.heartbeat.clone(),
+            resolved_workspace_dir,
+            observer,
+        );
+
+        let tasks = engine.collect_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].text, "Workspace task");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_startup_diagnostics_are_logged_as_structured_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+
+        record_daemon_started(&config, "127.0.0.1", 0);
+
+        let value = recv_log_event(&mut rx, "ZeroClaw daemon started").await;
+        assert_eq!(value["event"]["category"], "system");
+        assert_eq!(value["event"]["action"], "start");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(
+            value["attributes"]["requested_gateway"],
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(value["attributes"]["pairing_enabled"].as_bool(), Some(true));
+        assert_eq!(value["attributes"]["stop_signal"], "Ctrl+C or SIGTERM");
+        assert_eq!(
+            value["attributes"]["socket"],
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
     }
 
     #[tokio::test]
@@ -1620,11 +1893,17 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.channels.discord.insert(
@@ -1640,11 +1919,17 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(!has_supervised_channels(&config));
@@ -1658,6 +1943,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1666,6 +1952,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1706,6 +1994,8 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1761,6 +2051,8 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
@@ -1801,12 +2093,71 @@ mod tests {
     #[test]
     fn resolve_delivery_rejects_unsupported_channel() {
         let mut config = Config::default();
-        config.heartbeat.target = Some("email".into());
+        config.heartbeat.target = Some("carrier_pigeon".into());
         config.heartbeat.to = Some("ops@example.com".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("unsupported heartbeat.target channel")
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_matrix_target() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room:example.org".into());
+        config
+            .channels
+            .matrix
+            .insert("default".to_string(), Default::default());
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room:example.org".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_configured_but_undeliverable_channel() {
+        // #7681 review: a configured input-only channel (mqtt is a fan-in
+        // listener whose Channel::send is a no-op) must not pass heartbeat
+        // validation just because its table exists. Otherwise the validator
+        // claims a target the delivery surface silently drops.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("mqtt".into());
+        config.heartbeat.to = Some("ops/heartbeat".into());
+        config
+            .channels
+            .mqtt
+            .insert("default".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_voice_duplex_target() {
+        // #7680 review: voice_duplex has a configured table and a WebSocket
+        // event protocol but no Channel::send outbound path, so a heartbeat
+        // target pointing at it must be rejected like the other input-only
+        // transports rather than falling through to the dotted-ref error.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("voice_duplex".into());
+        config.heartbeat.to = Some("ops".into());
+        config
+            .channels
+            .voice_duplex
+            .insert("default".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
         );
     }
 
@@ -1832,6 +2183,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1840,6 +2192,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -1857,6 +2211,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1865,6 +2220,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
@@ -1873,7 +2230,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_default".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },
@@ -1937,6 +2294,73 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Reload);
+    }
+
+    #[tokio::test]
+    async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let expected_data_dir = config.data_dir.clone();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |host, port, config, event_tx, reload_controls, tui_registry| {
+                let seen_tx = seen_tx.clone();
+                Box::pin(async move {
+                    let has_event_tx = event_tx.is_some();
+                    let has_gateway_shutdown_tx = reload_controls.is_some();
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let has_reload_tx = !reload_tx.is_closed();
+                    let has_tui_registry = tui_registry.is_some();
+                    seen_tx
+                        .send((
+                            host,
+                            port,
+                            config.data_dir.clone(),
+                            has_event_tx,
+                            has_gateway_shutdown_tx,
+                            has_reload_tx,
+                            has_tui_registry,
+                        ))
+                        .expect("record gateway starter inputs");
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+        )
+        .await
+        .expect("daemon should return after gateway-triggered reload")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        let (
+            host,
+            port,
+            data_dir,
+            has_event_tx,
+            has_gateway_shutdown_tx,
+            has_reload_tx,
+            has_tui_registry,
+        ) = seen_rx
+            .try_recv()
+            .expect("gateway starter should record its daemon inputs");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 4242);
+        assert_eq!(data_dir, expected_data_dir);
+        assert!(has_event_tx);
+        assert!(has_gateway_shutdown_tx);
+        assert!(has_reload_tx);
+        assert!(has_tui_registry);
     }
 
     #[tokio::test]
@@ -2015,5 +2439,192 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Shutdown);
+    }
+
+    // ── #7895: daemon gateway bind-mode detection (fail-fast) ────────────────
+
+    /// Raw HTTP/1.1 `/health` body a real ZeroClaw gateway returns (shape
+    /// mirrors `handle_health` in `zeroclaw-gateway`): `status: ok` plus the
+    /// identity fields `require_pairing` and `runtime`.
+    fn zeroclaw_health_ok_response() -> Vec<u8> {
+        http_response(
+            "200 OK",
+            br#"{"status":"ok","paired":false,"require_pairing":true,"runtime":{"components":{}}}"#,
+        )
+    }
+
+    /// Build a minimal HTTP/1.1 response with a JSON body.
+    fn http_response(status_line: &str, body: &[u8]) -> Vec<u8> {
+        let mut resp = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(body);
+        resp
+    }
+
+    /// Spawn a one-shot HTTP responder on loopback. It answers the first
+    /// request with `response`, then holds the listener bound until the
+    /// returned guard (`oneshot::Sender`) is dropped — so the bind probe sees
+    /// the port as occupied and the follow-up `/health` probe gets answered.
+    async fn spawn_mock_gateway(response: Vec<u8>) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock listener");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        zeroclaw_spawn::spawn!(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            }
+            // Keep `listener` in scope (port stays bound) until released.
+            let _ = release_rx.await;
+        });
+        (port, release_tx)
+    }
+
+    #[test]
+    fn gateway_probe_authority_maps_wildcards_and_brackets_ipv6() {
+        // Wildcards map to loopback (IPv4 -> 127.0.0.1, IPv6 -> [::1]) the same
+        // way the CLI self-test probe does.
+        assert_eq!(gateway_probe_authority("0.0.0.0"), "127.0.0.1");
+        assert_eq!(gateway_probe_authority("::"), "[::1]");
+        assert_eq!(gateway_probe_authority("[::]"), "[::1]");
+        // Concrete hosts pass through; a bare IPv6 host is bracketed for URLs.
+        assert_eq!(gateway_probe_authority("127.0.0.1"), "127.0.0.1");
+        assert_eq!(gateway_probe_authority("::1"), "[::1]");
+        assert_eq!(gateway_probe_authority("[::1]"), "[::1]");
+        assert_eq!(gateway_probe_authority("example.test"), "example.test");
+    }
+
+    #[test]
+    fn gateway_health_probe_url_defaults_to_http_health() {
+        let config = Config::default();
+        assert_eq!(
+            gateway_health_probe_url(&config, "127.0.0.1", 8080),
+            "http://127.0.0.1:8080/health"
+        );
+    }
+
+    #[test]
+    fn gateway_health_probe_url_maps_ipv6_wildcard_to_loopback() {
+        let config = Config::default();
+        assert_eq!(
+            gateway_health_probe_url(&config, "[::]", 8080),
+            "http://[::1]:8080/health"
+        );
+        assert_eq!(
+            gateway_health_probe_url(&config, "0.0.0.0", 8080),
+            "http://127.0.0.1:8080/health"
+        );
+    }
+
+    #[test]
+    fn gateway_health_probe_url_honours_path_prefix() {
+        let mut config = Config::default();
+        config.gateway.path_prefix = Some("/api".to_string());
+        assert_eq!(
+            gateway_health_probe_url(&config, "127.0.0.1", 8080),
+            "http://127.0.0.1:8080/api/health"
+        );
+    }
+
+    #[test]
+    fn gateway_health_probe_url_uses_https_when_tls_enabled() {
+        let mut config = Config::default();
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            gateway_health_probe_url(&config, "127.0.0.1", 8443),
+            "https://127.0.0.1:8443/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_starts_fresh_on_ephemeral_port() {
+        // Port 0 is kernel-assigned: it cannot already be bound.
+        assert_eq!(
+            detect_gateway_bind_mode(&Config::default(), "0.0.0.0", 0).await,
+            GatewayBindMode::StartFresh
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_starts_fresh_on_free_port() {
+        // Reserve an ephemeral port, then release it so the address is free.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reserve port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert_eq!(
+            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            GatewayBindMode::StartFresh
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_flags_existing_zeroclaw_gateway() {
+        // A real ZeroClaw `/health` (status==ok + identity fields) on an
+        // occupied port → fail fast with the "gateway already running" message.
+        let (port, _release) = spawn_mock_gateway(zeroclaw_health_ok_response()).await;
+        assert_eq!(
+            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            GatewayBindMode::GatewayAlreadyRunning,
+            "a ZeroClaw /health on an occupied port is recognised as a gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_flags_generic_status_ok_as_occupied() {
+        // A foreign service answering the generic `{"status":"ok"}` (no
+        // ZeroClaw identity fields) must NOT be taken for a gateway — it is a
+        // plain occupied port.
+        let (port, _release) =
+            spawn_mock_gateway(http_response("200 OK", br#"{"status":"ok"}"#)).await;
+        assert_eq!(
+            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            GatewayBindMode::PortOccupied,
+            "a generic status:ok health response is not a ZeroClaw gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_flags_non_gateway_404_as_occupied() {
+        let (port, _release) = spawn_mock_gateway(http_response("404 Not Found", b"")).await;
+        assert_eq!(
+            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            GatewayBindMode::PortOccupied,
+            "a non-2xx /health on an occupied port fails fast as a foreign occupant"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_defers_on_non_addr_in_use_error() {
+        // A non-AddrInUse bind failure (e.g. EACCES on a privileged port when
+        // the daemon is not root) is NOT a "port occupied" condition: the
+        // address may be free. Classify it as StartFresh so the supervised
+        // gateway's own bind surfaces the real error, rather than misreporting
+        // the port as in use by another process. Injected directly because the
+        // error is environment-dependent (it would succeed as root in CI).
+        let outcome = classify_gateway_bind_outcome(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &Config::default(),
+            "0.0.0.0",
+            80,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            GatewayBindMode::StartFresh,
+            "a non-AddrInUse bind error must defer to the gateway's own bind, not fail fast"
+        );
     }
 }

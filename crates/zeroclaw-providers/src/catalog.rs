@@ -10,7 +10,13 @@
 //! `list_models_for_family` walks them in that order, returning the first
 //! non-empty list.
 
+use std::time::Duration;
+
 use anyhow::Result;
+use serde::Deserialize;
+
+const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
+const FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// `(models.dev key, openrouter.ai vendor prefix)` for a family name.
 /// Either or both can be `None` for families with no public catalog
@@ -31,6 +37,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "minimax" => (Some("minimax"), Some("minimax")),
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
+        "kilo" => (Some("kilo"), None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),
@@ -60,6 +67,9 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "aihubmix" => (Some("aihubmix"), None),
         "siliconflow" => (Some("siliconflow"), None),
         "venice" => (Some("venice"), None),
+        // NEAR AI Cloud publishes its own no-auth catalog at /v1/model/list.
+        // `list_models_for_family` handles that path before using this tuple.
+        "nearai" => (None, None),
         "novita" => (Some("novita-ai"), None),
         "nvidia" => (Some("nvidia"), Some("nvidia")),
         "vercel" => (Some("vercel"), None),
@@ -74,16 +84,89 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // the provider's `/models` endpoint serves the list directly.
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
-        | "llamacpp" | "ollama" | "custom" => (None, None),
+        | "llamacpp" | "ollama" | "manifest" | "morph" | "github_models" | "upstage"
+        | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => (None, None),
         _ => return None,
     };
     Some(pair)
+}
+
+#[derive(Debug, Deserialize)]
+struct NearaiCatalog {
+    #[serde(default)]
+    models: Vec<NearaiModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NearaiModel {
+    #[serde(rename = "modelId")]
+    model_id: String,
+    #[serde(default)]
+    metadata: NearaiModelMetadata,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NearaiModelMetadata {
+    #[serde(default)]
+    architecture: NearaiArchitecture,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NearaiArchitecture {
+    #[serde(default, rename = "outputModalities")]
+    output_modalities: Vec<String>,
+}
+
+fn is_nearai_chat_model(model: &NearaiModel) -> bool {
+    // Brittle: relies on NEAR keeping the "privacy-filter" substring in
+    // audit-class model IDs. Revisit if NEAR exposes an architectural
+    // classifier (e.g. a `model_class` or `endpoint_type` field) in the
+    // catalog metadata.
+    if model.model_id.contains("privacy-filter") {
+        return false;
+    }
+
+    let arch = &model.metadata.architecture;
+    arch.output_modalities
+        .iter()
+        .any(|modality| modality == "text")
+}
+
+pub(crate) fn parse_nearai_catalog(bytes: &[u8]) -> Result<Vec<String>> {
+    let catalog: NearaiCatalog = serde_json::from_slice(bytes)?;
+    let mut ids: Vec<String> = catalog
+        .models
+        .iter()
+        .filter(|model| is_nearai_chat_model(model))
+        .map(|model| model.model_id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+async fn list_nearai_models() -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .build()?;
+    let response = client
+        .get(NEARAI_CATALOG_URL)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    parse_nearai_catalog(&bytes)
 }
 
 /// Probe the catalog for `family` without constructing a live provider.
 /// Returns the union of every known public catalog source. Errors if
 /// `family` is unknown or has no public catalog source set.
 pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
+    if family == "nearai" {
+        return list_nearai_models().await;
+    }
+
     let Some((md_key, or_prefix)) = catalog_source_for(family) else {
         anyhow::bail!("unknown provider family {family:?}");
     };
@@ -97,6 +180,84 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
         return crate::openrouter_catalog::list_models_for_vendor(p).await;
     }
     anyhow::bail!("no public catalog for family {family:?}")
+}
+
+/// Sort a raw public model catalog for first-run chat/code setup.
+///
+/// This is a provisional catalog-level heuristic until per-model capabilities
+/// become explicit catalog data. Keeping it with the catalog source prevents
+/// every UI/client surface from growing its own model-name classifier.
+#[must_use]
+pub fn sort_model_catalog_for_chat(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
+    let provider_l = provider.to_ascii_lowercase();
+    let mut ranked: Vec<(i32, String, String)> = models
+        .into_iter()
+        .filter_map(|model| {
+            let model_l = model.to_ascii_lowercase();
+            if is_non_chat_model_lower(&model_l) {
+                None
+            } else {
+                Some((chat_model_rank_lower(&provider_l, &model_l), model_l, model))
+            }
+        })
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    Some(ranked.into_iter().map(|(_, _, model)| model).collect())
+}
+
+fn chat_model_rank_lower(provider: &str, model_l: &str) -> i32 {
+    let mut rank = 100;
+
+    if provider.starts_with("openai") {
+        if model_l.starts_with("gpt-5") {
+            rank -= 70;
+        } else if model_l.starts_with("gpt-4.1")
+            || model_l.starts_with("gpt-4o")
+            || model_l.starts_with("o3")
+            || model_l.starts_with("o4")
+        {
+            rank -= 55;
+        } else if model_l.starts_with("gpt-3.5") {
+            rank -= 10;
+        }
+    } else if contains_any(
+        model_l,
+        &[
+            "claude", "sonnet", "opus", "gpt", "gemini", "deepseek", "qwen", "kimi", "llama",
+            "mistral", "grok", "coder", "code", "reason", "r1", "o3", "o4",
+        ],
+    ) {
+        rank -= 45;
+    }
+
+    rank
+}
+
+fn is_non_chat_model_lower(model: &str) -> bool {
+    contains_any(
+        model,
+        &[
+            "image",
+            "audio",
+            "tts",
+            "transcribe",
+            "embedding",
+            "moderation",
+            "realtime",
+            "whisper",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 #[cfg(test)]
@@ -149,6 +310,59 @@ mod tests {
     }
 
     #[test]
+    fn nearai_family_uses_provider_catalog_source() {
+        let (md, or) = catalog_source_for("nearai").expect("nearai is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn parse_nearai_catalog_filters_to_chat_model_ids() {
+        let raw = r#"{
+            "models": [
+                {
+                    "modelId": "zai-org/GLM-5.1-FP8",
+                    "metadata": {
+                        "architecture": {
+                            "inputModalities": ["text"],
+                            "outputModalities": ["text"]
+                        }
+                    }
+                },
+                {
+                    "modelId": "openai/privacy-filter",
+                    "metadata": {
+                        "architecture": {
+                            "inputModalities": ["text"],
+                            "outputModalities": ["text"]
+                        }
+                    }
+                },
+                {
+                    "modelId": "Qwen/Qwen3-Embedding-0.6B",
+                    "metadata": {
+                        "architecture": {
+                            "inputModalities": ["text"],
+                            "outputModalities": ["embedding"]
+                        }
+                    }
+                },
+                {
+                    "modelId": "incomplete",
+                    "metadata": {
+                        "architecture": {
+                            "inputModalities": [],
+                            "outputModalities": []
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let ids = parse_nearai_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(ids, vec!["zai-org/GLM-5.1-FP8"]);
+    }
+
+    #[test]
     fn bespoke_family_with_only_models_dev() {
         let (md, or) = catalog_source_for("azure").expect("azure is canonical");
         assert_eq!(md, Some("azure"));
@@ -160,5 +374,49 @@ mod tests {
         let (md, or) = catalog_source_for("ai21").expect("ai21 is canonical");
         assert_eq!(md, None);
         assert_eq!(or, Some("ai21"));
+    }
+
+    #[test]
+    fn quickstart_sort_prefers_chat_and_coding_models() {
+        let sorted = sort_model_catalog_for_chat(
+            "openai",
+            vec![
+                "chatgpt-image-latest".into(),
+                "text-embedding-ada-002".into(),
+                "gpt-3.5-turbo".into(),
+                "gpt-5".into(),
+                "tts-1".into(),
+            ],
+        )
+        .expect("chat model catalog");
+
+        assert_eq!(sorted[0], "gpt-5");
+        assert!(!sorted.iter().any(|m| m == "chatgpt-image-latest"));
+        assert!(!sorted.iter().any(|m| m == "text-embedding-ada-002"));
+        assert!(!sorted.iter().any(|m| m == "tts-1"));
+
+        let sorted = sort_model_catalog_for_chat(
+            "openrouter",
+            vec![
+                "ai21/jamba-mini".into(),
+                "openai/gpt-4.1".into(),
+                "some/image-model".into(),
+                "anthropic/claude-sonnet-4".into(),
+            ],
+        )
+        .expect("chat model catalog");
+        assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
+        assert_eq!(sorted[1], "openai/gpt-4.1");
+        assert!(!sorted.iter().any(|m| m == "some/image-model"));
+    }
+
+    #[test]
+    fn quickstart_sort_returns_none_when_only_non_chat_models_exist() {
+        let sorted = sort_model_catalog_for_chat(
+            "openai",
+            vec!["gpt-image-1.5".into(), "text-embedding-ada-002".into()],
+        );
+
+        assert!(sorted.is_none());
     }
 }

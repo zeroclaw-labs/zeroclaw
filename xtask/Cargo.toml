@@ -17,20 +17,30 @@ path = "src/bin/fluent.rs"
 name = "web"
 path = "src/bin/web.rs"
 
+[[bin]]
+name = "generate"
+path = "src/bin/generate.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.5", features = ["derive"] }
 fluent-syntax = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+shlex = "1.3"
 toml = "0.8"
+cargo_metadata = "0.18"
+schemars = { version = "1.2" }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 zeroclaw-api = { workspace = true }
 zeroclaw-config = { workspace = true }
+zeroclaw-hardware = { workspace = true }
 zeroclaw-providers = { workspace = true }
 zeroclaw-gateway = { workspace = true, features = ["schema-export"] }
+zerocode = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

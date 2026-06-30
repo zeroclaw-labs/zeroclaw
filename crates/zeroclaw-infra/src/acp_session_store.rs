@@ -59,6 +59,12 @@ pub struct AcpSessionData {
     pub messages: Vec<ConversationMessage>,
 }
 
+pub enum AcpSessionRestore {
+    Missing,
+    Killed,
+    Restorable(AcpSessionData),
+}
+
 /// Lightweight summary for the ACP session picker. Avoids loading the full
 /// message history just to render a one-line label per session.
 pub struct AcpSessionSummary {
@@ -98,6 +104,7 @@ impl AcpSessionStore {
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
                  token_count   INTEGER NOT NULL DEFAULT 0,
+                 killed_at     TEXT,
                  created_at    TEXT NOT NULL,
                  last_activity TEXT NOT NULL
              );
@@ -139,9 +146,44 @@ impl AcpSessionStore {
         )
         .context("Failed to create ACP session schema")?;
 
+        Self::ensure_killed_at_column(&conn)
+            .context("Failed to migrate ACP session killed marker")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn ensure_killed_at_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "killed_at" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute("ALTER TABLE acp_sessions ADD COLUMN killed_at TEXT", []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session killed marker"),
+        }
     }
 
     /// Record a new session. Returns the integer `id` assigned by SQLite.
@@ -214,6 +256,20 @@ impl AcpSessionStore {
             last_activity,
             messages,
         }))
+    }
+
+    /// Load only durable ACP rows that are allowed to become live sessions.
+    /// Killed rows keep their transcript for history/export but are terminal
+    /// for runtime restore paths.
+    pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
+        if self.is_session_killed(session_uuid)? {
+            return Ok(AcpSessionRestore::Killed);
+        }
+
+        match self.load_session(session_uuid)? {
+            Some(data) => Ok(AcpSessionRestore::Restorable(data)),
+            None => Ok(AcpSessionRestore::Missing),
+        }
     }
 
     /// List all sessions as lightweight summaries, ordered by most recent
@@ -330,6 +386,11 @@ impl AcpSessionStore {
                     "out" => outs.push(ToolResultMessage {
                         tool_call_id,
                         content: payload,
+                        // Carry the producing tool name (looked up from the
+                        // matching 'in' row on write) so a resumed session
+                        // stays provenance-aware for media-marker
+                        // canonicalization (PR #7345).
+                        tool_name,
                     }),
                     other => {
                         ::zeroclaw_log::record!(
@@ -590,6 +651,144 @@ impl AcpSessionStore {
         Ok(rows > 0)
     }
 
+    // ── per-agent cascade (agent deletion, #7175) ───────────────────────────
+
+    /// Count *live* ACP sessions for `agent_alias` — rows not yet killed
+    /// (`killed_at IS NULL`). A non-zero count is a HARD blocker for deleting the
+    /// agent: the operator must end the sessions first.
+    pub fn count_live_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_sessions WHERE agent_alias = ?1 AND killed_at IS NULL",
+                params![agent_alias],
+                |row| row.get(0),
+            )
+            .context("Failed to count live ACP sessions for agent")?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Summaries of every ACP session (live or killed) attributed to
+    /// `agent_alias`, for the export-then-delete archive.
+    pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_uuid,
+                        s.agent_alias,
+                        s.workspace_dir,
+                        s.token_count,
+                        s.created_at,
+                        s.last_activity,
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                 FROM acp_sessions s
+                 WHERE s.agent_alias = ?1
+                 ORDER BY s.last_activity DESC",
+            )
+            .context("Failed to prepare ACP per-agent session query")?;
+
+        let rows = stmt
+            .query_map(params![agent_alias], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .context("Failed to query ACP sessions for agent")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                token_count,
+                created_s,
+                activity_s,
+                msg_count,
+            ) = row.context("Failed to read ACP session row")?;
+            out.push(AcpSessionSummary {
+                created_at: parse_ts(&created_s, "created_at", &session_uuid),
+                last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                token_count: token_count.max(0) as u64,
+                message_count: msg_count.max(0) as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete every ACP session (live or killed) for `agent_alias`, returning the
+    /// row count. Child tables (`acp_messages`/`acp_tool_calls`/`acp_session_events`)
+    /// cascade via their `ON DELETE CASCADE` FKs (`foreign_keys = ON`).
+    pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE agent_alias = ?1",
+                params![agent_alias],
+            )
+            .context("Failed to delete ACP sessions for agent")?;
+        Ok(rows)
+    }
+
+    /// Re-point every ACP session (live or killed) from `from` to `to`,
+    /// returning the row count. The agent-rename cascade (#7468) keeps the
+    /// session and its transcript; only the owning alias moves. Unlike delete,
+    /// a live session (`killed_at IS NULL`) is no obstacle to rename.
+    pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET agent_alias = ?2 WHERE agent_alias = ?1",
+                params![from, to],
+            )
+            .context("Failed to rename ACP session owner")?;
+        Ok(rows)
+    }
+
+    /// Persist that an admin intentionally killed this ACP session. The
+    /// transcript stays durable, but runtime rehydration must not revive it.
+    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions
+                    SET killed_at = COALESCE(killed_at, ?1),
+                        last_activity = ?1
+                  WHERE session_uuid = ?2",
+                params![now, session_uuid],
+            )
+            .context("Failed to mark ACP session killed")?;
+        Ok(rows > 0)
+    }
+
+    /// Return whether this durable ACP session has been intentionally killed.
+    /// Missing rows are not killed; callers can then use normal load handling
+    /// to distinguish SESSION_NOT_FOUND from a terminal killed session.
+    pub fn is_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT CASE WHEN killed_at IS NULL THEN 0 ELSE 1 END
+             FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get::<_, i64>(0),
+        );
+        match row {
+            Ok(killed) => Ok(killed != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e).context("Failed to query ACP session killed marker"),
+        }
+    }
+
     /// Update `last_activity` without appending messages.
     pub fn touch_session(&self, session_uuid: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -731,6 +930,7 @@ mod tests {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc-1".into(),
                 content: "file.txt\n".into(),
+                tool_name: String::new(),
             }]),
             ConversationMessage::Chat(ChatMessage::assistant("done")),
         ];
@@ -882,6 +1082,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "ok".into(),
+                        tool_name: String::new(),
                     }]),
                 ],
             )
@@ -905,6 +1106,49 @@ mod tests {
     fn delete_nonexistent_session_returns_false() {
         let (_tmp, store) = open_store();
         assert!(!store.delete_session("ghost").unwrap());
+    }
+
+    #[test]
+    fn mark_session_killed_persists_without_deleting_history() {
+        let (tmp, store) = open_store();
+        store
+            .create_session("sess-kill", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-kill",
+                &[ConversationMessage::Chat(ChatMessage::user("keep this"))],
+            )
+            .unwrap();
+
+        assert!(!store.is_session_killed("sess-kill").unwrap());
+        assert!(store.mark_session_killed("sess-kill").unwrap());
+        assert!(store.is_session_killed("sess-kill").unwrap());
+
+        let data = store.load_session("sess-kill").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            1,
+            "kill marker must not delete durable transcript history"
+        );
+
+        drop(store);
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(
+            reopened.is_session_killed("sess-kill").unwrap(),
+            "kill marker must survive store reopen"
+        );
+        assert!(
+            reopened.load_session("sess-kill").unwrap().is_some(),
+            "durable history remains loadable after reopen"
+        );
+    }
+
+    #[test]
+    fn mark_nonexistent_session_killed_returns_false() {
+        let (_tmp, store) = open_store();
+        assert!(!store.mark_session_killed("ghost").unwrap());
+        assert!(!store.is_session_killed("ghost").unwrap());
     }
 
     #[test]
@@ -1026,5 +1270,48 @@ mod tests {
     fn list_sessions_empty_when_no_sessions() {
         let (_tmp, store) = open_store();
         assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_agent_cascade_counts_live_and_deletes_only_that_agent() {
+        let (_tmp, store) = open_store();
+        store.create_session("a-live", "alpha", "/ws/a1").unwrap();
+        store.create_session("a-killed", "alpha", "/ws/a2").unwrap();
+        store.mark_session_killed("a-killed").unwrap();
+        store.create_session("b-live", "beta", "/ws/b1").unwrap();
+
+        // Only un-killed sessions count as live (the HARD-refuse signal).
+        assert_eq!(store.count_live_sessions_by_agent("alpha").unwrap(), 1);
+        assert_eq!(store.count_live_sessions_by_agent("beta").unwrap(), 1);
+        assert_eq!(store.count_live_sessions_by_agent("ghost").unwrap(), 0);
+
+        // list_by_agent returns all (live + killed) for export.
+        assert_eq!(store.list_sessions_by_agent("alpha").unwrap().len(), 2);
+
+        // delete_by_agent removes exactly that agent's sessions.
+        assert_eq!(store.delete_sessions_by_agent("alpha").unwrap(), 2);
+        assert!(store.list_sessions_by_agent("alpha").unwrap().is_empty());
+        assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rename_sessions_by_agent_repoints_live_and_killed() {
+        let (_tmp, store) = open_store();
+        store.create_session("a-live", "alpha", "/ws/a1").unwrap();
+        store.create_session("a-killed", "alpha", "/ws/a2").unwrap();
+        store.mark_session_killed("a-killed").unwrap();
+        store.create_session("b-live", "beta", "/ws/b1").unwrap();
+
+        // Rename re-points BOTH live and killed sessions; unlike delete, a live
+        // session is no obstacle.
+        assert_eq!(store.rename_sessions_by_agent("alpha", "gamma").unwrap(), 2);
+        assert!(store.list_sessions_by_agent("alpha").unwrap().is_empty());
+        assert_eq!(store.list_sessions_by_agent("gamma").unwrap().len(), 2);
+        // the live session followed the rename
+        assert_eq!(store.count_live_sessions_by_agent("gamma").unwrap(), 1);
+        // beta untouched
+        assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
+        // unknown source → 0
+        assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
     }
 }

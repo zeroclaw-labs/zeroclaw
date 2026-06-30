@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::sync::Arc;
+
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
     MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
@@ -23,6 +25,10 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// most-recent page only; the right-side detail pane shows the tail
 /// of the conversation. Long sessions never load the full history.
 const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
+
+pub(crate) enum DashboardMouseAction {
+    OpenAgentConfig(String),
+}
 
 // ── Tab enum ─────────────────────────────────────────────────────
 
@@ -63,8 +69,8 @@ impl Tab {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-pub(crate) struct Dashboard<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Dashboard {
+    rpc: Arc<RpcClient>,
     connect_label: String,
     insecure_tls: bool,
     tab: Tab,
@@ -78,6 +84,8 @@ pub(crate) struct Dashboard<'a> {
     cron_jobs: Vec<CronJobEntry>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
+    cost_error: Option<String>,
+    sessions_loaded: bool,
     /// Lazy-loaded full payload for the currently-open Memory detail
     /// row. Fetched via `memory/get` on selection (the list rows store
     /// only previews, with `content` truncated to ~200 bytes by the
@@ -119,12 +127,13 @@ pub(crate) struct Dashboard<'a> {
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
+    overview_agents_area: Rect,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
 }
 
-impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
+impl Dashboard {
+    pub(crate) fn new(rpc: Arc<RpcClient>, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
@@ -139,6 +148,8 @@ impl<'a> Dashboard<'a> {
             cron_jobs: Vec::new(),
             memories: Vec::new(),
             memory_error: None,
+            cost_error: None,
+            sessions_loaded: false,
             memory_detail: None,
             memory_detail_key: None,
             tuis: Vec::new(),
@@ -161,6 +172,7 @@ impl<'a> Dashboard<'a> {
             search_query_saved: String::new(),
             tab_area: Rect::default(),
             list_area: Rect::default(),
+            overview_agents_area: Rect::default(),
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
         }
@@ -197,8 +209,20 @@ impl<'a> Dashboard<'a> {
         // Fetch tab-specific data
         match self.tab {
             Tab::Overview => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
-                    self.cost = Some(c);
+                match self.rpc.cost_query(None).await {
+                    Ok(c) => {
+                        self.cost = Some(c);
+                        self.cost_error = None;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not available") {
+                            self.cost_error =
+                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                        } else {
+                            self.cost_error = Some(msg);
+                        }
+                    }
                 }
                 if let Ok(a) = self.rpc.agents_status().await {
                     self.agents = a.agents;
@@ -216,6 +240,7 @@ impl<'a> Dashboard<'a> {
                 };
                 if let Ok(s) = self.rpc.session_list(query).await {
                     self.sessions = s.sessions;
+                    self.sessions_loaded = true;
                 }
             }
             Tab::Agents => {
@@ -252,11 +277,20 @@ impl<'a> Dashboard<'a> {
                 }
             }
             Tab::Health => {} // health already fetched above
-            Tab::Cost => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
+            Tab::Cost => match self.rpc.cost_query(None).await {
+                Ok(c) => {
                     self.cost = Some(c);
+                    self.cost_error = None;
                 }
-            }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") {
+                        self.cost_error = Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                    } else {
+                        self.cost_error = Some(msg);
+                    }
+                }
+            },
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
@@ -329,7 +363,7 @@ impl<'a> Dashboard<'a> {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
@@ -432,7 +466,7 @@ impl<'a> Dashboard<'a> {
 
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -545,6 +579,7 @@ impl<'a> Dashboard<'a> {
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
         let agents_inner = agents_block.inner(chunks[1]);
+        self.overview_agents_area = chunks[1];
         frame.render_widget(agents_block, chunks[1]);
 
         let items: Vec<ListItem> = self
@@ -563,7 +598,10 @@ impl<'a> Dashboard<'a> {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        format!("  ({} active)", a.active_sessions),
+                        format!(
+                            "  ({} live, {} persisted)",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -674,13 +712,15 @@ impl<'a> Dashboard<'a> {
             })
             .collect();
 
+        let title = if self.sessions_loaded {
+            format!(" Sessions ({}) ", filtered.len())
+        } else {
+            " Sessions ".to_string()
+        };
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(Span::styled(
-                        format!(" Sessions ({}) ", filtered.len()),
-                        theme::title_style(),
-                    ))
+                    .title(Span::styled(title, theme::title_style()))
                     .borders(Borders::ALL)
                     .border_style(theme::dim_style()),
             )
@@ -750,11 +790,15 @@ impl<'a> Dashboard<'a> {
             )));
             lines.push(Line::from(""));
             for msg in &self.session_messages {
-                let role_style = match msg.role.as_str() {
-                    "user" => theme::user_label_style(),
-                    "assistant" => theme::agent_label_style(),
-                    "system" => theme::dim_style().add_modifier(Modifier::BOLD),
-                    _ => theme::body_style().add_modifier(Modifier::BOLD),
+                let role_style = match msg.role() {
+                    crate::client::MessageRole::User => theme::user_label_style(),
+                    crate::client::MessageRole::Assistant => theme::agent_label_style(),
+                    crate::client::MessageRole::System => {
+                        theme::dim_style().add_modifier(Modifier::BOLD)
+                    }
+                    crate::client::MessageRole::Other => {
+                        theme::body_style().add_modifier(Modifier::BOLD)
+                    }
                 };
                 lines.push(Line::from(Span::styled(
                     format!("[{}]", msg.role),
@@ -844,7 +888,10 @@ impl<'a> Dashboard<'a> {
                         status_style,
                     ),
                     Span::styled(
-                        format!("  sessions: {}", a.active_sessions),
+                        format!(
+                            "  live: {}, persisted: {}",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -898,9 +945,18 @@ impl<'a> Dashboard<'a> {
             ),
             detail_line(
                 &crate::i18n::t("zc-dashboard-detail-sessions"),
-                &a.active_sessions.to_string(),
+                &format!(
+                    "{} live, {} persisted",
+                    a.live_sessions, a.persisted_sessions
+                ),
             ),
         ];
+        if a.persisted_sessions > 0 {
+            lines.push(detail_line(
+                &crate::i18n::t("zc-dashboard-detail-persisted-sessions"),
+                &a.persisted_sessions.to_string(),
+            ));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1299,6 +1355,15 @@ impl<'a> Dashboard<'a> {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        if let Some(ref err) = self.cost_error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(err.as_str(), theme::warn_style()))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
+
         let Some(ref c) = self.cost else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -1684,6 +1749,19 @@ impl<'a> Dashboard<'a> {
                 self.search_buf.clear();
                 self.last_poll = None; // re-poll for server-side search
             }
+            Some(DashboardTabAction::KillSession) if self.tab == Tab::Sessions => {
+                if let Some(idx) = self.selected_session_index() {
+                    let sid = self.sessions[idx].session_id.clone();
+                    let _ = self.rpc.session_kill(&sid).await;
+                    self.detail_open = false;
+                    self.detail_scroll = 0;
+                    self.session_messages.clear();
+                    self.session_messages_id = None;
+                    self.session_messages_total = 0;
+                    self.session_messages_start = 0;
+                    self.last_poll = None;
+                }
+            }
             _ => {}
         }
         false
@@ -1799,7 +1877,11 @@ impl<'a> Dashboard<'a> {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(&mut self, evt: MouseEvent, _content_area: Rect) {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        evt: MouseEvent,
+        _content_area: Rect,
+    ) -> Option<DashboardMouseAction> {
         use crossterm::event::MouseButton;
 
         let col = evt.column;
@@ -1807,6 +1889,19 @@ impl<'a> Dashboard<'a> {
 
         match evt.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tab == Tab::Overview
+                    && mouse::in_rect(col, row, self.overview_agents_area)
+                    && let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.overview_agents_area,
+                        0,
+                        self.agents.len(),
+                    )
+                    && let Some(agent) = self.agents.get(idx)
+                {
+                    return Some(DashboardMouseAction::OpenAgentConfig(agent.alias.clone()));
+                }
+
                 // Tab bar clicks
                 let labels: Vec<String> = TABS
                     .iter()
@@ -1815,7 +1910,7 @@ impl<'a> Dashboard<'a> {
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
                     self.tab = TABS[idx];
-                    return;
+                    return None;
                 }
 
                 // List clicks
@@ -1858,6 +1953,7 @@ impl<'a> Dashboard<'a> {
             }
             _ => {}
         }
+        None
     }
 
     // ── Navigation helpers ───────────────────────────────────────
@@ -1971,61 +2067,38 @@ impl<'a> Dashboard<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Dashboard<'_> {
+impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::help::entries_for;
+        use crate::keymap::DashboardTabAction as D;
         use crate::widgets::{HelpEntry as E, HelpNode};
 
-        // Global tab-switching always available.
-        let tab_nav = vec![
-            E::new(
-                vec!["Tab", "l", "→"],
-                crate::i18n::t("zc-dashboard-help-next-tab"),
-            ),
-            E::new(
-                vec!["Shift+Tab", "h", "←"],
-                crate::i18n::t("zc-dashboard-help-prev-tab"),
-            ),
-            E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
-            E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
-            E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
-        ];
-
         if self.search_active {
-            return HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-dashboard-help-apply-search")),
-                E::key("Esc", crate::i18n::t("zc-dashboard-help-cancel-search")),
-            ]);
+            return HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]));
         }
 
+        // Global tab-switching always available.
+        let tab_nav = entries_for([D::NextTab, D::PrevTab, D::Tab1, D::Refresh]);
+
         if self.detail_open {
-            return HelpNode::entries(vec![
-                E::new(
-                    vec!["Esc", "Enter"],
-                    crate::i18n::t("zc-dashboard-help-close-detail"),
-                ),
-                E::new(
-                    vec!["j", "k"],
-                    crate::i18n::t("zc-dashboard-help-move-cursor"),
-                ),
-                E::new(
-                    vec!["J", "K"],
-                    crate::i18n::t("zc-dashboard-help-scroll-detail"),
-                ),
-                E::new(
-                    vec!["Shift+↑", "Shift+↓"],
-                    crate::i18n::t("zc-dashboard-help-scroll-detail"),
-                ),
-                E::key(
-                    "Shift+←/→",
-                    crate::i18n::t("zc-dashboard-help-resize-detail"),
-                ),
-                E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
-                E::key("/", crate::i18n::t("zc-dashboard-help-search")),
-                E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
-                E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
-            ]);
+            let mut detail = vec![
+                D::CloseDetail,
+                D::Up,
+                D::Down,
+                D::DetailScrollUp,
+                D::DetailScrollDown,
+                D::DetailWidenLeft,
+                D::DetailWidenRight,
+                D::Refresh,
+                D::BeginSearch,
+            ];
+            if self.tab == Tab::Sessions {
+                detail.push(D::KillSession);
+            }
+            return HelpNode::entries(entries_for(detail));
         }
 
         // Per-tab bindings — only show what actually works on this tab.
@@ -2036,30 +2109,14 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             }
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron => {
                 entries.push(E::spacer());
-                entries.push(E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-dashboard-help-move-cursor-list"),
-                ));
-                entries.push(E::new(
-                    vec!["G", "End"],
-                    crate::i18n::t("zc-dashboard-help-jump-bottom"),
-                ));
-                entries.push(E::new(
-                    vec!["g", "Home"],
-                    crate::i18n::t("zc-dashboard-help-jump-top"),
-                ));
-                entries.push(E::key(
-                    "Enter",
-                    crate::i18n::t("zc-dashboard-help-open-detail"),
-                ));
-                entries.push(E::key(
-                    "/",
-                    crate::i18n::t("zc-dashboard-help-search-filter"),
-                ));
-                entries.push(E::key(
-                    "c",
-                    crate::i18n::t("zc-dashboard-help-clear-search"),
-                ));
+                entries.extend(entries_for([
+                    D::Up,
+                    D::Down,
+                    D::JumpEnd,
+                    D::JumpStart,
+                    D::OpenDetail,
+                    D::BeginSearch,
+                ]));
             }
         }
         HelpNode::entries(entries)
@@ -2078,8 +2135,9 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
 
 fn truncate(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() > max {
-        format!("{}...", &first_line[..max])
+    if first_line.chars().count() > max {
+        let truncated: String = first_line.chars().take(max).collect();
+        format!("{truncated}...")
     } else {
         first_line.to_string()
     }
@@ -2138,5 +2196,57 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.0}K", bytes as f64 / 1024.0)
     } else {
         format!("{bytes}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // Regression: byte-index slicing panicked when the byte length exceeded
+        // `max` but `max` landed inside a multi-byte char. This 35-char CJK
+        // string is 105 bytes, so `&s[..40]` used to panic mid-character even
+        // though the string is well under the 40-*character* budget.
+        let s = "用户询问桌面文件列表，助手列出了桌面上的文件夹和文件，包括名称和大小。";
+        assert_eq!(s.chars().count(), 35);
+        assert!(s.len() > 40);
+        // Under the character budget -> returned unchanged, no panic.
+        assert_eq!(truncate(s, 40), s);
+    }
+
+    #[test]
+    fn truncate_multibyte_at_char_boundary() {
+        // Over the character budget: truncates on a char boundary and appends
+        // the ellipsis without panicking.
+        let s = "一二三四五六七八九十甲乙丙丁";
+        let result = truncate(s, 10);
+        assert_eq!(result, "一二三四五六七八九十...");
+        assert_eq!(result.chars().count(), 13);
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // 10 CJK chars (30 bytes) must not be truncated at a max of 20 chars.
+        let s = "一二三四五六七八九十";
+        assert_eq!(truncate(s, 20), s);
+    }
+
+    #[test]
+    fn truncate_short_ascii_unchanged() {
+        assert_eq!(truncate("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_long_ascii() {
+        let s = "a".repeat(50);
+        let result = truncate(&s, 40);
+        assert_eq!(result, format!("{}...", "a".repeat(40)));
+    }
+
+    #[test]
+    fn truncate_uses_first_line_only() {
+        assert_eq!(truncate("first\nsecond", 40), "first");
     }
 }

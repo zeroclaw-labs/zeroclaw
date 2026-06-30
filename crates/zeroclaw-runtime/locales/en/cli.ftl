@@ -71,8 +71,10 @@ cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
+cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
 cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
 cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
 cli-skills-install-tier-official = Installing {$name} v{$version} — Official (zeroclaw-labs maintained)
@@ -118,8 +120,8 @@ cli-cron-update-about = Update one or more fields of an existing scheduled task
 cli-cron-pause-about = Pause a scheduled task
 cli-cron-resume-about = Resume a paused task
 
-cli-auth-login-about = Login with OAuth (OpenAI Codex or Gemini)
-cli-auth-refresh-about = Refresh OpenAI Codex access token using refresh token
+cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
 cli-auth-list-about = List auth profiles
@@ -383,8 +385,15 @@ channel-wecom-ws-dm-access-denied =
     Your userid: {$userid}
 
     Ask an administrator to add your userid to {$allowed_users_path}.
+channel-discord-interaction-unauthorized = You're not authorized to use this command here.
+channel-discord-interaction-malformed = Unknown or malformed command.
+channel-discord-interaction-unavailable = That command is no longer available, or its input was empty.
+channel-discord-component-expired = This button or menu has expired or was already used.
+channel-discord-approval-recorded = Your decision has been recorded.
 channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
+channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
+channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -406,10 +415,16 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-doctor-systemd-linger-enabled = systemd user lingering enabled
+cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+
+# Service lifecycle warnings.
+cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -432,6 +447,14 @@ cli-skills-tags = Tags:  {$tags}
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.
+cli-sop-pending-none = No SOP runs waiting for approval.
+cli-sop-pending-header = SOP runs waiting for approval:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+# gateway WebSocket SOP approval error frames (UI-surfaced)
+cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
+cli-sop-ws-resolve-failed = sop resolve failed: {$error}
+cli-sop-ws-engine-lock-poisoned = SOP engine lock poisoned
+cli-sop-ws-subsystem-disabled = SOP subsystem not enabled
 cli-sop-create-hint = {"  "}Create one: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}then add SOP.toml and SOP.md
 cli-sop-loaded-header = Loaded SOPs ({$count}):
@@ -483,6 +506,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
+cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
 cli-cron-expr = {"  "}Expr  : {$v}
@@ -502,8 +526,99 @@ cli-cron-every = {"  "}Every(ms): {$v}
 cli-no-command = No command provided.
 cli-press-enter = Press Enter to exit...
 cli-quickstart-title = Quickstart — create one working agent end-to-end.
+cli-quickstart-needs-tty = Quickstart is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `zeroclaw config set <path> <value>` for headless configuration.
 cli-quickstart-cancelled = Quickstart cancelled. No config written.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
+cli-quickstart-create-agent = ── Create agent
+cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
+cli-quickstart-open-selector-prompt = Open a selector (Enter), or pick Create. Esc to quit.
+cli-quickstart-use-existing = Use existing
+cli-quickstart-create-new = Create new
+cli-quickstart-model-provider-prompt = Model provider
+cli-quickstart-pick-configured-provider = Pick a configured provider
+cli-quickstart-row-model-provider = {$glyph} Model provider     — {$summary}
+cli-quickstart-row-risk-profile = {$glyph} Risk profile       — {$summary}
+cli-quickstart-row-memory = {$glyph} Memory             — {$summary}
+cli-quickstart-row-channels = {$glyph} Channels (0..N)    — {$summary}
+cli-quickstart-row-peer-groups = {$glyph} Peer groups        — {$summary}
+cli-quickstart-row-agent-identity = {$glyph} Agent identity     — {$summary}
+cli-quickstart-summary-not-yet-chosen = not yet chosen
+cli-quickstart-summary-not-yet-visited = not yet visited
+cli-quickstart-summary-not-yet-named = not yet named
+cli-quickstart-summary-provider-fresh = {$name} (alias: {$alias}, model: {$model})
+cli-quickstart-summary-use-existing = use existing {$reference}
+cli-quickstart-summary-preset-fresh = preset: {$name}
+cli-quickstart-summary-channels-none = none (chat via `zeroclaw agent` only)
+cli-quickstart-summary-agent = alias: {$alias}, system prompt: {$chars} chars, {$files} personality file(s)
+cli-quickstart-summary-peer-groups-none = none — channels accept no peers
+cli-quickstart-channel-remove-row = {"  "}{$reference} (remove)
+cli-quickstart-peer-group-row = {$channel} → {$name} ({$count} peers)
+cli-quickstart-provider-local-label = {$name} (local)
+cli-quickstart-provider-type-prompt = Provider type
+cli-quickstart-alias-for = Alias for {$name}
+cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
+cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-risk-profile-prompt = Risk profile
+cli-quickstart-memory-backend-prompt = Memory backend
+cli-quickstart-add-channel = + Add a channel
+cli-quickstart-channels-done = Done (channels selector counts as visited)
+cli-quickstart-channels-prompt = Channels (optional, 0..N)
+cli-quickstart-channel-source-prompt = Channel source
+cli-quickstart-all-channels-bound = {"  "}Every configured channel is already bound to an agent. Free one with `zeroclaw config set agents.<alias>.channels ...` before reusing it here.
+cli-quickstart-pick-configured-channel = Pick a configured channel
+cli-quickstart-channel-type-prompt = Channel type
+cli-quickstart-add-peer-group = + Add peer group
+cli-quickstart-done = Done
+cli-quickstart-peer-groups-prompt = Peer groups (Enter on a row to remove, + Add to create)
+cli-quickstart-channel-to-authorize-prompt = Channel to authorize
+cli-quickstart-external-peers-prompt = External peers (comma- or newline-separated, blank for none)
+cli-quickstart-agent-alias-prompt = Agent alias
+cli-quickstart-edit-system-prompt = Edit system prompt in $EDITOR? (blank if you skip)
+cli-quickstart-personality-start-template = Start with template (open in $EDITOR)
+cli-quickstart-personality-start-current = Start from current content (open in $EDITOR)
+cli-quickstart-personality-start-scratch = Start from scratch (open in $EDITOR)
+cli-quickstart-personality-skip = Skip
+cli-quickstart-esc-go-back = {" "}(Esc to go back)
+cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
+cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
+cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
+cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
+cli-quickstart-pick-preset = Pick a preset
+cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
+cli-quickstart-pick-preset-prompt = Pick a {$prompt} preset
+cli-quickstart-step-model-provider = Model provider
+cli-quickstart-step-risk-profile = Risk profile
+cli-quickstart-step-runtime-profile = Runtime profile
+cli-quickstart-step-memory = Memory
+cli-quickstart-step-channels = Channels
+cli-quickstart-step-peer-groups = Peer groups
+cli-quickstart-step-agent = Agent
+cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
+cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
+cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
+cli-quickstart-error-no-configured-path = no `{$path}` configured
+cli-quickstart-error-provider-required = provider type, alias, and model are required
+cli-quickstart-error-unknown-provider-type = unknown model provider type `{$provider}` — pick one from the provider list
+cli-quickstart-error-alias-exists = alias `{$alias}` already exists
+cli-quickstart-error-no-profile = no `{$alias}` profile configured
+cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
+cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
+cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
+cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-peer-group-name-required = peer-group name is required
+cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
+cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
+cli-quickstart-error-peer-group-exists = peer-group `{$name}` already exists
+cli-quickstart-error-personality-workspace = could not create agent workspace: {$err}
+cli-quickstart-error-personality-filename-required = filename is required
+cli-quickstart-error-personality-not-editable = `{$filename}` is not an editable personality file
+cli-quickstart-error-personality-too-large = content exceeds {$limit} char limit
+cli-quickstart-error-personality-stage-failed = stage {$filename} failed: {$err}
+cli-quickstart-error-personality-write-failed = write {$path} failed: {$err}
+cli-quickstart-error-agent-name-required = agent name is required
+cli-quickstart-error-agent-exists = agent `{$name}` already exists
 cli-no-channels-compiled = {"  "}No channel types are compiled into this binary.
 cli-quickstart-complete = Quickstart complete. Created agent `{$alias}`.
 cli-next-steps = Next steps:
@@ -511,6 +626,9 @@ cli-agent-not-created = Your agent was not created — and nothing on disk was c
 cli-onboard-deprecated = `zeroclaw onboard` is deprecated — use `zeroclaw quickstart`.
 cli-otp-initialized = Initialized OTP secret for ZeroClaw.
 cli-otp-enrollment-uri = Enrollment URI: {$uri}
+cli-otp-received = {"  "}✓ OTP received
+cli-secret-captured = {"  "}● Value captured — press Enter to save
+cli-secret-received = {"  "}✓ Secret received
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -518,6 +636,30 @@ cli-pairing-restart = {"   "}Restart the gateway to generate a new pairing code.
 cli-pairing-disabled = ⚠️  Gateway pairing is disabled in config.
 cli-gateway-running-q = {"   "}Is the gateway running? Start it with:
 cli-status-title = 🦀 ZeroClaw Status
+cli-security-status-title = ZeroClaw Security Status
+cli-security-status-source = Source:      {$v}
+cli-security-status-agent = Agent:       {$v}
+cli-security-status-agent-enabled = Agent enabled: {$enabled}
+cli-security-status-risk-profile = Risk profile: {$v}
+cli-security-status-autonomy = Autonomy:   {$v}
+cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
+cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
+cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
+cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
+cli-security-status-credentials-classes-none = none
+cli-security-status-gateway = Gateway:    {$host}:{$port}; pairing required: {$pairing}; public bind: {$public_bind}; TLS: {$tls}
+cli-security-status-warnings = Warnings:   {$v}
+cli-security-status-warnings-none = Warnings:   none
+cli-security-status-warning-agent-disabled = agent is disabled
+cli-security-status-warning-sandbox-disabled = sandboxing is disabled for this agent risk profile
+cli-security-status-warning-sandbox-none = active sandbox is application-layer only
+cli-security-status-warning-sandbox-fallback = requested sandbox backend `{$requested}` fell back to `{$active}`
+cli-security-status-warning-workspace-not-restricted = workspace-only filesystem policy is disabled
+cli-security-status-warning-shell-env-passthrough = {$count} shell environment variable(s) are passed through
+cli-security-status-warning-secrets-unencrypted = config secret encryption is disabled
+cli-security-status-warning-credential-follow-up = some credential-shaped config surfaces still require follow-up
+cli-security-status-warning-pairing-disabled = gateway pairing is not required
+cli-security-status-warning-public-bind-no-tls = gateway allows public bind without TLS enabled
 cli-status-provider-none = 🤖 ModelProvider:      (none configured)
 cli-status-agents-none = 🛡️  Agents:        (none configured)
 cli-status-service-running = 🟢 Service:       running
@@ -538,17 +680,37 @@ cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}Model:         {$model}
 cli-status-observability = 📊 Observability:  {$v}
+cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
 cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-heartbeat = 💓 Heartbeat:      {$v}
+cli-status-heartbeat-every-minutes = every {$minutes}min
+cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
 cli-status-security-noprofile = Security ({$alias}): <no risk_profile>
 cli-status-security = Security ({$alias}):
 cli-status-workspace-only = {"  "}Workspace only:    {$v}
+cli-status-allowed-roots = {"  "}Allowed roots:     {$v}
+cli-status-allowed-commands = {"  "}Allowed commands:  {$v}
 cli-status-max-actions = {"  "}Max actions/hour:  {$v}
+cli-status-cost-tracking = {"  "}Cost tracking:     {$v}
 cli-status-max-cost-day = {"  "}Max cost/day:      ${$v}
 cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
+cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
+cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
 cli-status-otp = {"  "}OTP enabled:       {$v}
 cli-status-estop = {"  "}E-stop enabled:    {$v}
+cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
 cli-status-boards = {"  "}Boards:    {$v}
+cli-status-word-enabled = enabled
+cli-status-word-disabled = disabled
+cli-status-word-yes = yes
+cli-status-word-no = no
+cli-status-word-on = on
+cli-status-word-off = off
+cli-status-word-none = (none)
+cli-status-word-configured = configured
+cli-status-word-not-configured = not configured
+cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
 cli-desktop-not-installed = ZeroClaw companion app is not installed.
@@ -559,9 +721,18 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
+cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
+cli-plugin-migrated = Moved {$count} plugin(s) from {$path} to {$target}.
+cli-plugin-migrate-none = Nothing to migrate.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
 cli-estop-status = Estop status:
@@ -596,6 +767,16 @@ cli-auth-active-for = Active profile for {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
+cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-xai-device-code-started = xAI device-code login started.
+cli-auth-oauth-visit = Visit: {$uri}
+cli-auth-oauth-code = Code:  {$code}
+cli-auth-oauth-fast-link = Fast link: {$uri}
+cli-auth-xai-open-oauth-url = Open this xAI OAuth URL in your browser and authorize access:
+cli-auth-callback-capture-failed = Callback capture failed: {$error}
+cli-auth-run-paste-redirect = Run `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.
+cli-auth-paste-redirect-requires-input = paste-redirect requires the redirect URL or OAuth code
 
 # ── locales fetch ──
 cli-locales-fetched = {"  "}fetched {$name} -> {$path}
@@ -616,15 +797,109 @@ cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 # ── update (zeroclaw update) ──
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
+cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.
+cli-update-available = Update available: v{$current} -> v{$latest}
+cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
+cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
 cli-selftest-some-failed = {$failed}/{$total} checks failed.
+cli-selftest-channel-config-uncompiled = {$compiled} compiled channel types, {$configured} compiled/configured; configured but not compiled: {$names}. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 
 # ── channels (zeroclaw channel list) ──
 cli-channels-header = Channels:
 cli-channels-cli-always = {"  "}✅ CLI (always available)
 cli-channels-notion = {"  "}{$status} Notion
+cli-channels-not-compiled-header = {"  "}Configured but not compiled in this binary:
+cli-channels-not-compiled-entry = {"  "}🚫 {$name} (configured, not compiled)
+cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
-cli-channels-configure-hint = To configure:      zeroclaw onboard
+cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
+
+# ── Agent turn-engine user-visible markers (#7415) ────────────────────
+# Appended to (or persisted as) assistant output when a turn is cut short;
+# shown to end users across every transport (channels, WS, RPC, ACP, CLI).
+turn-interrupted-by-user = [interrupted by user]
+# Shown when a turn ends because the client RPC channel cancelled it. The actor
+# is not verified: human interrupt and programmatic client cancels both arrive
+# on this path, so the wording names the channel, not a user.
+turn-cancelled-client-rpc = [turn cancelled via client]
+turn-stream-interrupted = [stream interrupted]
+# Breadcrumb injected into history where older turns were dropped to fit the
+# context budget; user-visible across channels, WS, RPC, ACP.
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+# Reason carried on every history_trimmed event (WS, SSE, ACP).
+history-trim-reason-budget = context token budget exceeded
+# Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
+# turn before it reaches the model. Unreachable under the default `Loop` policy
+# (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
+turn-ingress-dropped = This request was not processed: { $reason }
+turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+# Safe reply delivered when the model repeatedly emits malformed internal
+# tool-call protocol and the turn gives up retrying.
+channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-stop-sent = Stop signal sent.
+channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
+channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
+channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+
+# ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
+cli-alias-list-empty = (no entries under {$section})
+cli-alias-created = created {$section}.{$alias}
+cli-alias-exists = {$section}.{$alias} already exists (no change)
+cli-alias-impact-scrub-header = deleting {$section}.{$alias} would scrub {$count} reference(s):
+cli-alias-impact-blocked-header = deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):
+cli-alias-impact-blocker = ✗ {$path} (hard reference)
+cli-alias-impact-scrub = • {$path} (would be scrubbed)
+cli-alias-no-changes = No changes made. Re-run with --yes to apply (or --dry-run to preview).
+cli-alias-warn-workspace-archive = warning: workspace archive failed: {$error}
+cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}
+cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
+cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
+cli-alias-warn = warning: {$warning}
+cli-alias-deleted = deleted {$section}.{$alias} (scrubbed {$count} reference(s))
+cli-alias-delete-refused-header = refused: {$count} hard reference(s) block the delete:
+cli-alias-delete-refused-hint = delete refused — resolve the hard references first
+cli-alias-not-configured = {$path} is not configured
+cli-alias-delete-failed = delete failed: {$error}
+cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-create-reserved-default = the `default` agent is reserved and cannot be created
+cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
+cli-alias-rename-invalid = invalid new alias: {$message}
+cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
+cli-alias-rename-postcondition = rename cascade post-condition failed: {$message}
+cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
+cli-alias-no-such-section = no such config section: {$section}
+cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first
+cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
+cli-bundle-not-configured = skill bundle '{$alias}' is not configured
+cli-bundle-rename-failed = rename failed: {$error}
+
+# ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
+cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
+cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})
+cli-bundle-created-warn = created skill_bundles.{$alias} (warning: dir resolve failed: {$error})
+cli-bundle-impact-header = deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):
+cli-bundle-no-changes = No changes made. Re-run with --yes to apply.
+cli-bundle-archived = archived bundle directory → {$path}
+cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
+cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
+cli-bundle-warn-move = warning: bundle directory move failed: {$error}
+cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
+# Emitted by the daemon startup guard in src/main.rs when the configured gateway
+# address is already bound. The daemon supervises its own in-process gateway
+# (shared event bus / canvas / reload channel) and cannot adopt a separate
+# process, so it fails fast with an actionable message instead of degrading into
+# a supervisor retry loop. The two variants differ only by who holds the port.
+cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.

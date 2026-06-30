@@ -1,6 +1,7 @@
 use crate::util::*;
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_BATCH_SIZE: usize = 50;
 
@@ -152,7 +153,7 @@ fn call_api(
         .enable_all()
         .build()?;
     let content = rt.block_on(async {
-        provider
+        ProviderDispatch::from_ref(provider)
             .chat_with_system(Some(&system), &user_content, model, None)
             .await
     })?;

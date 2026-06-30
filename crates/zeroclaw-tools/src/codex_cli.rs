@@ -13,7 +13,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Codex CLI (`codex -q`).
+/// Delegates coding tasks to the Codex CLI (`codex exec`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Codex, which has its own
@@ -39,7 +39,7 @@ impl Tool for CodexCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Codex CLI (codex -q). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
+        "Delegate a coding task to Codex CLI (codex exec). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -93,6 +93,16 @@ impl Tool for CodexCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
+            // Resolve relative working_directory against workspace_dir, NOT
+            // the daemon's current working directory. This prevents the bug
+            // where an external coding tool's relative working_directory
+            // would silently resolve to a path outside the workspace when
+            // the daemon cwd differs from workspace_dir.
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
             let workspace = &self.security.workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
@@ -136,14 +146,24 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Build CLI command
+        // Build CLI command: `codex exec [extra_args...] <prompt>`
         let codex_bin = if cfg!(target_os = "windows") {
             "codex.cmd"
         } else {
             "codex"
         };
         let mut cmd = Command::new(codex_bin);
-        cmd.arg("-q").arg(prompt);
+        cmd.arg("exec");
+
+        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
+        for arg in &self.config.extra_args {
+            let trimmed = arg.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
+
+        cmd.arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();
@@ -246,6 +266,17 @@ mod tests {
         })
     }
 
+    fn test_security_with_workspace(
+        autonomy: AutonomyLevel,
+        workspace_dir: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn codex_cli_tool_name() {
         let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
@@ -328,12 +359,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_cli_resolves_relative_working_directory_under_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
+        let relative_working_directory = "relative-workdir";
+        std::fs::create_dir(workspace.path().join(relative_working_directory))
+            .expect("relative working directory");
+
+        let previous_path = std::env::var_os("PATH");
+        // SAFETY: this test is intended to run with `--test-threads=1` and
+        // restores PATH before returning.
+        unsafe { std::env::set_var("PATH", empty_path.path()) };
+        let _path_guard = scopeguard::guard(previous_path, |previous_path| match previous_path {
+            Some(previous_path) => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::set_var("PATH", previous_path) }
+            }
+            None => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::remove_var("PATH") }
+            }
+        });
+
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "working_directory": relative_working_directory
+            }))
+            .await
+            .expect("should return a result after path validation");
+        let error = result.error.as_deref().unwrap_or("");
+
+        assert!(!result.success);
+        assert!(
+            !error.contains("outside the workspace"),
+            "relative working_directory should resolve inside workspace; got {error:?}"
+        );
+        assert!(
+            error.contains("Codex CLI ('codex') not found in PATH"),
+            "expected missing Codex CLI after path validation; got {error:?}"
+        );
+    }
+
     #[test]
     fn codex_cli_env_passthrough_defaults() {
         let config = CodexCliConfig::default();
         assert!(
             config.env_passthrough.is_empty(),
             "env_passthrough should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_extra_args_defaults() {
+        let config = CodexCliConfig::default();
+        assert!(
+            config.extra_args.is_empty(),
+            "extra_args should default to empty"
         );
     }
 

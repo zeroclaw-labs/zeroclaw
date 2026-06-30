@@ -409,6 +409,9 @@ mod tests {
         );
     }
 
+    // Symlink escape is a Unix-only concern; `std::os::unix::fs::symlink`
+    // and the threat it exercises don't exist on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn glob_search_filters_symlink_into_write_only_root() {
         let workspace = TempDir::new().unwrap();
@@ -416,10 +419,7 @@ mod tests {
         std::fs::write(sibling.path().join("secret.txt"), "secret").unwrap();
 
         let symlink_path = workspace.path().join("siblings");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(sibling.path(), &symlink_path).unwrap();
-        #[cfg(not(unix))]
-        return;
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,

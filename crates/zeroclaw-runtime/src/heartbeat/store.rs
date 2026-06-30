@@ -76,8 +76,12 @@ pub fn record_run(
 
 /// List the most recent heartbeat runs.
 pub fn list_runs(workspace_dir: &Path, limit: usize) -> Result<Vec<HeartbeatRun>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     with_connection(workspace_dir, |conn| {
-        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let lim = i64::try_from(limit).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
             "SELECT id, task_text, task_priority, started_at, finished_at, status, output, duration_ms
              FROM heartbeat_runs
@@ -257,6 +261,28 @@ mod tests {
 
         let runs = list_runs(tmp.path(), 10).unwrap();
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn list_runs_zero_limit_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+
+        record_run(
+            tmp.path(),
+            "Task",
+            "medium",
+            now,
+            now,
+            "ok",
+            Some("done"),
+            10,
+            0,
+        )
+        .unwrap();
+
+        assert!(list_runs(tmp.path(), 0).unwrap().is_empty());
+        assert_eq!(list_runs(tmp.path(), 10).unwrap().len(), 1);
     }
 
     #[test]

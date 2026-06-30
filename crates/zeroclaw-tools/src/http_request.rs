@@ -1,6 +1,10 @@
+use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +20,22 @@ pub struct HttpRequestTool {
     timeout_secs: u64,
     allow_private_hosts: bool,
     allowed_private_hosts: Vec<String>,
+    config_path: Option<PathBuf>,
+    secrets_encrypt: bool,
+}
+
+#[derive(Debug)]
+struct ValidatedHttpRequestTarget {
+    url: String,
+    host: String,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+struct HttpRequestUrlPolicy {
+    url: String,
+    host: String,
+    port: u16,
+    private_resolution_allowed: bool,
 }
 
 impl HttpRequestTool {
@@ -29,15 +49,55 @@ impl HttpRequestTool {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains)?,
+            allowed_domains: domain_guard::normalize_allowed_domains(
+                allowed_domains,
+                "http_request.allowed_domains",
+            )?,
             max_response_size,
             timeout_secs,
             allow_private_hosts,
-            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts)?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "http_request.allowed_private_hosts",
+            )?,
+            config_path: None,
+            secrets_encrypt: false,
+        })
+    }
+    pub fn new_with_config(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        max_response_size: usize,
+        timeout_secs: u64,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<String>,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            security,
+            allowed_domains: domain_guard::normalize_allowed_domains(
+                allowed_domains,
+                "http_request.allowed_domains",
+            )?,
+            max_response_size,
+            timeout_secs,
+            allow_private_hosts,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "http_request.allowed_private_hosts",
+            )?,
+            config_path: Some(config_path),
+            secrets_encrypt,
         })
     }
 
+    #[cfg(test)]
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
+        Ok(self.validate_url_policy(raw_url)?.url)
+    }
+
+    fn validate_url_policy(&self, raw_url: &str) -> anyhow::Result<HttpRequestUrlPolicy> {
         let url = raw_url.trim();
 
         if url.is_empty() {
@@ -59,23 +119,76 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
-        let private_host = is_private_or_local_host(&host);
-        let private_host_explicitly_allowed =
-            private_host && host_matches_allowlist(&host, &self.allowed_private_hosts);
+        if host
+            .parse::<IpAddr>()
+            .is_ok_and(domain_guard::is_cloud_metadata_ip)
+        {
+            anyhow::bail!("Blocked cloud metadata host: {host}");
+        }
+        let port = extract_port(url)?;
+
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_explicitly_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
         if private_host && !private_host_explicitly_allowed && !self.allow_private_hosts {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if private_host_explicitly_allowed {
-            return Ok(url.to_string());
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+        if !private_host_explicitly_allowed
+            && !domain_guard::host_matches_allowlist(&host, &self.allowed_domains)
+        {
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
-        Ok(url.to_string())
+        let private_resolution_allowed = self.allow_private_hosts
+            || domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+
+        Ok(HttpRequestUrlPolicy {
+            url: url.to_string(),
+            host,
+            port,
+            private_resolution_allowed,
+        })
+    }
+
+    async fn validate_request_target(
+        &self,
+        raw_url: &str,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget> {
+        self.validate_request_target_with_resolver(raw_url, resolve_host_for_request)
+            .await
+    }
+
+    async fn validate_request_target_with_resolver<F, Fut>(
+        &self,
+        raw_url: &str,
+        resolve_host: F,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<SocketAddr>>>,
+    {
+        let policy = self.validate_url_policy(raw_url)?;
+        let resolved_addrs = if let Ok(ip) = policy.host.parse::<IpAddr>() {
+            vec![SocketAddr::new(ip, policy.port)]
+        } else {
+            resolve_host(policy.host.clone(), policy.port).await?
+        };
+        validate_resolved_ips_for_ssrf(
+            &policy.host,
+            policy.private_resolution_allowed,
+            &resolved_addrs
+                .iter()
+                .map(|addr| addr.ip())
+                .collect::<Vec<_>>(),
+        )?;
+
+        Ok(ValidatedHttpRequestTarget {
+            url: policy.url,
+            host: policy.host,
+            resolved_addrs,
+        })
     }
 
     fn validate_method(&self, method: &str) -> anyhow::Result<reqwest::Method> {
@@ -111,6 +224,89 @@ impl HttpRequestTool {
         Ok(result)
     }
 
+    fn validate_secret_name(secret_name: &str) -> anyhow::Result<()> {
+        if secret_name.is_empty() {
+            anyhow::bail!("auth_secret cannot be empty");
+        }
+        if secret_name.len() > 64 {
+            anyhow::bail!("auth_secret must be 64 characters or fewer");
+        }
+        if !secret_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "auth_secret must contain only ASCII letters, numbers, underscores, or hyphens"
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        Self::validate_secret_name(secret_name)?;
+        self.reload_auth_secret(secret_name)
+    }
+
+    fn reload_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("auth_secret requires runtime config reload support")
+        })?;
+        if config_path.as_os_str().is_empty() {
+            anyhow::bail!("auth_secret requires a config.toml path");
+        }
+
+        let contents = std::fs::read_to_string(config_path).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for auth_secret '{secret_name}': {e}",
+                config_path.display()
+            ))
+        })?;
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {} for auth_secret '{secret_name}': {e}",
+                config_path.display()
+            ))
+        })?;
+
+        let raw_secret = config
+            .http_request
+            .secrets
+            .get(secret_name)
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| anyhow::Error::msg(format!("auth_secret '{secret_name}' not found")))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(raw_secret) {
+            let zeroclaw_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(raw_secret)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("auth_secret '{secret_name}' is empty after decryption");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_secret.clone())
+        }
+    }
+
+    fn apply_auth_secret(
+        &self,
+        headers: &mut HeaderMap,
+        auth_secret: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(secret_name) = auth_secret else {
+            return Ok(());
+        };
+        let secret = self.resolve_auth_secret(secret_name)?;
+        let header_value = HeaderValue::from_str(&secret).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Invalid value for auth_secret '{secret_name}' as Authorization header: {e}"
+            ))
+        })?;
+        headers.insert(AUTHORIZATION, header_value);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
@@ -133,7 +329,7 @@ impl HttpRequestTool {
 
     async fn execute_request(
         &self,
-        url: &str,
+        target: &ValidatedHttpRequestTarget,
         method: reqwest::Method,
         headers: HeaderMap,
         body: Option<&str>,
@@ -155,9 +351,14 @@ impl HttpRequestTool {
             .redirect(reqwest::redirect::Policy::none());
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
+        let builder = if target.host.parse::<IpAddr>().is_ok() {
+            builder
+        } else {
+            builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
+        };
         let client = builder.build()?;
 
-        let mut request = client.request(method, url).headers(headers);
+        let mut request = client.request(method, &target.url).headers(headers);
 
         if let Some(body_str) = body {
             request = request.body(body_str.to_string());
@@ -210,8 +411,12 @@ impl Tool for HttpRequestTool {
                 },
                 "headers": {
                     "type": "object",
-                    "description": "Optional HTTP headers as key-value pairs (e.g., {\"Authorization\": \"Bearer token\", \"Content-Type\": \"application/json\"})",
+                    "description": "Optional HTTP headers as key-value pairs. Use auth_secret for Authorization values that should come from config secrets.",
                     "default": {}
+                },
+                "auth_secret": {
+                    "type": "string",
+                    "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Overrides any literal Authorization header."
                 },
                 "body": {
                     "type": "string",
@@ -236,6 +441,19 @@ impl Tool for HttpRequestTool {
 
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
+        let auth_secret = match args.get("auth_secret") {
+            Some(value) => match value.as_str() {
+                Some(secret_name) => Some(secret_name),
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'auth_secret' must be a string".into()),
+                    });
+                }
+            },
+            None => None,
+        };
         let body = args.get("body").and_then(|v| v.as_str());
 
         if !self.security.can_act() {
@@ -249,7 +467,7 @@ impl Tool for HttpRequestTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        let url = match self.validate_url(url) {
+        let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -271,7 +489,7 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = match self.parse_headers(&headers_val) {
+        let mut request_headers = match self.parse_headers(&headers_val) {
             Ok(h) => h,
             Err(e) => {
                 return Ok(ToolResult {
@@ -281,9 +499,16 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
+        if let Err(e) = self.apply_auth_secret(&mut request_headers, auth_secret) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            });
+        }
 
         match self
-            .execute_request(&url, method, request_headers, body)
+            .execute_request(&target, method, request_headers, body)
             .await
         {
             Ok(response) => {
@@ -337,70 +562,6 @@ impl Tool for HttpRequestTool {
     }
 }
 
-// Helper functions similar to browser_open.rs
-
-fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut rejected = Vec::new();
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| {
-            normalize_domain(&d).or_else(|| {
-                rejected.push(d.clone());
-                None
-            })
-        })
-        .collect::<Vec<_>>();
-    if !rejected.is_empty() {
-        anyhow::bail!(
-            "Invalid http_request.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
-            rejected.join(", ")
-        );
-    }
-    normalized.sort_unstable();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let input = raw.trim();
-    if input.is_empty() || input.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
-        (true, true) => &input[1..input.len() - 1],
-        (false, false) => input,
-        _ => return None,
-    };
-    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string().to_lowercase());
-    }
-
-    let parsed = reqwest::Url::parse(input)
-        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
-        .ok()?;
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-
-    let host = parsed.host_str()?;
-    let trimmed = host.trim();
-    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
-        (true, true) => &trimmed[1..trimmed.len() - 1],
-        (false, false) => trimmed,
-        _ => return None,
-    };
-    let normalized = host_no_brackets
-        .trim_start_matches('.')
-        .trim_end_matches('.');
-    if normalized.is_empty() {
-        return None;
-    }
-
-    Some(normalized.to_lowercase())
-}
-
 fn extract_host(url: &str) -> anyhow::Result<String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         ::zeroclaw_log::record!(
@@ -449,82 +610,46 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
+fn extract_port(url: &str) -> anyhow::Result<u16> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
 
-    let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
-    allowed_domains.iter().any(|domain| {
-        if host_is_ip || domain.parse::<std::net::IpAddr>().is_ok() {
-            host == domain
-        } else {
-            host == domain
-                || host
-                    .strip_suffix(domain)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        }
-    })
+    parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a valid port"))
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
-    // Strip brackets from IPv6 addresses like [::1]
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+async fn resolve_host_for_request(host: String, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to resolve host '{host}': {e}")))?
+        .collect::<Vec<_>>();
 
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
-        return true;
+    if addrs.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
     }
 
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
+    Ok(addrs)
+}
+
+fn validate_resolved_ips_for_ssrf(
+    host: &str,
+    private_resolution_allowed: bool,
+    ips: &[std::net::IpAddr],
+) -> anyhow::Result<()> {
+    if private_resolution_allowed {
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+    } else {
+        domain_guard::validate_resolved_ips_are_public(host, ips)
     }
-
-    false
-}
-
-/// Returns true if the IPv4 address is not globally routable.
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()                       // 127.0.0.0/8
-        || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
-        || v4.is_link_local()              // 169.254.0.0/16
-        || v4.is_unspecified()             // 0.0.0.0
-        || v4.is_broadcast()              // 255.255.255.255
-        || v4.is_multicast()              // 224.0.0.0/4
-        || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
-        || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
-        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
-        || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
-        || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
-        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
-}
-
-/// Returns true if the IPv6 address is not globally routable.
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()                       // ::1
-        || v6.is_unspecified()             // ::
-        || v6.is_multicast()              // ff00::/8
-        || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
-        || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::AUTHORIZATION;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -562,74 +687,237 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn normalize_domain_strips_scheme_path_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
+    fn test_tool_with_auth_config(config_path: PathBuf, secrets_encrypt: bool) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            secrets_encrypt,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn normalize_domain_accepts_ipv6_literal() {
-        let got = normalize_domain("[2001:db8::1]").unwrap();
-        assert_eq!(got, "2001:db8::1");
+    fn schema_includes_auth_secret_parameter() {
+        let tool = test_tool(vec!["example.com"]);
+        let schema = tool.parameters_schema();
+        let properties = schema["properties"].as_object().expect("schema properties");
+
+        assert!(
+            properties.contains_key("auth_secret"),
+            "http_request schema must expose auth_secret"
+        );
     }
 
     #[test]
-    fn normalize_domain_rejects_userinfo() {
-        assert!(normalize_domain("https://user@example.com").is_none());
-        assert!(normalize_domain("user@example.com").is_none());
-        assert!(normalize_domain("https://user:pass@example.com").is_none());
-        assert!(normalize_domain("user:pass@example.com").is_none());
+    fn resolve_auth_secret_requires_config_reload_support() {
+        let tool = test_tool(vec!["example.com"]);
+
+        let err = tool.resolve_auth_secret("api_token").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth_secret requires runtime config reload support"),
+            "auth_secret without config path must fail clearly: {err}"
+        );
     }
 
     #[test]
-    fn normalize_domain_rejects_unmatched_brackets() {
-        assert!(normalize_domain("[::1").is_none());
-        assert!(normalize_domain("::1]").is_none());
-        assert!(normalize_domain("[127.0.0.1").is_none());
-        assert!(normalize_domain("127.0.0.1]").is_none());
+    fn auth_secret_overrides_explicit_authorization_header() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-secret"
+"#,
+        )
+        .unwrap();
+        let tool = test_tool_with_auth_config(config_path, false);
+        let mut headers = tool
+            .parse_headers(&json!({"Authorization": "Bearer literal"}))
+            .unwrap();
+
+        tool.apply_auth_secret(&mut headers, Some("api_token"))
+            .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer from-secret",
+            "auth_secret must win over literal Authorization headers"
+        );
+    }
+
+    #[test]
+    fn auth_secret_reloads_plain_config_value_without_boot_secret() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-disk"
+"#,
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tool.resolve_auth_secret("api_token").unwrap(),
+            "Bearer from-disk"
+        );
+    }
+
+    #[test]
+    fn auth_secret_decrypts_reloaded_config_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("Bearer encrypted-secret").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[http_request.secrets]
+api_token = "{encrypted}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            true,
+        )
+        .unwrap();
+        let mut headers = tool
+            .parse_headers(&json!({"Authorization": "Bearer literal"}))
+            .unwrap();
+
+        tool.apply_auth_secret(&mut headers, Some("api_token"))
+            .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer encrypted-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sends_auth_secret_as_authorization_header() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 loopback is unavailable in this environment.
+        };
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let _ = seen_tx.send(request.contains("authorization: bearer from-secret"));
+
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-secret"
+"#,
+        )
+        .unwrap();
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["::1".into()],
+            1_000_000,
+            5,
+            true,
+            Vec::new(),
+            config_path,
+            false,
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.execute(json!({
+                "url": format!("http://[::1]:{port}/"),
+                "auth_secret": "api_token",
+                "headers": {
+                    "Authorization": "Bearer literal"
+                }
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let saw_auth_header = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        server_handle.abort();
+
+        assert!(result.success);
+        assert!(
+            saw_auth_header,
+            "auth_secret must send the resolved Authorization header"
+        );
     }
 
     #[test]
     fn extract_host_normalizes_ipv6_without_brackets() {
         let got = extract_host("https://[2001:db8::1]:443/path").unwrap();
         assert_eq!(got, "2001:db8::1");
-    }
-
-    #[test]
-    fn normalize_allowed_domains_rejects_invalid_entries() {
-        let err = normalize_allowed_domains(vec![
-            "".into(),
-            "example.com".into(),
-            "   ".into(),
-            "api.example.com".into(),
-        ])
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Invalid http_request.allowed_domains entry"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn normalize_allowed_domains_accepts_all_valid() {
-        let got = normalize_allowed_domains(vec!["example.com".into(), "api.example.com".into()])
-            .unwrap();
-        assert_eq!(got.len(), 2);
-        assert!(got.contains(&"example.com".to_string()));
-        assert!(got.contains(&"api.example.com".to_string()));
-    }
-
-    #[test]
-    fn normalize_allowed_domains_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ])
-        .unwrap();
-        assert_eq!(got, vec!["example.com".to_string()]);
     }
 
     #[test]
@@ -746,89 +1034,6 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         let err = tool.validate_method("INVALID").unwrap_err().to_string();
         assert!(err.contains("Unsupported HTTP method"));
-    }
-
-    #[test]
-    fn blocks_multicast_ipv4() {
-        assert!(is_private_or_local_host("224.0.0.1"));
-        assert!(is_private_or_local_host("239.255.255.255"));
-    }
-
-    #[test]
-    fn blocks_broadcast() {
-        assert!(is_private_or_local_host("255.255.255.255"));
-    }
-
-    #[test]
-    fn blocks_reserved_ipv4() {
-        assert!(is_private_or_local_host("240.0.0.1"));
-        assert!(is_private_or_local_host("250.1.2.3"));
-    }
-
-    #[test]
-    fn blocks_documentation_ranges() {
-        assert!(is_private_or_local_host("192.0.2.1")); // TEST-NET-1
-        assert!(is_private_or_local_host("198.51.100.1")); // TEST-NET-2
-        assert!(is_private_or_local_host("203.0.113.1")); // TEST-NET-3
-    }
-
-    #[test]
-    fn blocks_benchmarking_range() {
-        assert!(is_private_or_local_host("198.18.0.1"));
-        assert!(is_private_or_local_host("198.19.255.255"));
-    }
-
-    #[test]
-    fn blocks_ipv6_localhost() {
-        assert!(is_private_or_local_host("::1"));
-        assert!(is_private_or_local_host("[::1]"));
-    }
-
-    #[test]
-    fn blocks_ipv6_multicast() {
-        assert!(is_private_or_local_host("ff02::1"));
-    }
-
-    #[test]
-    fn blocks_ipv6_link_local() {
-        assert!(is_private_or_local_host("fe80::1"));
-    }
-
-    #[test]
-    fn blocks_ipv6_unique_local() {
-        assert!(is_private_or_local_host("fd00::1"));
-    }
-
-    #[test]
-    fn blocks_ipv4_mapped_ipv6() {
-        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
-        assert!(is_private_or_local_host("::ffff:192.168.1.1"));
-        assert!(is_private_or_local_host("::ffff:10.0.0.1"));
-    }
-
-    #[test]
-    fn allows_public_ipv4() {
-        assert!(!is_private_or_local_host("8.8.8.8"));
-        assert!(!is_private_or_local_host("1.1.1.1"));
-        assert!(!is_private_or_local_host("93.184.216.34"));
-    }
-
-    #[test]
-    fn blocks_ipv6_documentation_range() {
-        assert!(is_private_or_local_host("2001:db8::1"));
-    }
-
-    #[test]
-    fn allows_public_ipv6() {
-        assert!(!is_private_or_local_host("2607:f8b0:4004:800::200e"));
-    }
-
-    #[test]
-    fn blocks_shared_address_space() {
-        assert!(is_private_or_local_host("100.64.0.1"));
-        assert!(is_private_or_local_host("100.127.255.255"));
-        assert!(!is_private_or_local_host("100.63.0.1")); // Just below range
-        assert!(!is_private_or_local_host("100.128.0.1")); // Just above range
     }
 
     #[tokio::test]
@@ -978,37 +1183,6 @@ mod tests {
         assert_eq!(headers[0].1, "Bearer real-token");
     }
 
-    // ── SSRF: alternate IP notation bypass defense-in-depth ─────────
-    //
-    // Rust's IpAddr::parse() rejects non-standard notations (octal, hex,
-    // decimal integer, zero-padded). These tests document that property
-    // so regressions are caught if the parsing strategy ever changes.
-
-    #[test]
-    fn ssrf_octal_loopback_not_parsed_as_ip() {
-        // 0177.0.0.1 is octal for 127.0.0.1 in some languages, but
-        // Rust's IpAddr rejects it — it falls through as a hostname.
-        assert!(!is_private_or_local_host("0177.0.0.1"));
-    }
-
-    #[test]
-    fn ssrf_hex_loopback_not_parsed_as_ip() {
-        // 0x7f000001 is hex for 127.0.0.1 in some languages.
-        assert!(!is_private_or_local_host("0x7f000001"));
-    }
-
-    #[test]
-    fn ssrf_decimal_loopback_not_parsed_as_ip() {
-        // 2130706433 is decimal for 127.0.0.1 in some languages.
-        assert!(!is_private_or_local_host("2130706433"));
-    }
-
-    #[test]
-    fn ssrf_zero_padded_loopback_not_parsed_as_ip() {
-        // 127.000.000.001 uses zero-padded octets.
-        assert!(!is_private_or_local_host("127.000.000.001"));
-    }
-
     #[test]
     fn ssrf_alternate_notations_rejected_by_validate_url() {
         // Alternate notations must be blocked by validation.
@@ -1036,48 +1210,6 @@ mod tests {
         // The actual Policy::none() enforcement is in execute_request's client builder.
         let tool = test_tool(vec!["example.com"]);
         assert_eq!(tool.name(), "http_request");
-    }
-
-    // ── §1.4 DNS rebinding / SSRF defense-in-depth tests ─────
-
-    #[test]
-    fn ssrf_blocks_loopback_127_range() {
-        assert!(is_private_or_local_host("127.0.0.1"));
-        assert!(is_private_or_local_host("127.0.0.2"));
-        assert!(is_private_or_local_host("127.255.255.255"));
-    }
-
-    #[test]
-    fn ssrf_blocks_rfc1918_10_range() {
-        assert!(is_private_or_local_host("10.0.0.1"));
-        assert!(is_private_or_local_host("10.255.255.255"));
-    }
-
-    #[test]
-    fn ssrf_blocks_rfc1918_172_range() {
-        assert!(is_private_or_local_host("172.16.0.1"));
-        assert!(is_private_or_local_host("172.31.255.255"));
-    }
-
-    #[test]
-    fn ssrf_blocks_unspecified_address() {
-        assert!(is_private_or_local_host("0.0.0.0"));
-    }
-
-    #[test]
-    fn ssrf_blocks_dot_localhost_subdomain() {
-        assert!(is_private_or_local_host("evil.localhost"));
-        assert!(is_private_or_local_host("a.b.localhost"));
-    }
-
-    #[test]
-    fn ssrf_blocks_dot_local_tld() {
-        assert!(is_private_or_local_host("service.local"));
-    }
-
-    #[test]
-    fn ssrf_ipv6_unspecified() {
-        assert!(is_private_or_local_host("::"));
     }
 
     #[test]
@@ -1228,6 +1360,189 @@ mod tests {
         assert!(err.contains("allowed_domains"));
     }
 
+    #[tokio::test]
+    async fn validate_request_target_checks_dns_for_allowed_public_host() {
+        let tool = test_tool(vec!["example.com"]);
+        let called = std::cell::Cell::new(false);
+
+        let got = tool
+            .validate_request_target_with_resolver("https://api.example.com/v1", |host, port| {
+                called.set(true);
+                assert_eq!(host, "api.example.com");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(got.url, "https://api.example.com/v1");
+        assert_eq!(got.host, "api.example.com");
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                443
+            )]
+        );
+        assert!(
+            called.get(),
+            "allowed public host must still pass DNS SSRF validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_allows_private_resolution_for_private_carveout() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["api.example.com"]);
+
+        let got = tool
+            .validate_request_target_with_resolver("https://api.example.com/v1", |host, port| {
+                assert_eq!(host, "api.example.com");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5)),
+                443
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_checks_metadata_for_explicit_private_host() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["device.local"]);
+
+        let err = tool
+            .validate_request_target_with_resolver("https://device.local/status", |host, port| {
+                assert_eq!(host, "device.local");
+                assert_eq!(port, 443);
+                async {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+                        443,
+                    )])
+                }
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_blocks_ec2_ipv6_metadata_for_private_carveout() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["device.local"]);
+
+        let err = tool
+            .validate_request_target_with_resolver("https://device.local/status", |host, port| {
+                assert_eq!(host, "device.local");
+                assert_eq!(port, 443);
+                async move {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V6("fd00:ec2::254".parse().unwrap()),
+                        port,
+                    )])
+                }
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_uses_direct_ip_without_dns_lookup() {
+        let tool = test_tool_with_private(vec!["*"], true);
+
+        let got = tool
+            .validate_request_target_with_resolver(
+                "http://10.0.0.1:8080/status",
+                |_host, _port| async {
+                    unreachable!("direct IP literals should not use DNS resolution")
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got.resolved_addrs,
+            vec![SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                8080
+            )]
+        );
+    }
+
+    #[test]
+    fn validate_resolved_private_ip_is_blocked_by_default() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
+        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_private_ip_is_allowed_with_private_carveout() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
+        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips).is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_metadata_ip_is_blocked_even_with_private_carveout() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 169, 254,
+        ))];
+        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_literal_is_blocked_even_when_private_hosts_are_allowed() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        let err = tool
+            .validate_url("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("metadata"), "unexpected error: {err}");
+    }
+
     // ── IPv6 end-to-end coverage ──────────────────────────────
 
     #[test]
@@ -1251,25 +1566,6 @@ mod tests {
         let tool = test_tool(vec!["::1", "fe80::1"]);
         assert!(tool.validate_url("https://[::1]:8443").is_err()); // blocked — local/private
         assert!(tool.validate_url("https://[fe80::1]").is_err()); // blocked — local/private
-    }
-
-    #[test]
-    fn ipv6_normalize_domain_handles_edge_cases() {
-        assert_eq!(normalize_domain("::1").unwrap(), "::1");
-        assert_eq!(normalize_domain("[::1]").unwrap(), "::1");
-        assert_eq!(normalize_domain("2001:db8::1").unwrap(), "2001:db8::1");
-        assert_eq!(normalize_domain("[2001:db8::1]").unwrap(), "2001:db8::1");
-    }
-
-    #[test]
-    fn ipv6_host_matches_allowlist_exact_only() {
-        let domains = vec!["2001:db8::1".to_string()];
-        // exact match
-        assert!(host_matches_allowlist("2001:db8::1", &domains));
-        // different IP — should NOT suffix-match as if it were a domain
-        assert!(!host_matches_allowlist("2001:db8::2", &domains));
-        // prefix should NOT match either
-        assert!(!host_matches_allowlist("2001:db8::", &domains));
     }
 
     #[tokio::test]

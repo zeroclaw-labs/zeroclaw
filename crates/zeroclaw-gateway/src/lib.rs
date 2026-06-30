@@ -12,7 +12,10 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod acp;
+pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
 pub mod api_config;
@@ -24,8 +27,16 @@ pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
+pub mod api_sop;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
+pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
 pub mod hardware_context;
@@ -50,11 +61,23 @@ use anyhow::{Context, Result};
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
-#[cfg(any(feature = "channel-wati", feature = "channel-whatsapp-cloud"))]
-use axum::extract::Query;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::extract::Path;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::response::Response;
 use axum::{
     Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
@@ -64,6 +87,38 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+/// Returns `true` when an error from a stream listener's `accept()` is
+/// transient and the listener itself remains usable, so the serve loop
+/// should log and keep running rather than terminating the daemon. Covers
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
+/// per-connection hiccups. Mirrors the non-fatal accept handling that
+/// `axum::serve` already performs on the plain-TCP path.
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -74,6 +129,7 @@ use uuid::Uuid;
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::tool::ToolSpec;
 #[cfg(feature = "channel-email")]
 use zeroclaw_channels::gmail_push::GmailPushChannel;
@@ -90,6 +146,10 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
+use zeroclaw_runtime::agent::loop_::{
+    eager_mcp_tool_allowed, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+};
+use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
@@ -390,6 +450,150 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+/// The default agent alias for the gateway's no-`?agent=` listings: the
+/// lexicographically smallest ENABLED agent alias, or `None` when no agent is
+/// enabled. Deterministic by design - `config.agents` is a `HashMap` whose
+/// iteration order is randomized per process, so seeding from `iter().find()`
+/// made the WebUI Tools page surface a different agent's tools on each
+/// restart. The smallest-alias pick keeps the default listing stable.
+fn default_agent_alias(config: &Config) -> Option<String> {
+    config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias.clone())
+        .min()
+}
+
+/// Connect the MCP servers granted to `agent_alias` by its `mcp_bundles` and
+/// append the resulting tools to `gw_tools`, gated by the agent's tool-access
+/// policy. Shared by the dashboard-agent seed and the per-agent
+/// `/api/tools` registry builder so both surfaces scope MCP identically
+/// (omission is not a grant; deny wins). A no-op when MCP is disabled or the
+/// agent's bundles grant no servers, and non-fatal on connect failure so the
+/// gateway still boots.
+async fn append_scoped_mcp_tools(
+    config: &Config,
+    agent_alias: &str,
+    security: &Arc<SecurityPolicy>,
+    gw_tools: &mut Vec<Box<dyn tools::Tool>>,
+    gw_delegate: Option<&tools::DelegateParentToolsHandle>,
+) {
+    let agent_mcp_servers = if config.mcp.enabled {
+        config.mcp_servers_for_agent(agent_alias)
+    } else {
+        Vec::new()
+    };
+    if agent_mcp_servers.is_empty() {
+        return;
+    }
+    use ::zeroclaw_log::Instrument;
+    let mcp_policy = mcp_tool_access_policy(security, None);
+    let mcp_model_provider = config
+        .agents
+        .get(agent_alias)
+        .map(|a| a.model_provider.as_str().to_string())
+        .unwrap_or_default();
+    let mcp_model = config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_default();
+    let attribution_span =
+        ::zeroclaw_log::attribution_span!(&zeroclaw_runtime::agent::AgentAttribution(agent_alias));
+    ::zeroclaw_log::scope!(
+        model_provider: mcp_model_provider,
+        model: mcp_model,
+        =>
+        async {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                Ok(registry) => {
+                    let registry = std::sync::Arc::new(registry);
+                    if config.mcp.deferred_loading {
+                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                            std::sync::Arc::clone(&registry),
+                        )
+                        .await;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "Gateway MCP deferred_loading: {} tool stub(s) from {} server(s)",
+                                deferred_set.len(),
+                                registry.server_count()
+                            )
+                        );
+                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                            tools::ActivatedToolSet::new(),
+                        ));
+                        let mut tool_search =
+                            tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        gw_tools.push(Box::new(tool_search));
+                    } else {
+                        let names = registry.tool_names();
+                        let mut registered = 0usize;
+                        let mut skipped = 0usize;
+                        for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
+                            if let Some(def) = registry.get_tool_def(&name).await {
+                                let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                    std::sync::Arc::new(tools::McpToolWrapper::new(
+                                        name,
+                                        def,
+                                        std::sync::Arc::clone(&registry),
+                                    ));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    gw_tools,
+                                    gw_delegate,
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
+                                }
+                            }
+                        }
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"skipped": skipped})),
+                            &format!(
+                                "Gateway MCP: {} tool(s) registered from {} server(s)",
+                                registered,
+                                registry.server_count()
+                            )
+                        );
+                    }
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Fail
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Gateway MCP registry failed to initialize"
+                    );
+                }
+            }
+        }
+    )
+    .instrument(attribution_span)
+    .await;
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -401,6 +605,7 @@ pub struct AppState {
     /// `Option<f64>` end-to-end; never substitute a hardcoded default.
     pub temperature: Option<f64>,
     pub mem: Arc<dyn Memory>,
+    pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
@@ -409,30 +614,43 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    /// `WhatsApp` channel instances keyed by config alias. Webhooks route by
+    /// `/whatsapp/{alias}`; the bare `/whatsapp` path falls back to the first
+    /// instance (see [`api_webhook`]).
     #[cfg(feature = "channel-whatsapp-cloud")]
-    pub whatsapp: Option<Arc<WhatsAppChannel>>,
-    /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
+    pub whatsapp: HashMap<String, Arc<WhatsAppChannel>>,
+    /// `WhatsApp` app secrets keyed by alias for webhook signature verification
+    /// (`X-Hub-Signature-256`).
     #[cfg(feature = "channel-whatsapp-cloud")]
-    pub whatsapp_app_secret: Option<Arc<str>>,
+    pub whatsapp_app_secret: HashMap<String, Arc<str>>,
     #[cfg(feature = "channel-linq")]
-    pub linq: Option<Arc<LinqChannel>>,
-    /// Linq webhook signing secret for signature verification
+    pub linq: HashMap<String, Arc<LinqChannel>>,
+    /// Linq webhook signing secrets per alias
     #[cfg(feature = "channel-linq")]
-    pub linq_signing_secret: Option<Arc<str>>,
+    pub linq_signing_secrets: HashMap<String, Arc<str>>,
+    /// Nextcloud Talk channel instances keyed by config alias.
     #[cfg(feature = "channel-nextcloud")]
-    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
-    /// Nextcloud Talk webhook secret for signature verification
+    pub nextcloud_talk: HashMap<String, Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secrets keyed by alias for signature verification.
     #[cfg(feature = "channel-nextcloud")]
-    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    pub nextcloud_talk_webhook_secret: HashMap<String, Arc<str>>,
+    /// WATI channel instances keyed by config alias.
     #[cfg(feature = "channel-wati")]
-    pub wati: Option<Arc<WatiChannel>>,
+    pub wati: HashMap<String, Arc<WatiChannel>>,
     /// Gmail Pub/Sub push notification channel
     #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
-    /// Registered tool specs (for web dashboard tools page)
+    /// Registered tool specs (for web dashboard tools page). This is the
+    /// default (no `?agent=`) listing, seeded from the deterministically
+    /// smallest enabled agent alias.
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Per-agent tool-spec listings keyed by agent alias, powering the
+    /// agent-aware `GET /api/tools?agent=<alias>` view so the WebUI Tools
+    /// page can show each agent's scoped tool set. Falls back to
+    /// `tools_registry` for an unknown or omitted alias.
+    pub tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -482,6 +700,11 @@ pub struct AppState {
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
     pub tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    /// Shared SOP engine from the daemon (for WS agent sessions).
+    /// `None` when the gateway runs standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    /// Shared SOP audit logger from the daemon (for WS agent sessions).
+    pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -491,13 +714,17 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-    // Reload sender owned by the daemon. /admin/reload writes `true` here;
-    // the daemon's wait loop reacts via `subscribe()` and tears down to
-    // re-init. Cross-platform replacement for the SIGUSR1 hack.
-    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // Reload controls owned by the daemon for supervised runs. RPC reloads
+    // write to `shutdown_tx` before signalling daemon reload so the listener
+    // releases its socket before the replacement gateway binds. /admin/reload
+    // writes to both controls directly. Standalone gateway passes `None`.
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
+    // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -526,7 +753,7 @@ pub async fn run_gateway(
         None
     };
 
-    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+    let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -542,7 +769,7 @@ pub async fn run_gateway(
                  127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
                  POST /admin/reload."
             );
-            SocketAddr::from(([127, 0, 0, 1], port))
+            zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -659,6 +886,7 @@ pub async fn run_gateway(
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
+            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {
@@ -694,26 +922,33 @@ pub async fn run_gateway(
             Arc::new(platform::NativeRuntime::new())
         }
     };
+    let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(
+        mem.clone(),
+        config.memory.clone(),
+        config.data_dir.clone(),
+    ));
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
     // request. The shared SecurityPolicy / risk_profile / tools_registry
     // built here are vestiges driving the legacy single-agent
     // `/api/tools` listing and the `run_gateway_chat_with_tools` test
-    // mock; per-request agent dispatch is tracked as a follow-up.
+    // mock; `/webhook` honors `?agent=` per-request (validated against
+    // `config.agents`), while SSE / pairing per-request dispatch is still
+    // tracked as a follow-up.
     //
     // Agent count is unconstrained at boot. Zero agents is a valid
-    // state — the gateway must come up so `/admin/reload` and
-    // `/quickstart` can install one — and the legacy seed simply stays
-    // empty. With one or more enabled agents, any of them seeds the
-    // vestige; aliases are arbitrary so the iteration-order pick is
-    // load-bearing on nothing.
+    // state (the gateway must come up so `/admin/reload` and
+    // `/quickstart` can install one) and the legacy seed simply stays
+    // empty. With one or more enabled agents, the lexicographically
+    // smallest enabled alias seeds the default (no `?agent=`) listing.
+    // The pick is deterministic on purpose: the previous `HashMap`
+    // iteration-order pick made the WebUI Tools page surface a different
+    // agent's tools on each restart. Every other enabled agent gets its
+    // own scoped listing (`tools_registry_by_agent`, built below) so
+    // `GET /api/tools?agent=<alias>` can show any agent's real tool set.
     let canvas_store = canvas_store.unwrap_or_default();
-    let agent_alias_opt = config
-        .agents
-        .iter()
-        .find(|(_, a)| a.enabled)
-        .map(|(alias, _)| alias.clone());
+    let agent_alias_opt = default_agent_alias(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -751,14 +986,14 @@ pub async fn run_gateway(
         Some((risk_profile, security))
     });
 
-    let (mut tools_registry_raw, delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
+    let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
             let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
                 agent_alias,
-                runtime,
+                Arc::clone(&runtime),
                 Arc::clone(&mem),
                 composio_key,
                 composio_entity_id,
@@ -774,6 +1009,8 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
                 None,
+                sop_engine.clone(),
+                sop_audit.clone(),
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -784,6 +1021,7 @@ pub async fn run_gateway(
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
+                &all_tools_result.channel_room_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
@@ -799,7 +1037,22 @@ pub async fn run_gateway(
                     ),
                 );
             }
-            (all_tools_result.tools, all_tools_result.delegate_handle)
+            let mut gw_tools = all_tools_result.tools;
+            let gw_delegate = all_tools_result.delegate_handle;
+            // MCP tools, scoped to this agent's `mcp_bundles` and gated by its
+            // tool policy (parity with the orchestrator + runtime paths;
+            // omission is not a grant). Factored into `append_scoped_mcp_tools`
+            // so the per-agent registry below scopes MCP identically; a gateway
+            // with no resolved agent gets no MCP servers.
+            append_scoped_mcp_tools(
+                &config,
+                agent_alias,
+                &security,
+                &mut gw_tools,
+                gw_delegate.as_ref(),
+            )
+            .await;
+            (gw_tools, gw_delegate)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -819,82 +1072,95 @@ pub async fn run_gateway(
         }
     };
 
-    // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
-    // Without this, the `/api/tools` endpoint misses MCP tools.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "Gateway: initializing MCP client — {} server(s) configured",
-                config.mcp.servers.len()
-            )
-        );
-        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set =
-                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
-                            .await;
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
-                            deferred_set.len(),
-                            registry.server_count()
-                        )
-                    );
-                    let activated =
-                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                    tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                std::sync::Arc::new(tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_gw {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "Gateway MCP: {} tool(s) registered from {} server(s)",
-                            registered,
-                            registry.server_count()
-                        )
-                    );
-                }
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "MCP registry failed to initialize"
-                );
-            }
-        }
-    }
-
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+
+    // Per-agent tool listings powering the agent-aware
+    // `GET /api/tools?agent=<alias>` view, so the WebUI Tools page can show
+    // each agent's real, scoped tool set instead of one arbitrary agent's.
+    // The dashboard seed above is reused verbatim as the default agent's
+    // entry; every OTHER enabled agent is built here with its own
+    // SecurityPolicy and `mcp_bundles`-scoped MCP tools. Channel handles are
+    // intentionally NOT registered for these agents: the tools are only
+    // enumerated for their specs, never invoked. A per-agent failure is
+    // logged and skipped so one broken agent never starves the rest.
+    let mut tools_registry_by_agent: HashMap<String, Arc<Vec<ToolSpec>>> = HashMap::new();
+    if let Some(default_alias) = agent_alias_opt.as_ref() {
+        tools_registry_by_agent.insert(default_alias.clone(), Arc::clone(&tools_registry));
+    }
+    let mut other_aliases: Vec<String> = config
+        .agents
+        .iter()
+        .filter(|(alias, a)| a.enabled && Some(*alias) != agent_alias_opt.as_ref())
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    other_aliases.sort();
+    for alias in other_aliases {
+        let Some(risk_profile) = config.risk_profile_for_agent(&alias) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"agent_alias": alias})),
+                "Gateway: agent risk_profile does not resolve; skipping its /api/tools listing."
+            );
+            continue;
+        };
+        let risk_profile = risk_profile.clone();
+        let security = match SecurityPolicy::for_agent(&config, &alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent SecurityPolicy failed to build; skipping its /api/tools listing."
+                );
+                continue;
+            }
+        };
+        let agent_tools_result = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &risk_profile,
+            &alias,
+            Arc::clone(&runtime),
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.data_dir,
+            &config.agents,
+            config
+                .model_provider_for_agent(&alias)
+                .and_then(|e| e.api_key.as_deref()),
+            &config,
+            Some(canvas_store.clone()),
+            false,
+            None,
+            sop_engine.clone(),
+            sop_audit.clone(),
+        );
+        let mut agent_tools = agent_tools_result.tools;
+        let agent_delegate = agent_tools_result.delegate_handle;
+        append_scoped_mcp_tools(
+            &config,
+            &alias,
+            &security,
+            &mut agent_tools,
+            agent_delegate.as_ref(),
+        )
+        .await;
+        let specs: Vec<ToolSpec> = agent_tools.iter().map(|t| t.spec()).collect();
+        tools_registry_by_agent.insert(alias, Arc::new(specs));
+    }
+    let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
+        Arc::new(tools_registry_by_agent);
 
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
@@ -917,105 +1183,127 @@ pub async fn run_gateway(
             })
         });
 
-    // WhatsApp channel (if configured)
+    // WhatsApp channel instances (one per cloud-configured alias), keyed by
+    // alias so `/whatsapp/{alias}` webhooks reach the matching instance (#6312).
     #[cfg(feature = "channel-whatsapp-cloud")]
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+    let whatsapp_channel: HashMap<String, Arc<WhatsAppChannel>> = config
         .channels
         .whatsapp
-        .get("default")
-        .filter(|wa| wa.is_cloud_config())
-        .map(|wa| {
-            let alias = "default".to_string();
+        .iter()
+        .filter(|(_, wa)| wa.is_cloud_config())
+        .map(|(alias, wa)| {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_state.clone();
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
             };
-            Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone().unwrap_or_default(),
-                wa.phone_number_id.clone().unwrap_or_default(),
-                wa.verify_token.clone().unwrap_or_default(),
-                alias,
-                peer_resolver,
-            ))
-        });
+            (
+                alias.clone(),
+                Arc::new(WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
 
-    // WhatsApp app secret for webhook signature verification.
+    // WhatsApp app secrets keyed by alias for webhook signature verification.
     #[cfg(feature = "channel-whatsapp-cloud")]
-    let whatsapp_app_secret: Option<Arc<str>> = config
+    let whatsapp_app_secret: HashMap<String, Arc<str>> = config
         .channels
         .whatsapp
-        .values()
-        .next()
-        .and_then(|wa| {
-            wa.app_secret
+        .iter()
+        .filter_map(|(alias, wa)| {
+            let secret = wa
+                .app_secret
                 .as_deref()
                 .map(str::trim)
                 .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
         })
-        .map(Arc::from);
+        .collect();
 
-    // Linq channel (if configured)
+    // Linq channel instances (multi-tenant: one per alias)
     #[cfg(feature = "channel-linq")]
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.values().next().map(|lq| {
-        let alias = "default".to_string();
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_state.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("linq", &alias))
-        };
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            alias,
-            peer_resolver,
-        ))
-    });
-
-    // Linq signing secret for webhook signature verification.
-    #[cfg(feature = "channel-linq")]
-    let linq_signing_secret: Option<Arc<str>> = config
+    let linq_channels: HashMap<String, Arc<LinqChannel>> = config
         .channels
         .linq
-        .values()
-        .next()
-        .and_then(|lq| {
-            lq.signing_secret
+        .iter()
+        .filter(|(_, lq)| lq.enabled)
+        .map(|(alias, lq)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("linq", &alias))
+            };
+            (
+                alias.clone(),
+                Arc::new(LinqChannel::new(
+                    lq.api_token.clone(),
+                    lq.from_phone.clone(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
+
+    // Linq signing secrets per alias.
+    #[cfg(feature = "channel-linq")]
+    let linq_signing_secrets: HashMap<String, Arc<str>> = config
+        .channels
+        .linq
+        .iter()
+        .filter_map(|(alias, lq)| {
+            let secret = lq
+                .signing_secret
                 .as_deref()
                 .map(str::trim)
-                .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
         })
-        .map(Arc::from);
+        .collect();
 
-    // WATI channel (if configured)
+    // WATI channel instances keyed by alias.
     #[cfg(feature = "channel-wati")]
-    let wati_channel: Option<Arc<WatiChannel>> =
-        config.channels.wati.values().next().map(|wati_cfg| {
-            let alias = "default".to_string();
+    let wati_channel: HashMap<String, Arc<WatiChannel>> = config
+        .channels
+        .wati
+        .iter()
+        .map(|(alias, wati_cfg)| {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_state.clone();
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
             };
-            Arc::new(
-                WatiChannel::new(
-                    wati_cfg.api_token.clone(),
-                    wati_cfg.api_url.clone(),
-                    wati_cfg.tenant_id.clone(),
-                    alias,
-                    peer_resolver,
-                )
-                .with_transcription(config.transcription.clone()),
+            (
+                alias.clone(),
+                Arc::new(
+                    WatiChannel::new(
+                        wati_cfg.api_token.clone(),
+                        wati_cfg.api_url.clone(),
+                        wati_cfg.tenant_id.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_transcription(config.transcription.clone()),
+                ),
             )
-        });
+        })
+        .collect();
 
-    // Nextcloud Talk channel (if configured)
+    // Nextcloud Talk channel instances keyed by alias.
     #[cfg(feature = "channel-nextcloud")]
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels.nextcloud_talk.values().next().map(|nc| {
-            let alias = "default".to_string();
+    let nextcloud_talk_channel: HashMap<String, Arc<NextcloudTalkChannel>> = config
+        .channels
+        .nextcloud_talk
+        .iter()
+        .map(|(alias, nc)| {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_state.clone();
                 let alias = alias.clone();
@@ -1025,29 +1313,35 @@ pub async fn run_gateway(
                         .channel_external_peers("nextcloud_talk", &alias)
                 })
             };
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.bot_name.clone().unwrap_or_default(),
-                alias,
-                peer_resolver,
-            ))
-        });
+            (
+                alias.clone(),
+                Arc::new(NextcloudTalkChannel::new(
+                    nc.base_url.clone(),
+                    nc.app_token.clone(),
+                    nc.bot_name.clone().unwrap_or_default(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
 
-    // Nextcloud Talk webhook secret for signature verification.
+    // Nextcloud Talk webhook secrets keyed by alias for signature verification.
     #[cfg(feature = "channel-nextcloud")]
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> = config
+    let nextcloud_talk_webhook_secret: HashMap<String, Arc<str>> = config
         .channels
         .nextcloud_talk
-        .get("default")
-        .and_then(|nc| {
-            nc.webhook_secret
+        .iter()
+        .filter_map(|(alias, nc)| {
+            let secret = nc
+                .webhook_secret
                 .as_deref()
                 .map(str::trim)
                 .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
         })
-        .map(Arc::from);
+        .collect();
 
     // Gmail Push channel (if configured and referenced by an enabled agent)
     #[cfg(feature = "channel-email")]
@@ -1248,15 +1542,17 @@ pub async fn run_gateway(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+             this machine and no fallback location was found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     } else {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     }
 
@@ -1274,15 +1570,9 @@ pub async fn run_gateway(
         println!("     └──────────────┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!(
-            "     To pair a new device: {}",
-            format_paircode_recovery_command(host, actual_port)
-        );
-        println!(
-            "     Fallback: {}",
-            format_paircode_recovery_curl(host, actual_port, pfx)
-        );
+        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+            println!("{line}");
+        }
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
@@ -1291,22 +1581,22 @@ pub async fn run_gateway(
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
     #[cfg(feature = "channel-whatsapp-cloud")]
-    if whatsapp_channel.is_some() {
-        println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
-        println!("  POST {pfx}/whatsapp  — WhatsApp message webhook");
+    if !whatsapp_channel.is_empty() {
+        println!("  GET  {pfx}/whatsapp[/<alias>]  — Meta webhook verification");
+        println!("  POST {pfx}/whatsapp[/<alias>]  — WhatsApp message webhook");
     }
     #[cfg(feature = "channel-linq")]
-    if linq_channel.is_some() {
-        println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
+    if !linq_channels.is_empty() {
+        println!("  POST {pfx}/linq[/<alias>]      — Linq message webhook (iMessage/RCS/SMS)");
     }
     #[cfg(feature = "channel-wati")]
-    if wati_channel.is_some() {
-        println!("  GET  {pfx}/wati      — WATI webhook verification");
-        println!("  POST {pfx}/wati      — WATI message webhook");
+    if !wati_channel.is_empty() {
+        println!("  GET  {pfx}/wati[/<alias>]      — WATI webhook verification");
+        println!("  POST {pfx}/wati[/<alias>]      — WATI message webhook");
     }
     #[cfg(feature = "channel-nextcloud")]
-    if nextcloud_talk_channel.is_some() {
-        println!("  POST {pfx}/nextcloud-talk — Nextcloud Talk bot webhook");
+    if !nextcloud_talk_channel.is_empty() {
+        println!("  POST {pfx}/nextcloud-talk[/<alias>] — Nextcloud Talk bot webhook");
     }
     println!("  GET  {pfx}/api/*     — REST API (bearer token required)");
     println!("  GET  {pfx}/ws/chat   — WebSocket agent chat");
@@ -1350,14 +1640,39 @@ pub async fn run_gateway(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, reload_tx) = reload_controls
+        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .unwrap_or((owned_shutdown_tx, None));
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir)))
+        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        // Reconcile the registry against the canonical paired-token set so that
+        // tokens paired via the legacy `/pair` route (and any other historical
+        // orphans) become visible and revocable in the management UI. The token
+        // set itself stays owned by `PairingGuard`/`gateway.paired_tokens`.
+        match registry.reconcile_from_token_hashes(&pairing.tokens()) {
+            Ok(0) => {}
+            Ok(n) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "backfilled": n })),
+                "backfilled legacy paired token(s) into the device registry"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                "device registry backfill from paired_tokens failed"
+            ),
+        }
+        Some(registry)
     } else {
         None
     };
@@ -1373,6 +1688,7 @@ pub async fn run_gateway(
         model,
         temperature,
         mem,
+        memory_strategy,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
         pairing,
@@ -1385,9 +1701,9 @@ pub async fn run_gateway(
         #[cfg(feature = "channel-whatsapp-cloud")]
         whatsapp_app_secret,
         #[cfg(feature = "channel-linq")]
-        linq: linq_channel,
+        linq: linq_channels,
         #[cfg(feature = "channel-linq")]
-        linq_signing_secret,
+        linq_signing_secrets,
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk: nextcloud_talk_channel,
         #[cfg(feature = "channel-nextcloud")]
@@ -1398,6 +1714,7 @@ pub async fn run_gateway(
         gmail_push: gmail_push_channel,
         observer: state_observer,
         tools_registry,
+        tools_registry_by_agent,
         cost_tracker,
         event_tx,
         event_buffer,
@@ -1414,6 +1731,8 @@ pub async fn run_gateway(
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
+        sop_engine,
+        sop_audit,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1445,6 +1764,9 @@ pub async fn run_gateway(
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
+        .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
+        .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -1481,10 +1803,15 @@ pub async fn run_gateway(
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
         .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
             "/api/config/map-key",
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
             "/api/config/catalog/models",
@@ -1555,6 +1882,10 @@ pub async fn run_gateway(
         .route(
             "/api/agents/{alias}/workspace/mkdir",
             post(api_browse::handle_agent_workspace_mkdir),
+        )
+        .route(
+            "/api/agents/{alias}/skills",
+            get(api_skills::handle_agent_skills),
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
         .route(
@@ -1638,6 +1969,9 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes());
+
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
     let inner = inner
@@ -1696,12 +2030,15 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger route lives on its own sub-router so it can opt out
-    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
-    // the route through `merge`, so only this endpoint sees the longer
-    // timeout.
-    let cron_run_router: Router = Router::new()
-        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+    // Manual cron-trigger and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // synchronous agent turn inline. Layers attached here travel with the
+    // route through `merge`, so only these endpoints see the longer timeout.
+    let long_running_router: Router<AppState> =
+        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    #[cfg(feature = "a2a")]
+    let long_running_router = long_running_router.merge(a2a::a2a_task_route());
+    let long_running_router: Router = long_running_router
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1709,7 +2046,7 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(cron_run_router);
+    let inner = inner.merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -1755,7 +2092,21 @@ pub async fn run_gateway(
         loop {
             tokio::select! {
                 conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = conn?;
+                    let (tcp_stream, remote_addr) = match conn {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if is_recoverable_accept_error(&e) {
+                                // Transient (e.g. EMFILE under fd pressure):
+                                // the listener is still valid. Back off
+                                // briefly to avoid hot-spinning, then keep
+                                // serving rather than killing the daemon (#7042).
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                    };
                     let tls_acceptor = tls_acceptor.clone();
                     let svc = tower::MakeService::<
                         SocketAddr,
@@ -1817,24 +2168,59 @@ pub async fn run_gateway(
     Ok(())
 }
 
-fn format_paircode_recovery_command(host: &str, port: u16) -> String {
-    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
-    if let Some(host_arg) = paircode_recovery_host_arg(host) {
-        cmd.push_str(" --host ");
-        cmd.push_str(host_arg);
-    }
-    cmd
+/// Admin paircode routes are localhost-only ([`require_localhost`]), so the
+/// recovery hint must never advertise a non-loopback `--host`: the CLI would
+/// then target an address the admin guard rejects with `403`. We omit `--host`
+/// entirely and let the CLI fall back to its loopback default. (`_host` is kept
+/// for call-site symmetry with [`format_paircode_recovery_curl`].)
+fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
+    format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
-fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
-    match host {
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
-        _ => Some(host),
-    }
+/// Startup-banner lines for the "pairing required, but no code exists because
+/// the gateway is already paired" state.
+///
+/// By design a fresh one-time code is NOT minted on restart once paired (see
+/// [`zeroclaw_config::pairing::PairingGuard::new`]) — that would reopen a
+/// standing, brute-forceable pairing window. The earlier banner ("Pairing:
+/// ACTIVE (bearer token required)") never said a code was *absent*, so an
+/// operator opening the dashboard hit a 6-digit prompt with no code printed
+/// anywhere and no in-band way out (#5266). This notice states the absence
+/// plainly and points at the commands that mint a code on demand.
+///
+/// Returned as lines (rather than printed inline in `run_gateway`) so the
+/// wording is the single, unit-tested source of truth and can be reused by any
+/// other operator-facing surface.
+fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+    vec![
+        "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
+         one-time code was generated on this start."
+            .to_string(),
+        format!(
+            "     To pair another device, run: {}",
+            format_paircode_recovery_command(host, port)
+        ),
+        format!(
+            "     Fallback (localhost only): {}",
+            format_paircode_recovery_curl(host, port, path_prefix)
+        ),
+    ]
 }
 
 fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
-    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
+    // Admin paircode routes are localhost-only, so the curl fallback must point
+    // at loopback. Bind-only hosts and non-loopback advertised hosts are
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    let recovery_host = paircode_recovery_curl_host(host);
+    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+}
+
+fn paircode_recovery_curl_host(host: &str) -> &str {
+    match host {
+        "127.0.0.1" | "localhost" => host,
+        "::1" => "[::1]",
+        _ => "127.0.0.1",
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1949,6 +2335,26 @@ async fn handle_pair(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "new client paired successfully"
             );
+            // Register the device so a token paired via the legacy `/pair`
+            // route is listable and revocable from the management UI, exactly
+            // like `/api/pair` (`submit_pairing_enhanced`). Without this the
+            // token authenticates but has no device row, so the UI can neither
+            // see nor revoke it. The token itself is owned by `PairingGuard`
+            // and persisted below; this row is metadata keyed by its hash.
+            if let Some(ref registry) = state.device_registry {
+                registry.register(
+                    PairingGuard::token_hash(&token),
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(rate_key.clone()),
+                        capabilities: None,
+                    },
+                );
+            }
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
             {
@@ -2004,13 +2410,21 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(config: Arc<RwLock<Config>>, pairing: &PairingGuard) -> Result<()> {
+pub(crate) async fn persist_pairing_tokens(
+    config: Arc<RwLock<Config>>,
+    pairing: &PairingGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.read().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
-    updated_cfg.mark_dirty("gateway.paired-tokens");
+    // Snake-case to match the prop-field name emitted by the `Configurable`
+    // derive. Until #7156 the string used here was `gateway.paired-tokens`
+    // (kebab); it kept working only thanks to the `-`→`_` fallback in
+    // `resolve_dirty_segments`. Aligning all references to the snake form
+    // removes that fallback dependency and keeps the codebase consistent.
+    updated_cfg.mark_dirty("gateway.paired_tokens");
     updated_cfg
         .save_dirty()
         .await
@@ -2022,7 +2436,7 @@ async fn persist_pairing_tokens(config: Arc<RwLock<Config>>, pairing: &PairingGu
 }
 
 /// Result of a gateway chat turn. Carries the response text plus per-turn
-/// token / cost totals captured from the cost-tracking scope (when present)
+/// token / cost totals collected from `TOOL_LOOP_TURN_USAGE` (when scoped)
 /// so callers can populate observer-event annotations without racing
 /// concurrent webhook traffic that shares the same `CostTracker`.
 struct GatewayChatOutcome {
@@ -2106,10 +2520,15 @@ fn needs_quickstart_channel_reply() -> String {
 }
 
 /// Full-featured chat with tools for channel and webhook handlers.
-async fn run_gateway_chat_with_tools(
+///
+/// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
+/// already validated against `config.agents` by the handler. `None` keeps the
+/// legacy default pick (migration-synthesized "default", else first enabled).
+pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
+    agent_override: Option<&str>,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
@@ -2121,7 +2540,7 @@ async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope, so usage stays None.
     #[cfg(test)]
     {
-        let _ = session_id;
+        let _ = (session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2137,78 +2556,44 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.read().clone();
-        // Legacy: webhook chat / SSE / pairing endpoints don't yet
-        // accept an explicit agent in the request payload. Pick the
-        // migration-synthesized "default" agent (or first enabled) until
-        // the per-request agent dispatch refactor lands.
-        let agent_alias = config
-            .agents
-            .keys()
-            .find(|k| k.as_str() == "default")
-            .or_else(|| {
-                config
-                    .agents
-                    .iter()
-                    .find(|(_, a)| a.enabled)
-                    .map(|(alias, _)| alias)
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "webhook chat rejected: no configured [agents.<alias>] entry"
-                );
-                anyhow::Error::msg(
-                    "webhook chat requires at least one configured [agents.<alias>] entry",
-                )
-            })?
-            .clone();
+        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
-        // Scope the cost tracking context so per-LLM-call usage flows into the
-        // gateway's cost tracker and costs.jsonl. Without this scope, the
-        // tracker exists on AppState but never receives any records from the
-        // runtime tool loop. The context's per-scope `turn_usage` accumulator
-        // also lets us read out this turn's tokens / cost after the scope
-        // exits without racing concurrent webhook traffic that shares the
-        // same tracker. Pricing comes from the V3 per-provider shape
-        // (`config.providers.models[*][*].pricing`), keyed as
-        // `<type>.<alias>` to match how the channels orchestrator builds
-        // its `ModelProviderPricing`.
+        // Scope the cost tracking context so per-LLM-call usage flows into
+        // the gateway's cost tracker and costs.jsonl. A separate
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals
+        // so callers can read the per-turn cost without racing concurrent
+        // requests sharing the same tracker. Pricing is built from the
+        // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
+        // wins over legacy per-alias pricing).
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .providers
-                .models
-                .iter_entries()
-                .filter(|(_, _, base)| !base.pricing.is_empty())
-                .map(|(type_k, alias_k, base)| {
-                    (format!("{type_k}.{alias_k}"), base.pricing.clone())
-                })
-                .collect();
+            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
             zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
                 tracker.clone(),
                 std::sync::Arc::new(pricing),
             )
             .with_agent_alias(&agent_alias)
         });
-        let captured_usage = cost_tracking_context
-            .as_ref()
-            .map(|ctx| ctx.turn_usage.clone());
-        let response = Box::pin(
+        let turn_usage = state.cost_tracker.as_ref().map(|_| {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                zeroclaw_runtime::agent::cost::TurnUsage::default(),
+            ))
+        });
+        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+            turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
             ),
-        )
+        ))
         .await?;
-        let usage = captured_usage
+        let usage = turn_usage
             .map(|cell| *cell.lock())
-            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
         let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(u) => (
-                Some(u.input_tokens),
-                Some(u.output_tokens),
-                Some(u.cost_usd),
+            Some(usage) => (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.cost_usd),
             ),
             None => (None, None, None),
         };
@@ -2221,20 +2606,56 @@ async fn run_gateway_chat_with_tools(
     }
 }
 
+fn resolve_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> Option<String> {
+    agent_override
+        .map(ToString::to_string)
+        .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
+}
+
+#[cfg(not(test))]
+fn require_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> anyhow::Result<String> {
+    resolve_gateway_chat_agent_alias(config, agent_override).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "webhook chat rejected: no configured [agents.<alias>] entry"
+        );
+        anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
+    })
+}
+
 fn optional_channel_routes() -> Router<AppState> {
     let router: Router<AppState> = Router::new();
     #[cfg(feature = "channel-whatsapp-cloud")]
     let router = router
         .route("/whatsapp", get(handle_whatsapp_verify))
-        .route("/whatsapp", post(handle_whatsapp_message));
+        .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/whatsapp/{alias}", get(handle_whatsapp_verify_alias))
+        .route("/whatsapp/{alias}", post(handle_whatsapp_message_alias));
     #[cfg(feature = "channel-linq")]
-    let router = router.route("/linq", post(handle_linq_webhook));
+    let router = router
+        .route("/linq", post(handle_linq_webhook))
+        .route("/linq/{alias}", post(handle_linq_webhook_alias));
     #[cfg(feature = "channel-wati")]
     let router = router
         .route("/wati", get(handle_wati_verify))
-        .route("/wati", post(handle_wati_webhook));
+        .route("/wati", post(handle_wati_webhook))
+        .route("/wati/{alias}", get(handle_wati_verify_alias))
+        .route("/wati/{alias}", post(handle_wati_webhook_alias));
     #[cfg(feature = "channel-nextcloud")]
-    let router = router.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
+    let router = router
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route(
+            "/nextcloud-talk/{alias}",
+            post(handle_nextcloud_talk_webhook_alias),
+        );
     #[cfg(feature = "channel-email")]
     let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
     router
@@ -2246,10 +2667,22 @@ pub struct WebhookBody {
     pub message: String,
 }
 
+/// Webhook query parameters
+#[derive(Default, serde::Deserialize)]
+pub struct WebhookQuery {
+    /// Configured agent alias to dispatch to. Optional — when omitted, the
+    /// legacy pick applies (migration-synthesized "default" agent, else the
+    /// first enabled one). Aliases mirror `WsQuery` so `/ws/chat` callers
+    /// can reuse their query string verbatim.
+    #[serde(default, alias = "agentAlias", alias = "agent_alias")]
+    pub agent: Option<String>,
+}
+
 /// POST /webhook — main webhook endpoint
 async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -2346,6 +2779,34 @@ async fn handle_webhook(
         }
     };
 
+    // ── Per-request agent dispatch (optional `?agent=` query param) ──
+    // Validate before idempotency / autosave so a typo'd alias doesn't
+    // consume the caller's idempotency key. Mirrors the `/ws/chat`
+    // unknown-agent rejection.
+    let agent_override = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(alias) = agent_override {
+        let cfg = state.config.read();
+        if cfg.agent(alias).is_none() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"agent": alias})),
+                "webhook: rejected — unknown agent alias"
+            );
+            let err = serde_json::json!({
+                "error": format!(
+                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
+                )
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    }
+
     // ── Idempotency (optional) ──
     if let Some(idempotency_key) = headers
         .get("X-Idempotency-Key")
@@ -2384,22 +2845,41 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = {
+    let (provider_label, model_label, resolved_agent_alias) = {
         let cfg = state.config.read();
-        cfg.providers
-            .models
-            .iter_entries()
-            .next()
+        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
+        let resolved_provider = resolved_agent_alias
+            .as_deref()
+            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
+        let provider_label = resolved_provider
+            .as_ref()
             .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let model_label = resolved_provider
+            .and_then(|(_, _, entry)| {
+                entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
+            })
+            .or_else(|| cfg.resolve_default_model())
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        (provider_label, model_label, resolved_agent_alias)
     };
-    let model_label = state.model.clone();
     let started_at = Instant::now();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let agent_alias = resolved_agent_alias.as_deref();
+    let channel_name = "gateway";
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
     state.observer.record_event(
@@ -2407,10 +2887,14 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await {
+    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    {
         Ok(GatewayChatOutcome {
             response,
             input_tokens,
@@ -2420,13 +2904,17 @@ async fn handle_webhook(
             let duration = started_at.elapsed();
             // Per-turn token / cost annotation captured from the cost-tracking
             // scope inside `run_gateway_chat_with_tools` (None outside of test
-            // / when no LLM call recorded). Cost is also persisted to
-            // /api/cost and costs.jsonl via the same scope.
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
+            // / when no LLM call recorded). `TurnUsage` always carries the real
+            // input/output split together, so `.zip` either gives both or
+            // neither — never fabricate `output_tokens: 0` from an aggregate.
+            // Cost is also persisted to /api/cost and costs.jsonl via the same
+            // scope.
+            let tokens_used = input_tokens.zip(output_tokens).map(|(i, o)| {
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                }
+            });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     model_provider: provider_label.clone(),
@@ -2434,8 +2922,12 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -2444,14 +2936,17 @@ async fn handle_webhook(
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                     model_provider: provider_label,
-                    model: model_label,
+                    model: model_label.clone(),
                     duration,
                     tokens_used,
                     cost_usd,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": model_label});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -2467,6 +2962,10 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -2485,6 +2984,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id),
                 },
             );
 
@@ -2527,14 +3029,34 @@ pub struct WhatsAppVerifyQuery {
     pub challenge: Option<String>,
 }
 
-/// GET /whatsapp — Meta webhook verification
+/// GET /whatsapp — Meta webhook verification (bare path, deprecated fallback).
 #[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
-) -> impl IntoResponse {
-    let Some(ref wa) = state.whatsapp else {
-        return (StatusCode::NOT_FOUND, "WhatsApp not configured".to_string());
+) -> Response {
+    handle_whatsapp_verify_impl(state, None, params).await
+}
+
+/// GET /whatsapp/{alias} — Meta webhook verification for a specific instance.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_verify_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Query(params): Query<WhatsAppVerifyQuery>,
+) -> Response {
+    handle_whatsapp_verify_impl(state, Some(alias), params).await
+}
+
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_verify_impl(
+    state: AppState,
+    alias: Option<String>,
+    params: WhatsAppVerifyQuery,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.whatsapp, alias.as_deref());
+    let Some((_alias, wa)) = resolved.entry() else {
+        return api_webhook::not_found("whatsapp");
     };
 
     // Verify the token matches (constant-time comparison to prevent timing attacks)
@@ -2542,7 +3064,7 @@ async fn handle_whatsapp_verify(
         .verify_token
         .as_deref()
         .is_some_and(|t| constant_time_eq(t, wa.verify_token()));
-    if params.mode.as_deref() == Some("subscribe") && token_matches {
+    let resp = if params.mode.as_deref() == Some("subscribe") && token_matches {
         if let Some(ch) = params.challenge {
             ::zeroclaw_log::record!(
                 INFO,
@@ -2550,19 +3072,21 @@ async fn handle_whatsapp_verify(
                     .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
                 "webhook verified successfully"
             );
-            return (StatusCode::OK, ch);
+            (StatusCode::OK, ch).into_response()
+        } else {
+            (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
         }
-        return (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string());
-    }
-
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
-        "webhook verification failed — token mismatch"
-    );
-    (StatusCode::FORBIDDEN, "Forbidden".to_string())
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
+            "webhook verification failed — token mismatch"
+        );
+        (StatusCode::FORBIDDEN, "Forbidden".to_string()).into_response()
+    };
+    api_webhook::tag_deprecation(resp, resolved, "whatsapp")
 }
 
 /// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
@@ -2593,21 +3117,55 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
 }
 
 /// POST /whatsapp — incoming message webhook
+/// POST /whatsapp — incoming message webhook (bare path, deprecated fallback).
 #[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref wa) = state.whatsapp else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "WhatsApp not configured"})),
-        );
-    };
+) -> Response {
+    handle_whatsapp_message_impl(state, None, headers, body).await
+}
 
+/// POST /whatsapp/{alias} — incoming message webhook for a specific instance.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_message_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_whatsapp_message_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_message_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.whatsapp, alias.as_deref());
+    let Some((alias_key, wa)) = resolved.entry() else {
+        return api_webhook::not_found("whatsapp");
+    };
+    let app_secret = state.whatsapp_app_secret.get(alias_key).cloned();
+    let resp = process_whatsapp_message(&state, wa, app_secret.as_deref(), headers, body).await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "whatsapp")
+}
+
+/// Verify, parse, and dispatch a WhatsApp webhook payload for one resolved
+/// instance. `app_secret` is that instance's `X-Hub-Signature-256` secret.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn process_whatsapp_message(
+    state: &AppState,
+    wa: &Arc<WhatsAppChannel>,
+    app_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
     // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(ref app_secret) = state.whatsapp_app_secret {
+    if let Some(app_secret) = app_secret {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
@@ -2682,9 +3240,10 @@ async fn handle_whatsapp_message(
         }
 
         match Box::pin(run_gateway_chat_with_tools(
-            &state,
+            state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -2734,24 +3293,66 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+/// POST /linq — incoming message webhook (bare path, deprecated fallback).
 #[cfg(feature = "channel-linq")]
 async fn handle_linq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref linq) = state.linq else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Linq not configured"})),
-        );
-    };
+) -> Response {
+    handle_linq_webhook_impl(state, None, headers, body).await
+}
 
+/// POST /linq/{alias} — incoming message webhook for a specific instance.
+#[cfg(feature = "channel-linq")]
+async fn handle_linq_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_linq_webhook_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-linq")]
+async fn handle_linq_webhook_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.linq, alias.as_deref());
+    let Some((alias_key, linq)) = resolved.entry() else {
+        return api_webhook::not_found("linq");
+    };
+    let signing_secret = state.linq_signing_secrets.get(alias_key).cloned();
+    let resp = process_linq_webhook(
+        &state,
+        alias_key,
+        linq,
+        signing_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "linq")
+}
+
+/// Verify, parse, and dispatch a Linq webhook payload for one resolved instance.
+/// `signing_secret` is that instance's `X-Webhook-Signature` secret.
+#[cfg(feature = "channel-linq")]
+async fn process_linq_webhook(
+    state: &AppState,
+    alias: &str,
+    linq: &Arc<LinqChannel>,
+    signing_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
     // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(ref signing_secret) = state.linq_signing_secret {
+    if let Some(signing_secret) = signing_secret {
         let timestamp = headers
             .get("X-Webhook-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -2771,9 +3372,10 @@ async fn handle_linq_webhook(
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
                 &format!(
-                    "Linq webhook signature verification failed (signature: {})",
+                    "Linq webhook signature verification failed for alias '{alias}' (signature: {})",
                     if signature.is_empty() {
                         "missing"
                     } else {
@@ -2806,7 +3408,7 @@ async fn handle_linq_webhook(
 
     // Process each message
     for msg in &messages {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "alias": alias, "sender": msg.sender, "content": msg.content})), "inbound webhook message");
         let session_id = sender_session_id("linq", msg);
 
         // Auto-save to memory
@@ -2825,9 +3427,10 @@ async fn handle_linq_webhook(
 
         // Call the LLM
         match Box::pin(run_gateway_chat_with_tools(
-            &state,
+            state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -2877,28 +3480,49 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// GET /wati — WATI webhook verification (echoes hub.challenge)
+/// GET /wati — WATI webhook verification (bare path, deprecated fallback).
 #[cfg(feature = "channel-wati")]
 async fn handle_wati_verify(
     State(state): State<AppState>,
     Query(params): Query<WatiVerifyQuery>,
-) -> impl IntoResponse {
-    if state.wati.is_none() {
-        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
+) -> Response {
+    handle_wati_verify_impl(state, None, params)
+}
+
+/// GET /wati/{alias} — WATI webhook verification for a specific instance.
+#[cfg(feature = "channel-wati")]
+async fn handle_wati_verify_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Query(params): Query<WatiVerifyQuery>,
+) -> Response {
+    handle_wati_verify_impl(state, Some(alias), params)
+}
+
+#[cfg(feature = "channel-wati")]
+fn handle_wati_verify_impl(
+    state: AppState,
+    alias: Option<String>,
+    params: WatiVerifyQuery,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
+    if resolved.entry().is_none() {
+        return api_webhook::not_found("wati");
     }
 
     // WATI may use Meta-style webhook verification; echo the challenge
-    if let Some(challenge) = params.challenge {
+    let resp = if let Some(challenge) = params.challenge {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"channel": "wati"})),
             "webhook verified successfully"
         );
-        return (StatusCode::OK, challenge);
-    }
-
-    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
+        (StatusCode::OK, challenge).into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
+    };
+    api_webhook::tag_deprecation(resp, resolved, "wati")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2907,16 +3531,39 @@ pub struct WatiVerifyQuery {
     pub challenge: Option<String>,
 }
 
-/// POST /wati — incoming WATI WhatsApp message webhook
+/// POST /wati — incoming WATI WhatsApp message webhook (bare path, deprecated).
 #[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
-    let Some(ref wati) = state.wati else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "WATI not configured"})),
-        );
-    };
+async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> Response {
+    handle_wati_webhook_impl(state, None, body).await
+}
 
+/// POST /wati/{alias} — incoming WATI message webhook for a specific instance.
+#[cfg(feature = "channel-wati")]
+async fn handle_wati_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    body: Bytes,
+) -> Response {
+    handle_wati_webhook_impl(state, Some(alias), body).await
+}
+
+#[cfg(feature = "channel-wati")]
+async fn handle_wati_webhook_impl(state: AppState, alias: Option<String>, body: Bytes) -> Response {
+    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
+    let Some((_alias, wati)) = resolved.entry() else {
+        return api_webhook::not_found("wati");
+    };
+    let resp = process_wati_webhook(&state, wati, body).await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "wati")
+}
+
+/// Parse and dispatch a WATI webhook payload for one resolved instance.
+#[cfg(feature = "channel-wati")]
+async fn process_wati_webhook(
+    state: &AppState,
+    wati: &Arc<WatiChannel>,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (
@@ -2964,9 +3611,10 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
 
         // Call the LLM
         match Box::pin(run_gateway_chat_with_tools(
-            &state,
+            state,
             &msg.content,
             Some(&session_id),
+            None,
         ))
         .await
         {
@@ -3016,24 +3664,64 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+/// POST /nextcloud-talk — incoming message webhook (bare path, deprecated).
 #[cfg(feature = "channel-nextcloud")]
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
-        );
-    };
+) -> Response {
+    handle_nextcloud_talk_webhook_impl(state, None, headers, body).await
+}
 
+/// POST /nextcloud-talk/{alias} — incoming message webhook for one instance.
+#[cfg(feature = "channel-nextcloud")]
+async fn handle_nextcloud_talk_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_nextcloud_talk_webhook_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-nextcloud")]
+async fn handle_nextcloud_talk_webhook_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.nextcloud_talk, alias.as_deref());
+    let Some((alias_key, nextcloud_talk)) = resolved.entry() else {
+        return api_webhook::not_found("nextcloud-talk");
+    };
+    let webhook_secret = state.nextcloud_talk_webhook_secret.get(alias_key).cloned();
+    let resp = process_nextcloud_talk_webhook(
+        &state,
+        nextcloud_talk,
+        webhook_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "nextcloud-talk")
+}
+
+/// Verify, parse, and dispatch a Nextcloud Talk webhook payload for one resolved
+/// instance. `webhook_secret` is that instance's HMAC signing secret.
+#[cfg(feature = "channel-nextcloud")]
+async fn process_nextcloud_talk_webhook(
+    state: &AppState,
+    nextcloud_talk: &Arc<NextcloudTalkChannel>,
+    webhook_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
     // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+    if let Some(webhook_secret) = webhook_secret {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())
@@ -3113,6 +3801,7 @@ async fn handle_nextcloud_talk_webhook(
                 &state,
                 &msg.content,
                 Some(&session_id),
+                None,
             ))
             .await
             {
@@ -3300,7 +3989,54 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/reload — reload the daemon in place (localhost only).
+/// Authorization decision for `POST /admin/reload`, derived purely from the
+/// caller's loopback status, the `gateway.allow_remote_admin` flag, and
+/// whether pairing is enabled.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminReloadGate {
+    /// Loopback caller (the CLI) — allow without further checks.
+    Allow,
+    /// Non-loopback caller, opted in with pairing on — allow only if pairing
+    /// auth passes.
+    RequireAuth,
+    /// Non-loopback caller, not opted in — reject.
+    Forbidden,
+    /// Non-loopback caller opted in, but pairing is disabled — reject rather
+    /// than allow an unauthenticated remote reload. `require_auth` is a no-op
+    /// when pairing is off, so without this guard `allow_remote_admin` would
+    /// expose reload to anonymous remote callers.
+    ForbiddenNoPairing,
+}
+
+/// Pure gate decision for `/admin/reload`. Auth enforcement (for the
+/// `RequireAuth` case) is handled separately by the caller.
+///
+/// Remote access requires *both* `allow_remote_admin` and pairing: opting in
+/// without pairing yields `ForbiddenNoPairing`, never an unauthenticated
+/// allow.
+fn admin_reload_gate(
+    is_loopback: bool,
+    allow_remote_admin: bool,
+    require_pairing: bool,
+) -> AdminReloadGate {
+    if is_loopback {
+        AdminReloadGate::Allow
+    } else if !allow_remote_admin {
+        AdminReloadGate::Forbidden
+    } else if require_pairing {
+        AdminReloadGate::RequireAuth
+    } else {
+        AdminReloadGate::ForbiddenNoPairing
+    }
+}
+
+/// POST /admin/reload — reload the daemon in place.
+///
+/// Loopback callers (the CLI) are always allowed. Non-loopback callers are
+/// rejected unless `gateway.allow_remote_admin` is enabled *and* pairing is
+/// on, in which case the request must also pass pairing authentication
+/// (`require_auth`). Opting in with pairing disabled is rejected rather than
+/// allowing an unauthenticated remote reload.
 ///
 /// Sends `true` on the reload channel the daemon owns. The daemon's main
 /// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
@@ -3319,8 +4055,43 @@ async fn handle_admin_shutdown(
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
+    // unless the operator opted in via `gateway.allow_remote_admin`, and even
+    // then must pass pairing auth — which requires pairing to be enabled, so
+    // opting in without pairing is rejected rather than left unauthenticated.
+    let allow_remote = state.config.read().gateway.allow_remote_admin;
+    // Source pairing status from the guard `require_auth` consults, not the
+    // raw config field, so the gate's `RequireAuth` decision can never
+    // diverge from what `require_auth` will actually enforce.
+    let require_pairing = state.pairing.require_pairing();
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
+        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
+        AdminReloadGate::Forbidden => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload is disabled. Call from localhost, \
+                              or set gateway.allow_remote_admin = true (with pairing \
+                              enabled, then pair) to allow authenticated remote reloads."
+                })),
+            ));
+        }
+        AdminReloadGate::ForbiddenNoPairing => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload requires pairing. \
+                              gateway.allow_remote_admin is enabled but \
+                              gateway.require_pairing is off, so remote callers \
+                              cannot be authenticated. Enable require_pairing, or \
+                              call /admin/reload from localhost."
+                })),
+            ));
+        }
+    }
 
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
@@ -3406,37 +4177,161 @@ async fn handle_admin_paircode(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/paircode/new — generate a new pairing code (localhost only)
+/// Query parameters for `POST /admin/paircode/new`.
+///
+/// `rotate` distinguishes the destructive "rotate after compromise" path from
+/// the default "add another client" path (#6984):
+/// - absent / empty → add another client; existing tokens stay valid.
+/// - `rotate=all` → revoke every paired token and clear the device registry,
+///   then issue a fresh code. The only safe action when the operator does not
+///   know which token leaked.
+/// - `rotate=<device_id>` → revoke just that device's token, then issue a code.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct AdminPaircodeQuery {
+    #[serde(default)]
+    pub rotate: Option<String>,
+}
+
+/// POST /admin/paircode/new — generate a new pairing code (localhost only).
+///
+/// With `?rotate=all` or `?rotate=<device_id>` this also revokes existing
+/// bearer tokens before issuing the code, so the CLI/admin surface can
+/// distinguish "add another client" from "rotate after compromise" (#6984).
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
-    match state.pairing.generate_new_pairing_code() {
-        Some(code) => {
+
+    if !state.pairing.require_pairing() {
+        let body = serde_json::json!({
+            "success": false,
+            "pairing_required": false,
+            "pairing_code": null,
+            "message": "Pairing is disabled for this gateway"
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(body)));
+    }
+
+    let rotate = params
+        .rotate
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let revocation_message = match rotate {
+        Some("all") => {
+            let revoked = state.pairing.revoke_all_tokens();
+            if let Some(registry) = state.device_registry.as_ref() {
+                if let Err(e) = registry.clear() {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            }
+            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"revoked": revoked})),
+                "all paired tokens revoked via admin endpoint"
+            );
+            Some(format!(
+                "Revoked all {revoked} paired token(s) and cleared the device registry."
+            ))
+        }
+        Some(device_id) => {
+            let Some(registry) = state.device_registry.as_ref() else {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": "Device registry is disabled; cannot rotate a single device.",
+                });
+                return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
+            };
+            let token_hash = match registry.revoke(device_id) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device '{device_id}' not found; nothing revoked."),
+                    });
+                    return Ok((StatusCode::NOT_FOUND, Json(body)));
+                }
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device registry error: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            };
+            state.pairing.revoke_token_hash(&token_hash);
+            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Token revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "new pairing code generated via admin endpoint"
+                "single device token revoked via admin endpoint"
             );
-            let body = serde_json::json!({
-                "success": true,
-                "pairing_required": state.pairing.require_pairing(),
-                "pairing_code": code,
-                "message": "New pairing code generated — use this one-time code to pair"
-            });
-            Ok((StatusCode::OK, Json(body)))
+            Some(format!(
+                "Revoked the bearer token for device '{device_id}'."
+            ))
         }
-        None => {
-            let body = serde_json::json!({
-                "success": false,
-                "pairing_required": false,
-                "pairing_code": null,
-                "message": "Pairing is disabled for this gateway"
-            });
-            Ok((StatusCode::BAD_REQUEST, Json(body)))
-        }
+        None => None,
+    };
+
+    let code = state
+        .pairing
+        .generate_new_pairing_code()
+        .expect("require_pairing checked above");
+    if rotate.is_none() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "new pairing code generated via admin endpoint"
+        );
     }
+
+    let message = match revocation_message {
+        Some(revoked) => {
+            format!("{revoked} Use this one-time code to re-pair.")
+        }
+        None => "New pairing code generated — use this one-time code to pair".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": true,
+        "pairing_code": code,
+        "message": message,
+    });
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
@@ -3470,7 +4365,7 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
@@ -3480,10 +4375,182 @@ mod tests {
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
 
+    #[test]
+    fn default_agent_alias_picks_smallest_enabled_and_is_deterministic() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let enabled = || AliasedAgentConfig {
+            enabled: true,
+            ..AliasedAgentConfig::default()
+        };
+
+        // No agents -> no default.
+        let mut config = Config::default();
+        assert_eq!(default_agent_alias(&config), None);
+
+        // Insertion order is deliberately not alphabetical; `config.agents` is
+        // a HashMap whose iteration order is randomized per process. The pick
+        // must still be the lexicographically smallest ENABLED alias so the
+        // Tools page seeds the same agent on every restart.
+        config.agents.insert("zeta".to_string(), enabled());
+        config.agents.insert("alpha".to_string(), enabled());
+        config.agents.insert("mid".to_string(), enabled());
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+
+        // A smaller-but-disabled alias is skipped (omission is not a grant).
+        config.agents.insert(
+            "aaa_disabled".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+    }
+
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
         hex::encode(bytes)
+    }
+
+    struct NamedMcpMockTool(&'static str);
+    zeroclaw_api::mock_tool_attribution!(NamedMcpMockTool);
+    #[async_trait]
+    impl tools::Tool for NamedMcpMockTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mcp mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
+            Ok(tools::ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    /// Regression test for #7733 at the gateway MCP wiring site.
+    /// `append_scoped_mcp_tools` must early-return without mutating
+    /// `gw_tools` when the agent has no `mcp_bundles` grant, even if
+    /// `[[mcp.servers]]` is non-empty.
+    ///
+    /// Note: this is a behavior-pinning test, not a mutation-discriminating
+    /// one. The configured stdio server (`/usr/bin/mcp-fs`) is unlikely
+    /// to exist on the test host, so a hypothetical regression that
+    /// reverted to `&config.mcp.servers` would also produce zero
+    /// registered tools (the stdio connect fails non-fatally). The
+    /// stronger guard against that regression is
+    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` plus
+    /// the resolver-level pins in `zeroclaw-config`. This test still
+    /// adds value by exercising the `append_scoped_mcp_tools` call
+    /// surface and ensuring it does not hang or panic for an unscoped
+    /// agent.
+    #[tokio::test]
+    async fn append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles() {
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        // Critically: NO mcp_bundles configured and NO agent grants.
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "unscoped".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let security: Arc<SecurityPolicy> = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let initial_len = gw_tools.len();
+
+        // Bound the call with a short timeout: if the no-bundle branch
+        // ever stops being an early-return and tries to spawn an stdio
+        // MCP child, we'd rather see a timeout failure here than a
+        // hanging CI job.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::append_scoped_mcp_tools(&config, "unscoped", &security, &mut gw_tools, None),
+        )
+        .await
+        .expect("append_scoped_mcp_tools must not hang for an unscoped agent");
+
+        assert_eq!(
+            gw_tools.len(),
+            initial_len,
+            "append_scoped_mcp_tools must not push any tool when the \
+             agent has no mcp_bundles grant; gw_tools went from {} \
+             to {}",
+            initial_len,
+            gw_tools.len()
+        );
+    }
+
+    /// Gateway parity with the channel path: the gateway now scopes MCP servers
+    /// by `mcp_bundles` and gates registration through the same
+    /// `register_eager_mcp_tool_if_allowed` helper, so an `excluded_tools`-denied
+    /// MCP tool must not be registered while a non-denied one is auto-admitted.
+    /// Pins the fifth-site fix from PR #8120 against silent regression.
+    #[test]
+    fn gateway_excluded_tools_drops_denied_mcp_tool() {
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let denied: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_items"));
+        let allowed: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut gw_tools, None, mcp_policy.as_ref());
+        let registered_allowed =
+            register_eager_mcp_tool_if_allowed(allowed, &mut gw_tools, None, mcp_policy.as_ref());
+        assert!(
+            !registered_denied,
+            "gateway must not register an `excluded_tools`-denied MCP tool"
+        );
+        assert!(
+            registered_allowed,
+            "gateway must register a non-denied MCP tool (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = gw_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the gateway registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the gateway registry; got {names:?}"
+        );
     }
 
     #[test]
@@ -3512,9 +4579,43 @@ mod tests {
 
     #[test]
     fn paircode_recovery_command_includes_specific_host_when_needed() {
+        // Admin paircode routes are localhost-only, so the recovery hint must
+        // not advertise a non-loopback `--host` (the admin guard would 403 it).
+        // The CLI is left to fall back to its loopback default.
         assert_eq!(
             format_paircode_recovery_command("192.168.1.20", 42617),
-            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
+        // Regression for #6561: a gateway bound to a non-loopback interface must
+        // not surface a recovery hint that the localhost-only admin guard rejects.
+        let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
+        assert!(
+            !cmd.contains("192.168.1.20"),
+            "recovery command must not advertise the non-loopback bound host: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--host"),
+            "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
+        );
+
+        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        assert_eq!(
+            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            "curl fallback must target loopback, not the non-loopback bound host"
+        );
+        assert!(
+            !curl.contains("192.168.1.20"),
+            "curl fallback must not advertise the non-loopback bound host: {curl}"
+        );
+
+        // Path prefix is still preserved while the host is normalized.
+        assert_eq!(
+            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
@@ -3527,10 +4628,381 @@ mod tests {
     }
 
     #[test]
+    fn already_paired_notice_states_no_code_was_generated() {
+        // Regression for #5266: the banner must say plainly that NO code exists
+        // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
+        // hits the dashboard's 6-digit prompt with no code printed anywhere.
+        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("already paired"),
+            "notice must say the gateway is already paired: {joined}"
+        );
+        assert!(
+            joined.contains("no new") && joined.contains("code"),
+            "notice must state that no new code was generated: {joined}"
+        );
+    }
+
+    #[test]
+    fn already_paired_notice_includes_recovery_command_and_curl() {
+        // The notice is the single source of truth for the on-demand recovery
+        // commands; it must reuse the loopback-safe builders so the banner and
+        // any future surface never drift from #6561's no-`--host` rule.
+        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
+            "notice must surface the get-paircode recovery command: {joined}"
+        );
+        assert!(
+            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            "notice must surface the curl fallback (honoring the path prefix): {joined}"
+        );
+        // #6561: never advertise the non-loopback bound host in the hint.
+        assert!(
+            !joined.contains("192.168.1.20"),
+            "notice must not advertise the non-loopback bound host: {joined}"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("localhost", 42617, ""),
+            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::1", 42617, ""),
+            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
     fn paircode_recovery_curl_preserves_path_prefix() {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
             "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    /// Build an AppState wired with a real pairing guard, on-disk config path,
+    /// and an optional device registry so the admin paircode handler's
+    /// revoke + persist paths can be exercised end to end.
+    fn admin_paircode_state(
+        tmp: &tempfile::TempDir,
+        require_pairing: bool,
+        with_registry: bool,
+    ) -> AppState {
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: registry,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
+        let dist_dir = tmp.path().join("web").join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(
+            dist_dir.join("index.html"),
+            r#"<!DOCTYPE html><html><head></head><body>dashboard shell</body></html>"#,
+        )
+        .unwrap();
+
+        let mut state = admin_paircode_state(tmp, false, false);
+        state.web_dist_dir = Some(dist_dir);
+        state
+    }
+
+    async fn spa_fallback_response(
+        path: &'static str,
+        state: AppState,
+    ) -> axum::response::Response {
+        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
+    }
+
+    /// Pair a device into both the pairing guard and the device registry,
+    /// returning the plaintext token so the test can assert it is revoked.
+    async fn pair_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state.device_registry.as_ref().unwrap().register(
+            PairingGuard::token_hash(&token),
+            api_pairing::DeviceInfo {
+                id: device_id.to_string(),
+                name: None,
+                device_type: None,
+                paired_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+        token
+    }
+
+    async fn admin_paircode_response_json(
+        result: Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Default `?` absent path still just adds a client; existing tokens live.
+    #[tokio::test]
+    async fn admin_paircode_new_without_rotate_keeps_existing_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "add-another-client path must not revoke existing tokens"
+        );
+    }
+
+    /// `?rotate=all` revokes every token, clears the registry, persists, and
+    /// still issues a fresh code.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_all_revokes_everything() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(!state.pairing.is_authenticated(&token_b));
+        assert!(
+            state.config.read().gateway.paired_tokens.is_empty(),
+            "rotate=all must persist an empty token set"
+        );
+        assert!(
+            state.device_registry.as_ref().unwrap().list().is_empty(),
+            "rotate=all must clear the device registry"
+        );
+    }
+
+    /// `?rotate=<id>` revokes only that device and leaves the rest valid.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_device_revokes_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("dev-a".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(
+            state.pairing.is_authenticated(&token_b),
+            "targeted rotate must not touch other devices"
+        );
+        let old_hash = PairingGuard::token_hash(&token_a);
+        assert!(
+            !state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&old_hash)
+        );
+    }
+
+    /// Unknown device id returns 404 and revokes nothing.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_unknown_device_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("ghost".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "a not-found rotate must not revoke any token"
+        );
+    }
+
+    /// Pairing disabled returns 400 regardless of rotate intent.
+    #[tokio::test]
+    async fn admin_paircode_new_pairing_disabled_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    /// The on-demand mint endpoint is the recovery path advertised to operators
+    /// (banner + dashboard "Generate pairing code" button) for the already-paired
+    /// state in #5266. It MUST stay localhost-only: a remote peer minting a code
+    /// would reopen the brute-forceable pairing window the design deliberately
+    /// closes once paired. The dashboard relies on this 403 to fall back to the
+    /// CLI hint for non-loopback origins.
+    #[tokio::test]
+    async fn admin_paircode_new_rejects_remote_peer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+
+        let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
+                .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "minting a pairing code must be rejected for non-loopback peers"
         );
     }
 
@@ -3573,6 +5045,96 @@ mod tests {
         assert_clone::<AppState>();
     }
 
+    #[tokio::test]
+    async fn spa_fallback_returns_json_not_html_for_unknown_api_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "unknown API paths must not be served as HTML"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "not_found");
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_api_root_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_path_prefixed_api_miss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = spa_fallback_state(&tmp);
+        state.path_prefix = "/gw".to_string();
+
+        let response = spa_fallback_response("/gw/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_still_serves_dashboard_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/config", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "dashboard routes should still receive the SPA shell"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("dashboard shell"));
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_does_not_treat_api_like_spa_paths_as_api() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/apiary", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "similarly named SPA routes should not be reserved as API paths"
+        );
+    }
+
     /// Regression: the gateway must boot with zero configured agents so
     /// a fresh install can reach `/admin/reload` and `/quickstart` to add
     /// one. Earlier the boot path returned
@@ -3581,9 +5143,18 @@ mod tests {
     /// channel could be exercised.
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Default Config has no [agents.*] entries — the exact shape
         // a fresh install presents on first daemon boot.
-        let config = Config::default();
         assert!(
             config.agents.is_empty(),
             "regression assumes default Config has no agents",
@@ -3595,7 +5166,7 @@ mod tests {
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -3639,18 +5210,27 @@ mod tests {
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
         use zeroclaw_config::schema::AliasedAgentConfig;
 
-        let mut config = Config::default();
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Enabled agent whose `risk_profile` does not resolve. No
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
             enabled: true,
-            risk_profile: "definitely_not_configured".to_string(),
+            risk_profile: "definitely_not_configured".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -3691,7 +5271,7 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -3719,6 +5299,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_gateway_uses_external_shutdown_sender() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        shutdown_tx
+            .send(true)
+            .expect("external daemon-owned shutdown sender should stay connected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway should return after external shutdown")
+            .expect("gateway task should not panic")
+            .expect("gateway shutdown should be graceful");
+
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
@@ -3726,6 +5368,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -3734,23 +5381,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -3769,6 +5417,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3805,6 +5455,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -3813,23 +5468,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -3848,6 +5504,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4122,6 +5780,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -4254,6 +5914,28 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CapturingObserver {
+        events: Mutex<Vec<zeroclaw_runtime::observability::ObserverEvent>>,
+    }
+
+    impl zeroclaw_runtime::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
     }
@@ -4366,7 +6048,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4375,23 +6062,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4410,6 +6098,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4423,6 +6113,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            Query(WebhookQuery::default()),
             headers.clone(),
             body,
         )
@@ -4433,9 +6124,15 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
         }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body)
-            .await
-            .into_response();
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await
+        .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
         let payload = second.into_body().collect().await.unwrap().to_bytes();
@@ -4443,6 +6140,225 @@ mod tests {
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_unknown_agent_rejected_before_dispatch() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        // An idempotency key on a rejected request must NOT be consumed.
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("ghost-key"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("ghost".into()),
+            }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown agent `ghost`")
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+        // Key still fresh — a corrected retry with the same key proceeds.
+        assert!(state.idempotency_store.record_if_new("ghost-key"));
+    }
+
+    #[tokio::test]
+    async fn webhook_explicit_agent_reports_agent_model() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let observer_impl = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = observer_impl.clone();
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("agent-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let expected_provider = "anthropic.default".to_string();
+        config.agents.insert(
+            "nova".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: expected_provider.clone().into(),
+                ..Default::default()
+            },
+        );
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            model_provider,
+            model: "startup-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer,
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("nova".into()),
+            }),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["model"], "agent-model");
+        let events = observer_impl.events.lock();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                    model_provider,
+                    model,
+                    ..
+                } if model_provider == &expected_provider && model == "agent-model"
+            )),
+            "expected AgentStart to use the explicit agent model; events were: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -4459,6 +6375,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: true,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4467,23 +6388,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4502,6 +6424,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4514,6 +6438,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            Query(WebhookQuery::default()),
             headers.clone(),
             body1,
         )
@@ -4524,9 +6449,15 @@ mod tests {
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
         }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
-            .await
-            .into_response();
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body2,
+        )
+        .await
+        .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
         let keys = tracking_impl.keys.lock().clone();
@@ -4562,7 +6493,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4571,23 +6507,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4606,6 +6543,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4613,6 +6552,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            Query(WebhookQuery::default()),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -4638,7 +6578,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4647,23 +6592,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4682,6 +6628,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4695,6 +6643,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            Query(WebhookQuery::default()),
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -4719,7 +6668,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4728,23 +6682,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4763,6 +6718,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4773,6 +6730,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            Query(WebhookQuery::default()),
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -4807,7 +6765,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4816,23 +6779,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4851,6 +6815,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4894,7 +6860,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4903,21 +6874,22 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
-            nextcloud_talk: Some(channel),
-            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
+            nextcloud_talk_webhook_secret: HashMap::from([(alias.to_string(), Arc::from(secret))]),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4936,6 +6908,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5029,7 +7003,12 @@ mod tests {
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5038,23 +7017,24 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
-            nextcloud_talk: Some(channel),
-            nextcloud_talk_webhook_secret: None,
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
+            nextcloud_talk_webhook_secret: HashMap::new(),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5071,6 +7051,8 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5536,6 +7518,176 @@ mod tests {
     }
 
     #[test]
+    fn admin_reload_gate_loopback_always_allowed() {
+        // Loopback is allowed regardless of the opt-in or pairing flags.
+        assert_eq!(
+            admin_reload_gate(true, false, false),
+            AdminReloadGate::Allow
+        );
+        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_blocked_by_default() {
+        // Non-loopback caller with the flag off is rejected outright,
+        // regardless of pairing.
+        assert_eq!(
+            admin_reload_gate(false, false, true),
+            AdminReloadGate::Forbidden
+        );
+        assert_eq!(
+            admin_reload_gate(false, false, false),
+            AdminReloadGate::Forbidden
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_requires_auth() {
+        // Non-loopback caller with the flag on and pairing on must authenticate.
+        assert_eq!(
+            admin_reload_gate(false, true, true),
+            AdminReloadGate::RequireAuth
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_without_pairing_is_rejected() {
+        // Opting in with pairing off cannot authenticate the caller, so the
+        // request is rejected rather than allowed anonymously.
+        assert_eq!(
+            admin_reload_gate(false, true, false),
+            AdminReloadGate::ForbiddenNoPairing
+        );
+    }
+
+    #[test]
+    fn allow_remote_admin_defaults_off() {
+        // Security default: remote admin reload is disabled until opted in.
+        assert!(!zeroclaw_config::schema::GatewayConfig::default().allow_remote_admin);
+    }
+
+    // ── handle_admin_reload route-level tests ─────────────────────
+    // Beyond the pure `admin_reload_gate` policy tests, these exercise the
+    // real handler path (ConnectInfo + HeaderMap + PairingGuard + config),
+    // proving `allow_remote_admin` cannot expose an unauthenticated remote
+    // reload and that a valid paired token is required and sufficient.
+
+    /// Build an `AppState` for `handle_admin_reload`: controls
+    /// `gateway.allow_remote_admin`, pairing (and its tokens), and wires a
+    /// live reload channel so the allowed path reaches `200` rather than the
+    /// `503` standalone-gateway branch.
+    fn admin_reload_state(
+        tmp: &tempfile::TempDir,
+        allow_remote_admin: bool,
+        require_pairing: bool,
+        tokens: &[String],
+    ) -> AppState {
+        let mut state = admin_paircode_state(tmp, require_pairing, false);
+        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 40000))
+    }
+
+    fn remote_peer() -> SocketAddr {
+        // RFC 5737 TEST-NET-3 documentation address — a stable non-loopback
+        // peer that is never a real host on anyone's network.
+        SocketAddr::from(([203, 0, 113, 50], 40000))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_reload_loopback_no_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let resp =
+            handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_default_off_is_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_without_pairing_does_not_reload() {
+        // The fixed hole: allow_remote_admin = true + require_pairing = false
+        // must NOT permit an anonymous remote reload.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, false, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_missing_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_invalid_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("not-the-token"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_valid_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let resp = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("zc_test_token"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
     fn needs_quickstart_for_flags_empty_model() {
         let err =
             needs_quickstart_for("").expect("empty model must produce a needs_quickstart error");
@@ -5621,5 +7773,559 @@ mod tests {
             reply.to_lowercase().contains("quickstart"),
             "channel reply must mention Quickstart so users know what's missing: {reply:?}"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Linq Multi-Tenant Webhook Routing Tests
+    // ══════════════════════════════════════════════════════════
+
+    /// Helper: compute a valid Linq HMAC-SHA256 signature for the given
+    /// secret, timestamp, and body.  Mirrors the verification logic in
+    /// `zeroclaw_channels::linq::verify_linq_signature`.
+    #[cfg(feature = "channel-linq")]
+    fn compute_linq_signature_hex(secret: &str, timestamp: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let message = format!("{timestamp}.{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Helper: build a minimal Linq webhook payload that `parse_webhook_payload`
+    /// recognises as a `message.received` event with one text part.
+    #[cfg(feature = "channel-linq")]
+    fn linq_webhook_body(sender: &str, text: &str) -> String {
+        serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "sender": { "phone": sender },
+                "message": {
+                    "parts": [{ "type": "text", "value": text }]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// Helper: build an `AppState` with one Linq channel registered under the
+    /// given alias, with an allow-any peer resolver and an optional signing
+    /// secret.
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let channel = Arc::new(LinqChannel::new(
+            "test-token".into(),
+            "+15550000000".into(),
+            alias,
+            peer_resolver,
+        ));
+        let mut linq = HashMap::new();
+        linq.insert(alias.to_string(), channel);
+
+        let mut linq_signing_secrets: HashMap<String, Arc<str>> = HashMap::new();
+        if let Some(secret) = signing_secret {
+            linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
+        }
+
+        AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq,
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets,
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_returns_not_found_for_unknown_alias() {
+        // No Linq channels configured at all.
+        let state = linq_test_state("production", None);
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("staging".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"event_type":"message.received"}"#),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_returns_not_found_when_no_channels_configured() {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"event_type":"message.received"}"#),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_accepts_valid_message_for_known_alias() {
+        let state = linq_test_state("default", None);
+        let body = linq_webhook_body("+15551234567", "hello from test");
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            HeaderMap::new(),
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_invalid_signature_for_alias() {
+        let secret = generate_test_secret();
+        let state = linq_test_state("secure-alias", Some(&secret));
+
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_static("sha256=deadbeef"),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_static("9999999999"),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("secure-alias".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_accepts_valid_signature_for_alias() {
+        let secret = generate_test_secret();
+        let state = linq_test_state("secure-alias", Some(&secret));
+
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("secure-alias".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Per-alias webhook routing (#6312) ───────────────────────────────────
+
+    /// Baseline `AppState` with no channels configured, for the per-alias
+    /// routing tests. Tests insert the WhatsApp instances they exercise.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn webhook_baseline_state() -> AppState {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let mem: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_instance(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            verify_token.into(),
+            alias.to_string(),
+            peer_resolver,
+        ))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_signature(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn verify_query(token: &str, challenge: &str) -> WhatsAppVerifyQuery {
+        WhatsAppVerifyQuery {
+            mode: Some("subscribe".to_string()),
+            verify_token: Some(token.to_string()),
+            challenge: Some(challenge.to_string()),
+        }
+    }
+
+    /// `/whatsapp/<alias>` reaches the addressed instance — proven by each
+    /// instance only verifying against its own token.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_alias_routes_to_the_matching_instance() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([
+            ("work".to_string(), whatsapp_instance("work", "tok-work")),
+            (
+                "personal".to_string(),
+                whatsapp_instance("personal", "tok-personal"),
+            ),
+        ]);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            Query(verify_query("tok-work", "challenge-work")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Explicit alias path carries no deprecation header.
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_none()
+        );
+
+        // The other instance's token must NOT verify against `work`.
+        let resp = handle_whatsapp_verify_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            Query(verify_query("tok-personal", "challenge")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state),
+            Path("personal".to_string()),
+            Query(verify_query("tok-personal", "challenge-personal")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Unknown alias → 404 (not a 500).
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_unknown_alias_is_404_not_500() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state),
+            Path("nope".to_string()),
+            Query(verify_query("tok", "challenge")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Bare path stays back-compatible for single-instance configs and flags the
+    /// deprecation header.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_bare_path_is_back_compat_and_flags_deprecation() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp =
+            HashMap::from([("default".to_string(), whatsapp_instance("default", "tok"))]);
+
+        let resp = handle_whatsapp_verify(
+            State(state),
+            Query(verify_query("tok", "challenge-default")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_some()
+        );
+    }
+
+    /// The alias path preserves per-instance signature auth.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_alias_path_preserves_signature_auth() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        // Unknown alias → 404 before any processing.
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("nope".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Configured alias, missing/invalid signature → 401.
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Configured alias, valid signature over an empty payload → 200 ack.
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 }

@@ -139,7 +139,7 @@ impl WatiChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"normalized_phone": normalized_phone})),
-                "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw onboard channels` to configure interactively."
+                "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw config set channels.wati.allowed-numbers='[\"<msisdn>\"]'`."
             );
             return None;
         }
@@ -261,6 +261,8 @@ impl WatiChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -443,6 +445,8 @@ impl WatiChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -522,12 +526,12 @@ impl Channel for WatiChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 }
@@ -885,6 +889,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -915,6 +920,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -964,6 +970,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -1136,6 +1143,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -1189,6 +1197,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,

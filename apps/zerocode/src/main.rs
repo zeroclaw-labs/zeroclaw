@@ -23,11 +23,15 @@ mod attachment;
 mod chat;
 mod client;
 mod clipboard;
+mod color_depth;
 mod config;
 mod config_manager;
 mod dashboard;
 mod diff;
+mod doctor;
+mod editor;
 mod file_explorer;
+mod help;
 mod i18n;
 mod input_bar;
 mod jsonrpc;
@@ -83,21 +87,21 @@ struct Cli {
 }
 
 /// Where zerocode should connect.
-enum ConnectTarget {
+pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
     Wss { url: String, skip_verify: bool },
 }
 
 impl ConnectTarget {
     /// Human-readable label for the dashboard Status box.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::LocalSocket(p) => format!("local:{}", p.display()),
             Self::Wss { url, .. } => url.clone(),
         }
     }
 
-    fn insecure_tls(&self) -> bool {
+    pub(crate) fn insecure_tls(&self) -> bool {
         matches!(
             self,
             Self::Wss {
@@ -105,6 +109,25 @@ impl ConnectTarget {
                 ..
             }
         )
+    }
+
+    /// Connect to this target, reclaiming a prior TUI identity when
+    /// `prev_id`/`prev_sig` are supplied. Single source of truth for the
+    /// per-transport connect call — used by initial startup and in-loop
+    /// reconnection alike.
+    pub(crate) async fn connect(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<client::RpcClient> {
+        match self {
+            Self::LocalSocket(socket) => {
+                client::RpcClient::connect(socket, prev_id, prev_sig).await
+            }
+            Self::Wss { url, skip_verify } => {
+                client::RpcClient::connect_wss(url, prev_id, prev_sig, *skip_verify).await
+            }
+        }
     }
 }
 
@@ -125,10 +148,23 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("zerocode: {e:#}");
+            eprintln!("zerocode: {}", format_startup_error(&e));
             ExitCode::FAILURE
         }
     }
+}
+
+fn format_startup_error(err: &anyhow::Error) -> String {
+    if let Some(mismatch) = err.downcast_ref::<client::DaemonVersionMismatch>() {
+        return i18n::t_args(
+            "zc-error-daemon-version-mismatch",
+            &[
+                ("client_version", mismatch.client_version()),
+                ("server_version", mismatch.server_version()),
+            ],
+        );
+    }
+    format!("{err:#}")
 }
 
 /// Install a panic hook that restores the terminal before printing the
@@ -162,25 +198,49 @@ enum InsecureTlsChoice {
     Abort,
 }
 
-fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
-    use std::io::Write as _;
-    eprintln!(
+/// Prompt the operator to accept an insecure-TLS connection to `url`.
+///
+/// Returns the operator's [`InsecureTlsChoice`]:
+/// - [`InsecureTlsChoice::Once`] for `y` / `yes` (connect once, do not persist)
+/// - [`InsecureTlsChoice::Always`] for `a` / `always` (connect and remember this route)
+/// - [`InsecureTlsChoice::Abort`] for everything else (default, empty, `n`, junk)
+///
+/// Reads the operator's answer from `reader` and writes the prompt to
+/// `writer` so tests can inject deterministic input without touching
+/// `stdin` / `stderr`.
+fn confirm_insecure_tls_with<R: std::io::BufRead, W: std::io::Write>(
+    mut reader: R,
+    writer: &mut W,
+    url: &str,
+) -> anyhow::Result<InsecureTlsChoice> {
+    writeln!(
+        writer,
         "\nWARNING: --tls-skip-verify DISABLES TLS certificate verification for\n\
          {url}\nThis connection is UNSAFE on untrusted networks (susceptible to\n\
          man-in-the-middle). Only continue on a trusted network against a\n\
          self-signed cert you control.\n\n\
          You are accepting an UNVERIFIED route, not a trusted peer.\n\
          [y] yes, connect once   [a] always (remember this route)   [N] no, abort"
-    );
-    eprint!("Continue with verification disabled? [y/a/N] ");
-    std::io::stderr().flush().ok();
+    )?;
+    write!(writer, "Continue with verification disabled? [y/a/N] ")?;
+    writer.flush().ok();
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    reader.read_line(&mut answer)?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(InsecureTlsChoice::Once),
         "a" | "always" => Ok(InsecureTlsChoice::Always),
         _ => Ok(InsecureTlsChoice::Abort),
     }
+}
+
+/// Production entry point: locks `stdin` and writes the prompt to `stderr`,
+/// delegating to [`confirm_insecure_tls_with`]. Behaviour is identical to
+/// the previous inline implementation — the refactor only adds the
+/// `BufRead` / `Write` seam so the prompt logic can be unit-tested.
+fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
+    let stdin = std::io::stdin();
+    let mut stderr = std::io::stderr();
+    confirm_insecure_tls_with(stdin.lock(), &mut stderr, url)
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -246,13 +306,19 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Initial connection (before the terminal is initialized).
+    // `owns_ephemeral` records whether THIS process spawned the daemon
+    // (initial connect failed → we started one). Only an owned ephemeral
+    // daemon may be respawned on disconnect, and then exactly once.
+    let mut owns_ephemeral = false;
     let rpc = match &target {
         ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
                 Ok(c) => c,
+                Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     spawn_ephemeral_daemon(&config_dir)?;
+                    owns_ephemeral = true;
                     await_daemon_ready(socket).await?
                 }
             }
@@ -276,114 +342,67 @@ async fn run() -> anyhow::Result<()> {
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
-    let result = run_until_exit(Arc::new(rpc), &mut term, &target, &local_config_dir).await;
+    let result = run_until_exit(
+        Arc::new(rpc),
+        &mut term,
+        &target,
+        &local_config_dir,
+        owns_ephemeral,
+    )
+    .await;
 
     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
     config_manager::restore_terminal(&mut term)?;
     result
 }
 
-/// Wraps the reconnect loop with a SIGTERM handler so the TUI exits
-/// cleanly (terminal restored) instead of dying mid-draw.
+/// Runs the TUI under a SIGTERM handler so the terminal is restored on
+/// signal instead of dying mid-draw. `app::run` owns the full session
+/// lifecycle — including in-loop reconnection and recovery — and returns
+/// only when the user quits.
 async fn run_until_exit(
     rpc: Arc<client::RpcClient>,
     term: &mut config_manager::Term,
     target: &ConnectTarget,
     config_dir: &std::path::Path,
+    owns_ephemeral: bool,
 ) -> anyhow::Result<()> {
-    // Shared state that survives the reconnect cycle. Quickstart's
-    // Stage 2 writes the new agent's alias here so the next
-    // `app::run` iteration drops the user into Chat once the daemon
-    // is back up.
+    // Shared state that survives a reconnect. Quickstart's Stage 2 writes
+    // the new agent's alias here so the recovering `app::run` loop drops
+    // the user into Chat once the daemon is back up.
     let reconnect_state: app::SharedReconnectState =
         Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
+
+    let label = target.label();
+    let insecure_tls = target.insecure_tls();
 
     #[cfg(unix)]
     {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            r = run_with_reconnect(Arc::clone(&rpc), term, target, Arc::clone(&reconnect_state), config_dir) => r,
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
             _ = sigterm.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        run_with_reconnect(
-            Arc::clone(&rpc),
-            term,
-            target,
-            Arc::clone(&reconnect_state),
-            config_dir,
-        )
-        .await
-    }
-}
-
-async fn run_with_reconnect(
-    rpc: Arc<client::RpcClient>,
-    term: &mut config_manager::Term,
-    target: &ConnectTarget,
-    reconnect_state: app::SharedReconnectState,
-    config_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    loop {
-        let label = target.label();
-        let should_reconnect = match app::run(
-            Arc::clone(&rpc),
+        app::run(
+            rpc,
             term,
             &label,
-            target.insecure_tls(),
-            Arc::clone(&reconnect_state),
+            insecure_tls,
+            reconnect_state,
             config_dir,
+            target,
+            owns_ephemeral,
         )
         .await
-        {
-            Ok(reconnect) => reconnect,
-            Err(_) if rpc.is_disconnected() => {
-                // RPC error caused by a dead connection — treat as
-                // disconnect and enter the reconnect loop instead of
-                // propagating a fatal error.
-                true
-            }
-            Err(e) => return Err(e),
-        };
-        if !should_reconnect {
-            return Ok(());
-        }
-        // Preserve TUI identity across reconnects so the daemon can
-        // reclaim the same UID via HMAC signature verification.
-        let prev_id = rpc.tui_id().map(String::from);
-        let prev_sig = rpc.tui_sig().map(String::from);
-        // Retry connecting. We do NOT spawn a new daemon here — multiple
-        // TUIs reconnecting simultaneously would each spawn their own,
-        // causing a stampede. The daemon is managed externally (service
-        // manager, manual restart, or the initial startup path in run()).
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let result = match target {
-                ConnectTarget::LocalSocket(socket) => {
-                    client::RpcClient::connect(socket, prev_id.as_deref(), prev_sig.as_deref())
-                        .await
-                }
-                ConnectTarget::Wss { url, skip_verify } => {
-                    client::RpcClient::connect_wss(
-                        url,
-                        prev_id.as_deref(),
-                        prev_sig.as_deref(),
-                        *skip_verify,
-                    )
-                    .await
-                }
-            };
-            if let Ok(_c) = result {
-                break;
-            }
-        }
+        .map(|_| ())
     }
 }
 
-fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))
@@ -429,9 +448,15 @@ async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::
         }
         match client::RpcClient::connect(socket, None, None).await {
             Ok(c) => return Ok(c),
+            Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
             Err(_) => tokio::time::sleep(DAEMON_CONNECT_INTERVAL).await,
         }
     }
+}
+
+fn is_daemon_version_mismatch(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<client::DaemonVersionMismatch>()
+        .is_some()
 }
 
 #[cfg(test)]
@@ -484,6 +509,209 @@ mod connection_tests {
         assert_eq!(
             resolve_wss_target(None, false, &cfg),
             Some(("wss://h:1".to_string(), false))
+        );
+    }
+}
+
+#[cfg(test)]
+mod confirm_insecure_tls_tests {
+    //! Tests for [`crate::confirm_insecure_tls_with`], the test-seam
+    //! extracted from the original `confirm_insecure_tls(url)` so the
+    //! input → choice mapping and prompt content can be asserted
+    //! deterministically without touching `stdin` / `stderr`.
+    //!
+    //! Acceptance criterion coverage for issue #7693:
+    //! 1. "Insecure TLS cannot be accepted without explicit confirmation"
+    //!    — the empty / `n` / junk / uppercase-`N` / default branches all
+    //!    return [`InsecureTlsChoice::Abort`].
+    //! 2. "Decline/abort paths leave no persisted insecure-TLS choice"
+    //!    — the static-source test
+    //!    [`abort_arm_of_confirm_match_must_not_call_persist`] enforces
+    //!    the structural invariant that the `Abort` arm of the production
+    //!    match in `run()` does not invoke `persist_wss_route_ack`.
+    //! 3. "Mode transition tests cover the quickstart/chat handoff" is
+    //!    covered by the existing `connection_tests::flag_connect_*` /
+    //!    `config_uri_*` / `skip_verify_*` tests; this issue does not
+    //!    change `resolve_wss_target`'s contract.
+    //! 4. "prompt persistence behavior needed to test those transitions
+    //!    deterministically" is covered by the existing
+    //!    `route_acked_membership` / `persist_wss_route_ack_dedups` /
+    //!    `persist_wss_route_ack_preserves_other_sections` tests in
+    //!    `crate::config` — this issue does not duplicate that coverage.
+
+    use super::InsecureTlsChoice::{Abort, Always, Once};
+    use super::*;
+    use std::io::Cursor;
+
+    /// Drive [`confirm_insecure_tls_with`] with a deterministic stdin
+    /// buffer and a fresh output buffer, returning the operator's
+    /// choice and the captured prompt text.
+    fn run(input: &str, url: &str) -> (InsecureTlsChoice, String) {
+        let mut output = Vec::new();
+        let choice = confirm_insecure_tls_with(Cursor::new(input), &mut output, url)
+            .expect("confirm_insecure_tls_with must succeed on plain stdin read");
+        let stderr = String::from_utf8(output).expect("prompt must be valid UTF-8");
+        (choice, stderr)
+    }
+
+    #[test]
+    fn confirm_input_y_returns_once() {
+        assert!(matches!(run("y\n", "wss://example.test:1").0, Once));
+    }
+
+    #[test]
+    fn confirm_input_yes_returns_once() {
+        assert!(matches!(run("yes\n", "wss://example.test:1").0, Once));
+    }
+
+    #[test]
+    fn confirm_input_a_returns_always() {
+        assert!(matches!(run("a\n", "wss://example.test:1").0, Always));
+    }
+
+    #[test]
+    fn confirm_input_always_returns_always() {
+        assert!(matches!(run("always\n", "wss://example.test:1").0, Always));
+    }
+
+    #[test]
+    fn confirm_input_n_returns_abort() {
+        assert!(matches!(run("n\n", "wss://example.test:1").0, Abort));
+    }
+
+    #[test]
+    fn confirm_input_empty_returns_abort() {
+        // Acceptance: insecure TLS cannot be accepted without explicit
+        // confirmation. An empty stdin (e.g. operator hits enter without
+        // typing) must default-decline.
+        assert!(matches!(run("\n", "wss://example.test:1").0, Abort));
+    }
+
+    #[test]
+    fn confirm_input_junk_returns_abort() {
+        // Acceptance: unknown input must default to the safe Abort
+        // branch — only `y` / `yes` / `a` / `always` may opt into
+        // verification-disabled transport.
+        assert!(matches!(run("xyz\n", "wss://example.test:1").0, Abort));
+    }
+
+    #[test]
+    fn confirm_input_uppercase_lowercases_before_match() {
+        // The match arm uses `to_ascii_lowercase()` so case variations
+        // resolve identically. This is the seam's contract; pin both
+        // "Once" and "Always" branches to defend against an
+        // accidental case-sensitive refactor.
+        assert!(matches!(run("Y\n", "wss://example.test:1").0, Once));
+        assert!(matches!(run("YES\n", "wss://example.test:1").0, Once));
+        assert!(matches!(run("ALWAYS\n", "wss://example.test:1").0, Always));
+        // Uppercase `N` and `NO` must still resolve to Abort — they
+        // are not in the affirmative set.
+        assert!(matches!(run("N\n", "wss://example.test:1").0, Abort));
+        assert!(matches!(run("NO\n", "wss://example.test:1").0, Abort));
+    }
+
+    #[test]
+    fn confirm_prompt_writes_url_and_choice_menu_to_writer() {
+        // The operator must see (a) which URL they are accepting
+        // insecure-TLS for, and (b) the `[y/a/N]` choice menu, before
+        // any answer is read. Capture the prompt text and pin both
+        // invariants so a future refactor cannot silently truncate the
+        // warning or the menu.
+        let url = "wss://insecure-host.example:8443";
+        let (_, stderr) = run("n\n", url);
+        assert!(
+            stderr.contains(url),
+            "stderr prompt must contain the URL being confirmed; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("[y/a/N]"),
+            "stderr prompt must show the y/a/N choice menu; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("WARNING"),
+            "stderr prompt must lead with a WARNING banner so the \
+             operator does not skim past an insecure-TLS confirmation; \
+             got: {stderr}"
+        );
+    }
+
+    /// Static invariant from issue #7693 acceptance criterion 2:
+    /// "Decline/abort paths leave no persisted insecure-TLS choice."
+    ///
+    /// `confirm_insecure_tls` is called from `run()` in a `match` that
+    /// decides whether to invoke `persist_wss_route_ack`. Persisting on
+    /// the `Abort` branch would silently store an insecure-TLS choice
+    /// the operator explicitly declined — a security-sensitive
+    /// regression that no other test in the suite catches.
+    ///
+    /// Rather than spawn the full CLI / daemon / config-dir stack to
+    /// exercise the abort path end-to-end, this test inspects the
+    /// production source of `main.rs` and asserts the `Abort` arm does
+    /// not contain the persist call. This is a structural guard: any
+    /// future move of `persist_wss_route_ack(...)` into the abort arm
+    /// trips this test loudly.
+    #[test]
+    fn abort_arm_of_confirm_match_must_not_call_persist() {
+        const MAIN_SRC: &str = include_str!("main.rs");
+        const MATCH_OPEN: &str = "match confirm_insecure_tls(url)? {";
+        const ABORT_ARM_LABEL: &str = "InsecureTlsChoice::Abort";
+        const PERSIST_CALL: &str = "persist_wss_route_ack(&local_config_dir, url)?";
+
+        let match_open_idx = MAIN_SRC
+            .find(MATCH_OPEN)
+            .unwrap_or_else(|| panic!("main.rs must contain a `{MATCH_OPEN}` block"));
+        // Locate the matching closing brace by scanning for the first
+        // `}\n` after the open that is preceded by another `}` at the
+        // same indentation depth. The match block in `run()` is
+        // followed by code at lower indentation, so we use a simple
+        // brace-pair scan: every `{` increments depth, every `}`
+        // decrements, and depth 0 is the close.
+        let after_open = match_open_idx + MATCH_OPEN.len();
+        let mut depth: usize = 1;
+        let mut idx = after_open;
+        let bytes = MAIN_SRC.as_bytes();
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        assert!(
+            depth == 0,
+            "match block in main.rs does not close cleanly (depth={depth} at idx={idx})"
+        );
+        let match_block = &MAIN_SRC[match_open_idx..=idx];
+
+        // Slice just the Abort arm: from `InsecureTlsChoice::Abort` to
+        // the next `=>` (the arm label terminator) or the end of the
+        // block.
+        let abort_label_idx = match_block.find(ABORT_ARM_LABEL).unwrap_or_else(|| {
+            panic!(
+                "main.rs match block must include `{ABORT_ARM_LABEL}` arm; \
+                 got block:\n{match_block}"
+            )
+        });
+        let arm_tail_start = match_block[abort_label_idx..]
+            .find("=>")
+            .map(|i| abort_label_idx + i + "=>".len())
+            .unwrap_or(match_block.len());
+        // The arm body extends to the end of the match block (we slice
+        // up to the closing brace which was at `idx`). Subtract 1 to
+        // exclude the `}` itself.
+        let abort_arm_body = &match_block[arm_tail_start..match_block.len() - 1];
+        assert!(
+            !abort_arm_body.contains(PERSIST_CALL),
+            "Abort arm of `match confirm_insecure_tls(url)?` MUST NOT call \
+             `{PERSIST_CALL}` — persisting on Abort would silently store an \
+             insecure-TLS choice the operator declined. Found in arm body:\n\
+             {abort_arm_body}"
         );
     }
 }

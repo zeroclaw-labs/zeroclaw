@@ -45,27 +45,24 @@ The agent has access to 30+ tools gated by security policy: shell, file_read, fi
 
 ---
 
-## Onboarding
+## Quickstart
 
-First-time setup or reconfiguration.
+First-time setup. Picks a model provider, writes a working `~/.zeroclaw/config.toml`, and binds one agent to that provider in a single shot.
 
 ```bash
-zeroclaw onboard                                 # Interactive run through every section
-zeroclaw onboard --quick --model-provider ollama # Non-interactive quick mode
-zeroclaw onboard channels                        # Run only the `channels` section
-zeroclaw onboard model-providers                 # Run only the `model-providers` section
-zeroclaw onboard --reinit                        # Back up existing config, start from defaults
+zeroclaw quickstart                                                           # Interactive prompts
+zeroclaw quickstart --model-provider ollama --model qwen2.5:7b                # Non-interactive (local)
+zeroclaw quickstart --model-provider openrouter --model openrouter/auto \
+                    --api-key sk-or-... --agent or                            # Non-interactive (hosted)
 ```
 
-**Key flags:**
-- `--provider <name>` — openrouter (default), anthropic, openai, ollama
-- `--model <model>` — default model
-- `--memory <backend>` — sqlite, markdown, lucid, none
-- `--force` — overwrite existing config.toml
-- `--channels-only` — only repair channel configuration
-- `--reinit` — start fresh (backs up existing config)
+**Flags:**
+- `--model-provider <name>` — anthropic, openai, openrouter, ollama, gemini, glm, telnyx, …
+- `--model <id>` — model id to write for the new provider entry
+- `--api-key <key>` — API key (omit for local providers like ollama)
+- `--agent <alias>` — agent alias (defaults to a sanitized provider name)
 
-Creates `~/.zeroclaw/config.toml` with `0600` permissions.
+Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent — re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <key>=<value>`; to reconfigure channels, use `zeroclaw config set channels.<name>.<field>=<value>` (per-channel guides live under [Channels → Overview](../../docs/book/src/channels/overview.md)).
 
 ---
 

@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -630,6 +631,62 @@ fn rootless_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+struct NormalizedRootlessPath {
+    drive: Option<u8>,
+    text: String,
+}
+
+fn normalized_rootless_path_text(path: &Path) -> Option<NormalizedRootlessPath> {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        text = rest.to_string();
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+
+    let mut drive = None;
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        drive = Some(bytes[0].to_ascii_lowercase());
+        text = text[2..].to_string();
+    }
+
+    let parts: Vec<&str> = text
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if parts.is_empty() || parts.contains(&"..") {
+        None
+    } else {
+        Some(NormalizedRootlessPath {
+            drive,
+            text: parts.join("/"),
+        })
+    }
+}
+
+fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Option<PathBuf> {
+    let path_text = normalized_rootless_path_text(path)?;
+    let workspace_text = normalized_rootless_path_text(workspace_dir)?;
+
+    if path_text.drive.is_some() && path_text.drive != workspace_text.drive {
+        return None;
+    }
+
+    if path_text.text == workspace_text.text {
+        return Some(PathBuf::new());
+    }
+
+    let prefix = format!("{}/", workspace_text.text);
+    path_text
+        .text
+        .strip_prefix(&prefix)
+        .map(|suffix| PathBuf::from(suffix.replace('/', std::path::MAIN_SEPARATOR_STR)))
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -666,6 +723,9 @@ enum QuoteState {
     Double,
 }
 
+/// Remove heredoc body lines from a single command segment, keeping the
+/// opener line and anything after the terminator. Body content is stdin
+/// data, never an argv path argument, so the path guard must not inspect it.
 /// Split a shell command into sub-commands by unquoted separators.
 ///
 /// Separators:
@@ -727,17 +787,19 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
-                    current.push(ch);
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
+                    } else {
+                        current.push(ch);
                     }
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    current.push(ch);
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
+                    } else {
+                        current.push(ch);
                     }
                     continue;
                 }
@@ -764,7 +826,11 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     continue;
                 }
 
-                // Inside a heredoc body: don't split on newlines.
+                // Inside a heredoc body: don't split on newlines, and drop the
+                // body content so the segment carries only the opener line and
+                // the command. This is the single source of heredoc-parsing
+                // truth — it is quote-aware, so quoted `<<WORD` text never opens
+                // a heredoc and cannot hide later real path arguments.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
                         if heredoc_line_buf.trim() == delim {
@@ -774,11 +840,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                             push_segment(&mut segments, &mut current);
                         } else {
                             heredoc_line_buf.clear();
-                            current.push(ch);
                         }
                     } else {
                         heredoc_line_buf.push(ch);
-                        current.push(ch);
                     }
                     continue;
                 }
@@ -1073,7 +1137,9 @@ fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
-        || candidate.starts_with('~')
+        || candidate == "~"
+        || candidate.starts_with("~/")
+        || (candidate.starts_with('~') && candidate.contains('/'))
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
@@ -1094,7 +1160,9 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if body.starts_with('-') || body.len() < 2 {
         return None;
     }
-    let value = body[1..].trim_start_matches('=').trim();
+    let mut chars = body.chars();
+    chars.next();
+    let value = chars.as_str().trim_start_matches('=').trim();
     if value.is_empty() { None } else { Some(value) }
 }
 
@@ -2097,6 +2165,14 @@ impl SecurityPolicy {
                 } else {
                     self.workspace_dir.join(stripped)
                 }
+            } else if let Some(stripped) =
+                workspace_prefixed_relative_suffix(&expanded, &self.workspace_dir)
+            {
+                if stripped.as_os_str().is_empty() {
+                    self.workspace_dir.clone()
+                } else {
+                    self.workspace_dir.join(stripped)
+                }
             } else {
                 self.workspace_dir.join(expanded)
             }
@@ -2402,6 +2478,16 @@ impl SecurityPolicy {
         // file_read/write/edit and the shell tool jail to the agent's
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        // The per-agent workspace is the shell tool's spawn cwd and the file-tool
+        // jail root. Create it here so every path that builds a per-agent policy
+        // (agent loop, gateway, channels) has the directory present. A missing cwd
+        // makes the shell tool's process spawn fail with ENOENT on a fresh agent.
+        std::fs::create_dir_all(&agent_workspace).with_context(|| {
+            format!(
+                "SecurityPolicy::for_agent: failed to create agent workspace dir {}",
+                agent_workspace.display()
+            )
+        })?;
         let mut policy = Self::from_profiles(risk_profile, runtime_profile, &agent_workspace);
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
@@ -2731,6 +2817,7 @@ mod tests {
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
+            approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
@@ -2806,6 +2893,29 @@ mod tests {
         assert!(
             !policy.workspace_only,
             "Full autonomy must drop workspace_only even when the profile sets it true"
+        );
+    }
+
+    #[test]
+    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(
+            policy.allowed_tools.is_none(),
+            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
+             from allowed_tools = []; both map to no authorization constraint"
+        );
+        assert!(
+            policy.is_tool_allowed("filesystem__write_file"),
+            "empty risk-profile allowed_tools is unrestricted, not deny-all"
         );
     }
 
@@ -3954,9 +4064,74 @@ mod tests {
             p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
             Some("~root/.ssh/id_rsa".into())
         );
+        // Bare `~user` with no path component is not a forbidden path argument:
+        // narrowed to avoid false-positives on non-path `~`-prefixed tokens
+        // (e.g. `~20`). A `~user/...` form with a slash still blocks (above).
+        assert_eq!(p.forbidden_path_argument("ls ~nobody"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_tilde_non_path_and_heredoc_body() {
+        let p = unix_forbidden_path_policy();
+
+        // Tilde-then-non-slash tokens are not home paths: `~20`, `~589`, `~foo`.
         assert_eq!(
-            p.forbidden_path_argument("ls ~nobody"),
-            Some("~nobody".into())
+            p.forbidden_path_argument("echo \"about ~20 percent\""),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument("python3 -c \"print('about ~589 lines')\""),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument("printf 'roughly ~foo here\\n'"),
+            None
+        );
+
+        // Heredoc body content is stdin data, never an argv path argument.
+        let heredoc =
+            "cat <<'EOF' > ./out.txt\nthis line has ~20 percent and /etc/passwd mentioned\nEOF";
+        assert_eq!(p.forbidden_path_argument(heredoc), None);
+
+        // Security preserved: real forbidden home/absolute path arguments still block.
+        assert_eq!(
+            p.forbidden_path_argument("cat ~/.ssh/id_rsa"),
+            Some("~/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/shadow"),
+            Some("/etc/shadow".into())
+        );
+        // A forbidden path used as a real argument on the heredoc opener line
+        // must still block, even when a heredoc body follows.
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd <<'EOF'\nbody ~20\nEOF"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
+        let p = unix_forbidden_path_policy();
+
+        // `<<EOF` inside a double-quoted string is data, not a heredoc opener.
+        // The closing quote ends the string, and `/etc/shadow` after it is a
+        // real argv path argument that must still block. A non-quote-aware
+        // heredoc stripper would treat the quoted `<<EOF` as a real opener,
+        // swallow the following lines, and hide the forbidden path.
+        assert_eq!(
+            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            Some("/etc/shadow".into())
+        );
+
+        // Single-quoted variant of the same shape.
+        assert_eq!(
+            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            Some("/etc/passwd".into())
         );
     }
 
@@ -4400,6 +4575,47 @@ mod tests {
     }
 
     #[test]
+    fn for_agent_creates_the_per_agent_workspace_dir() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-for-agent-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let ws = cfg.agent_workspace_dir("agent_a");
+        assert!(
+            !ws.exists(),
+            "precondition: workspace dir must not exist yet"
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert!(
+            ws.exists(),
+            "for_agent must create the per-agent workspace dir at the chokepoint"
+        );
+        assert_eq!(
+            policy.workspace_dir, ws,
+            "policy cwd/jail root must be the created workspace dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn for_agent_unrestricted_filesystem_disables_workspace_only() {
         use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
@@ -4818,6 +5034,32 @@ mod tests {
             resolved,
             PathBuf::from("/zeroclaw-data/workspace/scripts/daily.py")
         );
+    }
+
+    #[test]
+    fn resolve_tool_path_normalizes_windows_workspace_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_eq!(resolved, workspace.join("nested").join("out.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_does_not_normalize_mismatched_drive_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"D:Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_ne!(resolved, workspace.join("nested").join("out.txt"));
     }
 
     #[test]
@@ -5502,5 +5744,22 @@ mod tests {
         let t = PerSenderTracker::new();
         // Key "ghost" has never been recorded — should not be exhausted at max=1
         assert!(!t.is_exhausted("ghost", 1));
+    }
+
+    #[test]
+    fn attached_short_option_value_handles_multibyte_token() {
+        // A multibyte char immediately after the dash must not panic on a
+        // byte-index slice. Regression for a char-boundary abort.
+        assert_eq!(
+            attached_short_option_value("-é/etc/passwd"),
+            Some("/etc/passwd")
+        );
+        assert_eq!(attached_short_option_value("-—"), None);
+        assert_eq!(
+            attached_short_option_value("-f/etc/passwd"),
+            Some("/etc/passwd")
+        );
+        assert_eq!(attached_short_option_value("-f"), None);
+        assert_eq!(attached_short_option_value("--long"), None);
     }
 }

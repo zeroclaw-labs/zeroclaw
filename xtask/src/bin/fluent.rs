@@ -24,7 +24,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider alias from [providers.models.<kind>.<alias>] in config.toml.
+        /// Provider alias from `[providers.models.<kind>.<alias>]` in config.toml.
         /// Pass a bare alias (e.g. `lineation`) or a `kind.alias` qualifier
         /// (e.g. `anthropic.lineation`) when the alias is ambiguous.
         #[arg(long)]

@@ -189,7 +189,7 @@ struct ResponseMessage {
 /// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
 /// automatically.
 pub struct CopilotModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     github_token: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
@@ -392,7 +392,11 @@ impl CopilotModelProvider {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — spec-compliant
+            // validators reject tool_choice without a non-empty tools field.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
         };
 

@@ -18,6 +18,8 @@
 import { useState } from 'react';
 import { Loader2, RotateCw, X } from 'lucide-react';
 import { ApiError, reloadDaemon } from '../../lib/api';
+import { useReloadAvailable } from '../../lib/reloadAvailability';
+import { t } from '@/lib/i18n';
 
 interface ReloadDaemonButtonProps {
   /** Called when /health answers post-reload (parent typically reloads its data). */
@@ -36,6 +38,14 @@ type State =
 
 export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: ReloadDaemonButtonProps) {
   const [state, setState] = useState<State>({ kind: 'idle' });
+  const reloadAvailable = useReloadAvailable();
+
+  // The gateway rejects /admin/reload from a remote host unless remote admin
+  // and pairing are enabled. When our proxy for that says it can't succeed,
+  // hide the whole control rather than offer a button that only errors.
+  if (!reloadAvailable) {
+    return null;
+  }
 
   const triggerReload = async () => {
     setState({ kind: 'reloading' });
@@ -48,7 +58,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
           : e instanceof Error
             ? e.message
             : String(e);
-      setState({ kind: 'error', message: `Reload request failed: ${msg}` });
+      setState({ kind: 'error', message: `${t('reload_btn.request_failed_prefix')}${msg}` });
       return;
     }
 
@@ -76,7 +86,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
     }
     setState({
       kind: 'error',
-      message: `Daemon did not respond within ${(timeoutMs / 1000).toFixed(0)}s. Check the gateway logs (it may still be starting, or it may have crashed).`,
+      message: `${t('reload_btn.timeout_prefix')}${(timeoutMs / 1000).toFixed(0)}${t('reload_btn.timeout_suffix')}`,
     });
   };
 
@@ -92,7 +102,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
         onClick={() => setState({ kind: 'confirming' })}
         disabled={isBusy}
         className="btn-secondary flex items-center gap-2 text-sm px-3 py-2"
-        title="Re-read config and re-init every daemon subsystem in place"
+        title={t('reload_btn.button_title')}
       >
         {state.kind === 'reloading' || state.kind === 'waiting' ? (
           <Loader2 className="h-4 w-4 animate-spin" />
@@ -100,12 +110,12 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
           <RotateCw className="h-4 w-4" />
         )}
         {state.kind === 'reloading'
-          ? 'Reloading…'
+          ? t('reload_btn.reloading')
           : state.kind === 'waiting'
-            ? 'Waiting for daemon…'
+            ? t('reload_btn.waiting')
             : state.kind === 'back'
-              ? 'Daemon back ✓'
-              : 'Reload daemon'}
+              ? t('reload_btn.back')
+              : t('reload_btn.reload_daemon')}
       </button>
 
       {state.kind === 'error' && (
@@ -123,7 +133,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
             onClick={() => setState({ kind: 'idle' })}
             className="ml-3 underline"
           >
-            dismiss
+            {t('reload_btn.dismiss')}
           </button>
         </div>
       )}
@@ -137,7 +147,7 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
                 style={{ color: 'var(--pc-text-primary)' }}
               >
                 <RotateCw className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-                Reload daemon?
+                {t('reload_btn.modal_title')}
               </h3>
               <button
                 type="button"
@@ -150,25 +160,19 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
 
             <div className="space-y-3 text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
               <p>
-                The daemon process stays running (same PID), but every
-                subsystem tears down and re-initializes from the on-disk
-                config:
+                {t('reload_btn.body_intro')}
               </p>
               <ul className="list-disc pl-5 space-y-1">
-                <li>Gateway listener stops and rebinds (clients briefly see connection-refused).</li>
-                <li>Channel listeners (Matrix, Slack, etc.) abort and respawn.</li>
-                <li>MCP servers, scheduler, heartbeat re-init.</li>
-                <li>Provider clients pick up new API keys / model defaults.</li>
+                <li>{t('reload_btn.effect_gateway')}</li>
+                <li>{t('reload_btn.effect_channels')}</li>
+                <li>{t('reload_btn.effect_mcp')}</li>
+                <li>{t('reload_btn.effect_providers')}</li>
               </ul>
               <p style={{ color: 'var(--pc-text-muted)' }}>
-                Use this after editing config from the dashboard. For everyday
-                in-flight changes (toggle, comment, etc.) save is enough — reload
-                is for changes that need a fresh subsystem (added a channel,
-                changed gateway port, swapped memory backend).
+                {t('reload_btn.body_when')}
               </p>
               <p>
-                In-flight HTTP requests will fail. The dashboard auto-reconnects
-                when the daemon is back.
+                {t('reload_btn.body_inflight')}
               </p>
             </div>
 
@@ -178,14 +182,14 @@ export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: R
                 onClick={() => setState({ kind: 'idle' })}
                 className="btn-secondary px-4 py-2 text-sm font-medium"
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
                 onClick={() => void triggerReload()}
                 className="btn-electric px-4 py-2 text-sm font-medium"
               >
-                Reload
+                {t('reload_btn.reload')}
               </button>
             </div>
           </div>

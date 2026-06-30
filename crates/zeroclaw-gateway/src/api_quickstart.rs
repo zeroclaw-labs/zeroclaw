@@ -54,7 +54,7 @@ pub enum ApplyResult {
 /// needs to render every step's "Use existing" section without
 /// pulling the entire config. Response shape is owned by
 /// `zeroclaw_runtime::quickstart::QuickstartState`; both transports
-/// build the body via [`snapshot_state`] so they cannot drift.
+/// build the body via [`zeroclaw_runtime::quickstart::snapshot_state`] so they cannot drift.
 pub async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();

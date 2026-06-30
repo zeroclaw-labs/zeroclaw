@@ -1,14 +1,14 @@
 # Contributor License Agreement
 
-**Version 1.0 — February 2026 · ZeroClaw Labs**
+> Version 1.0, February 2026 · ZeroClaw Labs
 
 By submitting a contribution (pull request, patch, issue with code, or any other form of code submission) to the ZeroClaw repository, you agree to the terms below. No separate signature is required for individual contributors.
 
 ## Definitions
 
-- **Contribution** — any original work of authorship, including modifications or additions to existing work, submitted to ZeroClaw Labs for inclusion in the ZeroClaw project.
-- **You** — the individual or legal entity submitting a Contribution.
-- **ZeroClaw Labs** — the maintainers and organization responsible for the ZeroClaw project at <https://github.com/zeroclaw-labs/zeroclaw>.
+- **Contribution**: any original work of authorship, including modifications or additions to existing work, submitted to ZeroClaw Labs for inclusion in the ZeroClaw project.
+- **You**: the individual or legal entity submitting a Contribution.
+- **ZeroClaw Labs**: the maintainers and organization responsible for the ZeroClaw project at <https://github.com/zeroclaw-labs/zeroclaw>.
 
 ## Grant of copyright license
 
@@ -46,14 +46,14 @@ ZeroClaw Labs maintains attribution to contributors in the repository commit his
 
 All Contributions accepted into the ZeroClaw project are licensed under both:
 
-- **MIT License** — permissive open-source use
-- **Apache License 2.0** — patent protection and stronger IP guarantees
+- **MIT License**: permissive open-source use
+- **Apache License 2.0**: patent protection and stronger IP guarantees
 
 This dual-license model ensures maximum compatibility and protection for the entire contributor community.
 
 ## Corporate contributors
 
-For contributions on behalf of a company or organization, open an issue titled "Corporate CLA — [Company Name]" and a maintainer will follow up.
+For contributions on behalf of a company or organization, open an issue titled "Corporate CLA, [Company Name]" and a maintainer will follow up.
 
 ## Questions
 

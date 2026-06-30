@@ -1,6 +1,7 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
-use crate::agent::agent::{Agent, TurnEvent};
+use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -14,6 +15,7 @@ pub enum TurnOutcome {
     },
     Cancelled {
         partial_text: String,
+        messages: Vec<ConversationMessage>,
     },
 }
 
@@ -50,6 +52,7 @@ pub async fn execute_turn<F, Fut>(
     prompt: String,
     cancel: CancellationToken,
     attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -60,7 +63,7 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
-    let turn_handle = zeroclaw_spawn::spawn!(async move {
+    let mut turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
@@ -74,9 +77,25 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            guard
-                .turn_streamed(&prompt, event_tx, Some(cancel_clone))
-                .instrument(span)
+            // Scope the cost-tracking context so this turn's per-call token
+            // usage is persisted and counted against budgets.
+            // `turn_streamed_with_steering_state` reuses this outer scope; with
+            // no scope set it falls back to a tracker-less `usage_only` context
+            // and model cost is silently dropped (#5221 regression). The scope
+            // must live INSIDE the spawned task — task-locals don't cross the
+            // spawn boundary.
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    cost_context,
+                    guard
+                        .turn_streamed_with_steering_state(
+                            &prompt,
+                            event_tx,
+                            Some(cancel_clone),
+                            None,
+                        )
+                        .instrument(span),
+                )
                 .await
         })
         .await
@@ -95,22 +114,71 @@ where
     let _ = session_key; // consumed above
 
     match drain {
-        DrainOutcome::Completed => match turn_handle
-            .await
-            .map_err(|e| TurnError::Panicked(format!("{e}")))?
-        {
-            Ok((text, messages)) => Ok(TurnOutcome::Completed { text, messages }),
-            Err(e) if is_tool_loop_cancelled(&e) => Ok(TurnOutcome::Cancelled {
-                partial_text: accumulated_text,
-            }),
-            Err(e) => Err(TurnError::AgentError(format!("{e}"))),
-        },
-        DrainOutcome::ExplicitCancel => {
-            turn_handle.abort();
-            Ok(TurnOutcome::Cancelled {
-                partial_text: accumulated_text,
-            })
+        DrainOutcome::Completed => {
+            let joined = turn_handle
+                .await
+                .map_err(|e| TurnError::Panicked(format!("{e}")))?;
+            outcome_from_task_result(joined, accumulated_text)
         }
+        DrainOutcome::ExplicitCancel => {
+            // The turn task races the same cancel token and unwinds
+            // cooperatively: it synthesizes results for any in-flight tool
+            // call, pushes the `[interrupted]` assistant message, and commits
+            // both into the agent history before returning. Persistence reads
+            // that committed history, so aborting the task mid-commit drops
+            // the cancelled turn's tool exchange and corrupts the next turn.
+            // Give the task a bounded grace window to land its own unwind;
+            // only abort if it is genuinely wedged in a non-cooperative call.
+            match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
+                Ok(joined) => outcome_from_task_result(
+                    joined.map_err(|e| TurnError::Panicked(format!("{e}")))?,
+                    accumulated_text,
+                ),
+                Err(_) => {
+                    turn_handle.abort();
+                    Ok(TurnOutcome::Cancelled {
+                        partial_text: accumulated_text,
+                        messages: Vec::new(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Grace window allowing a cancelled turn task to commit its cooperative
+/// unwind (synthesized tool results + `[interrupted]` message) into the agent
+/// history before the dispatch path falls back to a hard abort.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Map a finished turn task into a [`TurnOutcome`]. A successful turn yields
+/// `Completed`; a cooperative cancel yields `Cancelled` carrying the messages
+/// the task committed so persistence never depends on the abort/commit race.
+fn outcome_from_task_result(
+    joined: Result<StreamedTurnSuccess, StreamedTurnError>,
+    accumulated_text: String,
+) -> Result<TurnOutcome, TurnError> {
+    match joined {
+        Ok(StreamedTurnSuccess {
+            response,
+            new_messages,
+        }) => Ok(TurnOutcome::Completed {
+            text: response,
+            messages: new_messages,
+        }),
+        Err(StreamedTurnError {
+            error,
+            committed_response,
+            new_messages,
+        }) if is_tool_loop_cancelled(&error) => Ok(TurnOutcome::Cancelled {
+            partial_text: if committed_response.is_empty() {
+                accumulated_text
+            } else {
+                committed_response
+            },
+            messages: new_messages,
+        }),
+        Err(StreamedTurnError { error, .. }) => Err(TurnError::AgentError(format!("{error}"))),
     }
 }
 
@@ -267,6 +335,205 @@ mod tests {
              window must sit comfortably between the inter-chunk gap of a \
              healthy stream (~hundreds of ms) and the user-perceptible hang \
              threshold (~seconds)."
+        );
+    }
+
+    #[test]
+    fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
+        // A cooperative cancel returns StreamedTurnError whose new_messages
+        // hold the synthesized tool results + `[interrupted]` message the task
+        // already committed. The mapping must surface them, not drop them onto
+        // the floor and fall back to bare accumulated text — that drop is what
+        // truncated the cancelled turn's tool exchange from persisted history.
+        let msgs = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
+        )];
+        let err = StreamedTurnError {
+            error: crate::agent::loop_::ToolLoopCancelled.into(),
+            committed_response: "partial".to_string(),
+            new_messages: msgs.clone(),
+        };
+
+        let outcome = outcome_from_task_result(Err(err), "accumulated".to_string())
+            .expect("cooperative cancel maps to a Cancelled outcome, not an error");
+
+        match outcome {
+            TurnOutcome::Cancelled {
+                partial_text,
+                messages,
+            } => {
+                assert_eq!(
+                    partial_text, "partial",
+                    "committed_response from the task must win over the drain's \
+                     accumulated text when present"
+                );
+                assert_eq!(
+                    messages.len(),
+                    msgs.len(),
+                    "cancelled outcome dropped the messages the task committed"
+                );
+            }
+            TurnOutcome::Completed { .. } => {
+                panic!("a tool-loop cancel must not map to Completed")
+            }
+        }
+    }
+
+    #[test]
+    fn non_cancel_agent_error_stays_an_error() {
+        let err = StreamedTurnError {
+            error: anyhow::Error::msg("provider exploded"),
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+        let outcome = outcome_from_task_result(Err(err), String::new());
+        assert!(
+            matches!(outcome, Err(TurnError::AgentError(_))),
+            "a genuine agent failure must surface as an error, not a silent \
+             cancel"
+        );
+    }
+
+    /// Regression guard for #5221: a turn driven through `execute_turn` with a
+    /// real cost-tracking context must persist token usage to the tracker. The
+    /// RPC/zerocode-TUI path previously ran the turn without scoping the cost
+    /// context, so `turn_streamed_with_steering_state` fell back to a
+    /// tracker-less `usage_only` context and model cost was silently dropped.
+    #[tokio::test]
+    async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::cost::CostTracker;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::collections::HashMap;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::ChatRequest;
+
+        // Minimal provider that returns a final answer carrying non-zero token
+        // usage on the non-streaming `chat` path (the default the engine takes
+        // when the provider does not advertise streaming).
+        struct UsageProvider;
+
+        #[async_trait]
+        impl ModelProvider for UsageProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for UsageProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "mock-provider"
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("rpc-agent");
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(UsageProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("s1".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "mock-provider".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            Some(cost_context),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn should complete normally"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(
+            summary.request_count, 1,
+            "execute_turn must scope the cost context so the turn's usage is \
+             persisted (#5221)"
+        );
+        assert_eq!(summary.total_tokens, 1_200);
+        let agent_summary = tracker
+            .get_summary_for_agent("rpc-agent")
+            .expect("agent-scoped summary");
+        assert_eq!(
+            agent_summary.request_count, 1,
+            "the agent alias must flow through to the persisted cost record"
         );
     }
 }

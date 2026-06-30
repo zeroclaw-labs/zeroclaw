@@ -1,9 +1,9 @@
 //! Enumerate the channel types compiled into this binary.
 //!
-//! Use [`compiled_channels`] in display commands (`zeroclaw channel list`) that
-//! should only mention channels that can actually be started.  For a full
-//! channel inventory regardless of compile-time features, use
-//! [`zeroclaw_config::schema::ChannelsConfig::channels`] instead.
+//! Use [`compiled_channels`] in display commands that should only mention
+//! channels that can actually be started. Use
+//! [`configured_uncompiled_channels`] when an operator-facing surface must show
+//! configured channels that this binary cannot run.
 
 use zeroclaw_config::schema::ChannelsConfig;
 use zeroclaw_config::traits::ChannelInfo;
@@ -80,7 +80,7 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
     },
     ChannelCompileSpec {
         schema_name: Some("NextCloud Talk"),
-        type_keys: &["nextcloud-talk", "nextcloud_talk"],
+        type_keys: &["nextcloud", "nextcloud-talk", "nextcloud_talk"],
         compiled: cfg!(feature = "channel-nextcloud"),
     },
     ChannelCompileSpec {
@@ -97,6 +97,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         schema_name: Some("IRC"),
         type_keys: &["irc"],
         compiled: cfg!(feature = "channel-irc"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Twitch"),
+        type_keys: &["twitch"],
+        compiled: cfg!(feature = "channel-twitch"),
     },
     ChannelCompileSpec {
         schema_name: Some("Lark"),
@@ -179,6 +184,16 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-mqtt"),
     },
     ChannelCompileSpec {
+        schema_name: Some("AMQP"),
+        type_keys: &["amqp"],
+        compiled: cfg!(feature = "channel-amqp"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Filesystem"),
+        type_keys: &["filesystem"],
+        compiled: cfg!(feature = "channel-filesystem"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Webhook"),
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),
@@ -199,7 +214,7 @@ fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
 
 /// Returns one entry per channel type compiled into this binary.
 ///
-/// Filters the canonical channel list from [`ChannelsConfig::channels`] down to
+/// Filters the canonical channel list from [`zeroclaw_config::schema::ChannelsConfig::channels`] down to
 /// only those enabled at compile time via `channel-*` / `voice-wake` feature
 /// flags. Name, desc, and configured status come from the config crate's single
 /// source of truth; this function contributes only the compile-time filter.
@@ -207,6 +222,18 @@ pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     cfg.channels()
         .into_iter()
         .filter(|info| compiled_channel_names().any(|name| name == info.name))
+        .collect()
+}
+
+/// Returns configured channel types that exist in config but are not compiled.
+///
+/// This is an on-demand view over the config crate's canonical channel
+/// inventory plus this module's compile-spec table. It does not introduce a
+/// second channel list.
+pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
+    cfg.channels()
+        .into_iter()
+        .filter(|info| info.configured && !is_channel_type_compiled(info.kind))
         .collect()
 }
 
@@ -226,7 +253,7 @@ pub fn is_channel_type_compiled(channel_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{CHANNEL_COMPILE_SPECS, ChannelsConfig};
-    use super::{compiled_channels, is_channel_type_compiled};
+    use super::{compiled_channels, configured_uncompiled_channels, is_channel_type_compiled};
     use std::collections::BTreeSet;
 
     #[cfg(feature = "default-channels")]
@@ -236,6 +263,7 @@ mod tests {
         assert!(is_channel_type_compiled("email"));
         assert!(is_channel_type_compiled("webhook"));
         assert!(is_channel_type_compiled("acp-server"));
+        assert!(is_channel_type_compiled("discord"));
         assert_eq!(
             is_channel_type_compiled("nextcloud-talk"),
             cfg!(feature = "channel-nextcloud")
@@ -276,6 +304,22 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn configured_uncompiled_channels_uses_schema_config_status() {
+        let mut cfg = ChannelsConfig::default();
+        cfg.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig::default(),
+        );
+
+        let names: BTreeSet<_> = configured_uncompiled_channels(&cfg)
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+
+        assert_eq!(names.contains("Slack"), !cfg!(feature = "channel-slack"));
     }
 
     #[test]

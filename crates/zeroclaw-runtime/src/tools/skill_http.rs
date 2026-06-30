@@ -29,7 +29,7 @@ impl SkillHttpTool {
     /// to prevent collisions with built-in tools.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: crate::tools::skill_tool::composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -178,6 +178,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -220,6 +221,28 @@ mod tests {
     }
 
     #[test]
+    fn skill_http_tool_name_sanitized_for_provider_regex() {
+        // A plugin-namespaced HTTP skill (colons) or a dotted tool name must
+        // still yield a provider-valid function name, the same as shell/builtin
+        // tools, so #6678 cannot survive through the HTTP registration path.
+        let mut st = sample_http_tool();
+        st.name = "fetch.weather".to_string();
+        let tool = SkillHttpTool::new("pr-review-toolkit:code-reviewer", &st);
+        let name = tool.name();
+        assert!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "HTTP skill tool name `{name}` is not provider-valid",
+        );
+        // A valid name must still pass through unchanged (no spurious suffix).
+        let plain = SkillHttpTool::new("weather_skill", &sample_http_tool());
+        assert_eq!(plain.name(), "weather_skill__get_weather");
+    }
+
+    #[test]
     fn skill_http_tool_empty_args() {
         let st = SkillTool {
             name: "ping".to_string(),
@@ -229,6 +252,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

@@ -25,6 +25,11 @@ export interface AgentSummary {
   memoryCount: number;
 }
 
+export interface AgentPickerSummary {
+  alias: string;
+  enabled: boolean;
+}
+
 function entryValue(entry: { populated?: boolean; value?: unknown }): unknown {
   if (!entry.populated) return undefined;
   return entry.value;
@@ -145,6 +150,27 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   }
 
   return summaries;
+}
+
+/**
+ * Load the minimum agent data needed for route-level agent pickers. Keep this
+ * separate from loadAgentSummaries(), which intentionally gathers dashboard
+ * sessions, cost, memory, and peer-group data.
+ */
+export async function loadAgentPickerSummaries(): Promise<AgentPickerSummary[]> {
+  const { keys } = await getMapKeys('agents');
+  if (keys.length === 0) return [];
+
+  return Promise.all(
+    keys.map(async (alias): Promise<AgentPickerSummary> => {
+      const { entries } = await listProps(`agents.${alias}`);
+      const enabled = entries.find((entry) => entry.path === `agents.${alias}.enabled`);
+      return {
+        alias,
+        enabled: entryValue(enabled ?? { populated: false }) === 'true',
+      };
+    }),
+  );
 }
 
 /** Flip the `enabled` flag for one agent via a JSON-Patch replace. */

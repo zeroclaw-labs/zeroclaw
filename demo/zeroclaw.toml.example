@@ -1,0 +1,95 @@
+# ZeroClaw demo config — ESP32 Smart Room (adapted from original #6148 bundle)
+#
+# This harness is part of the split/port of the original big PR.
+# It depends on the small PRs for:
+# - dev-sim (for simulator paths)
+# - esp32_sim example
+# - smartroom named-device tools (set_device / read_device)
+#
+# The agent can ONLY use hardware tools on the simulated ESP32.
+# Everything else is locked down.
+#
+# To run the end-to-end demo:
+#     ./demo/run-sim.sh
+#     ./demo/run-zeroclaw.sh --agent demo "turn on the reading lamp"
+#
+# You should see the command flow through to the simulator and the visualizer update.
+
+# ─── Providers ─────────────────────────────────────────────────────────────
+# Use OpenRouter (set OPENROUTER_API_KEY in your .env).
+# The demo is tuned for tool-calling capable models available via OpenRouter.
+
+default_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+# API key is picked up from OPENROUTER_API_KEY environment variable.
+temperature = 0.3
+max_tokens = 1024
+
+# ─── Hardware peripherals ──────────────────────────────────────────────────
+# Simulated ESP32 board via the esp32_sim example (dev-sim path).
+# This brings in the high-level smart-room tools (set_device / read_device)
+# that map friendly names → pins, plus the lower-level gpio_* tools.
+
+[peripherals]
+enabled = true
+
+[[peripherals.boards]]
+board = "esp32-sim"
+transport = "serial"
+path = "/tmp/zc-sim-esp32"
+baud = 115200
+
+# ─── Lock down all other surfaces ──────────────────────────────────────────
+[shell-tool]
+enabled = false
+
+[browser]
+enabled = false
+
+[web-search]
+enabled = false
+
+[http-request]
+enabled = false
+
+[mcp]
+enabled = false
+
+[transcription]
+enabled = false
+
+# ─── Safety ────────────────────────────────────────────────────────────────
+[autonomy]
+max_actions_per_hour = 60
+# Expose only smart-room named devices + raw gpio fallbacks + capabilities.
+# `auto_approve` controls approval prompts; `allowed_tools` controls which tools
+# the model can see/call at all.
+allowed_tools = [
+    "set_device", "read_device",
+    "gpio_write", "gpio_read", "hardware_capabilities"
+]
+auto_approve = [
+    "set_device", "read_device",
+    "gpio_write", "gpio_read", "hardware_capabilities"
+]
+
+# ─── Agent (required for current CLI) ──────────────────────────────────────
+[agents.demo]
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"  # Good balance for tool use; swap for a stronger model on OpenRouter as needed (e.g. sonnet, gpt-4o, etc.)
+temperature = 0.3
+
+# ─── Telegram channel for host-mode end-to-end test ────────────────────────
+# Set TELEGRAM_BOT_TOKEN in demo/.env (get from @BotFather).
+# The host run script injects it via ZEROCLAW_channels__telegram__default__bot_token
+# at runtime so the secret does not need to live in this TOML.
+# Leave the placeholder below as-is; do not put your real bot token here.
+# For testing, receive all messages from the bot chat (adjust as needed for your setup).
+[channels_config.telegram]
+enabled = true
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+mention_only = false
+stream_mode = "partial"

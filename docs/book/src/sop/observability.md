@@ -17,20 +17,26 @@ Common key patterns:
 
 ### 2.1 Definition-level CLI
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw sop list
 zeroclaw sop validate [name]
 zeroclaw sop show <name>
 ```
 
+</div>
+
 ### 2.2 Runtime run-state tools
 
 SOP run state is queried from in-agent tools:
 
-- `sop_status` — active/finished runs and optional metrics
-- `sop_status` with `include_gate_status: true` — trust phase and gate evaluator state (when available)
-- `sop_approve` — approve waiting run step
-- `sop_advance` — submit step result and move run forward
+- `sop_status`: active/finished runs and optional metrics
+- `sop_status` with `include_gate_status: true`: trust phase and gate evaluator state (when available)
+- `sop_approve`: approve waiting run step
+- `sop_advance`: submit step result and move run forward
 
 ## 3. Metrics
 

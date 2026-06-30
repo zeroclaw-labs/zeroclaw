@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeroClaw · ESP32 Smart Room</title>
+    <style>
+      :root {
+        --bg: #020617;
+        --panel: #0f172a;
+        --border: #334155;
+        --ink: #e5e7eb;
+        --ink-dim: #94a3b8;
+        --accent: #93c5fd;
+        --warm: #fbbf24;
+        --hot: #ef4444;
+        --cool: #38bdf8;
+        --good: #34d399;
+        --off: #475569;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0; padding: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+        min-height: 100vh;
+      }
+      header {
+        padding: 16px 24px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 16px;
+        letter-spacing: 0.04em;
+        font-weight: 600;
+      }
+      header .status {
+        font-size: 12px;
+        color: var(--ink-dim);
+      }
+      header .status .dot {
+        display: inline-block;
+        width: 8px; height: 8px; border-radius: 50%;
+        background: var(--off);
+        margin-right: 6px;
+        vertical-align: middle;
+        transition: background 200ms;
+      }
+      header .status.connected .dot { background: var(--good); }
+      main {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 24px;
+        padding: 24px;
+        max-width: 1400px;
+        margin: 0 auto;
+      }
+      .room-panel, .events-panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+      }
+      .room-panel h2, .events-panel h2 {
+        margin: 0 0 16px 0;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--ink-dim);
+        font-weight: 600;
+      }
+      .room {
+        position: relative;
+        aspect-ratio: 4 / 3;
+        background: #0b1224;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .device {
+        position: absolute;
+        text-align: center;
+        font-size: 11px;
+        color: var(--ink-dim);
+        transition: all 300ms ease;
+      }
+      .device .icon {
+        width: 64px; height: 64px;
+        border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        background: #1e293b;
+        border: 2px solid var(--border);
+        font-size: 28px;
+        margin: 0 auto 6px;
+        transition: all 300ms ease;
+        box-shadow: 0 0 0 0 rgba(0,0,0,0);
+      }
+      .device .pin-label {
+        font-family: "SF Mono", Menlo, monospace;
+        font-size: 10px;
+        color: var(--ink-dim);
+        margin-top: 2px;
+      }
+      .device.on .icon {
+        border-color: var(--warm);
+      }
+      .device[data-id="overhead"].on .icon {
+        background: #fef3c7; color: #1f2937;
+        box-shadow: 0 0 30px 8px rgba(251, 191, 36, 0.5);
+      }
+      .device[data-id="lamp"].on .icon {
+        background: #fbbf24; color: #1f2937;
+        box-shadow: 0 0 24px 6px rgba(251, 191, 36, 0.6);
+      }
+      .device[data-id="fan"].on .icon {
+        background: #38bdf8; color: #0c4a6e;
+        animation: spin 1.5s linear infinite;
+        box-shadow: 0 0 18px 4px rgba(56, 189, 248, 0.4);
+        border-color: var(--cool);
+      }
+      .device[data-id="heater"].on .icon {
+        background: #ef4444; color: #fff;
+        box-shadow: 0 0 24px 6px rgba(239, 68, 68, 0.6);
+        border-color: var(--hot);
+      }
+      .device[data-id="status"].on .icon {
+        background: #34d399; color: #064e3b;
+        box-shadow: 0 0 16px 4px rgba(52, 211, 153, 0.5);
+        border-color: var(--good);
+      }
+      .device[data-id="motion"].on .icon {
+        background: #34d399; color: #064e3b;
+        border-color: var(--good);
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      /* Layout positions inside the room (relative to .room dimensions) */
+      .device[data-id="overhead"]  { top: 6%;   left: 50%; transform: translateX(-50%); }
+      .device[data-id="lamp"]      { top: 40%;  left: 12%; }
+      .device[data-id="fan"]       { top: 12%;  right: 8%; }
+      .device[data-id="heater"]    { bottom: 8%; right: 14%; }
+      .device[data-id="status"]    { bottom: 8%; left: 12%; }
+      .device[data-id="motion"]    { top: 38%;  right: 38%; }
+
+      .events {
+        height: 380px;
+        overflow-y: auto;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 11px;
+        padding: 12px;
+        background: #0b1224;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        line-height: 1.6;
+      }
+      .events .row { padding: 4px 0; border-bottom: 1px dashed #1e293b; }
+      .events .row:last-child { border-bottom: none; }
+      .events .ts { color: var(--ink-dim); margin-right: 8px; }
+      .events .src-agent { color: var(--accent); }
+      .events .src-manual { color: var(--warm); }
+      .events .pin { color: #f472b6; }
+      .events .val-1 { color: var(--good); font-weight: 600; }
+      .events .val-0 { color: var(--ink-dim); }
+      .events .err { color: var(--hot); }
+      .events .empty { color: var(--ink-dim); text-align: center; padding: 24px; }
+
+      .manual-controls {
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 1px solid var(--border);
+      }
+      .manual-controls h3 {
+        margin: 0 0 8px;
+        font-size: 11px;
+        text-transform: uppercase;
+        color: var(--ink-dim);
+        letter-spacing: 0.06em;
+      }
+      .manual-controls .pin-row {
+        display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+        font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+      }
+      .manual-controls .pin-row .label { width: 88px; color: var(--ink-dim); }
+      .manual-controls button {
+        background: #1e293b; color: var(--ink);
+        border: 1px solid var(--border); border-radius: 4px;
+        padding: 4px 10px; cursor: pointer;
+        font-family: inherit; font-size: 11px;
+        transition: background 150ms;
+      }
+      .manual-controls button:hover { background: #334155; }
+      .manual-controls button.on { background: #1d4ed8; border-color: var(--accent); }
+
+      footer {
+        padding: 16px 24px;
+        text-align: center;
+        font-size: 11px;
+        color: var(--ink-dim);
+      }
+      footer code {
+        background: var(--panel);
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ZeroClaw · ESP32 Smart Room (simulated)</h1>
+      <div class="status" id="status"><span class="dot"></span><span class="text">connecting…</span></div>
+    </header>
+
+    <main>
+      <section class="room-panel">
+        <h2>Room</h2>
+        <div class="room">
+          <div class="device" data-id="overhead" data-pin="13">
+            <div class="icon">💡</div>
+            <div>Overhead</div>
+            <div class="pin-label">GPIO 13</div>
+          </div>
+          <div class="device" data-id="lamp" data-pin="12">
+            <div class="icon">🛋️</div>
+            <div>Reading Lamp</div>
+            <div class="pin-label">GPIO 12</div>
+          </div>
+          <div class="device" data-id="fan" data-pin="2">
+            <div class="icon">🌀</div>
+            <div>Fan</div>
+            <div class="pin-label">GPIO 2 (LED)</div>
+          </div>
+          <div class="device" data-id="heater" data-pin="14">
+            <div class="icon">🔥</div>
+            <div>Heater</div>
+            <div class="pin-label">GPIO 14</div>
+          </div>
+          <div class="device" data-id="motion" data-pin="5">
+            <div class="icon">👤</div>
+            <div>Motion Sensor</div>
+            <div class="pin-label">GPIO 5 (in)</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="events-panel">
+        <h2>Pin events</h2>
+        <div class="events" id="events"><div class="empty">Awaiting agent commands…</div></div>
+
+        <div class="manual-controls">
+          <h3>Manual override</h3>
+          <div class="pin-row">
+            <span class="label">GPIO 12 lamp</span>
+            <button onclick="manualFlip(12, 1)">on</button>
+            <button onclick="manualFlip(12, 0)">off</button>
+          </div>
+          <div class="pin-row">
+            <span class="label">GPIO 13 light</span>
+            <button onclick="manualFlip(13, 1)">on</button>
+            <button onclick="manualFlip(13, 0)">off</button>
+          </div>
+          <div class="pin-row">
+            <span class="label">GPIO 14 heater</span>
+            <button onclick="manualFlip(14, 1)">on</button>
+            <button onclick="manualFlip(14, 0)">off</button>
+          </div>
+          <div class="pin-row">
+            <span class="label">GPIO 2 fan</span>
+            <button onclick="manualFlip(2, 1)">on</button>
+            <button onclick="manualFlip(2, 0)">off</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      Simulated ESP32 · firmware protocol from <code>firmware/esp32/src/main.rs</code> · pty bridge at <code>/tmp/zc-sim-esp32</code>
+    </footer>
+
+    <script>
+      const eventsEl = document.getElementById('events');
+      const statusEl = document.getElementById('status');
+      const events = [];
+      const MAX_EVENTS = 50;
+
+      function setStatus(text, connected) {
+        statusEl.querySelector('.text').textContent = text;
+        statusEl.classList.toggle('connected', connected);
+      }
+
+      function pad(n) { return n < 10 ? '0' + n : '' + n; }
+      function ts() {
+        const d = new Date();
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      }
+
+      function pushEvent(ev) {
+        events.unshift({ ...ev, time: ts() });
+        if (events.length > MAX_EVENTS) events.pop();
+        renderEvents();
+      }
+
+      function renderEvents() {
+        if (events.length === 0) {
+          eventsEl.innerHTML = '<div class="empty">Awaiting agent commands…</div>';
+          return;
+        }
+        eventsEl.innerHTML = events.map(e => {
+          const srcClass = e.source === 'manual' ? 'src-manual' : 'src-agent';
+          const valClass = e.value === 1 ? 'val-1' : 'val-0';
+          return `<div class="row">
+            <span class="ts">${e.time}</span>
+            <span class="${srcClass}">${e.source}</span>
+            <span> → </span>
+            <span>${e.cmd}</span>
+            <span> </span>
+            <span class="pin">pin ${e.pin}</span>
+            <span> = </span>
+            <span class="${valClass}">${e.value}</span>
+          </div>`;
+        }).join('');
+      }
+
+      function applyState(snap) {
+        if (!snap || !snap.pins) return;
+        document.querySelectorAll('.device').forEach(el => {
+          const pin = parseInt(el.dataset.pin, 10);
+          const value = snap.pins[pin] || 0;
+          el.classList.toggle('on', value === 1);
+        });
+        // Highlight which manual button is "active"
+        document.querySelectorAll('.manual-controls button').forEach(b => {
+          b.classList.remove('on');
+        });
+        for (const [pin, val] of Object.entries(snap.pins)) {
+          if (val === 1) {
+            const btn = document.querySelector(`.manual-controls button[onclick*="manualFlip(${pin}, 1)"]`);
+            if (btn) btn.classList.add('on');
+          }
+        }
+      }
+
+      async function manualFlip(pin, value) {
+        try {
+          const r = await fetch('/manual', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin, value }),
+          });
+          if (!r.ok) console.error('manual flip failed:', await r.text());
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      function connect() {
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        ws.onopen = () => setStatus('connected', true);
+        ws.onclose = () => {
+          setStatus('disconnected — retrying…', false);
+          setTimeout(connect, 1500);
+        };
+        ws.onerror = () => setStatus('error', false);
+        ws.onmessage = (msg) => {
+          try {
+            const snap = JSON.parse(msg.data);
+            applyState(snap);
+            if (snap.last_event) {
+              const ev = snap.last_event;
+              const last = events[0];
+              if (!last || last.cmd !== ev.cmd || last.pin !== ev.pin || last.value !== ev.value || last.source !== ev.source) {
+                pushEvent(ev);
+              }
+            }
+          } catch (e) {
+            console.error('bad frame', e, msg.data);
+          }
+        };
+      }
+
+      connect();
+    </script>
+  </body>
+</html>

@@ -584,12 +584,12 @@ impl FileExplorerState {
             footer_spans.push(Span::styled("\u{2588}", theme::body_style()));
         } else if self.dir_picker {
             footer_spans.push(Span::styled(
-                " c=choose dir  Enter=open  Backspace=up  /=search  .=hidden  Esc=cancel",
+                " j/k=move  l/h=in/out dir  c=choose dir  Enter=open  /=search  .=hidden  Esc=cancel",
                 theme::dim_style(),
             ));
         } else {
             footer_spans.push(Span::styled(
-                " Space=select Enter=confirm Esc=cancel /=search .=hidden",
+                " j/k=move  l/h=in/out dir  Space=select  Enter=confirm  /=search  .=hidden  Esc=cancel",
                 theme::dim_style(),
             ));
         }
@@ -601,34 +601,13 @@ impl FileExplorerState {
 
 impl crate::widgets::HelpContext for FileExplorerState {
     fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::widgets::{HelpEntry as E, HelpNode};
+        use crate::widgets::HelpNode;
         if self.searching {
-            HelpNode::entries(vec![
-                E::key("Enter", "Confirm search"),
-                E::key("Esc", "Cancel search"),
-            ])
-        } else if self.dir_picker {
-            HelpNode::entries(vec![
-                E::new(vec!["j", "↓"], "Next entry"),
-                E::new(vec!["k", "↑"], "Prev entry"),
-                E::key("Enter", "Open directory"),
-                E::key("c", "Choose this directory"),
-                E::key("Backspace", "Parent dir"),
-                E::key("/", "Search"),
-                E::key(".", "Toggle hidden"),
-                E::new(vec!["q", "Esc"], "Cancel"),
-            ])
+            HelpNode::entries(crate::help::help_entries::<
+                crate::keymap::FileExplorerSearchAction,
+            >())
         } else {
-            HelpNode::entries(vec![
-                E::new(vec!["j", "↓"], "Next entry"),
-                E::new(vec!["k", "↑"], "Prev entry"),
-                E::key("Enter", "Open dir / confirm"),
-                E::key("Space", "Select file"),
-                E::key("Backspace", "Parent dir"),
-                E::key("/", "Search"),
-                E::key(".", "Toggle hidden"),
-                E::new(vec!["q", "Esc"], "Cancel"),
-            ])
+            HelpNode::entries(crate::help::help_entries::<crate::keymap::FileExplorerAction>())
         }
     }
 }

@@ -14,8 +14,8 @@
 //!   [`RuntimeProfileConfig`] field values. The Quickstart writes
 //!   these verbatim into the corresponding config table on apply.
 //!
-//! Adding or removing a preset is one row in the [`risk_presets!`] /
-//! [`runtime_presets!`] table below; every consumer dispatches off
+//! Adding or removing a preset is one row in the `risk_presets!` /
+//! `runtime_presets!` table below; every consumer dispatches off
 //! `&'static [RiskPreset]` / `&'static [RuntimePreset]` so drift is
 //! impossible.
 //!
@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::autonomy::AutonomyLevel;
-use crate::autonomy::DelegationPolicy;
+use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
 use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -70,8 +70,11 @@ pub const RISK_PRESETS: &[RiskPreset] = &[
     RiskPreset {
         preset_name: "balanced",
         label: "Balanced",
-        help: "Sensible day-to-day defaults. Workspace-scoped with approval \
-               gates on risky operations. Recommended for most users.",
+        help: "Trusted daily driver for a personal dev box. Supervised, \
+               workspace-scoped with sensitive paths blocked and the sandbox \
+               on. Any command runs without an allowlist, but high-risk \
+               commands stay blocked unless explicitly allowlisted. \
+               Recommended for most users.",
         values: balanced_risk,
     },
     RiskPreset {
@@ -104,6 +107,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         always_ask: vec![],
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy::default(),
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -113,25 +117,59 @@ fn locked_down_risk() -> RiskProfileConfig {
 }
 
 fn balanced_risk() -> RiskProfileConfig {
-    // Schema default is already the Balanced shape (Supervised,
-    // workspace_only=true, medium-risk approval). Use it directly so
-    // the preset can't drift away from the schema default by accident.
-    RiskProfileConfig::default()
+    // Trusted-local daily-driver shape: Supervised autonomy, workspace-scoped
+    // with sensitive paths blocked, sandbox on, and any command permitted with
+    // high-risk commands still gated. `allowed_commands: ["*"]` lifts the
+    // medium-risk allowlist friction, while `block_high_risk_commands: true`
+    // keeps the `*` wildcard from exempting high-risk commands: `*` is not an
+    // explicit allowlist entry, so a high-risk command matched only by `*` is
+    // blocked outright (it never reaches the approval branch), not merely
+    // prompted. Medium-risk approval is off so routine work does not interrupt.
+    RiskProfileConfig {
+        level: AutonomyLevel::Supervised,
+        workspace_only: true,
+        allowed_commands: vec!["*".to_string()],
+        forbidden_paths: default_forbidden_paths(),
+        require_approval_for_medium_risk: false,
+        block_high_risk_commands: true,
+        shell_env_passthrough: vec![],
+        auto_approve: vec![],
+        always_ask: vec![],
+        allowed_roots: vec![],
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
+        allowed_tools: vec![],
+        excluded_tools: vec![],
+        sandbox_enabled: Some(true),
+        sandbox_backend: None,
+        firejail_args: vec![],
+    }
 }
 
 fn yolo_risk() -> RiskProfileConfig {
     RiskProfileConfig {
         level: AutonomyLevel::Full,
         workspace_only: false,
-        allowed_commands: vec![],
+        // YOLO means "no command denylist" — but an EMPTY allowlist is
+        // deny-by-default (`is_command_allowed` rejects any command not
+        // matched by an entry), so `vec![]` blocks every shell command.
+        // The `*` wildcard + `block_high_risk_commands: false` is what
+        // actually grants unrestricted execution (the trusted-env path in
+        // `is_command_allowed`).
+        allowed_commands: vec!["*".to_string()],
         forbidden_paths: vec![],
         require_approval_for_medium_risk: false,
         block_high_risk_commands: false,
         shell_env_passthrough: vec![],
-        auto_approve: vec![],
+        auto_approve: vec!["*".to_string()],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
@@ -215,7 +253,6 @@ fn tight_runtime() -> RuntimeProfileConfig {
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
         max_system_prompt_chars: Some(4_000),
-        context_aware_tools: Some(true),
         max_tool_result_chars: Some(8_000),
         keep_tool_context_turns: Some(2),
         memory_recall_limit: Some(3),
@@ -233,8 +270,13 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
     RuntimeProfileConfig {
         agentic: true,
         max_tool_iterations: 100,
-        max_actions_per_hour: 0, // 0 = inherit / unlimited per schema docs
-        max_cost_per_day_cents: 0,
+        // `0` is NOT "unlimited" for these budgets — the per-sender rate
+        // tracker treats a max of 0 as *exhausted* (see
+        // `PerSenderTracker::is_exhausted` / `rate_limit_zero_blocks_everything`),
+        // so an `unbounded` agent set to 0 has every action rejected. Use the
+        // type max for an effectively-unlimited budget instead.
+        max_actions_per_hour: u32::MAX,
+        max_cost_per_day_cents: u32::MAX,
         shell_timeout_secs: 600,
         max_delegation_depth: 8,
         delegation_timeout_secs: Some(900),
@@ -246,7 +288,6 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
         max_system_prompt_chars: Some(64_000),
-        context_aware_tools: Some(true),
         max_tool_result_chars: Some(64_000),
         keep_tool_context_turns: Some(8),
         memory_recall_limit: Some(10),
@@ -397,13 +438,13 @@ pub struct BuilderSubmission {
 }
 
 /// Peer-group entry staged in the Quickstart. Maps 1:1 to a
-/// `[peer-groups.<name>]` table written at apply time. The `channel`
+/// `[peer_groups.<name>]` table written at apply time. The `channel`
 /// field carries a `<type>.<alias>` ref pointing at either a staged
 /// channel from the same submission or a pre-existing one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuickstartPeerGroup {
-    /// Map key written to `peer-groups.<name>`. Synthesized by surfaces
+    /// Map key written to `peer_groups.<name>`. Synthesized by surfaces
     /// from the channel ref so no `match` table is involved.
     pub name: String,
     /// Channel ref (`<type>.<alias>`) the peer group authorizes.
@@ -523,17 +564,59 @@ mod tests {
         }
     }
 
-    /// The `Balanced` preset must equal the schema's `Default::default()` —
-    /// that's the contract that lets us call `RiskProfileConfig::default()`
-    /// / `RuntimeProfileConfig::default()` for the Balanced factory
-    /// instead of duplicating field literals.
     #[test]
-    fn balanced_risk_matches_schema_default() {
+    fn balanced_risk_is_trusted_local_shape() {
         let preset = risk_preset("balanced").unwrap();
-        let preset_values = (preset.values)();
-        let schema_default = RiskProfileConfig::default();
-        // Compare via Debug since RiskProfileConfig doesn't derive PartialEq.
-        assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+        let v = (preset.values)();
+        // Supervised, workspace-scoped, sandbox on: a trusted personal dev box.
+        assert_eq!(v.level, AutonomyLevel::Supervised);
+        assert!(v.workspace_only);
+        assert_eq!(v.sandbox_enabled, Some(true));
+        // Any command runs without an allowlist, but high-risk is blocked, not
+        // prompted: the `*` wildcard is not an explicit exemption, so
+        // block_high_risk_commands rejects high-risk commands outright while
+        // medium-risk friction is off.
+        assert_eq!(v.allowed_commands, vec!["*".to_string()]);
+        assert!(v.block_high_risk_commands);
+        assert!(!v.require_approval_for_medium_risk);
+    }
+
+    #[test]
+    fn balanced_risk_allows_routine_commands_but_blocks_high_risk() {
+        let preset = risk_preset("balanced").unwrap();
+        let values = (preset.values)();
+        let policy = crate::policy::SecurityPolicy {
+            autonomy: values.level,
+            allowed_commands: values.allowed_commands.clone(),
+            block_high_risk_commands: values.block_high_risk_commands,
+            require_approval_for_medium_risk: values.require_approval_for_medium_risk,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        for cmd in ["ls", "cat README.md", "git status"] {
+            assert!(
+                policy.is_command_allowed(cmd),
+                "balanced must allow routine command `{cmd}` without an allowlist",
+            );
+        }
+        // High-risk command passes the allowlist but is blocked outright at
+        // execution: the `*` wildcard is not an explicit allowlist entry, so
+        // block_high_risk_commands rejects it even when approved=true. This is
+        // a hard block, not an approval prompt.
+        assert!(policy.is_command_allowed("rm -rf node_modules"));
+        let err_unapproved = policy
+            .validate_command_execution("rm -rf node_modules", false)
+            .expect_err("balanced must block a wildcard-matched high-risk command");
+        let err_approved = policy
+            .validate_command_execution("rm -rf node_modules", true)
+            .expect_err("blocked even with approved=true: not an approval prompt");
+        assert!(
+            err_approved.contains("high-risk command is disallowed"),
+            "must be the hard-block error, not the approval-required one: {err_approved}",
+        );
+        assert_eq!(
+            err_unapproved, err_approved,
+            "approval state must not change the outcome for a wildcard-matched high-risk command",
+        );
     }
 
     #[test]
@@ -542,6 +625,92 @@ mod tests {
         let preset_values = (preset.values)();
         let schema_default = RuntimeProfileConfig::default();
         assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+    }
+
+    /// Regression: the `unbounded` preset must NOT zero out the action
+    /// budget. A `max_actions_per_hour` of 0 is a hard zero budget (the
+    /// per-sender tracker treats 0 as always exhausted), so an agent on
+    /// the `unbounded` profile previously had every tool call rejected
+    /// with "max 0 actions per hour". Assert the budget is non-zero and
+    /// that a policy carrying it actually permits an action.
+    #[test]
+    fn unbounded_runtime_does_not_block_all_actions() {
+        let preset = runtime_preset("unbounded").unwrap();
+        let values = (preset.values)();
+        assert_ne!(
+            values.max_actions_per_hour, 0,
+            "unbounded must not use 0 — 0 means a hard zero action budget, not unlimited",
+        );
+        let policy = crate::policy::SecurityPolicy {
+            max_actions_per_hour: values.max_actions_per_hour,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        assert!(
+            policy.record_action(),
+            "an unbounded-profile agent must be allowed to take actions",
+        );
+    }
+
+    /// Regression: the `yolo` risk preset must actually permit shell
+    /// commands. `allowed_commands` is deny-by-default — an empty list
+    /// matches nothing, so a `yolo` agent (whose whole point is "no
+    /// command denylist, full autonomy") previously had every shell
+    /// command rejected with "Command not allowed by security policy".
+    /// The preset must carry the `*` wildcard so unrestricted execution
+    /// is actually granted.
+    #[test]
+    fn yolo_risk_allows_shell_commands() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        let policy = crate::policy::SecurityPolicy {
+            autonomy: values.level,
+            allowed_commands: values.allowed_commands.clone(),
+            block_high_risk_commands: values.block_high_risk_commands,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        for cmd in ["ls", "pwd", "cat README.md", "rm -rf node_modules"] {
+            assert!(
+                policy.is_command_allowed(cmd),
+                "yolo profile must allow `{cmd}` — it grants full autonomy with no denylist",
+            );
+        }
+    }
+
+    /// Regression: the `yolo` preset must declare unrestricted intent.
+    #[test]
+    fn yolo_risk_auto_approves_everything_with_no_forbidden_paths() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        assert_eq!(
+            values.auto_approve,
+            vec!["*".to_string()],
+            "yolo must auto-approve every tool via the `*` wildcard",
+        );
+        assert!(
+            values.forbidden_paths.is_empty(),
+            "yolo must have no forbidden paths",
+        );
+        assert!(
+            values.always_ask.is_empty(),
+            "yolo must never force an approval prompt",
+        );
+        assert!(
+            values.delegation_policy.permits(),
+            "yolo must permit delegation",
+        );
+    }
+
+    /// Regression: `yolo` and `balanced` both permit delegation.
+    #[test]
+    fn yolo_and_balanced_permit_delegation() {
+        for name in ["yolo", "balanced"] {
+            let preset = risk_preset(name).unwrap();
+            let values = (preset.values)();
+            assert!(
+                values.delegation_policy.permits(),
+                "{name} must permit delegation",
+            );
+        }
     }
 
     /// `BuilderSubmission` and its dependent types must round-trip

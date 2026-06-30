@@ -22,6 +22,22 @@ impl Acp {
         self.inner.init().await
     }
 
+    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
+        self.inner.set_resume_session_id(sid);
+    }
+
+    pub(crate) fn set_resume_agent_alias(&mut self, alias: Option<String>) {
+        self.inner.set_resume_agent_alias(alias);
+    }
+
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
+    pub(crate) fn current_agent_alias(&self) -> Option<&str> {
+        self.inner.current_agent_alias()
+    }
+
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
     }
@@ -42,8 +58,20 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
-        self.inner.handle_mouse(mouse, area);
+    pub(crate) fn clear_input(&mut self) {
+        self.inner.clear_input();
+    }
+
+    pub(crate) fn in_browse_mode(&self) -> bool {
+        self.inner.in_browse_mode()
+    }
+
+    pub(crate) fn exit_browse_mode(&mut self) {
+        self.inner.exit_browse_mode();
+    }
+
+    pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_mouse(mouse, area).await;
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
@@ -52,6 +80,10 @@ impl Acp {
 
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
+    }
+
+    pub(crate) fn selected_agent(&self) -> Option<&str> {
+        self.inner.selected_agent()
     }
 }
 

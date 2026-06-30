@@ -11,8 +11,20 @@ use zeroclaw_providers::ChatMessage;
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
+// Matches a local image path that a tool printed as bare text so it can be
+// promoted to an `[IMAGE:…]` marker. Three rooted forms are recognized:
+//   - POSIX absolute:      `/path/to/a.png`
+//   - Windows drive:       `C:\path\a.png` or `C:/path/a.png`
+//   - Windows UNC share:   `\\server\share\a.png`
+// Only rooted paths are promoted; `is_existing_local_image_path` further
+// requires the path to be absolute and to point at a real file, so on
+// non-Windows hosts the Windows forms match here but are filtered out there
+// (their `is_absolute()` is false), leaving behavior unchanged off-Windows.
 static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"/[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#).expect("valid image path regex")
+    Regex::new(
+        r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
+    )
+    .expect("valid image path regex")
 });
 
 /// Find the largest byte index `<= i` that is a valid char boundary.
@@ -145,11 +157,35 @@ fn is_existing_local_image_path(path: &str) -> bool {
             })
 }
 
+/// Collect the inner payloads of every explicit `[IMAGE:…]` marker already
+/// present in `output`. A bare path matching one of these must not be promoted
+/// into a *second* marker, otherwise the same image would be counted (and
+/// inlined) twice. This lets a tool emit both a durable human-readable path
+/// line and an explicit marker for the same file (e.g. `image_info`, which
+/// keeps a `File: <path>` line so the path survives in history after the image
+/// marker is stripped from older turns) without the pipeline double-counting.
+fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
+    const OPEN: &str = "[IMAGE:";
+    let mut set = std::collections::HashSet::new();
+    let mut from = 0usize;
+    while let Some(rel) = output[from..].find(OPEN) {
+        let inner_start = from + rel + OPEN.len();
+        let Some(rel_end) = output[inner_start..].find(']') else {
+            break;
+        };
+        let inner_end = inner_start + rel_end;
+        set.insert(output[inner_start..inner_end].trim());
+        from = inner_end + 1;
+    }
+    set
+}
+
 /// Rewrite real local image file paths in tool output into `[IMAGE:...]`
 /// markers so the multimodal pipeline can normalize them before the next
 /// provider call. This targets shell/skill outputs that print filesystem
 /// paths directly rather than returning explicit media markers.
 pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
+    let existing_markers = existing_marker_payloads(output);
     let mut rewritten = String::with_capacity(output.len());
     let mut cursor = 0usize;
     let mut changed = false;
@@ -161,6 +197,13 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
 
         // Skip paths that are already part of an explicit media marker.
         if output[..start].ends_with("[IMAGE:") {
+            continue;
+        }
+
+        // Skip a bare path that already appears inside an explicit marker
+        // elsewhere in the same output — promoting it would double-count the
+        // image (see `existing_marker_payloads`).
+        if existing_markers.contains(path) {
             continue;
         }
 
@@ -184,6 +227,39 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     rewritten
 }
 
+/// Tools whose output merely *lists* or *quotes* local filesystem paths
+/// (search hits, glob matches) rather than presenting an image as visual
+/// content. Their incidental image-file paths must NOT be auto-promoted to
+/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
+/// tool-result markers (`multimodal::count_image_markers`) when deciding
+/// whether to switch to a vision provider, so a path echo here falsely
+/// triggers vision routing - producing a provider-capability error on a
+/// text-only provider. See PR #7345.
+///
+/// This is a denylist (default-allow): any other tool - including ones that
+/// genuinely *generate* or *fetch* an image and print its path (e.g.
+/// `image_gen`, `file_download`) - keeps canonicalization, so real
+/// tool-produced images still route to a configured vision provider.
+fn is_path_listing_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "content_search" | "glob_search"
+    )
+}
+
+/// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
+///
+/// Returns the output unchanged for path-listing tools (`is_path_listing_tool`)
+/// so their incidental image paths never become routable `[IMAGE:...]` markers;
+/// all other tools are canonicalized exactly as before.
+pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
+    if is_path_listing_tool(tool_name) {
+        output.to_string()
+    } else {
+        canonicalize_tool_result_media_markers(output)
+    }
+}
+
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
@@ -202,61 +278,6 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
         return serde_json::to_string(&obj).unwrap_or_else(|_| msg_content.to_string());
     }
     truncate_tool_result(msg_content, max_chars)
-}
-
-/// Aggressively trim old tool result messages in history to recover from
-/// context overflow. Keeps the last `protect_last_n` messages untouched.
-/// Returns total characters saved.
-pub fn fast_trim_tool_results(
-    history: &mut [zeroclaw_providers::ChatMessage],
-    protect_last_n: usize,
-) -> usize {
-    let trim_to = 2000;
-    let mut saved = 0;
-    let cutoff = history.len().saturating_sub(protect_last_n);
-    for msg in &mut history[..cutoff] {
-        if msg.role == "tool" && msg.content.len() > trim_to {
-            let original_len = msg.content.len();
-            msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
-        }
-    }
-    saved
-}
-
-/// Emergency: drop oldest non-system, non-recent messages from history.
-/// Tool groups (assistant + consecutive tool messages) are dropped
-/// atomically to preserve tool_use/tool_result pairing.
-/// Returns number of messages dropped.
-pub fn emergency_history_trim(
-    history: &mut Vec<zeroclaw_providers::ChatMessage>,
-    keep_recent: usize,
-) -> usize {
-    let mut dropped = 0;
-    let target_drop = history.len() / 3;
-    let mut i = 0;
-    while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
-        if history[i].role == "system" {
-            i += 1;
-        } else if history[i].role == "assistant" {
-            // Count following tool messages — drop as atomic group
-            let mut tool_count = 0;
-            while i + 1 + tool_count < history.len().saturating_sub(keep_recent)
-                && history[i + 1 + tool_count].role == "tool"
-            {
-                tool_count += 1;
-            }
-            for _ in 0..=tool_count {
-                history.remove(i);
-                dropped += 1;
-            }
-        } else {
-            history.remove(i);
-            dropped += 1;
-        }
-    }
-    dropped += remove_orphaned_tool_messages(history).removed;
-    dropped
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
@@ -486,6 +507,63 @@ mod tests {
         let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
         let output = canonicalize_tool_result_media_markers(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_for_skips_path_listing_tools() {
+        // A search/listing tool that surfaces a real image path must be left
+        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
+        // routing (PR #7345).
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("hit.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let input = format!("match: {}", image.display());
+
+        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
+            let output = canonicalize_tool_result_media_markers_for(tool, &input);
+            assert_eq!(output, input, "{tool} output must be left untouched");
+            assert!(!output.contains("[IMAGE:"));
+        }
+    }
+
+    #[test]
+    fn canonicalize_for_wraps_image_producing_and_fetching_tools() {
+        // Default-allow: image_gen (produces) and file_download (fetches) keep
+        // canonicalization so a genuinely produced/fetched image still routes.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("generated.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let input = format!("Saved to {}", image.display());
+        let expected = format!("[IMAGE:{}]", image.display());
+
+        for tool in ["image_gen", "file_download", "some_future_tool"] {
+            let output = canonicalize_tool_result_media_markers_for(tool, &input);
+            assert!(
+                output.contains(&expected),
+                "{tool} output should be canonicalized into a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_dedups_path_already_in_marker() {
+        // `image_info` emits a durable `File: <path>` line *and* an explicit
+        // `[IMAGE:<path>]` marker for the same file (so the path survives in
+        // history once the marker is stripped from older turns). The promoter
+        // must not wrap the bare `File:` path into a second marker, which would
+        // double-count the image. Order-independent: the bare path appears
+        // before the marker here.
+        let input = "File: /tmp/pic.png\nFormat: png\n[IMAGE:/tmp/pic.png]";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(
+            output, input,
+            "bare path duplicating an existing marker must not be promoted"
+        );
+        assert_eq!(
+            output.matches("[IMAGE:").count(),
+            1,
+            "exactly one image marker expected, got: {output}"
+        );
     }
 
     /// Regression: when `truncate_tool_result`'s head boundary fell inside an

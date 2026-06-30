@@ -50,21 +50,13 @@ use zeroclaw_providers::{
 /// When the queue is exhausted it returns a simple "done" text response.
 struct ScriptedModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
-    /// Records every request for assertion.
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl ScriptedModelProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            requests: Mutex::new(Vec::new()),
         }
-    }
-
-    #[allow(dead_code)]
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
     }
 }
 
@@ -82,15 +74,10 @@ impl ModelProvider for ScriptedModelProvider {
 
     async fn chat(
         &self,
-        request: ChatRequest<'_>,
+        _request: ChatRequest<'_>,
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        self.requests
-            .lock()
-            .unwrap()
-            .push(request.messages.to_vec());
-
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -1284,6 +1271,7 @@ fn conversation_message_serialization_roundtrip() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1447,6 +1435,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1474,10 +1463,12 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
         ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {}", image_path.display().to_string()),
+            tool_name: String::new(),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
             content: "output2".into(),
+            tool_name: String::new(),
         },
     ])];
 

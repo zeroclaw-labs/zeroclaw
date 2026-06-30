@@ -4,6 +4,7 @@
 //! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
 //! plumbing the daemon uses for bidirectional calls.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
+use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -59,6 +60,7 @@ pub mod method {
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
+    pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
@@ -80,14 +82,16 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
-    pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
+    pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
+    pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
@@ -165,6 +169,23 @@ pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
 /// A server-initiated notification (no `id` field).
 #[derive(Debug, Clone)]
 pub struct RpcNotification {
+    pub method: String,
+    pub params: Value,
+}
+
+/// A server-initiated JSON-RPC request (has both `id` and `method`)
+/// that expects a response back on the same id.
+///
+/// The daemon issues these for ACP `elicitation/create` calls when
+/// the TUI advertised `clientCapabilities.elicitation.form` during
+/// `initialize`. The recipient of an `RpcInboundRequest` is the
+/// `Chat` widget for the targeted session — it surfaces a modal,
+/// waits for the user's choice, and writes a JSON-RPC response back
+/// via `RpcClient::respond_to_inbound_request`.
+#[derive(Debug, Clone)]
+pub struct RpcInboundRequest {
+    /// The JSON-RPC `id`. Echoed back verbatim in the response.
+    pub id: Value,
     pub method: String,
     pub params: Value,
 }
@@ -327,7 +348,125 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+/// The TUI and daemon are built from the same package version and do not
+/// promise cross-version wire compatibility.
+#[derive(Debug)]
+pub struct DaemonVersionMismatch {
+    client_version: &'static str,
+    server_version: String,
+}
+
+impl DaemonVersionMismatch {
+    fn new(server_version: impl Into<String>) -> Self {
+        Self {
+            client_version: env!("CARGO_PKG_VERSION"),
+            server_version: server_version.into(),
+        }
+    }
+
+    pub fn client_version(&self) -> &'static str {
+        self.client_version
+    }
+
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+}
+
+impl fmt::Display for DaemonVersionMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Version mismatch: zerocode is {} but the daemon is {}. \
+             Rebuild and restart the daemon from the same checkout as zerocode.",
+            self.client_version, self.server_version
+        )
+    }
+}
+
+impl std::error::Error for DaemonVersionMismatch {}
+
+#[derive(Debug)]
+struct InitializeResponse {
+    server_version: String,
+    tui_id: Option<String>,
+    tui_sig: Option<String>,
+}
+
+fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+    let server_version = resp
+        .get("server_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(DaemonVersionMismatch::new(server_version).into());
+    }
+
+    Ok(InitializeResponse {
+        server_version,
+        tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
+        tui_sig: resp
+            .get("tui_sig")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
+}
+
 // ── Client ───────────────────────────────────────────────────────
+
+/// Classify an incoming JSON-RPC frame and route it to the right
+/// sink.
+///
+/// Frames are one of three shapes (per JSON-RPC 2.0):
+/// 1. **Response** — has `id` plus `result` or `error`, but no
+///    `method`. Routed to `RpcOutbound::dispatch_response` to wake
+///    the pending outbound call on the same id.
+/// 2. **Server-initiated request** — has both `id` and `method`.
+///    Routed to `inbound_tx` for an in-TUI handler to answer (today:
+///    `elicitation/create`). The id is preserved verbatim so the
+///    response correlates correctly.
+/// 3. **Notification** — has `method` but no `id`. Routed to
+///    `notif_tx` for the existing notification router.
+fn route_inbound_frame(
+    rpc: &Arc<RpcOutbound>,
+    notif_tx: &broadcast::Sender<RpcNotification>,
+    inbound_tx: &broadcast::Sender<RpcInboundRequest>,
+    frame: Value,
+) {
+    let id = frame.get(field::ID).cloned();
+    let method = frame
+        .get(field::METHOD)
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    match (id, method) {
+        // Server-initiated request: both id and method present.
+        (Some(id), Some(method)) if !id.is_null() => {
+            let params = frame.get("params").cloned().unwrap_or(Value::Null);
+            let _ = inbound_tx.send(RpcInboundRequest { id, method, params });
+        }
+        // Response: id present (typically a string), result or error,
+        // no method.
+        (Some(id), None) => {
+            // The outbound id format is always a string; defensively
+            // only dispatch when we can stringify it.
+            if let Some(id_str) = id.as_str() {
+                let result = frame.get(field::RESULT).cloned();
+                let error: Option<JsonRpcError> = frame
+                    .get(field::ERROR)
+                    .and_then(|e| serde_json::from_value(e.clone()).ok());
+                rpc.dispatch_response(id_str, result, error);
+            }
+        }
+        // Notification: method present, no id (or null id).
+        (None, Some(method)) => {
+            let params = frame.get("params").cloned().unwrap_or(Value::Null);
+            let _ = notif_tx.send(RpcNotification { method, params });
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug)]
 pub struct RpcClient {
@@ -336,6 +475,11 @@ pub struct RpcClient {
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
     notifications_bcast: broadcast::Sender<RpcNotification>,
+    /// Broadcast channel for server-initiated requests that expect a
+    /// response (today: `elicitation/create`). The Chat widget for the
+    /// targeted session subscribes and answers via
+    /// [`RpcClient::respond_to_inbound_request`].
+    inbound_requests_bcast: broadcast::Sender<RpcInboundRequest>,
     connection_state: Arc<Mutex<ConnectionState>>,
     /// TUI session UID assigned by the daemon during initialize.
     pub tui_id: Option<String>,
@@ -377,6 +521,8 @@ impl RpcClient {
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
+        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
@@ -406,24 +552,26 @@ impl RpcClient {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(id) = frame.get(field::ID).and_then(Value::as_str) {
-                    let result = frame.get(field::RESULT).cloned();
-                    let error: Option<JsonRpcError> = frame
-                        .get(field::ERROR)
-                        .and_then(|e| serde_json::from_value(e.clone()).ok());
-                    rpc_for_reader.dispatch_response(id, result, error);
-                } else if let Some(method) = frame.get(field::METHOD).and_then(Value::as_str) {
-                    let params = frame.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = notif_tx_for_reader.send(RpcNotification {
-                        method: method.to_string(),
-                        params,
-                    });
-                }
+                route_inbound_frame(
+                    &rpc_for_reader,
+                    &notif_tx_for_reader,
+                    &inbound_tx_for_reader,
+                    frame,
+                );
             }
         });
 
         let mut init_params = serde_json::json!({
-            "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION
+            "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION,
+            // Advertise the ACP `elicitation` capability (form mode) so the
+            // daemon's per-session `RpcApprovalChannel` routes `request_choice`
+            // / `request_multi_choice` over `elicitation/create` instead of
+            // silently returning `Ok(None)`. The Code tab handles inbound
+            // `elicitation/create` requests via `route_inbound_frame` →
+            // the chat widget's pending-elicitation modal.
+            "clientCapabilities": {
+                "elicitation": { "form": {} }
+            }
         });
         if let Some(id) = prev_tui_id {
             init_params["tui_id"] = serde_json::Value::String(id.to_string());
@@ -438,22 +586,24 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -463,18 +613,19 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
+            inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Local,
         })
     }
 
     /// Connect to the daemon via WebSocket Secure (WSS).
     ///
-    /// Same handshake and reconnect semantics as [`connect`] — pass
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
@@ -515,6 +666,8 @@ impl RpcClient {
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
+        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
@@ -528,21 +681,12 @@ impl RpcClient {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        if let Some(id) = frame.get(jsonrpc::field::ID).and_then(Value::as_str) {
-                            let result = frame.get(jsonrpc::field::RESULT).cloned();
-                            let error: Option<jsonrpc::JsonRpcError> = frame
-                                .get(jsonrpc::field::ERROR)
-                                .and_then(|e| serde_json::from_value(e.clone()).ok());
-                            rpc_for_reader.dispatch_response(id, result, error);
-                        } else if let Some(method) =
-                            frame.get(jsonrpc::field::METHOD).and_then(Value::as_str)
-                        {
-                            let params = frame.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = notif_tx_for_reader.send(RpcNotification {
-                                method: method.to_string(),
-                                params,
-                            });
-                        }
+                        route_inbound_frame(
+                            &rpc_for_reader,
+                            &notif_tx_for_reader,
+                            &inbound_tx_for_reader,
+                            frame,
+                        );
                     }
                     Some(Ok(Message::Close(frame))) => {
                         let reason = frame
@@ -572,7 +716,12 @@ impl RpcClient {
 
         // Initialize handshake — identical to Unix socket path.
         let mut init_params = serde_json::json!({
-            "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION
+            "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION,
+            // Advertise ACP elicitation form-mode support. See
+            // `connect` above for the rationale.
+            "clientCapabilities": {
+                "elicitation": { "form": {} }
+            }
         });
         if let Some(id) = prev_tui_id {
             init_params["tui_id"] = serde_json::Value::String(id.to_string());
@@ -587,22 +736,24 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -612,11 +763,12 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
+            inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Wss,
         })
     }
@@ -681,15 +833,27 @@ impl RpcClient {
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call_with_timeout(method, params, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
         // Timeout prevents indefinite hangs when the daemon dies between
         // the connection-state check and the actual RPC send/recv.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.rpc.request(method, params),
-        )
-        .await
-        .map_err(|_| anyhow::Error::msg(format!("RPC {method}: timed out after 5s")))?
-        .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+        let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "RPC {method}: timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -700,19 +864,34 @@ impl RpcClient {
         self.connection_state.lock().unwrap().clone()
     }
 
-    /// Returns `true` when the daemon connection is known to be dead.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::Disconnected { .. }
-        )
-    }
-
     // ── Notifications ─────────────────────────────────────────────
 
     /// Get a receiver for server-initiated notifications.
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
         self.notifications_bcast.subscribe()
+    }
+
+    /// Get a receiver for server-initiated JSON-RPC requests that
+    /// expect a response (today: `elicitation/create`). The Chat
+    /// widget subscribes per Code tab, filters by `params.sessionId`,
+    /// surfaces a modal, and answers via [`Self::respond_to_inbound_request`].
+    pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
+        self.inbound_requests_bcast.subscribe()
+    }
+
+    /// Send a JSON-RPC response back to the daemon for a previously
+    /// received server-initiated request. The `id` must be the same
+    /// `Value` carried by the originating `RpcInboundRequest`.
+    pub async fn respond_to_inbound_request(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> Result<()> {
+        let sent = self.rpc.respond(id, result).await;
+        if !sent {
+            anyhow::bail!("writer task closed before response could be sent");
+        }
+        Ok(())
     }
 
     /// Ask the daemon to start streaming log events as notifications.
@@ -803,6 +982,19 @@ impl RpcClient {
         Ok(result.keys)
     }
 
+    pub async fn config_resolve_alias_source(
+        &self,
+        source: crate::wire::AliasSource,
+    ) -> Result<Vec<String>> {
+        let result: ConfigResolveAliasSourceResult = self
+            .call(
+                method::CONFIG_RESOLVE_ALIAS_SOURCE,
+                serde_json::json!({ "source": source }),
+            )
+            .await?;
+        Ok(result.values)
+    }
+
     pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
         let _: Value = self
             .call(
@@ -831,9 +1023,10 @@ impl RpcClient {
     }
 
     pub async fn catalog_models(&self, provider: &str) -> Result<CatalogModelsResult> {
-        self.call(
+        self.call_with_timeout(
             method::CONFIG_CATALOG_MODELS,
             serde_json::json!({ "model_provider": provider }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -999,7 +1192,7 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`session_new_with_id`] but sets `exclude_memory: true` so the
+    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
     /// daemon strips memory tools and uses a NoneMemory backend. Used by the
     /// ACP pane, which should never have access to persistent memory.
     pub async fn session_new_acp(
@@ -1048,6 +1241,22 @@ impl RpcClient {
         .await
     }
 
+    /// Apply session-scoped overrides (model, model_provider, temperature) to a
+    /// live session. The daemon applies them immediately and returns the merged
+    /// set. A `model_provider` override triggers a live provider-box rebuild
+    /// daemon-side.
+    pub async fn session_configure(
+        &self,
+        session_id: &str,
+        overrides: SessionOverrides,
+    ) -> Result<SessionConfigureResult> {
+        self.call(
+            method::SESSION_CONFIGURE,
+            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
     pub async fn session_git_branch(&self, session_id: &str) -> Result<SessionGitBranchResult> {
         self.call(
             method::SESSION_GIT_BRANCH,
@@ -1081,16 +1290,14 @@ impl RpcClient {
         .await
     }
 
-    pub async fn session_rename(
-        &self,
-        session_id: &str,
-        name: &str,
-    ) -> Result<SessionRenameResult> {
-        self.call(
-            method::SESSION_RENAME,
-            serde_json::json!({ "session_id": session_id, "name": name }),
-        )
-        .await
+    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_KILL,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -1101,6 +1308,10 @@ impl RpcClient {
 
     pub async fn health(&self) -> Result<Value> {
         self.call(method::HEALTH, serde_json::json!({})).await
+    }
+
+    pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
+        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
     }
 
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
@@ -1223,12 +1434,14 @@ impl RpcClient {
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+        let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             rpc: outbound,
             _read_task: tokio::spawn(async {}),
             _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
             notifications_bcast: notif_tx,
+            inbound_requests_bcast: inbound_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
@@ -1253,6 +1466,52 @@ pub struct ConfigListResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigSetResult {}
+
+#[cfg(test)]
+mod initialize_version_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_response_accepts_matching_server_version() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "tui_id": "tui_1",
+            "tui_sig": "sig_1"
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
+        assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_mismatched_server_version() {
+        let err = parse_initialize_response(&json!({
+            "server_version": "0.0.0-test"
+        }))
+        .unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("mismatched daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "0.0.0-test");
+        assert!(err.to_string().contains("Version mismatch"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_missing_server_version_as_unknown() {
+        let err = parse_initialize_response(&json!({})).unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("missing daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "unknown");
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1301,6 +1560,12 @@ pub struct ConfigMapKeysResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct ConfigResolveAliasSourceResult {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigSectionsResult {
     pub sections: Vec<ConfigSectionEntry>,
 }
@@ -1312,8 +1577,16 @@ pub struct ConfigSectionEntry {
     pub label: String,
     pub help: String,
     pub completed: bool,
+    /// Display group label (`"Foundation"`, `"Tools"`, …) from
+    /// `zeroclaw_config::sections::SectionGroup::label()`. Empty when
+    /// the daemon predates group plumbing — the sections pane falls
+    /// back to the flat ungrouped list.
+    #[serde(default)]
+    pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
+    #[serde(default)]
+    pub cost_category: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1326,8 +1599,27 @@ pub struct ConfigTemplatesResult {
 #[serde(rename_all = "snake_case")]
 pub struct CatalogModelsResult {
     pub models: Vec<String>,
+    /// Pricing keyed by upstream model id, when the provider's catalog
+    /// returns it. Mirrors the gateway `/api/config/catalog/models` payload
+    /// (same RPC) so the Costs tab can pre-fill rate sheets.
+    #[serde(default)]
+    pub pricing: Option<std::collections::HashMap<String, CatalogModelPricing>>,
     #[serde(default)]
     pub live: bool,
+}
+
+/// Per-token USD pricing strings as emitted by the catalog RPC. Field names
+/// match `zeroclaw_api::model_provider::ModelPricing`; only the rates the
+/// cost-rate sheet consumes are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CatalogModelPricing {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub completion: Option<String>,
+    #[serde(default)]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1594,6 +1886,12 @@ pub struct LogsQueryParams {
     pub until_ts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until_id: Option<String>,
+    /// Byte offset cap passed back from the previous page's
+    /// `next_cursor_line_offset`. When set, the reader stops scanning
+    /// at this offset so the follow-up page only sees lines strictly
+    /// older than the previous one. Independent of id ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_line_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_min: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1616,7 +1914,18 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
+    /// `until_id` for older. Tie-breaks same-timestamp events by
+    /// lexicographic id, which can drop earlier-written events when id
+    /// order diverges from file insertion order. Prefer
+    /// [`Self::next_cursor_line_offset`] when available — it is
+    /// independent of id ordering.
     pub next_cursor: Option<(String, String)>,
+    /// Byte offset past the OLDEST event on the current page. Pass back
+    /// as [`LogsQueryParams::until_line_offset`] on the next request to
+    /// walk older pages deterministically regardless of id ordering.
+    /// `None` when the page is empty.
+    pub next_cursor_line_offset: Option<u64>,
     pub at_end: bool,
 }
 
@@ -1642,20 +1951,43 @@ pub struct SessionNewResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
 
+/// Session-scoped overrides mirror of
+/// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
+/// `session/configure`; every field is optional and omitted when `None`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureResult {
+    /// Echoed by the daemon; retained to lock the wire shape even though the
+    /// TUI keys off the caller's own session id.
+    #[allow(dead_code)]
+    pub session_id: String,
+    #[serde(default)]
+    pub overrides: SessionOverrides,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionGitBranchResult {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionApproveResult {}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SessionRenameResult {}
 
 #[derive(Debug, Clone)]
 pub enum ApprovalDecision {
@@ -1713,7 +2045,10 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
-    pub active_sessions: usize,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
     #[serde(default)]
     pub channels: Vec<String>,
 }
@@ -1857,6 +2192,37 @@ pub struct MessageEntry {
     pub content: String,
 }
 
+impl MessageEntry {
+    /// Classify the wire `role` string into the closed set the UI renders.
+    /// Unknown roles map to [`MessageRole::Other`] so surfaces can fall back
+    /// without string-matching at the call site.
+    pub fn role(&self) -> MessageRole {
+        MessageRole::from_wire(&self.role)
+    }
+}
+
+/// Closed taxonomy of persisted message roles, as they arrive over the
+/// `session/messages` wire. The daemon emits these as strings; this is the
+/// single place that maps the wire form into a type the UI matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Other,
+}
+
+impl MessageRole {
+    fn from_wire(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            _ => Self::Other,
+        }
+    }
+}
+
 // ── TUI identity types ───────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1875,8 +2241,6 @@ pub struct TuiListEntry {
 pub struct TuiListResult {
     pub tuis: Vec<TuiListEntry>,
 }
-
-// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod session_method_tests {
@@ -1983,6 +2347,117 @@ mod session_method_tests {
 mod notification_tests {
     use super::*;
     use tokio::sync::{broadcast, mpsc};
+
+    /// Channels handed back by [`route_fixture`]. Aliased to keep the
+    /// return type readable (clippy::type_complexity).
+    type RouteFixture = (
+        Arc<RpcOutbound>,
+        broadcast::Sender<RpcNotification>,
+        broadcast::Receiver<RpcNotification>,
+        broadcast::Sender<RpcInboundRequest>,
+        broadcast::Receiver<RpcInboundRequest>,
+        mpsc::Receiver<String>,
+    );
+
+    /// Build a fresh fixture for routing tests. The writer receiver is
+    /// returned (not dropped) so `RpcOutbound`'s writer channel stays
+    /// open — dropping it would make every `request`/`respond` fail with
+    /// "Writer task closed".
+    fn route_fixture() -> RouteFixture {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let (notif_tx, notif_rx) = broadcast::channel::<RpcNotification>(16);
+        let (inbound_tx, inbound_rx) = broadcast::channel::<RpcInboundRequest>(16);
+        (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
+    }
+
+    /// Response frames — id + result/error, no method — should reach the
+    /// pending outbound call via `dispatch_response` and emit nothing on
+    /// the notification / inbound channels.
+    #[tokio::test]
+    async fn route_inbound_frame_routes_response_to_pending_call() {
+        let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, mut writer_rx) =
+            route_fixture();
+        // Register a pending outbound call so dispatch_response has a target.
+        let call_task = {
+            let rpc = Arc::clone(&rpc);
+            tokio::spawn(async move { rpc.request("ping", serde_json::Value::Null).await })
+        };
+        // Drain the one outbound frame the request writes so the spawned
+        // task makes progress and registers its pending id (`zc-out-0`,
+        // the first id from a fresh RpcOutbound).
+        let _outbound = writer_rx.recv().await.expect("request wrote a frame");
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "zc-out-0",
+            "result": { "pong": true }
+        });
+        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+
+        let answer = call_task.await.unwrap().unwrap();
+        assert_eq!(answer["pong"], true);
+        assert!(inbound_rx.try_recv().is_err(), "inbound rx must stay empty");
+        assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
+    }
+
+    /// Notification frames — method, no id — should reach the
+    /// notification broadcast and not the inbound-request channel.
+    #[tokio::test]
+    async fn route_inbound_frame_routes_notification() {
+        let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "type": "agent_message_chunk", "session_id": "s1", "text": "hi" }
+        });
+        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        let notif = notif_rx.try_recv().expect("notification routed");
+        assert_eq!(notif.method, "session/update");
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    /// Server-initiated request frames — both id and method — should
+    /// reach the inbound-request broadcast and NOT be misclassified
+    /// as a response (which would silently drop the elicitation prompt).
+    #[tokio::test]
+    async fn route_inbound_frame_routes_server_initiated_request() {
+        let (rpc, notif_tx, mut notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "elicit-42",
+            "method": "elicitation/create",
+            "params": {
+                "sessionId": "sess-1",
+                "mode": "form",
+                "message": "Pick one",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }
+        });
+        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        let req = inbound_rx.try_recv().expect("inbound request routed");
+        assert_eq!(req.method, "elicitation/create");
+        assert_eq!(req.id, serde_json::Value::String("elicit-42".to_string()));
+        assert_eq!(req.params["sessionId"], "sess-1");
+        assert!(notif_rx.try_recv().is_err());
+    }
+
+    /// Frames with both fields but a numeric id — the JSON-RPC spec
+    /// permits int ids, even though the daemon emits strings — must
+    /// still route as a server-initiated request (we forward the
+    /// `Value` verbatim so the response carries the same shape).
+    #[tokio::test]
+    async fn route_inbound_frame_handles_numeric_request_id() {
+        let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "elicitation/create",
+            "params": {}
+        });
+        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        let req = inbound_rx.try_recv().expect("inbound request routed");
+        assert_eq!(req.id, serde_json::json!(7));
+    }
 
     fn make_notification(method: &str, params: serde_json::Value) -> RpcNotification {
         RpcNotification {

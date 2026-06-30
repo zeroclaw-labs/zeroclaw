@@ -197,6 +197,16 @@ code span {
   padding: 1rem 0.75rem;
 }
 
+/* Suppress the brief flash ("wink") while toc.js populates the sidebar web
+   component: hide the scrollbox until it has children, then show it with no
+   transition so it appears already-rendered. */
+html.js .sidebar .sidebar-scrollbox:empty {
+  visibility: hidden;
+}
+html.js .sidebar .sidebar-scrollbox {
+  visibility: visible;
+}
+
 .chapter li.chapter-item {
   line-height: 1.5;
   margin: 0.1rem 0;
@@ -206,6 +216,14 @@ code span {
   border-radius: 0.5rem;
   padding: 0.32rem 0.6rem;
   transition: background 0.18s ease, color 0.18s ease;
+}
+
+/* Foldable section rows double-pad their text: the wrapper adds 0.6rem and the
+   inner label <a> adds another 0.6rem. Childless rows (e.g. Introduction) have
+   only the <a> padding, so their text sat 0.6rem to the left of every section.
+   Match the wrapper offset so all top-level rows align. */
+.chapter li.chapter-item > .chapter-link-wrapper:not(:has(> a.chapter-fold-toggle)) {
+  padding-left: 0.6rem;
 }
 
 .chapter li a:hover {
@@ -410,6 +428,11 @@ pre > .buttons .clip-button:hover {
   border-bottom: 1px solid var(--pc-border-strong);
   padding: 0.5rem 0.9rem;
   vertical-align: middle;
+  /* Header labels are short; keep them on one line so a narrow column does not
+     stack a two-word header (e.g. "Inbound port?") into ragged lines. Prose in
+     body cells still wraps, and a genuinely wide table scrolls via
+     `.table-wrapper`. */
+  white-space: nowrap;
 }
 
 .content table td {
@@ -435,10 +458,11 @@ pre > .buttons .clip-button:hover {
   border-bottom: none;
 }
 
-/* Keep Key/Type/Default reference columns from wrapping; Description flexes */
-.content table td:nth-child(1),
-.content table td:nth-child(2),
-.content table td:nth-child(3) {
+/* Reference tables (config Key/Type/Default) hold single code tokens that read
+   badly when wrapped mid-identifier. Keep a cell from wrapping only when its
+   sole content is one inline-code token; prose cells (e.g. the review-depth
+   matrix) wrap normally and the table scrolls if it overflows. */
+.content table td:has(> code:only-child) {
   white-space: nowrap;
 }
 
@@ -543,7 +567,10 @@ mark {
 }
 .theme-popup .theme {
   border-radius: 0.5rem;
-  padding: 0.4rem 0.7rem 0.4rem 1.4rem;
+  font-size: 0.95rem;
+  line-height: 1.25;
+  min-height: 2.1rem;
+  padding: 0.55rem 0.85rem 0.55rem 1.55rem;
 }
 .theme-popup .theme:hover {
   background: var(--pc-hover-strong);
@@ -842,7 +869,7 @@ body,
 #mdbook-theme-list {
   max-height: 70vh;
   overflow-y: auto;
-  min-width: 13rem;
+  min-width: 16rem;
   padding: 0.4rem;
 }
 
@@ -850,10 +877,10 @@ body,
   list-style: none;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   font-weight: 600;
   color: var(--pc-text-muted);
-  padding: 0.6rem 0.7rem 0.3rem;
+  padding: 0.75rem 0.85rem 0.35rem;
   pointer-events: none;
 }
 
@@ -861,7 +888,7 @@ body,
   /* mdBook's theme-list buttons default to display:block; force flex for the swatch + label row. */
   display: flex !important;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.7rem;
   width: 100%;
   text-align: left;
 }
@@ -870,8 +897,8 @@ body,
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
   grid-template-rows: 1fr 1fr;
-  width: 1.1rem;
-  height: 1.1rem;
+  width: 1.25rem;
+  height: 1.25rem;
   border-radius: 0.3rem;
   overflow: hidden;
   flex-shrink: 0;
@@ -893,7 +920,7 @@ body,
 }
 
 .pc-theme-name {
-  font-size: 0.82rem;
+  font-size: 0.95rem;
   white-space: nowrap;
 }
 
@@ -948,4 +975,288 @@ body,
 .content h3[id],
 .content h4[id] {
   scroll-margin-top: 5rem;
+}
+
+/* Keep the left sidebar to SUMMARY chapters only. mdBook's toc.js injects an
+   `.on-this-page` block of in-page headings under the active chapter; that
+   duplicates the right-hand "On this page" panel and breaks the numbered
+   sidebar. Suppress the injected block in the nav. */
+#mdbook-sidebar .on-this-page {
+  display: none !important;
+}
+
+/* ── OS tabs ────────────────────────────────────────────────────────────────
+   Pure CSS tabbed widget for per-OS shell invocations. No JS, no build dep.
+   Markup order inside .os-tabs: all radios first (one checked), then a single
+   .os-tab-labels row of <label for>, then the .os-tab-panel blocks in the same
+   order as the radios. Each radio targets its panel by document order. */
+.os-tabs {
+  margin: 1rem 0;
+  border: 1px solid var(--pc-border);
+  border-radius: 0.6rem;
+  overflow: hidden;
+}
+.os-tabs > input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.os-tab-labels {
+  display: flex;
+  gap: 0.25rem;
+  background: var(--pc-hover);
+  padding: 0.3rem 0.3rem 0;
+}
+.os-tab-labels > label {
+  padding: 0.5rem 1.1rem;
+  cursor: pointer;
+  font-size: 1.6rem;
+  color: var(--pc-text-secondary);
+  border-bottom: 2px solid transparent;
+  border-radius: 0.4rem 0.4rem 0 0;
+  user-select: none;
+}
+.os-tab-labels > label:hover {
+  color: var(--pc-text-primary);
+}
+.os-tabs > .os-tab-panel {
+  display: none;
+  padding: 0 1rem;
+}
+.os-tabs > .os-tab-panel > pre {
+  margin: 1rem 0;
+}
+.os-tabs > .os-tab-panel.is-active {
+  display: block;
+}
+.os-tabs > .os-tab-labels > label.is-active {
+  color: var(--pc-accent);
+  border-bottom-color: var(--pc-accent);
+  background: var(--pc-bg, transparent);
+}
+
+/* ── Theme-aware syntax highlighting ─────────────────────────────────────────
+   highlight.js applies .hljs-* token classes client-side. mdBook only ships
+   two highlight stylesheets (light + ayu), which don't track the custom
+   palettes in pc-themes.css. Map every token group to the active theme's
+   --pc-* variables so highlighting always matches the current theme. The vars
+   change per theme, so one ruleset covers all of them. */
+:root {
+  --pc-hl-comment: var(--pc-text-muted);
+  --pc-hl-keyword: var(--pc-accent);
+  --pc-hl-string: var(--links);
+  --pc-hl-number: var(--pc-accent-light);
+  --pc-hl-literal: var(--pc-accent-light);
+  --pc-hl-title: var(--pc-text-primary);
+  --pc-hl-attr: var(--pc-text-primary);
+  --pc-hl-section: var(--pc-accent);
+  --pc-hl-meta: var(--pc-text-muted);
+  --pc-hl-type: var(--links);
+  --pc-hl-variable: var(--pc-text-primary);
+  --pc-hl-default: var(--pc-text-secondary);
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--pc-hl-comment) !important;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-builtin {
+  color: var(--pc-hl-keyword) !important;
+}
+.hljs-string,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition,
+.hljs-template-tag,
+.hljs-template-variable {
+  color: var(--pc-hl-string) !important;
+}
+.hljs-number,
+.hljs-regexp,
+.hljs-link {
+  color: var(--pc-hl-number) !important;
+}
+.hljs-literal,
+.hljs-type,
+.hljs-params {
+  color: var(--pc-hl-literal) !important;
+}
+.hljs-title,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--pc-hl-title) !important;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-tag {
+  color: var(--pc-hl-attr) !important;
+}
+.hljs-section,
+.hljs-meta-keyword {
+  color: var(--pc-hl-section) !important;
+  font-weight: 600;
+}
+.hljs-meta {
+  color: var(--pc-hl-meta) !important;
+}
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-deletion { color: var(--pc-hl-comment) !important; }
+
+/* ---------------------------------------------------------------------------
+   Page transitions
+   Static mdBook navigation is a full document load per click, which feels
+   harsh. Fade (and lightly lift) only the content area in on each load so
+   navigation reads as smooth. The sidebar is intentionally left static so it
+   does not flicker on every navigation. Gated on `html.js` so no-JS users
+   never get stuck on an invisible page, and disabled under reduced-motion.
+   --------------------------------------------------------------------------- */
+@keyframes pc-page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+html.js #mdbook-content main {
+  animation: pc-page-in 0.28s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.js #mdbook-content main {
+    animation: none;
+  }
+}
+
+/* ── Config field accordion (mdbook config-fields directive) ──────────────── */
+/* Each field is a native <details class="cfg-field"> so the description and tab
+   guidance inside are Markdown (translatable). */
+.cfg-fields .cfg-field {
+  border: 1px solid var(--pc-separator);
+  border-radius: var(--pc-radius);
+  margin: 0.35rem 0;
+  overflow: hidden;
+}
+.cfg-fields .cfg-field > summary {
+  cursor: pointer;
+  padding: 0.5rem 0.9rem;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+}
+.cfg-fields .cfg-field > summary::-webkit-details-marker {
+  display: none;
+}
+.cfg-fields .cfg-field > summary::before {
+  content: "\25B8"; /* ▸ */
+  color: var(--pc-accent);
+  flex: 0 0 0.8em;
+  text-align: center;
+  font-size: 0.85em;
+  transition: transform 0.12s ease;
+}
+.cfg-fields .cfg-field[open] > summary::before {
+  transform: rotate(90deg);
+}
+.cfg-fields .cfg-field > summary:hover,
+.cfg-fields .cfg-field[open] > summary {
+  background: var(--pc-hover);
+}
+.cfg-fields .cfg-field > summary > code:first-of-type {
+  background: none;
+  padding: 0;
+  color: var(--pc-text-primary);
+}
+.cfg-fields .cfg-field-meta {
+  margin-left: auto;
+  color: var(--pc-text-secondary);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.cfg-fields .cfg-field > :not(summary) {
+  padding-left: 0.9rem;
+  padding-right: 0.9rem;
+}
+.cfg-fields .cfg-field > p {
+  color: var(--pc-text-secondary);
+  overflow-wrap: anywhere;
+}
+.cfg-fields .cfg-field > .os-tabs {
+  margin: 0.6rem 0.9rem 0.9rem;
+}
+
+/* ── Model-provider field accordion (mdbook model-provider-fields directive) ── */
+.provider-fields {
+  margin: 1rem 0;
+}
+.provider-entry {
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  margin: 0.4rem 0;
+  overflow: hidden;
+}
+/* Base-only providers: a plain non-expandable row aligned with the
+   expandable entries, but no caret, no pointer, nothing to reveal. */
+/* Base-only providers: a plain non-expandable row. Mirror the expandable
+   summary's flex layout exactly, with a transparent caret placeholder, so the
+   slot names line up with the expandable rows above/below. */
+.provider-fields .provider-row {
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  margin: 0.4rem 0;
+  padding: 0.55rem 0.9rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+.provider-fields .provider-row::before {
+  content: "\25B8"; /* same glyph as the expandable caret, made invisible */
+  visibility: hidden;
+  font-size: 0.85em;
+}
+.provider-fields .provider-row .provider-endpoint {
+  color: var(--pc-text-secondary);
+  font-size: 0.9em;
+}
+.provider-entry > summary {
+  cursor: pointer;
+  padding: 0.55rem 0.9rem;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+.provider-entry > summary::-webkit-details-marker {
+  display: none;
+}
+.provider-entry > summary::before {
+  content: "\25B8"; /* ▸ */
+  color: var(--pc-accent);
+  transition: transform 0.12s ease;
+  font-size: 0.85em;
+}
+.provider-entry[open] > summary::before {
+  transform: rotate(90deg);
+}
+.provider-entry > summary:hover {
+  background: var(--pc-hover);
+}
+.provider-entry[open] > summary {
+  background: var(--pc-hover);
+  border-bottom: 1px solid var(--pc-border);
+}
+.provider-entry .provider-endpoint {
+  color: var(--pc-text-secondary);
+  font-size: 0.9em;
+}
+.provider-entry > .cfg-fields {
+  margin: 0.6rem 0.9rem 0.9rem;
+}
+.provider-entry > .cfg-fields table {
+  margin-top: 0;
 }

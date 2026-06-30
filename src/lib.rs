@@ -42,7 +42,7 @@ pub mod agent;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod approval;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod auth;
+pub mod auth;
 #[cfg(feature = "agent-runtime")]
 pub mod channels;
 pub mod commands;
@@ -131,6 +131,11 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Restart the gateway server
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -152,6 +157,11 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Show or generate the pairing code without restarting
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -162,16 +172,35 @@ Displays the pairing code for connecting new clients without \
 restarting the gateway. Requires the gateway to be running.
 
 With --new, generates a fresh pairing code even if the gateway \
-was previously paired (useful for adding additional clients).
+was previously paired (useful for adding additional clients). This \
+does NOT revoke existing tokens.
+
+With --rotate, revokes ALL paired bearer tokens, clears the device \
+registry, and issues a fresh code. Use this after a suspected token \
+leak when you do not know which token was compromised; every client \
+must re-pair.
+
+With --rotate-device ID, revokes just that device's bearer token \
+and issues a fresh code for re-pairing that one device.
 
 Examples:
-  zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code
+  zeroclaw gateway get-paircode               # show current pairing code
+  zeroclaw gateway get-paircode --new         # add another client (no revocation)
+  zeroclaw gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
+  zeroclaw gateway get-paircode --rotate-device dash-1  # revoke one device's token
   zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
     GetPaircode {
-        /// Generate a new pairing code (even if already paired)
+        /// Generate a new pairing code for adding a client (does not revoke existing tokens)
         #[arg(long)]
         new: bool,
+
+        /// Revoke ALL paired tokens and clear the device registry, then issue a new code
+        #[arg(long, conflicts_with_all = ["new", "rotate_device"])]
+        rotate: bool,
+
+        /// Revoke a single device's bearer token by id, then issue a new code
+        #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
+        rotate_device: Option<String>,
 
         /// Port of the running gateway to query; defaults to config gateway.port
         #[arg(short, long)]
@@ -286,6 +315,109 @@ Examples:
     },
 }
 
+/// Alias CRUD for agents (`[agents.<alias>]`). Distinct from the `agent`
+/// run command. Rename/delete cascade config references; for agents they also
+/// re-point owned state (memory / cron / acp / session) and move the workspace.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentsCommands {
+    /// List configured agent aliases
+    List,
+    /// Create a new agent alias with default config
+    Create {
+        /// New agent alias (lowercase alphanumeric + single underscore)
+        alias: String,
+    },
+    /// Rename an agent alias, rewriting every reference to it
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
+    },
+    /// Delete an agent alias, scrubbing references and cascading owned state
+    Delete {
+        /// Alias to delete
+        alias: String,
+        /// Show the impact (references that would be scrubbed) without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for providers (`[providers.<category>.<family>.<alias>]`).
+/// `category` is one of `models`, `tts`, `transcription`.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProvidersCommands {
+    /// List provider aliases (optionally filtered by category)
+    List {
+        /// Category: models | tts | transcription
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Create a new provider alias with default config
+    Create {
+        /// Category: models | tts | transcription
+        category: String,
+        /// Provider family (e.g. anthropic, openai, elevenlabs)
+        family: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a provider alias, rewriting every reference
+    Rename {
+        category: String,
+        family: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a provider alias, scrubbing references
+    Delete {
+        category: String,
+        family: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for channels (`[channels.<type>.<alias>]`).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelsCommands {
+    /// List channel aliases (optionally filtered by type)
+    List {
+        /// Channel type, e.g. discord, telegram
+        #[arg(long)]
+        channel_type: Option<String>,
+    },
+    /// Create a new channel alias with default config
+    Create {
+        /// Channel type (discord, telegram, slack, …)
+        channel_type: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a channel alias, rewriting every reference
+    Rename {
+        channel_type: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a channel alias, scrubbing references
+    Delete {
+        channel_type: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
@@ -294,7 +426,7 @@ pub enum SkillCommands {
     /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
+Scaffold a new skill under a skill bundle. Writes `<bundle.directory>`/`<name>`/SKILL.md \
 plus the canonical optional subdirs (scripts/, references/, assets/). \
 Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
 
@@ -380,7 +512,7 @@ Examples:
 pub enum SkillBundleCommands {
     /// List configured skill bundles and their resolved directories
     List,
-    /// Add a new skill bundle. Directory defaults to shared/skills/<alias>/.
+    /// Add a new skill bundle. Directory defaults to shared/skills/`<alias>`/.
     Add {
         /// Bundle alias (lowercase + hyphens; same convention as agents/channels)
         alias: String,
@@ -389,10 +521,21 @@ pub enum SkillBundleCommands {
         #[arg(long)]
         directory: Option<String>,
     },
-    /// Remove a configured skill bundle
+    /// Remove a configured skill bundle (archives its directory + strips it
+    /// from every agent's `skill_bundles` list)
     Remove {
         /// Bundle alias
         alias: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a skill bundle (moves its directory + rewrites agent references)
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
     },
     /// Show metadata + skill list for a bundle
     Show {
@@ -752,4 +895,18 @@ pub enum SopCommands {
         /// Name of the SOP to show
         name: String,
     },
+    /// Approve a SOP run waiting for out-of-band approval (talks to the running daemon)
+    Approve {
+        /// The run ID to approve
+        run_id: String,
+    },
+    /// Deny (cancel) a SOP run waiting for approval (talks to the running daemon)
+    Deny {
+        /// The run ID to deny
+        run_id: String,
+        /// Optional reason recorded in the approval ledger
+        reason: Option<String>,
+    },
+    /// List SOP runs currently waiting for approval (talks to the running daemon)
+    Pending,
 }

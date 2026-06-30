@@ -16,12 +16,105 @@ pub fn ref_dir(root: &Path) -> PathBuf {
     root.join("docs/book/src/reference")
 }
 
+/// Resolve the Cargo target directory, honoring `CARGO_TARGET_DIR`, a
+/// `.cargo/config.toml` `build.target-dir`, and any other override Cargo
+/// applies. `cargo doc` writes its output under `<target-dir>/doc`; hardcoding
+/// `<root>/target/doc` breaks whenever the target dir is relocated (CI runners,
+/// shared caches, `CARGO_TARGET_DIR`). Falls back to `<root>/target` only when
+/// `cargo metadata` is unavailable.
+pub fn target_dir(root: &Path) -> PathBuf {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output();
+    if let Ok(out) = output
+        && out.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(dir) = json.get("target_directory").and_then(|v| v.as_str())
+    {
+        return PathBuf::from(dir);
+    }
+    root.join("target")
+}
+
+/// The rustdoc output directory (`<target-dir>/doc`), resolved through
+/// [`target_dir`] so it tracks `cargo doc`'s actual output location.
+pub fn doc_dir(root: &Path) -> PathBuf {
+    target_dir(root).join("doc")
+}
+
 pub fn po_dir(root: &Path) -> PathBuf {
     root.join("docs/book/po")
 }
 
 pub fn pot_file(root: &Path) -> PathBuf {
     root.join("docs/book/po/messages.pot")
+}
+
+/// Ensure the `docs/book/po` translations submodule is initialized and checked
+/// out before the sync writes `.po`/`.pot` files into it. A bare clone leaves
+/// the gitlink path as an empty directory with no `.git`; writing catalogs there
+/// lands them in the parent worktree instead of the translations repo, so the
+/// translations silently never reach the submodule. `git submodule update
+/// --init` is idempotent: a no-op when the submodule is already populated.
+///
+/// A prior broken sync may have already scattered generated catalogs
+/// (`.po`/`.pot`/`.failures.log`) into the empty gitlink directory, which makes
+/// `git submodule update --init` abort with "destination path already exists and
+/// is not an empty directory". When the directory holds only those generated
+/// artifacts and no `.git`, clear them first so the clone can proceed; refuse to
+/// touch anything else.
+pub fn ensure_po_submodule(root: &Path) -> anyhow::Result<()> {
+    let po = po_dir(root);
+    if po.join(".git").exists() {
+        return Ok(());
+    }
+    if po.is_dir() {
+        clear_stray_po_artifacts(&po)?;
+    }
+    println!("==> initializing translations submodule → {}", po.display());
+    run_cmd(
+        Command::new("git")
+            .args(["submodule", "update", "--init", "--", "docs/book/po"])
+            .current_dir(root),
+    )?;
+    if !po.join(".git").exists() {
+        anyhow::bail!(
+            "translations submodule still not checked out at {}\n  \
+             run manually: git submodule update --init -- docs/book/po",
+            po.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only generated catalog artifacts from an uninitialized gitlink
+/// directory so the submodule clone can populate it. Bails if the directory
+/// holds any other file, so unexpected content is never silently deleted.
+fn clear_stray_po_artifacts(po: &Path) -> anyhow::Result<()> {
+    let generated = |name: &str| {
+        name.ends_with(".po") || name.ends_with(".pot") || name.ends_with(".failures.log")
+    };
+    let mut stray = vec![];
+    for entry in std::fs::read_dir(po)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if generated(&name) {
+            stray.push(entry.path());
+        } else {
+            anyhow::bail!(
+                "translations submodule path {} is not checked out but holds \
+                 unexpected file '{name}'; refusing to clear it. Resolve manually, then \
+                 run: git submodule update --init -- docs/book/po",
+                po.display()
+            );
+        }
+    }
+    for path in stray {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
 }
 
 pub struct LocaleEntry {
@@ -104,6 +197,33 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     }
     anyhow::bail!(
         "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.0 --locked"
+    )
+}
+
+/// Point mdBook's `peer-groups` preprocessor at the xtask binary Cargo actually
+/// built, rather than the repo-relative `target/release/mdbook` hardcoded in
+/// `book.toml`. With a non-default `CARGO_TARGET_DIR` the helper lands under the
+/// external target dir while mdBook still tries the repo-relative path and fails
+/// with "preprocessor not found". The running xtask binary *is* the preprocessor
+/// (its `preprocess` subcommand), so the override resolves wherever Cargo placed
+/// it. mdBook maps `MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND` to the
+/// `preprocessor.peer-groups.command` key (`__` -> `.`, `_` -> `-`) and splits
+/// the value with shlex, so the path is quoted.
+pub fn peer_groups_preprocessor_env() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_str = exe.to_string_lossy();
+    Some(peer_groups_preprocessor_env_for(&exe_str))
+}
+
+/// Pure form of [`peer_groups_preprocessor_env`] over an explicit helper path,
+/// so the mdBook env-key mapping and shlex quoting are unit-testable without
+/// resolving `current_exe`.
+fn peer_groups_preprocessor_env_for(helper_path: &str) -> (String, String) {
+    let quoted =
+        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
+    (
+        "MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND".to_string(),
+        format!("{quoted} preprocess"),
     )
 }
 
@@ -273,4 +393,77 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_stray_po_artifacts_removes_only_generated() {
+        let dir = std::env::temp_dir().join(format!("zc-po-stray-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["fr.po", "messages.pot", "ja.failures.log"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        clear_stray_po_artifacts(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_stray_po_artifacts_refuses_unknown_files() {
+        let dir = std::env::temp_dir().join(format!("zc-po-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fr.po"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let err = clear_stray_po_artifacts(&dir).unwrap_err();
+        assert!(err.to_string().contains("notes.txt"));
+        assert!(dir.join("fr.po").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn peer_groups_env_key_matches_mdbook_mapping() {
+        let (key, value) = peer_groups_preprocessor_env_for("/some/dir/mdbook");
+        // mdBook lowercases, maps `__` -> `.` and `_` -> `-`, so this key must
+        // resolve to `preprocessor.peer-groups.command`.
+        assert_eq!(
+            key.strip_prefix("MDBOOK_")
+                .map(|k| k.to_lowercase().replace("__", ".").replace('_', "-")),
+            Some("preprocessor.peer-groups.command".to_string())
+        );
+        assert_eq!(value, "/some/dir/mdbook preprocess");
+    }
+
+    #[test]
+    fn peer_groups_env_quotes_paths_with_spaces() {
+        let (_, value) = peer_groups_preprocessor_env_for("/tmp/my target/release/mdbook");
+        let words: Vec<String> = shlex::Shlex::new(&value).collect();
+        assert_eq!(words, ["/tmp/my target/release/mdbook", "preprocess"]);
+    }
+
+    #[test]
+    fn doc_dir_follows_cargo_target_dir_override() {
+        // cargo metadata reflects CARGO_TARGET_DIR; doc_dir must resolve to
+        // <override>/doc so the assemble()/refs copy reads from where `cargo doc`
+        // actually wrote. This is the exact failure the hardcoded `target/doc`
+        // path had under a non-default CARGO_TARGET_DIR.
+        // SAFETY: single-threaded body; env is saved and restored.
+        let prev = std::env::var_os("CARGO_TARGET_DIR");
+        let alt = std::env::temp_dir().join("zc-xtask-target-dir-test");
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", &alt);
+        }
+        let resolved_target = target_dir(&repo_root());
+        let resolved_doc = doc_dir(&repo_root());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+                None => std::env::remove_var("CARGO_TARGET_DIR"),
+            }
+        }
+        assert_eq!(resolved_target, alt);
+        assert_eq!(resolved_doc, alt.join("doc"));
+    }
 }

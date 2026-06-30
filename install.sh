@@ -225,17 +225,39 @@ shell_export_syntax() {
 
 # ── Platform / target triple detection ───────────────────────────
 
+detect_libc() {
+  if [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
+     ldd --version 2>&1 | grep -qi musl || \
+     { [ -r /etc/os-release ] && grep -qiE 'alpine|postmarket' /etc/os-release; }; then
+    echo "musl"
+  else
+    echo "gnu"
+  fi
+}
+
 detect_target_triple() {
-  local os arch
+  local os arch libc
   os=$(uname -s)
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    # Apple Silicon reports arm64; Intel reports x86_64. A Rosetta-translated
+    # shell on Apple Silicon also reports x86_64 from `uname -m`, so consult
+    # `sysctl hw.optional.arm64` to recover the true CPU. Without this an Intel
+    # Mac (or an M-series Mac run under Rosetta) is handed the wrong-arch
+    # binary and hits "bad CPU type in executable".
+    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      echo "aarch64-apple-darwin"
+    else
+      echo "x86_64-apple-darwin"
+    fi
+    ;;
   Linux)
+    libc=$(detect_libc)
     case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
     armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
     armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
     *) echo "" ;;
@@ -273,20 +295,12 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
+  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
+  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
-  case "$(uname -s)" in
-  Darwin)
-    web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
-    ;;
-  MINGW* | CYGWIN* | MSYS*)
-    web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
-    ;;
-  *)
-    web_data_dir="${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
-    ;;
-  esac
+  web_data_dir=$(resolve_web_data_dir)
 
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
@@ -299,14 +313,11 @@ install_prebuilt() {
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
 
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
-    {
-      warn "Download failed — falling back to source build"
-      rm -rf "$tmp_dir"
-      return 1
-    }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
+  # Fetch the checksum manifest first — it lists every published asset, so we
+  # can tell "no pre-built binary for this platform" (e.g. Intel macOS, which
+  # ships no release tarball) from a genuine download failure, and we never
+  # pull a tarball we couldn't verify anyway. All failure modes fall back to
+  # source rather than install unverified.
   if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
     warn "Could not fetch SHA256SUMS — falling back to source build"
     rm -rf "$tmp_dir"
@@ -315,10 +326,17 @@ install_prebuilt() {
 
   expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
   if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
+    warn "No pre-built binary published for $triple — falling back to source build"
     rm -rf "$tmp_dir"
     return 1
   fi
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
+    {
+      warn "Download failed — falling back to source build"
+      rm -rf "$tmp_dir"
+      return 1
+    }
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
@@ -366,7 +384,8 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (default features). Source builds only.
+                       'full' (every channel plus heavyweight extras such as
+                       whatsapp-web and channel-matrix). Source builds only.
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -377,7 +396,9 @@ Options:
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
-  --skip-onboard       Skip the post-install onboarding prompt
+  --no-modify-path     Don't add ZeroClaw to PATH in your shell profile; just
+                       print the line to add manually
+  --skip-quickstart       Skip the post-install quickstart prompt
   --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
   -V, --version        Show version from Cargo.toml
@@ -388,8 +409,9 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --skip-onboard                            # install only, configure later
-  $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
+  $0 --source --preset full                   # every channel plus heavyweight extras
+  $0 --skip-quickstart                            # install only, configure later
+  $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
   $0 --uninstall                               # remove ZeroClaw
 
@@ -440,6 +462,21 @@ do_uninstall() {
     fi
   fi
 
+  # Strip the PATH marker block this installer may have added to the profile.
+  local profile
+  profile=$(detect_shell_profile)
+  if [ -f "$profile" ] && grep -q "# >>> zeroclaw >>>" "$profile" 2>/dev/null; then
+    local tmp_profile
+    tmp_profile=$(mktemp)
+    if sed '/# >>> zeroclaw >>>/,/# <<< zeroclaw <<</d' "$profile" >"$tmp_profile" 2>/dev/null &&
+      cat "$tmp_profile" >"$profile" 2>/dev/null; then
+      info "Removed PATH entry from $profile"
+    else
+      warn "Could not edit $profile — remove the zeroclaw PATH block manually"
+    fi
+    rm -f "$tmp_profile"
+  fi
+
   # Check if another zeroclaw still lurks in PATH
   local other_bin
   other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
@@ -456,22 +493,22 @@ do_uninstall() {
   exit 0
 }
 
-# ── Onboarding-needed status check ───────────────────────────────
+# ── Quickstart-needed status check ───────────────────────────────
 #
-# Detect whether the operator already has a completed onboarding so the
-# 3-way "how would you like to onboard?" prompt can skip silently on a
-# re-install. We treat onboarding as complete when a config file exists at
-# the expected path AND it contains at least one `[providers.models.*]` or
-# `[providers.fallback]` line — i.e. some provider is configured. Empty or
-# default config files still trigger the prompt.
-onboarding_needed() {
+# Detect whether the operator already has a configured ZeroClaw so the
+# 3-way "how would you like to complete setup?" prompt can skip silently
+# on a re-install. We treat setup as complete when a config file exists
+# at the expected path AND it contains at least one `[providers.models.*]`
+# or `[providers.fallback]` line — i.e. some provider is configured.
+# Empty or default config files still trigger the prompt.
+quickstart_needed() {
   cfg="$PREFIX/.zeroclaw/config.toml"
-  [ -f "$cfg" ] || return 0 # no config → onboard
+  [ -f "$cfg" ] || return 0 # no config → run quickstart
   # Already-configured signal: any of these patterns means a provider was set.
   if grep -qE '^\[providers\.models\.|^fallback *=|^default_provider *=' "$cfg" 2>/dev/null; then
     return 1 # configured → skip
   fi
-  return 0 # config exists but empty → onboard
+  return 0 # config exists but empty → run quickstart
 }
 
 # ── Interactive feature picker ───────────────────────────────────
@@ -587,14 +624,49 @@ interactive_feature_picker() {
   PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
 }
 
+# Resolve the platform data directory the gateway auto-detects for the
+# dashboard bundle. Single source of truth so the prebuilt and source
+# install paths cannot drift.
+resolve_web_data_dir() {
+  case "$(uname -s)" in
+  Darwin)
+    printf '%s' "${HOME}/Library/Application Support/zeroclaw/web/dist"
+    ;;
+  MINGW* | CYGWIN* | MSYS*)
+    printf '%s' "${LOCALAPPDATA}/zeroclaw/web/dist"
+    ;;
+  *)
+    printf '%s' "${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
+    ;;
+  esac
+}
+
+# Copy a built web/dist into the gateway data directory so a
+# systemd-launched daemon finds it regardless of CWD.
+install_web_dist() {
+  src_dist="$1"
+  if [ ! -f "$src_dist/index.html" ]; then
+    return 0
+  fi
+  web_data_dir=$(resolve_web_data_dir)
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would install web dashboard to $web_data_dir"
+    return 0
+  fi
+  mkdir -p "$web_data_dir"
+  cp -r "$src_dist/." "$web_data_dir/"
+  info "Web dashboard installed to $web_data_dir"
+}
+
 # ── Web dashboard build for source installs ──────────────────────
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
 # is on PATH we run `cargo web build` from the source root so the
-# generated API client is refreshed before TypeScript compiles. Without
-# Node.js we warn — the gateway still starts but the dashboard route
-# returns 404 until `web/dist` is populated.
+# generated API client is refreshed before TypeScript compiles, then the
+# built bundle is copied into the gateway data directory. Without Node.js
+# we warn and tell the user to re-run the installer once Node.js is
+# present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
   if [ ! -d "$src_dir/web" ]; then
@@ -603,8 +675,8 @@ build_web_dashboard() {
   fi
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
-    warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir && cargo web build"
+    warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
+    warn "  --source to build and install the dashboard."
     return 0
   fi
   # Always rebuild — a stale dist from a prior revision serves outdated
@@ -616,6 +688,7 @@ build_web_dashboard() {
     return 0
   }
   info "Web dashboard built at $src_dir/web/dist"
+  install_web_dist "$src_dir/web/dist"
 }
 
 # ── Low-memory build heuristic ────────────────────────────────────
@@ -648,10 +721,11 @@ apply_low_mem_lto_default() {
 
 MINIMAL=false
 USER_FEATURES=""
-SKIP_ONBOARD=false
+SKIP_QUICKSTART=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
+MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opts out
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
@@ -707,7 +781,8 @@ while [ $# -gt 0 ]; do
     PREFIX=$(echo "$1" | sed 's|/*$||')
     ;;
   --dry-run) DRY_RUN=true ;;
-  --skip-onboard) SKIP_ONBOARD=true ;;
+  --no-modify-path) MODIFY_PATH=false ;;
+  --skip-quickstart) SKIP_QUICKSTART=true ;;
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
   --uninstall) UNINSTALL=true ;;
@@ -815,7 +890,7 @@ fi
 # ── Locate source ─────────────────────────────────────────────────
 
 [ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + onboard
+  # Jump past the source build to PATH + quickstart
   SOURCE_SKIPPED=true
 }
 
@@ -924,6 +999,22 @@ See all available features:
     esac
   fi
 
+  # `--preset full` must actually deliver the broad bundle the installer
+  # advertises (whatsapp-web, channel-matrix, the heavyweight extras), not
+  # Cargo's lean `default`. Resolve the explicit feature list from the
+  # canonical registry (`cargo generate features --selection all`), the same
+  # source of truth the release workflow consumes, and build with
+  # --no-default-features against it so the advertised set is exact.
+  if [ "$PRESET" = "full" ]; then
+    preset_features=$(cargo run --quiet -p xtask --bin generate -- features --selection all 2>/dev/null || true)
+    if [ -n "$preset_features" ]; then
+      CARGO_FLAGS="--no-default-features"
+      USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$preset_features"
+    else
+      warn "Could not resolve --preset full from the feature registry; falling back to default features."
+    fi
+  fi
+
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
@@ -991,7 +1082,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the full default feature set."
+      info "--preset full: building from source with the complete feature set (every channel plus heavyweight extras) resolved from the registry."
     fi
   fi
 
@@ -1010,6 +1101,7 @@ See all available features:
   fi
   echo
 
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1017,6 +1109,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so
@@ -1115,21 +1208,19 @@ fi # end source build block
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
-# ── PATH guidance ─────────────────────────────────────────────────
+# ── PATH setup ────────────────────────────────────────────────────
 
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
-SHOW_PATH_HELP=false
-if [ "$PREFIX" != "$HOME" ]; then
-  SHOW_PATH_HELP=true
-elif [ -f "$PROFILE" ] && ! grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
-  SHOW_PATH_HELP=true
-elif [ ! -f "$PROFILE" ]; then
-  SHOW_PATH_HELP=true
+# Is our bin dir already on PATH via the profile — either pre-existing or
+# from a prior run of this installer? If so there's nothing to do.
+PATH_ALREADY_SET=false
+if [ -f "$PROFILE" ] && grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
+  PATH_ALREADY_SET=true
 fi
 
-if [ "$SHOW_PATH_HELP" = true ]; then
+print_path_help() {
   echo
   printf "  %s (%s):\n" "$(bold "Add to your shell profile")" "$PROFILE"
   echo
@@ -1139,14 +1230,37 @@ if [ "$SHOW_PATH_HELP" = true ]; then
   echo
   printf "    source %s\n" "$PROFILE"
   echo
+}
+
+if [ "$PATH_ALREADY_SET" = true ]; then
+  : # already on PATH — nothing to do
+elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
+  # Auto-append to the profile, wrapped in a marker block so re-installs
+  # stay idempotent and an uninstall can strip it cleanly.
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would add $CARGO_HOME/bin to PATH in $PROFILE"
+  elif {
+    printf '\n# >>> zeroclaw >>>\n'
+    printf '%s\n' "$EXPORT_LINE"
+    printf '# <<< zeroclaw <<<\n'
+  } >>"$PROFILE" 2>/dev/null; then
+    info "Added $CARGO_HOME/bin to PATH in $PROFILE"
+    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+  else
+    warn "Could not write to $PROFILE — add this line manually:"
+    print_path_help
+  fi
+else
+  # --no-modify-path, or a custom --prefix install we won't auto-edit for.
+  print_path_help
 fi
 
-# ── Onboard ───────────────────────────────────────────────────────
+# ── Quickstart prompt ─────────────────────────────────────────────
 
-if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
+if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   # Skip the prompt entirely when the operator already has a configured
   # ZeroClaw — re-installs should not re-prompt.
-  if ! onboarding_needed; then
+  if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
     info "Run 'zeroclaw quickstart' to reconfigure."
   elif [ -t 0 ]; then
@@ -1160,8 +1274,8 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
-    read -r onboard_choice
-    case "${onboard_choice:-1}" in
+    read -r quickstart_choice
+    case "${quickstart_choice:-1}" in
     1 | "")
       echo
       "$BIN" quickstart || warn "Quickstart exited with an error — run 'zeroclaw quickstart' manually"
@@ -1177,7 +1291,7 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
       info "Skipped setup. Run 'zeroclaw quickstart' (CLI) or 'zeroclaw daemon' (browser) when ready."
       ;;
     *)
-      warn "Unknown choice '$onboard_choice' — skipping. Run 'zeroclaw quickstart' to configure."
+      warn "Unknown choice '$quickstart_choice' — skipping. Run 'zeroclaw quickstart' to configure."
       ;;
     esac
   else

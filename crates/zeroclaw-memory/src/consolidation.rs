@@ -12,6 +12,7 @@ use crate::conflict;
 use crate::importance;
 use crate::traits::{Memory, MemoryCategory};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_providers::ProviderDispatch;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -47,7 +48,8 @@ Do not include any text outside the JSON object."#;
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .expect("media-tag regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -80,7 +82,7 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    let raw = model_provider
+    let raw = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,

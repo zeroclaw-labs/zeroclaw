@@ -2,6 +2,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+const MAX_ROUND_DECIMALS: i64 = 15;
+
+/// Maximum number of entries in the `values` array passed to array-shaped
+/// calculator operations. Caps the pre-allocated `Vec<f64>` so a caller
+/// cannot OOM the host process by passing a multi-million-element array.
+/// 10 000 f64 = 80 KiB — large enough for realistic statistical workloads,
+/// small enough to keep memory bounded under hostile or buggy input.
+const MAX_VALUES_LEN: usize = 10_000;
+
 pub struct CalculatorTool;
 
 impl CalculatorTool {
@@ -172,6 +181,12 @@ fn extract_values(args: &serde_json::Value, min_len: usize) -> Result<Vec<f64>, 
             values.len()
         ));
     }
+    if values.len() > MAX_VALUES_LEN {
+        return Err(format!(
+            "values array must be at most {MAX_VALUES_LEN} entries, got {}",
+            values.len()
+        ));
+    }
     let mut nums = Vec::with_capacity(values.len());
     for (i, v) in values.iter().enumerate() {
         match v.as_f64() {
@@ -263,7 +278,10 @@ fn calc_round(args: &serde_json::Value) -> Result<String, String> {
     if decimals < 0 {
         return Err("decimals must be non-negative".to_string());
     }
-    let multiplier = 10_f64.powi(i32::try_from(decimals).unwrap_or(i32::MAX));
+    if decimals > MAX_ROUND_DECIMALS {
+        return Err(format!("decimals must be at most {MAX_ROUND_DECIMALS}"));
+    }
+    let multiplier = 10_f64.powi(decimals as i32);
     Ok(format_num((x * multiplier).round() / multiplier))
 }
 
@@ -299,8 +317,8 @@ fn calc_factorial(args: &serde_json::Value) -> Result<String, String> {
     }
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let n = x.round() as u128;
-    if n > 170 {
-        return Err("Factorial result exceeds f64 range (max input: 170)".to_string());
+    if n > 34 {
+        return Err("Factorial input too large (max input: 34); 34! is the largest factorial that fits in a 128-bit integer".to_string());
     }
     let mut result: u128 = 1;
     for i in 2..=n {
@@ -578,6 +596,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_round_rejects_excessive_decimals() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "round", "x": 2.715, "decimals": 1_000_000}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_rejects_oversized_array() {
+        // Regression for audit OOM: a hostile or buggy caller passing a
+        // million-entry `values` array would pre-allocate ~8 MiB and burn
+        // CPU on f64 reductions. The cap is enforced at the shared
+        // `extract_values` helper so all 15 array-shaped operations
+        // (add, subtract, divide, multiply, sum, average, median, mode,
+        // min, max, range, variance, stdev, percentile, count) inherit it.
+        let tool = CalculatorTool::new();
+        let oversized: Vec<f64> = (0..(MAX_VALUES_LEN + 1)).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": oversized}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.as_ref().unwrap();
+        assert!(
+            err.contains("must be at most 10000 entries"),
+            "expected cap-rejection error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_accepts_exact_cap() {
+        // Boundary: an array of exactly `MAX_VALUES_LEN` entries must
+        // succeed. Off-by-one protection: the cap is inclusive, not
+        // exclusive. Matches the boundary-test pattern from PR #8463
+        // (`read_capped_line_at_exact_cap_is_not_truncated`).
+        let tool = CalculatorTool::new();
+        let at_cap: Vec<f64> = (0..MAX_VALUES_LEN).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": at_cap}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "exact-cap array should succeed: {:?}",
+            result.error
+        );
+        // 0 + 1 + ... + 9999 = 9999 * 10000 / 2 = 49_995_000
+        assert_eq!(result.output, "49995000");
+    }
+
+    #[tokio::test]
     async fn test_log_base10() {
         let tool = CalculatorTool::new();
         let result = tool
@@ -630,6 +702,30 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "120");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_max_input() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 34.0}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "295232799039604140847618609643520000000");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_overflow_is_graceful() {
+        let tool = CalculatorTool::new();
+        // 35! overflows the u128 accumulator (~1.03e40 > u128::MAX ~3.40e38).
+        // This must return a graceful error rather than panicking on overflow.
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 35.0}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("too large"));
     }
 
     #[tokio::test]
