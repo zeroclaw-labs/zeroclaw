@@ -2278,19 +2278,15 @@ impl RpcDispatcher {
     fn handle_session_approve(&self, params: &Value) -> RpcResult {
         let p: SessionApproveParams = parse_params(params)?;
 
-        let response = match p.decision.as_str() {
-            "allow_once" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
-            "allow_always" => zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-            "reject" | "reject_once" => zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-            "reject_with_edit" => {
+        let response = match p.decision {
+            ApprovalDecision::AllowOnce => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            ApprovalDecision::AllowAlways => {
+                zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+            }
+            ApprovalDecision::Reject => zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            ApprovalDecision::RejectWithEdit => {
                 let replacement = p.replacement.unwrap_or_default();
                 zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit { replacement }
-            }
-            other => {
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    format!("unknown decision: {other}"),
-                ));
             }
         };
 
