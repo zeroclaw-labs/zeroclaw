@@ -11968,6 +11968,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub imessage: HashMap<String, IMessageConfig>,
+    /// Inkbox channel instances (`[channels.inkbox.<alias>]`). Email, SMS/MMS,
+    /// iMessage, and voice for an agent identity, delivered over the Inkbox
+    /// tunnel.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub inkbox: HashMap<String, InkboxConfig>,
     /// Matrix channel instances (`[channels.matrix.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12165,6 +12171,12 @@ impl ChannelsConfig {
                 configured: !self.imessage.is_empty(),
             },
             ChannelInfo {
+                kind: "inkbox",
+                name: "Inkbox",
+                desc: "email, SMS, iMessage, and voice for an agent identity",
+                configured: !self.inkbox.is_empty(),
+            },
+            ChannelInfo {
                 kind: "matrix",
                 name: "Matrix",
                 desc: "self-hosted chat",
@@ -12359,6 +12371,7 @@ impl ChannelsConfig {
             || self.mattermost.values().any(|c| c.enabled)
             || self.webhook.values().any(|c| c.enabled)
             || self.imessage.values().any(|c| c.enabled)
+            || self.inkbox.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
@@ -12397,7 +12410,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12405,6 +12418,7 @@ impl ChannelsConfig {
             ("mattermost", !self.mattermost.is_empty(), true),
             ("webhook", !self.webhook.is_empty(), true),
             ("imessage", !self.imessage.is_empty(), true),
+            ("inkbox", !self.inkbox.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
@@ -12490,6 +12504,7 @@ impl Default for ChannelsConfig {
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
+            inkbox: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
@@ -12591,6 +12606,117 @@ fn default_channel_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+fn default_inkbox_base_url() -> String {
+    "https://inkbox.ai".to_string()
+}
+
+fn default_inkbox_realtime_model() -> String {
+    "gpt-realtime-2".to_string()
+}
+
+fn default_inkbox_realtime_voice() -> String {
+    "cedar".to_string()
+}
+
+/// Inkbox channel configuration.
+///
+/// One instance per agent identity. Inbound email/SMS/iMessage/voice arrive
+/// over the Inkbox tunnel; outbound replies go through the Inkbox API.
+/// `[channels.inkbox.default]` is the conventional single-instance key.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.inkbox"]
+pub struct InkboxConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Inkbox API key (`X-API-Key`). Agent-scoped keys are recommended.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: String,
+    /// Inkbox agent identity handle. Also the tunnel name the data plane opens.
+    #[tab(Connection)]
+    pub identity: String,
+    /// Webhook signing key (`whsec_...`) used to verify inbound events. When
+    /// empty, inbound events fail verification and are dropped.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub signing_key: String,
+    /// Inkbox API base URL. Defaults to `https://inkbox.ai`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_base_url")]
+    pub base_url: String,
+    /// Tools excluded from this channel's tool spec.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
+    /// Enable the OpenAI Realtime voice bridge for calls (raw g711 audio bridged
+    /// to a realtime model). Requires `realtime_api_key`; when off (or no key),
+    /// calls use Inkbox's built-in STT/TTS.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub realtime_enabled: bool,
+    /// OpenAI API key for the Realtime call bridge (`OPENAI_API_KEY` is the
+    /// usual source). Empty disables realtime regardless of `realtime_enabled`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub realtime_api_key: String,
+    /// Realtime model id. Defaults to `gpt-realtime-2`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_realtime_model")]
+    pub realtime_model: String,
+    /// Realtime voice. Defaults to `cedar`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_realtime_voice")]
+    pub realtime_voice: String,
+    /// Fall back to Inkbox STT/TTS when the realtime bridge can't connect.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub realtime_fallback: bool,
+}
+
+impl Default for InkboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            identity: String::new(),
+            signing_key: String::new(),
+            base_url: default_inkbox_base_url(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            realtime_enabled: false,
+            realtime_api_key: String::new(),
+            realtime_model: default_inkbox_realtime_model(),
+            realtime_voice: default_inkbox_realtime_voice(),
+            realtime_fallback: true,
+        }
+    }
+}
+
+impl ChannelConfig for InkboxConfig {
+    fn name() -> &'static str {
+        "Inkbox"
+    }
+    fn desc() -> &'static str {
+        "email, SMS, iMessage, and voice for an agent identity"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -13669,6 +13795,7 @@ impl_reply_pacing!(
     MatrixConfig,
     SignalConfig,
     WhatsAppConfig,
+    InkboxConfig,
 );
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -17642,6 +17769,7 @@ impl Config {
             .chain(rows("mattermost", &c.mattermost))
             .chain(rows("webhook", &c.webhook))
             .chain(rows("imessage", &c.imessage))
+            .chain(rows("inkbox", &c.inkbox))
             .chain(rows("matrix", &c.matrix))
             .chain(rows("signal", &c.signal))
             .chain(rows("whatsapp", &c.whatsapp))
@@ -20581,6 +20709,32 @@ mod tests {
     }
 
     #[test]
+    async fn inkbox_config_default_matches_helpers_and_deserializes() {
+        use super::*;
+        // The hand-rolled Default must not drift from the default_inkbox_* helpers.
+        let d = InkboxConfig::default();
+        assert_eq!(d.base_url, default_inkbox_base_url());
+        assert_eq!(d.realtime_model, default_inkbox_realtime_model());
+        assert_eq!(d.realtime_voice, default_inkbox_realtime_voice());
+        assert!(!d.enabled);
+        assert!(d.realtime_fallback); // default_true
+
+        // A minimal block fills required fields and serde-defaults the rest.
+        let cfg: InkboxConfig = toml::from_str(
+            r#"
+            api_key = "ApiKey_x"
+            identity = "zero-claw-inkbox"
+            "#,
+        )
+        .expect("inkbox config deserializes");
+        assert_eq!(cfg.identity, "zero-claw-inkbox");
+        assert_eq!(cfg.base_url, "https://inkbox.ai");
+        assert_eq!(cfg.realtime_model, "gpt-realtime-2");
+        assert!(cfg.realtime_fallback);
+        assert!(!cfg.realtime_enabled);
+    }
+
+    #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
             enabled: true,
@@ -22162,6 +22316,7 @@ auto_save = true
                 mattermost: HashMap::new(),
                 webhook: HashMap::new(),
                 imessage: HashMap::new(),
+                inkbox: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
@@ -23661,6 +23816,7 @@ allowed_users = ["@u:matrix.org"]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            inkbox: HashMap::new(),
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -24191,6 +24347,7 @@ allowed_numbers = ["+1", "+2"]
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
+            inkbox: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
             whatsapp: HashMap::from([(

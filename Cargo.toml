@@ -317,7 +317,7 @@ channels-full = [
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-inkbox",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
@@ -342,6 +342,7 @@ channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
 channel-irc = ["zeroclaw-channels/channel-irc"]
 channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
+channel-inkbox = ["zeroclaw-channels/channel-inkbox", "zeroclaw-runtime?/inkbox-tools"]
 channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
 channel-qq = ["zeroclaw-channels/channel-qq"]
 channel-bluesky = ["zeroclaw-channels/channel-bluesky"]

@@ -90,6 +90,11 @@ pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
     pub token: Option<String>,
+    /// Extra `channels.<type>.<alias>.<key>` settings for multi-field channels
+    /// (Inkbox: api_key / identity / signing_key …). Mirrors
+    /// `zeroclaw_config::presets::ChannelQuickStart::fields`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -30,6 +30,10 @@ pub mod peers;
 pub mod platform;
 pub mod process_stats;
 pub mod quickstart;
+/// Inkbox channel onboarding helpers, re-exported from `zeroclaw-tools` so the
+/// CLI Quickstart surface can reach them without a direct tools dependency.
+#[cfg(feature = "inkbox-tools")]
+pub use zeroclaw_tools::inkbox_onboarding;
 pub mod rag;
 pub mod routines;
 pub mod rpc;

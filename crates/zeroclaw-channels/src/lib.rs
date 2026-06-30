@@ -43,6 +43,8 @@ pub mod filesystem;
 pub mod gmail_push;
 #[cfg(feature = "channel-imessage")]
 pub mod imessage;
+#[cfg(feature = "channel-inkbox")]
+pub mod inkbox;
 #[cfg(feature = "channel-irc")]
 pub mod irc;
 #[cfg(feature = "channel-lark")]

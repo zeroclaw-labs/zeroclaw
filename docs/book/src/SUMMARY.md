@@ -72,6 +72,7 @@
   - [Other chat platforms](./channels/chat-others.md)
   - [Social (Bluesky, Nostr, Twitter, Reddit)](./channels/social.md)
   - [Email](./channels/email.md)
+  - [Inkbox](./channels/inkbox.md)
   - [Voice & telephony](./channels/voice.md)
   - [Webhooks](./channels/webhook.md)
   - [ACP (Agent Client Protocol)](./channels/acp.md)

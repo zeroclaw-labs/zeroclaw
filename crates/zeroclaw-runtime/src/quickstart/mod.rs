@@ -779,7 +779,18 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
     "requires_openai_auth",
     "wire_api",
 ];
-const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
+const CHANNEL_ESSENTIALS: &[&str] = &[
+    "bot_token",
+    "token",
+    "webhook_url",
+    "allowed_users",
+    // Inkbox needs more than a single secret — surface its core fields so the
+    // TUI field-form (and CLI fallback) can collect them.
+    "api_key",
+    "identity",
+    "signing_key",
+    "base_url",
+];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 /// Runtime profile the Quickstart silently installs. The Runtime Profile
@@ -1361,6 +1372,18 @@ fn apply_channels(
                             err.to_string(),
                         ));
                         continue;
+                    }
+                }
+                // Extra fields for channels that need more than a single
+                // secret (Inkbox writes api_key / identity / signing_key …).
+                for (key, value) in &entry.fields {
+                    let path = format!("channels.{}.{}.{}", entry.channel_type, entry.alias, key);
+                    if let Err(err) = config.set_prop_persistent(&path, value) {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].{key}"),
+                            err.to_string(),
+                        ));
                     }
                 }
                 refs.push(format!("{}.{}", entry.channel_type, entry.alias));
@@ -2150,11 +2173,13 @@ mod tests {
                 channel_type: "telegram".into(),
                 alias: "tg".into(),
                 token: Some("tok-a".into()),
+                fields: Default::default(),
             }),
             SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "discord".into(),
                 alias: "dc".into(),
                 token: Some("tok-b".into()),
+                fields: Default::default(),
             }),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
@@ -2173,12 +2198,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_extra_fields_persist_to_their_own_paths() {
+        // A multi-field channel (Inkbox-shaped): no bot_token, several
+        // dedicated fields. Each must land at its real config path.
+        let mut submission = fresh_submission("bot");
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("api_key".to_string(), "ApiKey_test".to_string());
+        fields.insert("identity".to_string(), "on-call-agent".to_string());
+        fields.insert("signing_key".to_string(), "whsec_test".to_string());
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "inkbox".into(),
+            alias: "main".into(),
+            token: None,
+            fields,
+        })];
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let ink = reloaded
+            .channels
+            .inkbox
+            .get("main")
+            .expect("inkbox channel persisted");
+        // `identity` is a plain field — it round-trips verbatim, proving the
+        // write landed at `channels.inkbox.main.identity`.
+        assert_eq!(ink.identity, "on-call-agent");
+        // `api_key` and `signing_key` are `#[secret]`, so they are encrypted at
+        // rest (`enc2:…`). A non-empty value proves the field was written and
+        // recognised as a secret — i.e. routed to the right path.
+        assert!(!ink.api_key.is_empty(), "api_key persisted (encrypted)");
+        assert!(
+            !ink.signing_key.is_empty(),
+            "signing_key persisted (encrypted)"
+        );
+    }
+
+    #[tokio::test]
     async fn peer_groups_persist_to_canonical_section() {
         let mut submission = fresh_submission("bot");
         submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            fields: Default::default(),
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),

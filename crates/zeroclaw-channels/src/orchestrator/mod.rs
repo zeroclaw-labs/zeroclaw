@@ -254,7 +254,6 @@ const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
-const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -4117,7 +4116,7 @@ fn spawn_scoped_typing_task(
     cancellation_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
-    let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
+    let refresh_interval = Duration::from_secs(channel.typing_refresh_secs());
     zeroclaw_spawn::spawn!(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7435,6 +7434,84 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Telegram channel is configured but this build was compiled without \
              `channel-telegram`; skipping Telegram."
+        );
+    }
+
+    #[cfg(feature = "channel-inkbox")]
+    for (alias, ic) in &config.channels.inkbox {
+        if !active_channel_aliases.contains(&format!("inkbox.{alias}")) {
+            continue;
+        }
+        if !ic.enabled {
+            continue;
+        }
+        // The Inkbox client embeds `reqwest::blocking`, whose construction spins
+        // up and drops a temporary tokio runtime — and dropping a runtime on a
+        // tokio worker panics ("cannot drop a runtime in an async context").
+        // This collection runs inside the async daemon, so build the client on a
+        // plain OS thread; the resulting `Arc<Inkbox>` is `Send`.
+        let api_key = ic.api_key.clone();
+        let base_url = ic.base_url.clone();
+        let built = std::thread::spawn(move || {
+            ::inkbox::Inkbox::builder(api_key)
+                .base_url(base_url)
+                .build()
+        })
+        .join();
+        let client = match built {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] skipping channel inkbox.{alias}: {e}"),
+                );
+                continue;
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] skipping channel inkbox.{alias}: client build panicked"),
+                );
+                continue;
+            }
+        };
+        // Realtime call bridge is active only when enabled AND credentialed.
+        let realtime =
+            if crate::inkbox::RealtimeConfig::usable(ic.realtime_enabled, &ic.realtime_api_key) {
+                Some(crate::inkbox::RealtimeConfig {
+                    api_key: ic.realtime_api_key.clone(),
+                    model: ic.realtime_model.clone(),
+                    voice: ic.realtime_voice.clone(),
+                    fallback: ic.realtime_fallback,
+                })
+            } else {
+                None
+            };
+        channels.push(ConfiguredChannel {
+            display_name: "Inkbox",
+            alias: Some(alias.clone()),
+            channel: Arc::new(crate::inkbox::InkboxChannel::new(
+                client,
+                ic.identity.clone(),
+                ic.signing_key.clone(),
+                alias.clone(),
+                realtime,
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-inkbox"))]
+    if !config.channels.inkbox.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Inkbox channel is configured but this build was compiled without \
+             `channel-inkbox`; skipping Inkbox."
         );
     }
 

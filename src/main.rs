@@ -240,7 +240,12 @@ mod auth;
 mod channels;
 #[cfg(feature = "agent-runtime")]
 mod cli_input;
+// Interactive Inkbox onboarding for the CLI Quickstart "Channels" step.
+// Needs both the runtime (agent-runtime brings `zeroclaw-runtime`, which
+// re-exports `inkbox_onboarding`) and the Inkbox channel feature.
 mod commands;
+#[cfg(all(feature = "agent-runtime", feature = "channel-inkbox"))]
+mod quickstart_inkbox;
 #[cfg(feature = "agent-runtime")]
 mod rag {
     pub use zeroclaw::rag::*;
@@ -1872,6 +1877,21 @@ async fn run_quickstart_cli(
                             continue;
                         };
                         let chosen = &channel_types[ci];
+                        // Inkbox is a native channel in this fork — branch into
+                        // the live onboarding wizard instead of the generic
+                        // schema field-form.
+                        #[cfg(all(feature = "agent-runtime", feature = "channel-inkbox"))]
+                        if chosen.kind == "inkbox" {
+                            if let Some((alias, extras)) = quickstart_inkbox::run()? {
+                                form.channels.push(ChannelChoice::Fresh {
+                                    kind: chosen.kind.clone(),
+                                    display_name: chosen.display_name.clone(),
+                                    alias,
+                                    extras,
+                                });
+                            }
+                            continue;
+                        }
                         let Ok(alias) = Input::<String>::new()
                             .with_prompt(qta(
                                 "cli-quickstart-alias-for",
@@ -2277,18 +2297,31 @@ async fn run_quickstart_cli(
                 alias,
                 extras,
                 ..
-            } => SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: kind,
-                alias,
-                token: extras
+            } => {
+                // Single-secret channels (Telegram, Discord) carry their secret
+                // as `token`; everything else (Inkbox: api_key/identity/…) flows
+                // through `fields`. Splitting here keeps existing channels byte
+                // -for-byte identical while letting multi-field channels persist.
+                let is_token_key = |k: &str| {
+                    k.eq_ignore_ascii_case("bot-token")
+                        || k.eq_ignore_ascii_case("token")
+                        || k.eq_ignore_ascii_case("access-token")
+                };
+                let token = extras
+                    .iter()
+                    .find(|(k, _)| is_token_key(k))
+                    .map(|(_, v)| v.clone());
+                let fields = extras
                     .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
-            }),
+                    .filter(|(k, _)| !is_token_key(k))
+                    .collect();
+                SelectorChoice::Fresh(ChannelQuickStart {
+                    channel_type: kind,
+                    alias,
+                    token,
+                    fields,
+                })
+            }
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
         .collect();

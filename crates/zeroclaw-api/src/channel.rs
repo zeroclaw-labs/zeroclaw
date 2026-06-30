@@ -269,6 +269,9 @@ impl SendMessage {
     }
 }
 
+/// Default interval for refreshing a channel's typing indicator, in seconds.
+const DEFAULT_TYPING_REFRESH_SECS: u64 = 4;
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -298,6 +301,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Seconds between typing-indicator refreshes for this channel.
+    fn typing_refresh_secs(&self) -> u64 {
+        DEFAULT_TYPING_REFRESH_SECS
     }
 
     /// Whether this channel supports progressive message updates via draft edits.
