@@ -244,6 +244,8 @@ impl Channel for MochatChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             };
 
                             if tx.send(channel_msg).await.is_err() {

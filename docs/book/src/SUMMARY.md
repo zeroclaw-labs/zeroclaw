@@ -34,6 +34,7 @@
   - [Request lifecycle](./architecture/request-lifecycle.md)
   - [Crates](./architecture/crates.md)
   - [Logging](./architecture/logging.md)
+  - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
   - [RPC socket transport](./architecture/rpc-socket.md)
 - [Reference](./reference/index.md)
   - [CLI](./reference/cli.md)
@@ -142,3 +143,4 @@
   - [Labels](./maintainers/labels.md)
   - [Superseding PRs](./maintainers/superseding.md)
   - [Release runbook](./maintainers/release-runbook.md)
+  - [Release artifact verification](./maintainers/release-verification.md)

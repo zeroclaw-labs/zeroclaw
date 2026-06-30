@@ -249,7 +249,7 @@ fn is_path_listing_tool(tool_name: &str) -> bool {
 
 /// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
 ///
-/// Returns the output unchanged for path-listing tools ([`is_path_listing_tool`])
+/// Returns the output unchanged for path-listing tools (`is_path_listing_tool`)
 /// so their incidental image paths never become routable `[IMAGE:...]` markers;
 /// all other tools are canonicalized exactly as before.
 pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {

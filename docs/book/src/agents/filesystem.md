@@ -12,7 +12,7 @@ each get their own top-level directory.
 │   │   └── sessions.db, acp-sessions.db
 │   ├── state/                    — runtime state
 │   │   └── costs.jsonl, runtime-trace.jsonl
-│   ├── devices.db                — gateway pairing store
+│   ├── devices.db                — paired-device metadata
 │   └── memory/                   — shared instance memory
 │       └── brain.db, audit.db, response_cache.db,
 │           MEMORY_SNAPSHOT.md, archive/
@@ -30,7 +30,9 @@ The three roots map to three scopes:
 
 - **`data/`** holds state that belongs to the whole install, not to any one
   agent: chat `sessions/`, runtime `state/` (cost tracking and the like), the
-  pairing `devices.db`, and the shared instance memory under `data/memory/`.
+  paired-device metadata in `devices.db`, and the shared instance memory under
+  `data/memory/`. Valid gateway bearer tokens remain config state; `devices.db`
+  makes paired devices visible and manageable.
 - **`shared/`** holds resources agents draw on in common, notably skill bundles
   under `shared/skills/<bundle>/`.
 - **`agents/<alias>/`** holds everything private to one agent. By default an
@@ -67,7 +69,8 @@ The backend defaults to SQLite for a new agent, and once the agent has written
 on-disk data the value is locked, so you cannot silently swap a backend out from
 under existing memory. Cross-agent memory sharing is opt-in through the
 workspace `read_memory_from` allowlist. For the memory model itself, see
-[Runtime internals](./internals.md).
+[Runtime internals](./internals.md). For a cross-system state map, see
+[Runtime state and persistence](../architecture/runtime-state-and-persistence.md).
 
 ## Identity
 
