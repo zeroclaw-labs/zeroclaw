@@ -175,10 +175,9 @@ jobs:
           cargo_log="${RUNNER_TEMP}/cargo-clippy-windows-tools.log"
           SECONDS=0
           cargo clippy \
-            --workspace \
-            --exclude zeroclaw-desktop \
+            -p zeroclaw-tools \
             --all-targets \
-            --features ci-all \
+            --all-features \
             --target x86_64-pc-windows-msvc \
             -- -D warnings 2>&1 | tee "$cargo_log"
           cargo_status=${PIPESTATUS[0]}
