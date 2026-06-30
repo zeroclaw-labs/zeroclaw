@@ -362,10 +362,22 @@ pub async fn run(
     // its own event_tx; the daemon's RPC event_tx must be wired here).
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    if config.heartbeat.enabled {
-        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.data_dir)
-            .await;
+    if config.heartbeat.enabled
+        && let Ok((_, heartbeat_workspace_dir)) = resolve_heartbeat_workspace_dir(&config)
+    {
+        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(
+            &heartbeat_workspace_dir,
+        )
+        .await;
     }
+
+    // Consume the pricing catalog (`<data_dir>/pricing.json`) if present so the
+    // cost engine can price models the operator never hand-priced in config.
+    // This is consumption only and vendor-neutral: a typical build populates the
+    // file from a public price feed, while an air-gapped build may ship no file
+    // (self-hosted/free models then stay $0). Refreshing the file is a CLI +
+    // scheduler concern, never a public-feed fetch inside this shared daemon.
+    crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
@@ -857,12 +869,7 @@ where
     })
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    use crate::heartbeat::engine::{
-        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
-    };
-    use std::sync::Arc;
-
+fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)> {
     let agent_alias = config.heartbeat.agent.trim().to_string();
     if agent_alias.is_empty() {
         anyhow::bail!(
@@ -874,10 +881,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             "[heartbeat] agent = {agent_alias:?} is not configured ([agents.{agent_alias}] missing)"
         );
     }
+    let workspace_dir = config.agent_workspace_dir(&agent_alias);
+    Ok((agent_alias, workspace_dir))
+}
+
+async fn run_heartbeat_worker(config: Config) -> Result<()> {
+    use crate::heartbeat::engine::{
+        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
+    };
+    use std::sync::Arc;
+
+    let (agent_alias, heartbeat_workspace_dir) = resolve_heartbeat_workspace_dir(&config)?;
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = HeartbeatEngine::new(config.heartbeat.clone(), config.data_dir.clone(), observer);
+    let engine = HeartbeatEngine::new(config.heartbeat.clone(), heartbeat_workspace_dir, observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
@@ -1241,7 +1259,32 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    if let Some((channel, target)) = &delivery {
+                    // Skip delivery when the heartbeat agent signalled "nothing
+                    // to report" via the quiet NO_REPLY sentinel. Without this
+                    // guard the literal sentinel string is announced to the
+                    // channel (zeroclaw-labs/zeroclaw#2128). The empty-output
+                    // branch above never produces the sentinel, so checking the
+                    // final announcement is sufficient. Failure/refusal kinds
+                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
+                    // suppressed — they carry operator-visible meaning.
+                    let suppress_delivery =
+                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                            .should_deliver();
+                    if suppress_delivery {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"task": task.text})),
+                            "Heartbeat task returned NO_REPLY sentinel — skipping delivery"
+                        );
+                    }
+                    if let Some((channel, target)) = &delivery
+                        && !suppress_delivery
+                    {
                         let delivery_result = tokio::time::timeout(
                             Duration::from_secs(30),
                             crate::cron::scheduler::deliver_announcement(
@@ -1644,6 +1687,17 @@ mod tests {
         config
     }
 
+    fn add_agent_with_workspace(config: &mut Config, agent_alias: &str, workspace_dir: PathBuf) {
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace_dir),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.agents.insert(agent_alias.to_string(), agent);
+    }
+
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
@@ -1676,6 +1730,65 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_seed_uses_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let agent_alias = "ops";
+        let workspace_dir = tmp
+            .path()
+            .join("agents")
+            .join(agent_alias)
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = agent_alias.to_string();
+        add_agent_with_workspace(&mut config, agent_alias, workspace_dir.clone());
+
+        let (_, resolved_workspace_dir) = resolve_heartbeat_workspace_dir(&config).unwrap();
+        assert_eq!(resolved_workspace_dir, workspace_dir);
+        assert_ne!(resolved_workspace_dir, config.data_dir);
+
+        crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&resolved_workspace_dir)
+            .await
+            .unwrap();
+
+        assert!(workspace_dir.join("HEARTBEAT.md").exists());
+        assert!(!config.data_dir.join("HEARTBEAT.md").exists());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_engine_reads_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let agent_alias = "ops";
+        let workspace_dir = tmp
+            .path()
+            .join("agents")
+            .join(agent_alias)
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = agent_alias.to_string();
+        add_agent_with_workspace(&mut config, agent_alias, workspace_dir.clone());
+
+        std::fs::write(config.data_dir.join("HEARTBEAT.md"), "- Data dir task").unwrap();
+        std::fs::write(workspace_dir.join("HEARTBEAT.md"), "- Workspace task").unwrap();
+
+        let (_, resolved_workspace_dir) = resolve_heartbeat_workspace_dir(&config).unwrap();
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
+        let engine = crate::heartbeat::engine::HeartbeatEngine::new(
+            config.heartbeat.clone(),
+            resolved_workspace_dir,
+            observer,
+        );
+
+        let tasks = engine.collect_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].text, "Workspace task");
     }
 
     #[allow(clippy::await_holding_lock)]

@@ -348,3 +348,94 @@ pub struct FsStatError {
     pub code: &'static str, // e.g. "fs.not_found"
     pub message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_new_sets_version_and_wraps_id() {
+        let req = JsonRpcRequest::new("ping", json!({"x": 1}), json!(7));
+        assert_eq!(req.jsonrpc, JSONRPC_VERSION);
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, json!({"x": 1}));
+        assert_eq!(req.id, Some(json!(7)));
+    }
+
+    #[test]
+    fn request_deserializes_with_default_params_when_omitted() {
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"m","id":1}"#).unwrap();
+        assert_eq!(req.method, "m");
+        assert_eq!(req.params, Value::Null);
+        assert_eq!(req.id, Some(json!(1)));
+    }
+
+    #[test]
+    fn notification_new_sets_version_and_carries_no_id() {
+        let n = JsonRpcNotification::new("event", json!([1, 2]));
+        assert_eq!(n.jsonrpc, JSONRPC_VERSION);
+        assert_eq!(n.method, "event");
+        let v = serde_json::to_value(&n).unwrap();
+        assert!(v.get("id").is_none(), "notifications carry no id");
+        assert_eq!(v["jsonrpc"].as_str(), Some(JSONRPC_VERSION));
+    }
+
+    #[test]
+    fn response_omits_none_result_and_error() {
+        let ok = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!("ok")),
+            error: None,
+            id: json!(1),
+        };
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["result"], json!("ok"));
+        assert!(v.get("error").is_none(), "error omitted when None");
+
+        let err = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: "nope".to_string(),
+                data: None,
+            }),
+            id: json!(2),
+        };
+        let v = serde_json::to_value(&err).unwrap();
+        assert!(v.get("result").is_none(), "result omitted when None");
+        assert_eq!(
+            v["error"]["code"].as_i64(),
+            Some(error_codes::METHOD_NOT_FOUND as i64)
+        );
+        assert!(
+            v["error"].get("data").is_none(),
+            "error.data omitted when None"
+        );
+    }
+
+    #[test]
+    fn standard_error_codes_match_jsonrpc_spec() {
+        assert_eq!(error_codes::PARSE_ERROR, -32700);
+        assert_eq!(error_codes::INVALID_REQUEST, -32600);
+        assert_eq!(error_codes::METHOD_NOT_FOUND, -32601);
+        assert_eq!(error_codes::INVALID_PARAMS, -32602);
+        assert_eq!(error_codes::INTERNAL_ERROR, -32603);
+    }
+
+    #[test]
+    fn error_roundtrips_through_serde() {
+        let e = JsonRpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "bad".to_string(),
+            data: Some(json!({"field": "x"})),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: JsonRpcError = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.code, error_codes::INVALID_PARAMS);
+        assert_eq!(back.message, "bad");
+        assert_eq!(back.data, Some(json!({"field": "x"})));
+    }
+}

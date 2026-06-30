@@ -145,6 +145,176 @@ pub fn tool_dispatcher_for_provider(
     }
 }
 
+/// Outcome of consulting a cross-channel [`ApprovalRoute`](zeroclaw_config::autonomy::ApprovalRoute).
+///
+/// Either the decision is settled here (the named approver answered, or the gate
+/// fails closed), or the caller should fall through to the originating fan-out
+/// (explicit `InheritOriginator`).
+enum RoutedApproval {
+    /// Use this response. `decider` names the channel that answered, for audit
+    /// attribution; `None` for a bridge-synthesized fail-closed deny.
+    Decided {
+        response: zeroclaw_api::channel::ChannelApprovalResponse,
+        decider: Option<String>,
+    },
+    /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
+    Fallthrough,
+}
+
+/// Resolve a cross-channel approval route: ask the named approver channel alone,
+/// bounded by `timeout_secs`, and apply `on_no_approver` (fail-closed by default)
+/// when the approver does not answer decisively, is unreachable, is unregistered,
+/// or times out.
+///
+/// Extracted from `AskUserApprovalBridge::request_approval` so the routing
+/// decision is unit-testable against stub channels without a full Agent.
+async fn resolve_routed_approval(
+    handles: &tools::PerToolChannelHandle,
+    route: &zeroclaw_config::autonomy::ApprovalRoute,
+    recipient: &str,
+    request: &zeroclaw_api::channel::ChannelApprovalRequest,
+) -> RoutedApproval {
+    let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = handles
+        .read()
+        .iter()
+        .find(|(name, _)| name.as_str() == route.approver_channel)
+        .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+
+    let reason: &str = if let Some((channel_name, channel)) = approver {
+        let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
+        match tokio::time::timeout(dur, channel.request_approval(recipient, request)).await {
+            Ok(Ok(Some(response))) => {
+                return RoutedApproval::Decided {
+                    response,
+                    decider: Some(channel_name),
+                };
+            }
+            Ok(Ok(None)) => "approver returned no decision",
+            Ok(Err(_)) => "approver channel unreachable",
+            Err(_) => "approver timed out",
+        }
+    } else {
+        "approver channel not registered"
+    };
+
+    match route.on_no_approver {
+        zeroclaw_config::autonomy::OnNoApprover::Deny => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": request.tool_name,
+                        "approver_channel": route.approver_channel,
+                        "reason": reason,
+                        "policy": "deny",
+                    })),
+                "approval route fail-closed: denying gated tool"
+            );
+            RoutedApproval::Decided {
+                response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                decider: None,
+            }
+        }
+        zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool": request.tool_name,
+                        "approver_channel": route.approver_channel,
+                        "reason": reason,
+                        "policy": "inherit-originator",
+                    })),
+                "approval route falling back to originating channel"
+            );
+            RoutedApproval::Fallthrough
+        }
+    }
+}
+
+/// A route-only approval bridge for the channel-less turn path
+/// (`process_message`): gateway chat/webhook dispatch and agent-to-agent peer
+/// messages run an agent turn with no originating channel handle, so a gated
+/// tool there can only reach a human through a configured
+/// [`ApprovalRoute`](zeroclaw_config::autonomy::ApprovalRoute).
+///
+/// Unlike the per-turn `AskUserApprovalBridge`, this carries NO originating
+/// fan-out — there is nothing to fall through to on this path. `request_approval`
+/// asks the named approver via [`resolve_routed_approval`]; a `Decided` outcome
+/// (including the fail-closed `Deny` synthesized when the approver is
+/// unreachable/unregistered/silent/timed-out under the default policy) is
+/// returned to the gate, and `InheritOriginator` returns `None` so the gate
+/// applies the non-interactive default (auto-deny) — "inherit the originator"
+/// degrades to today's channel-less behavior when there is no originator.
+pub(crate) struct RoutedApprovalChannel {
+    handles: tools::PerToolChannelHandle,
+    route: zeroclaw_config::autonomy::ApprovalRoute,
+    last_decision: parking_lot::Mutex<Option<String>>,
+}
+
+impl RoutedApprovalChannel {
+    pub(crate) fn new(
+        handles: tools::PerToolChannelHandle,
+        route: zeroclaw_config::autonomy::ApprovalRoute,
+    ) -> Self {
+        Self {
+            handles,
+            route,
+            last_decision: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RoutedApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Cli)
+    }
+    fn alias(&self) -> &str {
+        "approval-route"
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
+    fn name(&self) -> &str {
+        "approval-route"
+    }
+
+    fn last_decision_channel(&self) -> Option<String> {
+        self.last_decision.lock().clone()
+    }
+
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        *self.last_decision.lock() = None;
+        match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+            RoutedApproval::Decided { response, decider } => {
+                *self.last_decision.lock() = decider;
+                Ok(Some(response))
+            }
+            // No originating channel to inherit on this path; let the gate apply
+            // the non-interactive default (auto-deny).
+            RoutedApproval::Fallthrough => Ok(None),
+        }
+    }
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -179,6 +349,11 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Cross-channel HITL: resolved from the active risk profile's
+    /// `approval_route`. When set, the per-turn approval bridge asks the named
+    /// approver channel (bounded + fail-closed) instead of the originating
+    /// fan-out. `None` ⇒ today's behavior. See EPIC B.
+    approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     /// Activated MCP tools for deferred loading mode.
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
@@ -322,6 +497,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
@@ -367,6 +543,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            approval_route: None,
             activated_tools: None,
             hook_runner: None,
             approval_manager: None,
@@ -523,6 +700,14 @@ impl AgentBuilder {
 
     pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
         self.autonomy_level = Some(level);
+        self
+    }
+
+    pub fn approval_route(
+        mut self,
+        route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
+    ) -> Self {
+        self.approval_route = route;
         self
     }
 
@@ -706,6 +891,7 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            approval_route: self.approval_route,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
@@ -1298,7 +1484,11 @@ impl Agent {
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
+        // `mcp_bundles` (omission is not a grant). Regression-covered by
+        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
+        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
+        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
+        // If you change the call below, update those tests.
         let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
@@ -1319,6 +1509,14 @@ impl Agent {
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
+                        crate::agent::loop_::register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -1538,6 +1736,7 @@ impl Agent {
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
+            .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
@@ -2248,6 +2447,11 @@ impl Agent {
             // than the loop's static "cli" channel name. See
             // `last_decision_channel` below and `gate_tool_approval`.
             last_decision: parking_lot::Mutex<Option<String>>,
+            // Cross-channel HITL: when the active risk profile names a DISTINCT
+            // approver channel, this gate asks only that channel (bounded by a
+            // timeout, fail-closed) instead of fanning out to the originating
+            // back-channels. `None` ⇒ today's fan-out behavior. See EPIC B.
+            route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
         }
 
         impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
@@ -2291,16 +2495,39 @@ impl Agent {
                 request: &zeroclaw_api::channel::ChannelApprovalRequest,
             ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>>
             {
+                // Clear the previous decision's attribution; only a decisive
+                // answer below sets it, so an all-`None` fan-out leaves it unset
+                // and the gate falls back to the loop's channel name.
+                *self.last_decision.lock() = None;
+
+                // ── Cross-channel HITL route (EPIC B) ──────────────────────
+                // A configured `ApprovalRoute` redirects this gate to a DISTINCT
+                // approver channel rather than the originating fan-out. The
+                // approver is asked alone, bounded by `timeout_secs`; any
+                // non-decisive outcome (declined-without-answer, unreachable,
+                // unregistered, or timed out) is resolved by `on_no_approver` —
+                // fail-closed `Deny` by default, or fall through to the
+                // originating fan-out on explicit `InheritOriginator`. The
+                // decision logic lives in `resolve_routed_approval` so it is
+                // unit-testable without standing up a full Agent.
+                if let Some(route) = &self.route {
+                    match resolve_routed_approval(&self.handles, route, recipient, request).await {
+                        RoutedApproval::Decided { response, decider } => {
+                            *self.last_decision.lock() = decider;
+                            return Ok(Some(response));
+                        }
+                        RoutedApproval::Fallthrough => {
+                            // explicit InheritOriginator → originating fan-out below
+                        }
+                    }
+                }
+
                 let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
                     .handles
                     .read()
                     .iter()
                     .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
                     .collect();
-                // Clear the previous decision's attribution; only a decisive
-                // answer below sets it, so an all-`None` fan-out leaves it unset
-                // and the gate falls back to the loop's channel name.
-                *self.last_decision.lock() = None;
                 for (channel_name, channel) in &channels {
                     match channel.request_approval(recipient, request).await {
                         Ok(Some(response)) => {
@@ -2435,6 +2662,7 @@ impl Agent {
                 Box::new(AskUserApprovalBridge {
                     handles: Arc::clone(handles),
                     last_decision: parking_lot::Mutex::new(None),
+                    route: self.approval_route.clone(),
                 }) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
@@ -7432,5 +7660,222 @@ mod tests {
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+}
+
+/// Cross-channel HITL approval routing (EPIC B): `resolve_routed_approval`
+/// asks the named approver channel alone and applies `on_no_approver`
+/// (fail-closed by default) on any non-decisive outcome.
+#[cfg(test)]
+mod approval_route_tests {
+    use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use zeroclaw_api::channel::{ChannelApprovalRequest, ChannelApprovalResponse};
+    use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+    enum StubBehavior {
+        Answer(ChannelApprovalResponse),
+        NoDecision,
+        Slow,
+    }
+
+    struct StubChannel {
+        name: String,
+        behavior: StubBehavior,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for StubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for StubChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, _m: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            match &self.behavior {
+                StubBehavior::Answer(resp) => Ok(Some(resp.clone())),
+                StubBehavior::NoDecision => Ok(None),
+                StubBehavior::Slow => {
+                    // Far exceeds the route timeout; with a paused clock the
+                    // timeout fires at +timeout_secs virtual time, instantly.
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Ok(Some(ChannelApprovalResponse::Approve))
+                }
+            }
+        }
+    }
+
+    fn registry(channels: Vec<StubChannel>) -> tools::PerToolChannelHandle {
+        let mut map: HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> = HashMap::new();
+        for c in channels {
+            map.insert(c.name.clone(), Arc::new(c));
+        }
+        Arc::new(RwLock::new(map))
+    }
+
+    fn req() -> ChannelApprovalRequest {
+        ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "rm -rf /".into(),
+            raw_arguments: None,
+        }
+    }
+
+    fn route(approver: &str, policy: OnNoApprover) -> ApprovalRoute {
+        ApprovalRoute {
+            approver_channel: approver.into(),
+            on_no_approver: policy,
+            timeout_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn approver_answer_is_used_and_attributed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        }]);
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+            RoutedApproval::Decided { response, decider } => {
+                assert_eq!(response, ChannelApprovalResponse::Approve);
+                assert_eq!(
+                    decider.as_deref(),
+                    Some("ops"),
+                    "decider names the approver"
+                );
+            }
+            RoutedApproval::Fallthrough => panic!("expected a routed decision"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_approver_fails_closed_by_default() {
+        let h = registry(vec![]);
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+            RoutedApproval::Decided { response, decider } => {
+                assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
+                assert!(decider.is_none(), "synthetic deny has no decider");
+            }
+            RoutedApproval::Fallthrough => panic!("default policy must NOT fall through"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_approver_inherits_when_opted_in() {
+        let h = registry(vec![]);
+        let out = resolve_routed_approval(
+            &h,
+            &route("ops", OnNoApprover::InheritOriginator),
+            "r",
+            &req(),
+        )
+        .await;
+        assert!(
+            matches!(out, RoutedApproval::Fallthrough),
+            "InheritOriginator must fall through to the originating fan-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_decision_fails_closed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::NoDecision,
+        }]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                ..
+            }
+        ));
+    }
+
+    // The route timeout (1s) fires and cancels the stub's long sleep, so this
+    // resolves in ~1s of real time without needing tokio's `test-util` clock.
+    #[tokio::test]
+    async fn slow_approver_times_out_and_fails_closed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Slow,
+        }]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                ..
+            }
+        ));
+    }
+
+    // ── RoutedApprovalChannel (the channel-less / process_message bridge) ──
+    // Proves the route is CONSULTED on the non-interactive path: the bridge the
+    // gate sees as `ctx.channel` returns the approver's decision, fails closed
+    // by default, and yields `None` (gate auto-denies) when opted into
+    // inherit-originator on a path that has no originator.
+    use zeroclaw_api::channel::Channel as _;
+
+    #[tokio::test]
+    async fn routed_channel_returns_and_attributes_approver_decision() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        }]);
+        let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(out, Some(ChannelApprovalResponse::Approve));
+        assert_eq!(
+            bridge.last_decision_channel().as_deref(),
+            Some("ops"),
+            "the gate attributes the approval to the deciding channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_channel_fails_closed_when_approver_unregistered() {
+        let bridge = RoutedApprovalChannel::new(registry(vec![]), route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out,
+            Some(ChannelApprovalResponse::Deny),
+            "unreachable approver denies, not auto-approves"
+        );
+        assert!(bridge.last_decision_channel().is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_returns_none_on_channelless_path() {
+        let bridge = RoutedApprovalChannel::new(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+        );
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out, None,
+            "no originator to inherit; gate applies the non-interactive auto-deny"
+        );
     }
 }
