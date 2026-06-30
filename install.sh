@@ -28,8 +28,8 @@ TUI_BIN_NAME="zerocode"
 
 # Apps installed by default (the rest are discovered and listed but off
 # until selected via --apps or the interactive picker). Intentionally a
-# fixed list: Tauri-based apps need the Tauri toolchain + webview deps,
-# so they ship off-by-default.
+# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
+# so it ships off-by-default.
 DEFAULT_APPS="zerocode"
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
@@ -92,9 +92,9 @@ expand_default_features() {
 # `cargo install --path apps/<dir>` — they are NOT cargo features of the
 # main binary. The installable set is discovered from `apps/*/Cargo.toml`
 # so adding an app surfaces here without editing this script. `zerocode`
-# (the TUI) is the default app. Tauri-based apps need the Tauri toolchain
-# + system webview deps and are excluded from the simple `cargo install`
-# path.
+# (the TUI) is the default app. Tauri-based apps (e.g. zeroclaw-desktop)
+# need the Tauri toolchain + system webview deps and are excluded from the
+# simple `cargo install` path.
 discover_apps() {
   APPS=""
   for dir in apps/*/; do
