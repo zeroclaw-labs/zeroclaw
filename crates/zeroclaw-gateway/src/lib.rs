@@ -2927,6 +2927,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -2964,6 +2965,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -4434,6 +4436,82 @@ mod tests {
         }
     }
 
+    /// Regression test for #7733 at the gateway MCP wiring site.
+    /// `append_scoped_mcp_tools` must early-return without mutating
+    /// `gw_tools` when the agent has no `mcp_bundles` grant, even if
+    /// `[[mcp.servers]]` is non-empty.
+    ///
+    /// Note: this is a behavior-pinning test, not a mutation-discriminating
+    /// one. The configured stdio server (`/usr/bin/mcp-fs`) is unlikely
+    /// to exist on the test host, so a hypothetical regression that
+    /// reverted to `&config.mcp.servers` would also produce zero
+    /// registered tools (the stdio connect fails non-fatally). The
+    /// stronger guard against that regression is
+    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` plus
+    /// the resolver-level pins in `zeroclaw-config`. This test still
+    /// adds value by exercising the `append_scoped_mcp_tools` call
+    /// surface and ensuring it does not hang or panic for an unscoped
+    /// agent.
+    #[tokio::test]
+    async fn append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles() {
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        // Critically: NO mcp_bundles configured and NO agent grants.
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "unscoped".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let security: Arc<SecurityPolicy> = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let initial_len = gw_tools.len();
+
+        // Bound the call with a short timeout: if the no-bundle branch
+        // ever stops being an early-return and tries to spawn an stdio
+        // MCP child, we'd rather see a timeout failure here than a
+        // hanging CI job.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::append_scoped_mcp_tools(&config, "unscoped", &security, &mut gw_tools, None),
+        )
+        .await
+        .expect("append_scoped_mcp_tools must not hang for an unscoped agent");
+
+        assert_eq!(
+            gw_tools.len(),
+            initial_len,
+            "append_scoped_mcp_tools must not push any tool when the \
+             agent has no mcp_bundles grant; gw_tools went from {} \
+             to {}",
+            initial_len,
+            gw_tools.len()
+        );
+    }
+
     /// Gateway parity with the channel path: the gateway now scopes MCP servers
     /// by `mcp_bundles` and gates registration through the same
     /// `register_eager_mcp_tool_if_allowed` helper, so an `excluded_tools`-denied
@@ -5702,6 +5780,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let key = whatsapp_memory_key(&msg);

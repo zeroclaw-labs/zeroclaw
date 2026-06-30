@@ -561,8 +561,9 @@ fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<Str
         return false;
     }
 
-    static JSON_NAME_FIELD_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
+    static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
+    });
 
     JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
         cap.get(1)
@@ -725,21 +726,22 @@ fn is_xml_meta_tag(tag: &str) -> bool {
 }
 
 /// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
-static XML_OPEN_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
+static XML_OPEN_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").expect("XML_OPEN_TAG_RE regex must compile")
+});
 
 /// MiniMax XML invoke format:
 /// `<invoke name="shell"><parameter name="command">pwd</parameter></invoke>`
 static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</invoke>"#)
-        .unwrap()
+        .expect("MINIMAX_INVOKE_RE regex must compile")
 });
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?is)<parameter\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</parameter>"#,
     )
-    .unwrap()
+    .expect("MINIMAX_PARAMETER_RE regex must compile")
 });
 
 /// Extracts all `<tag>…</tag>` pairs from `input`, returning `(tag_name, inner_content)`.
@@ -1082,12 +1084,14 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Regex to find <invoke name="toolname">...</invoke> blocks
     static INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#).unwrap()
+        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#)
+            .expect("INVOKE_RE regex must compile")
     });
 
     // Regex to find <parameter name="paramname">value</parameter>
     static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#).unwrap()
+        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#)
+            .expect("PARAM_RE regex must compile")
     });
 
     for cap in INVOKE_RE.captures_iter(response) {
@@ -1145,22 +1149,24 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     // Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
     static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
-            .unwrap()
+            .expect("PERL_RE regex must compile")
     });
 
     // Regex to find tool => "name" in the content
-    static TOOL_NAME_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
+    static TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"tool\s*=>\s*"([^"]+)""#).expect("TOOL_NAME_RE regex must compile")
+    });
 
     // Regex to find args => { ... } block.
     // The closing brace is optional: in the square bracket variant [TOOL_CALL]{...}}[/TOOL_CALL]
     // the outer regex may consume the inner closing brace, so the args content may run to end of string.
-    static ARGS_BLOCK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").unwrap());
+    static ARGS_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").expect("ARGS_BLOCK_RE regex must compile")
+    });
 
     // Regex to find --key "value" pairs
     static ARGS_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).unwrap());
+        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).expect("ARGS_RE regex must compile"));
 
     for cap in PERL_RE.captures_iter(response) {
         let content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -1222,7 +1228,8 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Regex to find <FunctionCall> blocks
     static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>").unwrap()
+        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>")
+            .expect("FUNC_RE regex must compile")
     });
 
     for cap in FUNC_RE.captures_iter(response) {
@@ -1750,7 +1757,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             Regex::new(
                 r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>|</minimax:toolcall>)",
             )
-            .unwrap()
+            .expect("MD_TOOL_CALL_RE regex must compile")
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
@@ -1783,8 +1790,10 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Try ```tool <name> format used by some model_providers (e.g., xAI grok)
     // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
     if calls.is_empty() {
-        static MD_TOOL_NAME_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)").unwrap());
+        static MD_TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)")
+                .expect("MD_TOOL_NAME_RE regex must compile")
+        });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
@@ -1989,16 +1998,22 @@ pub fn strip_think_tags(s: &str) -> String {
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {
-    static TOOL_RESULT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap());
-    static THINKING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
-    static THINK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
-    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap());
+    static TOOL_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>")
+            .expect("TOOL_RESULT_RE regex must compile")
+    });
+    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<thinking>.*?</thinking>").expect("THINKING_RE regex must compile")
+    });
+    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<think>.*?</think>").expect("THINK_RE regex must compile")
+    });
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\[Tool results\]\s*\n?")
+            .expect("TOOL_RESULTS_PREFIX_RE regex must compile")
+    });
     static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+        LazyLock::new(|| Regex::new(r"\n{3,}").expect("EXCESS_BLANK_LINES_RE regex must compile"));
 
     let result = TOOL_RESULT_RE.replace_all(text, "");
     let result = THINKING_RE.replace_all(&result, "");
