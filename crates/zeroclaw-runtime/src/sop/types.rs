@@ -64,6 +64,37 @@ impl fmt::Display for SopExecutionMode {
     }
 }
 
+// ── Filesystem event kind ───────────────────────────────────────
+
+/// A normalized filesystem change kind reported by the watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilesystemEventKind {
+    Created,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl fmt::Display for FilesystemEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
+            Self::Renamed => write!(f, "renamed"),
+        }
+    }
+}
+
+impl std::str::FromStr for FilesystemEventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| ())
+    }
+}
+
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
@@ -87,6 +118,13 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
+    Filesystem {
+        path: String,
+        #[serde(default)]
+        events: Vec<FilesystemEventKind>,
+        #[serde(default)]
+        condition: Option<String>,
+    },
     Calendar {
         calendar_source: String,
         #[serde(default)]
@@ -102,6 +140,7 @@ impl fmt::Display for SopTrigger {
             Self::Webhook { path } => write!(f, "webhook:{path}"),
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
+            Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
@@ -287,6 +326,7 @@ pub enum SopTriggerSource {
     Webhook,
     Cron,
     Peripheral,
+    Filesystem,
     Calendar,
     Manual,
 }
@@ -298,6 +338,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Webhook => write!(f, "webhook"),
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
+            Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
             Self::Manual => write!(f, "manual"),
         }
@@ -595,6 +636,69 @@ condition = "$.value > 85"
         let toml_str = r#"type = "manual""#;
         let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
         assert_eq!(trigger, SopTrigger::Manual);
+    }
+
+    #[test]
+    fn trigger_filesystem_toml_roundtrip() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox/**/*.json"
+events = ["created", "modified"]
+condition = "$.extension == \"json\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        match trigger {
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            } => {
+                assert_eq!(path, "/var/inbox/**/*.json");
+                assert_eq!(
+                    events,
+                    vec![FilesystemEventKind::Created, FilesystemEventKind::Modified]
+                );
+                assert_eq!(condition.as_deref(), Some(r#"$.extension == "json""#));
+            }
+            other => panic!("expected Filesystem trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_filesystem_defaults_events_empty() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Filesystem { ref events, ref condition, .. } if events.is_empty() && condition.is_none())
+        );
+    }
+
+    #[test]
+    fn filesystem_event_kind_display_and_serde() {
+        assert_eq!(FilesystemEventKind::Created.to_string(), "created");
+        assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
+        let json = serde_json::to_string(&FilesystemEventKind::Deleted).unwrap();
+        assert_eq!(json, "\"deleted\"");
+        let parsed: FilesystemEventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, FilesystemEventKind::Deleted);
+    }
+
+    #[test]
+    fn trigger_filesystem_display() {
+        let trigger = SopTrigger::Filesystem {
+            path: "/var/inbox/*.json".into(),
+            events: vec![FilesystemEventKind::Created],
+            condition: None,
+        };
+        assert_eq!(trigger.to_string(), "filesystem:/var/inbox/*.json");
+    }
+
+    #[test]
+    fn trigger_source_filesystem_display() {
+        assert_eq!(SopTriggerSource::Filesystem.to_string(), "filesystem");
     }
 
     #[test]
