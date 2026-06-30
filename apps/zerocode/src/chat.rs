@@ -1932,6 +1932,7 @@ impl Chat {
 
         if let ChatPhase::Active(state) = &self.phase
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
             && matches!(state.session_overlay, SessionOverlay::None)
             && !state.model_picker.is_open()
@@ -6246,6 +6247,40 @@ mod tests {
         };
         assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
         assert_eq!(list_state.selected(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn active_agent_title_click_ignored_while_turn_in_flight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let area = Rect::new(10, 4, 80, 20);
+        let mut state = ChatState::new("abcdef1234".to_string(), "beta".to_string());
+        state.turn_in_flight = true;
+        state.refresh_title_hit_rects(area);
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        chat.handle_mouse(click, area).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "in-flight agent title click must not call agents/status"
+        );
+        assert!(
+            matches!(chat.phase, ChatPhase::Active(_)),
+            "in-flight agent title click must leave the active session visible"
+        );
     }
 
     #[tokio::test]
