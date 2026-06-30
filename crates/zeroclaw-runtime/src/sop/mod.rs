@@ -5,6 +5,7 @@ pub mod condition;
 pub mod dispatch;
 pub mod engine;
 pub mod executor;
+pub mod graph;
 pub mod metrics;
 pub mod route;
 pub mod rundata;
@@ -16,6 +17,10 @@ pub mod types;
 
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
+pub use graph::{
+    FlowRole, GraphDiagnostic, GraphNode, GraphPin, GraphRender, GraphSeverity, GraphWire,
+    PinClass, SopGraph,
+};
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
 pub use step_contract::{StepFailure, StepRouting};
