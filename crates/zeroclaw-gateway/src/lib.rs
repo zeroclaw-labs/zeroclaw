@@ -1970,7 +1970,9 @@ pub async fn run_gateway(
         );
 
     #[cfg(feature = "a2a")]
-    let inner = inner.merge(a2a::a2a_routes());
+    let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
+        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
+    )));
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
