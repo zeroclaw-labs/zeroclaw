@@ -127,3 +127,18 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+
+# Machine-local dev workspace (rebuild scripts, nested clones, specs — not upstream)
+/dev-local/
+
+# Local WASM plugin build tree (canonical install: ~/.zeroclaw/plugins/)
+/plugins/
+
+# Codebase Memory MCP graph cache
+/.codebase-memory/
+
+# Windows: accidental file from shell redirect to `nul` (e.g. `git ... 2>nul`)
+/nul
+
+# Ad-hoc voice/TTS test artifacts at repo root
+/tts_output.wav
