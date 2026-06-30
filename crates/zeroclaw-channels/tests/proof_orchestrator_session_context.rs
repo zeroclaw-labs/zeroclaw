@@ -69,6 +69,7 @@ fn msg_from(
         interruption_scope_id: None,
         attachments: Vec::new(),
         subject: None,
+        ..Default::default()
     }
 }
 

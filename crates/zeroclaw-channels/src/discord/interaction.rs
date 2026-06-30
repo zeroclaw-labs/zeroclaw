@@ -6,7 +6,9 @@
 
 use serde_json::json;
 
-use super::types::{DISCORD_MAX_MESSAGE_LENGTH, DiscordOutgoing};
+use super::components::DiscordActionRow;
+use super::embed::DiscordEmbed;
+use super::types::DiscordOutgoing;
 
 /// Credentials needed to answer a deferred interaction later: the followup
 /// webhook is addressed by application id + interaction token.
@@ -45,6 +47,80 @@ pub(crate) async fn discord_defer_interaction(
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
         anyhow::bail!("interaction defer failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Open a modal in response to a button/slash interaction (callback type 9).
+/// The caller registers the modal's `custom_id` in the pending registry as a
+/// resolve-into-turn so the eventual type-5 submit resolves it. Driven by the
+/// `OpenModal` dispatch arm (a `[COMPONENTS:…]` modal button click).
+pub(crate) async fn discord_open_modal(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    modal: &super::components::DiscordModal,
+) -> anyhow::Result<()> {
+    let Some(data) = modal.to_api() else {
+        anyhow::bail!("modal custom_id exceeds Discord's 100-char limit; cannot open");
+    };
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    // type 9 = MODAL
+    let body = json!({ "type": 9, "data": data });
+    // without_url: transport errors embed the token-bearing URL.
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("modal open failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Answer an APPLICATION_COMMAND_AUTOCOMPLETE (type 4) interaction with a
+/// callback type 8 (APPLICATION_COMMAND_AUTOCOMPLETE_RESULT) carrying inline
+/// choices. Discord shows up to 25 choices; over that it 400s, so the caller's
+/// list is truncated here. An empty list is a valid answer (clears the
+/// suggestion box) — used when authz fails or no choices are available, so a
+/// per-keystroke event never hangs or leaks a policy decision.
+///
+/// Unlike `discord_reject_interaction`/`discord_defer_interaction`, this is the
+/// ONLY response an autocomplete keystroke may produce: it neither defers nor
+/// posts an ephemeral, so authorization stays side-effect-free.
+pub(crate) async fn discord_answer_autocomplete(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    choices: &[(String, String)],
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    let rendered: Vec<serde_json::Value> = choices
+        .iter()
+        .take(25)
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect();
+    // type 8 = APPLICATION_COMMAND_AUTOCOMPLETE_RESULT
+    let body = json!({ "type": 8, "data": { "choices": rendered } });
+    // without_url: transport errors embed the token-bearing URL.
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction autocomplete answer failed ({status}): {err}");
     }
     Ok(())
 }
@@ -100,34 +176,43 @@ pub(crate) async fn discord_reject_interaction(
     Ok(())
 }
 
-/// Deliver the agent's answer by editing the deferred interaction response
-/// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
-/// for 15 minutes; no bot auth header is required for the followup webhook.
+/// Edit the deferred interaction's @original message
+/// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
+/// is valid for 15 minutes; no bot auth header is required for the followup
+/// webhook. Renders any `[EMBED:…]` the agent emitted by attaching `embeds`
+/// alongside the content via the same `DiscordOutgoing` envelope the normal send
+/// path uses. `content` must be within Discord's 2000-char limit — callers whose
+/// reply may exceed it chunk first and post the remainder via
+/// [`discord_post_interaction_followup`]. `api_base` is injectable for tests.
+///
+/// `components` are the interactive action rows that ride on this edit (the
+/// `[COMPONENTS:{…}]` marker's buttons/selects, already registered server-side
+/// by the caller). An empty slice omits the `components` key entirely, so plain
+/// text replies serialise byte-identically to before — no behaviour change.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
     interaction_token: &str,
+    api_base: &str,
     content: &str,
+    embeds: &[DiscordEmbed],
+    components: &[DiscordActionRow],
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
-    );
-    let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
-    if trimmed.chars().count() < content.chars().count() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "content_chars": content.chars().count(),
-                })),
-            "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
-        );
-    }
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
+    // No truncation: the caller chunks (deliver_interaction_answer) and this edit
+    // carries the first ≤2000-char chunk plus any embeds (EPIC C) and any
+    // interactive action rows (EPIC B). `to_rest_json` omits whichever are empty,
+    // so a plain text reply stays byte-identical.
+    let payload = DiscordOutgoing {
+        content: Some(content.to_string()),
+        embeds: embeds.to_vec(),
+        components: components.to_vec(),
+        ..Default::default()
+    };
     // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
-        .json(&DiscordOutgoing::text(trimmed).to_rest_json())
+        .json(&payload.to_rest_json())
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -137,4 +222,84 @@ pub(crate) async fn discord_edit_interaction_response(
         anyhow::bail!("interaction followup edit failed ({status}): {err}");
     }
     Ok(())
+}
+
+/// Post an additional interaction followup message
+/// (`POST {api_base}/webhooks/{app_id}/{token}`), used to deliver the answer
+/// chunks beyond the first when a reply exceeds Discord's 2000-char limit.
+pub(crate) async fn discord_post_interaction_followup(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}");
+    let resp = client
+        .post(&url)
+        .json(&DiscordOutgoing::text(content).to_rest_json())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction followup post failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod embed_reply_tests {
+    use super::*;
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn slash_reply_attaches_embeds_to_the_original_edit() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "see below",
+                "embeds": [{ "title": "Report" }]
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let embed = DiscordEmbed {
+            title: Some("Report".to_string()),
+            ..Default::default()
+        };
+        discord_edit_interaction_response(
+            &client,
+            "app",
+            "tok",
+            &server.uri(),
+            "see below",
+            std::slice::from_ref(&embed),
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_only_slash_reply_omits_the_embeds_key() {
+        // No embeds → the @original edit body stays byte-stable {"content": …}.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        discord_edit_interaction_response(&client, "app", "tok", &server.uri(), "hi", &[], &[])
+            .await
+            .unwrap();
+    }
 }

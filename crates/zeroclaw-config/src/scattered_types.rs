@@ -306,6 +306,20 @@ pub struct ContextCompressionConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_notify_on_compression")]
     pub notify_on_compression: bool,
+    /// Summarizer provider as a `providers.models.<type>.<alias>` reference.
+    /// Empty (Default) = inherit the agent's own resolved provider+model.
+    /// Self-contained (provider + model + auth), so a profile shared across
+    /// agents on different providers always summarizes on *this* provider —
+    /// fixes the cross-provider bug the deprecated `summary_model` had. An
+    /// agent-level `summary_provider` overrides this. Validated in
+    /// `Config::validate()`.
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
+    /// DEPRECATED bare model id — historically swapped onto the AGENT's own
+    /// provider (the cross-provider footgun, #7964). Still honored as a fallback
+    /// when `summary_provider` is empty, so existing configs keep working
+    /// unchanged. Prefer `summary_provider`. **Slated for removal in schema v4**
+    /// (batched with the next schema bump — not bumped for a single field).
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -328,6 +342,7 @@ impl Default for ContextCompressionConfig {
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
             notify_on_compression: default_notify_on_compression(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
             summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
@@ -792,5 +807,96 @@ impl Default for VoiceCallConfig {
             webhook_base_url: None,
             excluded_tools: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_level_from_str_canonical_aliases() {
+        let cases = [
+            ("off", ThinkingLevel::Off),
+            ("none", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("min", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("med", ThinkingLevel::Medium),
+            ("default", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("max", ThinkingLevel::Max),
+            ("maximum", ThinkingLevel::Max),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(s),
+                Some(expected),
+                "input={s}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_from_str_case_insensitive() {
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("OFF"),
+            Some(ThinkingLevel::Off)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("HIGH"),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("MAX"),
+            Some(ThinkingLevel::Max)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("Medium"),
+            Some(ThinkingLevel::Medium)
+        );
+    }
+
+    #[test]
+    fn thinking_level_from_str_unknown_returns_none() {
+        assert_eq!(ThinkingLevel::from_str_insensitive("unknown"), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive(""), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive("ultra"), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive("123"), None);
+    }
+
+    #[test]
+    fn thinking_level_as_str_roundtrips() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let s = level.as_str();
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(s),
+                Some(level),
+                "roundtrip failed for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_budget_tokens_only_high_and_max() {
+        assert_eq!(ThinkingLevel::Off.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Minimal.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Low.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Medium.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::High.default_budget_tokens(), Some(10_000));
+        assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
+    }
+
+    #[test]
+    fn thinking_level_default_is_medium() {
+        assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
     }
 }

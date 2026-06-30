@@ -126,6 +126,10 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
 | `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
 | `zeroclaw-macros` | Beta | Tightly coupled to config schema |
+| `zeroclaw-eval` | Experimental | Agent evaluation harness — Phase 0 deterministic replay of LLM trace fixtures |
+| `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
+| `robot-kit` | Experimental | Robot control toolkit — drive, vision, speech, sensors, safety |
+| `aardvark-sys` | Experimental | Low-level FFI bindings for Total Phase Aardvark I2C/SPI/GPIO USB adapter; only crate where `unsafe` is permitted |
 
 **Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
 
@@ -144,13 +148,18 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
 - `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
 - `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
+- `crates/zeroclaw-eval/` — agent evaluation harness (Phase 0 deterministic replay)
 - `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
 - `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `crates/zeroclaw-spawn/` — attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log`
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zerocode/` — TUI onboarding wizard
+- `crates/robot-kit/` — robot control toolkit (drive, vision, speech, sensors, safety)
+- `crates/aardvark-sys/` — Total Phase Aardvark I2C/SPI/GPIO FFI bindings
+- `apps/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `apps/tauri/` — Tauri-based desktop GUI
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -174,7 +183,7 @@ When uncertain, classify as higher risk.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
-- Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
+- Use conventional commit titles. Prefer small PRs (`size:XS`, `size:S`, or `size:M`).
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/book/src/contributing/privacy.md`).
 

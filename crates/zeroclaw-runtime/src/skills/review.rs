@@ -56,6 +56,7 @@ pub async fn maybe_run_skill_review(
     max_tool_result_chars: usize,
     max_context_tokens: usize,
     cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
 ) {
     if !config.enabled {
         return;
@@ -91,45 +92,63 @@ pub async fn maybe_run_skill_review(
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let turn_id = uuid::Uuid::new_v4().to_string();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
-            crate::agent::loop_::run_tool_call_loop(
-                provider,
-                &mut review_history,
-                &tools,
-                observer,
-                provider_name,
-                model_name,
-                Some(0.3),      // temperature — low so the fork doesn't ramble
-                true,           // silent
-                None,           // approval: no human in the loop here
-                "skill_review", // channel_name
-                None,           // channel_reply_target
-                multimodal,
-                config.max_review_iterations as usize,
-                cancellation_token.cloned(), // cancellation_token
-                None,                        // on_delta
-                None,                        // hooks
-                &[],                         // excluded_tools
-                &[],                         // dedup_exempt_tools
-                None,                        // activated_tools
-                None,                        // model_switch_callback
-                pacing,
-                false, // strict_tool_parsing — lenient for the restricted fork
-                false, // parallel_tools — sequential for the mutation-capable fork
-                max_tool_result_chars,
-                max_context_tokens,
-                None, // shared_budget
-                None, // channel
-                None, // receipt_generator
-                Some(&receipts),
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &crate::agent::loop_::LoopKnobs::default(),
-                None, // image_cache
-            )
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name,
+                        model: model_name,
+                        temperature: Some(0.3),
+                    },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &tools,
+                        observer,
+                        // low so the fork doesn't ramble
+                        silent: true,
+                        approval: None,
+                        multimodal_config: multimodal,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: config.max_review_iterations as usize,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing,
+                        strict_tool_parsing: false,
+                        // lenient for the restricted fork
+                        parallel_tools: false,
+                        // sequential for the mutation-capable fork
+                        max_tool_result_chars,
+                        context_token_budget: max_context_tokens,
+                        knobs: &crate::agent::loop_::LoopKnobs::default(),
+                    },
+                ),
+                history: &mut review_history,
+                // no human in the loop here
+                channel_name: "skill_review",
+                channel_reply_target: None,
+                cancellation_token: cancellation_token.cloned(),
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: Some(&receipts),
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                agent_alias,
+                turn_id: &turn_id,
+            })
             .await
         })
         .await;

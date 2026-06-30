@@ -530,6 +530,52 @@ mod tests {
     }
 
     #[test]
+    fn channel_compile_guidance_cli_strings_format_from_fluent() {
+        let cases = [
+            (
+                "cli-selftest-channel-config-uncompiled",
+                &[("compiled", "4"), ("configured", "1"), ("names", "Slack")][..],
+                ["4", "1", "Slack"].as_slice(),
+            ),
+            (
+                "cli-update-prebuilt-channel-note",
+                &[][..],
+                ["Slack", "channel-*"].as_slice(),
+            ),
+            (
+                "cli-channels-not-compiled-entry",
+                &[("name", "Slack")][..],
+                ["Slack"].as_slice(),
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+                if key == "cli-update-prebuilt-channel-note" {
+                    assert!(
+                        !value.contains("Discord"),
+                        "{key} in {locale} should not mention Discord because it is in default-channels"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn skills_install_cli_strings_format_from_fluent() {
         type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
@@ -627,6 +673,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn daemon_gateway_bind_cli_strings_format_from_fluent() {
+        // The daemon gateway-bind pre-flight messages (#7895) are routed through
+        // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
+        // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
+        // operator-facing fail-fast message back to a `{cli-...}` stub.
+        let en = include_str!("../locales/en/cli.ftl");
+        let args = &[("host", "127.0.0.1"), ("port", "9090")][..];
+
+        let already_running =
+            format_ftl_message(en, "en", "cli-daemon-gateway-already-running", args)
+                .expect("cli-daemon-gateway-already-running should format");
+        assert!(already_running.contains("127.0.0.1:9090"));
+        assert!(already_running.contains("ZeroClaw gateway is already running"));
+        assert!(already_running.contains("gateway.port"));
+
+        let port_occupied = format_ftl_message(en, "en", "cli-daemon-gateway-port-occupied", args)
+            .expect("cli-daemon-gateway-port-occupied should format");
+        assert!(port_occupied.contains("127.0.0.1:9090"));
+        assert!(port_occupied.contains("already in use by another process"));
+        assert!(port_occupied.contains("gateway.port"));
     }
 
     #[test]

@@ -102,6 +102,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(50),
             output_tokens: Some(25),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,

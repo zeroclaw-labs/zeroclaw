@@ -81,6 +81,7 @@ pub enum ChannelKind {
     DingTalk,
     Discord,
     Email,
+    Filesystem,
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,
@@ -113,6 +114,7 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
+    Plugin,
 }
 
 /// Built-in tool implementations. Closed set — plugins that need their
@@ -385,13 +387,10 @@ impl Role {
             Self::Channel(_) => "channel",
             Self::Tool(_) => "tool",
             Self::Cron(_) => "cron",
-            Self::Provider(ProviderKind::Model(_)) => "model_provider",
-            Self::Provider(ProviderKind::Tts(_)) => "tts_provider",
-            Self::Provider(ProviderKind::Transcription(_)) => "transcription_provider",
-            Self::Provider(ProviderKind::Tunnel(_)) => "tunnel_provider",
+            Self::Provider(_) => "provider",
             Self::Memory(_) => "memory",
             Self::Session => "session",
-            Self::Sop => "sop",
+            Self::Sop => "system",
             Self::PeerGroup | Self::Skill | Self::Mcp | Self::System => "system",
         }
     }

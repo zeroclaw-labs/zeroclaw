@@ -45,7 +45,16 @@ cd zeroclaw
 ./install.sh
 ```
 
-The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way — `zeroclaw quickstart` kicks off automatically.
+The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way: `zeroclaw quickstart` kicks off automatically.
+
+> **Working on the docs?** The translated documentation catalogues live in a
+> git submodule (`docs/book/po`). The Rust build does not need it, but building
+> or syncing the docs does. Clone with it, or add it to an existing clone:
+>
+> ```bash
+> git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw.git
+> git submodule update --init docs/book/po   # existing clone
+> ```
 
 Flags:
 

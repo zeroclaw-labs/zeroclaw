@@ -71,6 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_runtime::sop::approval::{
+    ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
+};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -261,6 +264,88 @@ async fn resolve_ws_memory_handle(
         .map(Some)
 }
 
+/// Resolve a SOP approval gate from a WebSocket `kind:"sop"` `approval_response`
+/// frame and reply with the result/error frame. Returns `true` when the frame was
+/// a SOP frame (handled), so the caller stops further processing.
+///
+/// EPIC C: the principal is transport-derived (ws + session id), never from the
+/// frame. Shared by the idle connection loop AND the mid-turn forward loop so a
+/// SOP approval over the same connection is answered, never silently dropped, no
+/// matter when it arrives.
+async fn handle_ws_sop_frame<S>(
+    parsed: &serde_json::Value,
+    state: &AppState,
+    session_id: &str,
+    sender: &mut S,
+) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if parsed["kind"].as_str() != Some("sop") {
+        return false;
+    }
+    let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+    let decision = match parsed["decision"].as_str().unwrap_or("") {
+        "approve" => Some(SopApprovalDecision::Approve),
+        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
+        // the ledger records it.
+        "deny" => Some(SopApprovalDecision::Deny {
+            reason: parsed["reason"].as_str().map(str::to_string),
+        }),
+        _ => None,
+    };
+    // run_id + a valid decision are both required; the let-else avoids an expect()
+    // on the downstream resolve (codebase rule: no expect/unwrap in production).
+    let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-invalid-approval"
+            ),
+            "code": "INVALID_APPROVAL_RESPONSE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return true;
+    };
+    let frame = if let Some(engine) = state.sop_engine.as_ref() {
+        let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
+        match engine.lock() {
+            Ok(mut g) => match g.resolve_gate(&run_id, decision, principal) {
+                Ok(outcome) => serde_json::json!({
+                    "type": "sop_approval_result",
+                    "run_id": run_id,
+                    "outcome": outcome.label(),
+                }),
+                Err(e) => serde_json::json!({
+                    "type": "error",
+                    "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-sop-ws-resolve-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    "code": "SOP_RESOLVE_FAILED"
+                }),
+            },
+            Err(_) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-sop-ws-engine-lock-poisoned"
+                ),
+                "code": "SOP_LOCK_POISONED"
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-subsystem-disabled"
+            ),
+            "code": "SOP_DISABLED"
+        })
+    };
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    true
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -422,6 +507,7 @@ async fn handle_socket(
             false,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
+            Some(state.canvas_store.clone()),
         )
         .await
         {
@@ -451,6 +537,7 @@ async fn handle_socket(
                 return;
             }
         };
+    agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -485,6 +572,7 @@ async fn handle_socket(
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
         &config,
         &ch.ask_user,
+        &ch.channel_room,
         &Some(ch.reaction.clone()),
         &ch.poll,
         &ch.escalate,
@@ -527,6 +615,7 @@ async fn handle_socket(
                         &ws_memory,
                         &content,
                         &session_key,
+                        &session_id,
                     )
                     .await;
                 }
@@ -597,6 +686,13 @@ async fn handle_socket(
 
                 // ── approval_response (operator answered a tool prompt) ──
                 if msg_type == "approval_response" {
+                    // EPIC C: a SOP-kind frame resolves a SOP gate via the shared
+                    // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
+                    // pending_approvals map (keyed by request_id). The principal is
+                    // transport-derived (ws + session id), never from the frame.
+                    if handle_ws_sop_frame(&parsed, &state, &session_id, &mut sender).await {
+                        continue;
+                    }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
                     let decision_str = parsed["decision"].as_str().unwrap_or("");
                     let decision = match decision_str {
@@ -669,6 +765,7 @@ async fn handle_socket(
                     &ws_memory,
                     &content,
                     &session_key,
+                    &session_id,
                 )
                 .await;
             }
@@ -890,6 +987,7 @@ async fn process_chat_message(
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
+    session_id: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -901,13 +999,26 @@ async fn process_chat_message(
     // gateway_ws_turn / agent_start / cost record mislabelled the model.
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
-    let model_label = turn_model.clone();
+    let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+        let config = state.config.read();
+        let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
+        zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+            tracker.clone(),
+            Arc::new(pricing),
+        )
+        .with_agent_alias(&turn_alias)
+    });
+    let turn_usage = state.cost_tracker.as_ref().map(|_| {
+        Arc::new(parking_lot::Mutex::new(
+            zeroclaw_runtime::agent::cost::TurnUsage::default(),
+        ))
+    });
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "model_provider": provider_label,
-        "model": model_label,
+        "model": turn_model,
     }));
 
     // Set session state to running
@@ -953,14 +1064,20 @@ async fn process_chat_message(
         );
         zeroclaw_runtime::agent::loop_::scope_session_key(
             Some(session_key_owned.clone()),
-            agent
-                .turn_streamed_with_steering_state(
-                    &content_owned,
-                    event_tx,
-                    Some(cancel_token.clone()),
-                    Some(&mut steering_rx),
-                )
-                .instrument(span),
+            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                turn_usage.clone(),
+                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context.clone(),
+                    agent
+                        .turn_streamed_with_steering_state(
+                            &content_owned,
+                            event_tx,
+                            Some(cancel_token.clone()),
+                            Some(&mut steering_rx),
+                        )
+                        .instrument(span),
+                ),
+            ),
         )
         .await
     };
@@ -1033,6 +1150,15 @@ async fn process_chat_message(
                     };
                     match parsed["type"].as_str() {
                         Some("approval_response") => {
+                            // A SOP-kind frame is a gate resolution (keyed by run_id),
+                            // not a tool-prompt response (keyed by request_id). Resolve
+                            // it here too so it is answered mid-turn instead of being
+                            // silently dropped on the request_id path below.
+                            if handle_ws_sop_frame(&parsed, state, session_id, &mut *sender)
+                                .await
+                            {
+                                continue;
+                            }
                             let request_id = parsed["request_id"].as_str().unwrap_or("");
                             let decision = match parsed["decision"].as_str().unwrap_or("") {
                                 "approve" => Some(ChannelApprovalResponse::Approve),
@@ -1148,6 +1274,16 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         }),
+                        TurnEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns,
+                            reason,
+                        } => serde_json::json!({
+                            "type": "history_trimmed",
+                            "dropped_messages": dropped_messages,
+                            "kept_turns": kept_turns,
+                            "reason": reason,
+                        }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
@@ -1250,7 +1386,7 @@ async fn process_chat_message(
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
             "model_provider": provider_label,
-            "model": model_label,
+            "model": turn_model,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1261,7 +1397,7 @@ async fn process_chat_message(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model_provider": provider_label,
-                    "model": model_label,
+                    "model": turn_model,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1319,23 +1455,17 @@ async fn process_chat_message(
                 }
             }
 
-            // Compute cost from accumulated tokens + configured pricing,
-            // then write the cost record so /api/cost and costs.jsonl reflect
-            // this turn. Done before the done frame so cost_usd can ride along.
             let total_tokens = match (total_input_tokens, total_output_tokens) {
                 (Some(i), Some(o)) => Some(i.saturating_add(o)),
                 (Some(i), None) => Some(i),
                 (None, Some(o)) => Some(o),
                 (None, None) => None,
             };
-            let cost_usd = record_turn_cost(
-                state,
-                &provider_label,
-                &model_label,
-                total_input_tokens,
-                total_output_tokens,
-                None,
-            );
+            let cost_usd = turn_usage
+                .as_ref()
+                .map(|usage| *usage.lock())
+                .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
+                .map(|usage| usage.cost_usd);
 
             let done = serde_json::json!({
                 "type": "done",
@@ -1344,7 +1474,7 @@ async fn process_chat_message(
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": model_label,
+                "model": turn_model,
                 "provider": provider_label,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
@@ -1358,7 +1488,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "model_provider": provider_label,
-                "model": model_label,
+                "model": turn_model,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1370,7 +1500,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": model_label,
+                        "model": turn_model,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -1436,7 +1566,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": model_label,
+                        "model": turn_model,
                         "session_key": session_key,
                         "error": sanitized,
                         "error_code": error_code,
@@ -1448,91 +1578,36 @@ async fn process_chat_message(
     }
 }
 
-/// Record token usage for the just-completed turn against the gateway's
-/// cost tracker, returning the computed cost in USD (or `None` when no
-/// tracker is configured or no usage was reported).
-fn record_turn_cost(
-    state: &AppState,
-    provider_name: &str,
-    model: &str,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cached_input_tokens: Option<u64>,
-) -> Option<f64> {
-    let tracker = state.cost_tracker.as_ref()?;
-    if input_tokens.is_none() && output_tokens.is_none() {
-        return None;
-    }
-    let input = input_tokens.unwrap_or(0);
-    let output = output_tokens.unwrap_or(0);
-    let cached_input = cached_input_tokens.unwrap_or(0);
-    if input == 0 && output == 0 {
-        return None;
-    }
-    // V3 per-provider pricing lookup. Mirrors how the channels
-    // orchestrator and the gateway lib.rs cost-tracking scope build
-    // their `ModelProviderPricing`: walk every
-    // `[providers.models.<type>.<alias>]` and key the per-profile
-    // pricing map by `<type>.<alias>`. The streaming and non-streaming
-    // paths derive identical costs because both bottom out in the same
-    // `<type>.<alias>` key shape.
-    let config = state.config.read();
-    let pricing_map = config
-        .providers
-        .models
-        .iter_entries()
-        .filter(|(_, _, base)| !base.pricing.is_empty())
-        .map(|(type_k, alias_k, base)| (format!("{type_k}.{alias_k}"), base.pricing.clone()))
-        .collect::<std::collections::HashMap<String, std::collections::HashMap<String, f64>>>();
-    drop(config);
-    let model_pricing = pricing_map.get(provider_name);
-    let try_lookup = |key: &str| -> (f64, f64, f64) {
-        let Some(map) = model_pricing else {
-            return (0.0, 0.0, 0.0);
-        };
-        let in_rate = map
-            .get(&format!("{key}.input"))
-            .copied()
-            .or_else(|| map.get(key).copied())
-            .unwrap_or(0.0);
-        let out_rate = map
-            .get(&format!("{key}.output"))
-            .copied()
-            .or_else(|| map.get(key).copied())
-            .unwrap_or(0.0);
-        let cached_rate = map
-            .get(&format!("{key}.cached_input"))
-            .copied()
-            .unwrap_or(0.0);
-        (in_rate, out_rate, cached_rate)
-    };
-    let (input_rate, output_rate, cached_rate) = match try_lookup(model) {
-        (0.0, 0.0, 0.0) => model
-            .rsplit_once('/')
-            .map(|(_, suffix)| try_lookup(suffix))
-            .unwrap_or((0.0, 0.0, 0.0)),
-        rates => rates,
-    };
-    let usage = zeroclaw_runtime::cost::types::TokenUsage::new(
-        model,
-        input,
-        output,
-        cached_input,
-        input_rate,
-        output_rate,
-        cached_rate,
-    );
-    let cost_usd = usage.cost_usd;
-    if let Err(error) = tracker.record_usage(usage) {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"provider": provider_name, "model": model, "error": format!("{}", error)})), "Failed to record gateway turn cost");
-    }
-    Some(cost_usd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn sop_ws_error_frames_resolve_via_fluent() {
+        // The SOP WebSocket error frames are UI-surfaced and route through the
+        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
+        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+        for key in [
+            "cli-sop-ws-invalid-approval",
+            "cli-sop-ws-engine-lock-poisoned",
+            "cli-sop-ws-subsystem-disabled",
+        ] {
+            let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
+            assert!(
+                !s.starts_with('{') || !s.ends_with('}'),
+                "fluent missing-key fallback leaked for {key}: {s:?}"
+            );
+        }
+        let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-sop-ws-resolve-failed",
+            &[("error", "boom")],
+        );
+        assert!(
+            resolved.contains("boom"),
+            "the resolve-failed frame must interpolate the error: {resolved:?}"
+        );
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {
