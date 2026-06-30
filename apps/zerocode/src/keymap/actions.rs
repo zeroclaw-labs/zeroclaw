@@ -283,6 +283,7 @@ keyactions! {
         Up    [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down  [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter [Chord::key(KeyCode::Enter)] => "load graph",
+        Watch [Chord::char('w'), Chord::char('W')] => "watch run",
     }
 }
 

@@ -53,3 +53,36 @@ export async function listSops(): Promise<SopSummary[]> {
 export function getSopGraph(name: string): Promise<SopGraph> {
   return apiFetch<SopGraph>(`/api/sops/${encodeURIComponent(name)}/graph`);
 }
+
+export type NodeRunState = 'pending' | 'active' | 'completed' | 'failed' | 'skipped';
+
+export type SopRunStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_approval'
+  | 'paused_checkpoint'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface NodeRunOverlay {
+  step: number;
+  state: NodeRunState;
+}
+
+export interface RunOverlay {
+  run_id: string;
+  sop_name: string;
+  status: SopRunStatus;
+  current_step: number;
+  total_steps: number;
+  waiting: boolean;
+  paused: boolean;
+  nodes: NodeRunOverlay[];
+}
+
+export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> {
+  return apiFetch<RunOverlay>(
+    `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/overlay`,
+  );
+}

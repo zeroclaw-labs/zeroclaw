@@ -19,7 +19,21 @@ pub(crate) struct SopPane {
     names: Vec<String>,
     list_state: ListState,
     graph_lines: Vec<String>,
+    run_input: Option<String>,
+    overlay: Option<RunOverlayView>,
     error: Option<String>,
+}
+
+/// Projected run state the pane overlays onto the graph: per-step states keyed
+/// for marker lookup, plus the run-level status line. The backend produces the
+/// projection (`sops/run-overlay`); this pane only formats what it receives.
+struct RunOverlayView {
+    status: String,
+    current_step: u64,
+    total_steps: u64,
+    waiting: bool,
+    paused: bool,
+    states: std::collections::HashMap<u64, String>,
 }
 
 impl SopPane {
@@ -29,6 +43,8 @@ impl SopPane {
             names: Vec::new(),
             list_state: ListState::default(),
             graph_lines: Vec::new(),
+            run_input: None,
+            overlay: None,
             error: None,
         }
     }
@@ -60,6 +76,20 @@ impl SopPane {
         match self.rpc.sops_graph(&name).await {
             Ok(value) => {
                 self.graph_lines = graph_to_lines(&value);
+                self.overlay = None;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) async fn load_run_overlay(&mut self, run_id: &str) {
+        let Some(name) = self.selected_name().map(String::from) else {
+            return;
+        };
+        match self.rpc.sops_run_overlay(&name, run_id).await {
+            Ok(value) => {
+                self.overlay = Some(parse_overlay(&value));
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -90,18 +120,56 @@ impl SopPane {
 
     pub(crate) async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crate::keymap::SopTabAction;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if self.run_input.is_some() {
+            match key.code {
+                KeyCode::Enter => self.submit_run_input().await, // keyguard: text-entry submit
+                KeyCode::Esc => self.run_input = None,           // keyguard: text-entry cancel
+                KeyCode::Backspace => self.run_input_backspace(), // keyguard: text-entry edit
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(buf) = self.run_input.as_mut() {
+                        buf.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
         match SopTabAction::from_chord(&key) {
             Some(SopTabAction::Up) => self.select_prev(),
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
+            Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
             None => {}
         }
         false
     }
 
+    async fn submit_run_input(&mut self) {
+        let run_id = self
+            .run_input
+            .take()
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
+        if !run_id.is_empty() {
+            self.load_run_overlay(&run_id).await;
+        }
+    }
+
+    fn run_input_backspace(&mut self) {
+        if let Some(buf) = self.run_input.as_mut() {
+            buf.pop();
+        }
+    }
+
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::SopTabAction as S;
-        crate::widgets::HelpNode::entries(crate::help::entries_for([S::Up, S::Down, S::Enter]))
+        crate::widgets::HelpNode::entries(crate::help::entries_for([
+            S::Up,
+            S::Down,
+            S::Enter,
+            S::Watch,
+        ]))
     }
 
     pub(crate) fn render(&mut self, f: &mut Frame, area: Rect) {
@@ -123,12 +191,107 @@ impl SopPane {
         let body = if let Some(err) = &self.error {
             err.clone()
         } else {
-            self.graph_lines.join("\n")
+            self.body_lines().join("\n")
+        };
+        let title = match &self.overlay {
+            Some(o) => format!(
+                "Graph [{} {}/{}{}]",
+                o.status,
+                o.current_step,
+                o.total_steps,
+                if o.waiting {
+                    " waiting"
+                } else if o.paused {
+                    " paused"
+                } else {
+                    ""
+                }
+            ),
+            None => "Graph".to_string(),
         };
         let para = Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title("Graph"))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
         f.render_widget(para, cols[1]);
+    }
+
+    /// Display lines: the graph lines, prefixed with per-step state markers when
+    /// a run overlay is active, with the run-id prompt appended when entering it.
+    fn body_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .graph_lines
+            .iter()
+            .map(|line| match &self.overlay {
+                Some(o) => match leading_step(line).and_then(|s| o.states.get(&s)) {
+                    Some(state) => format!("{} {line}", state_marker(state)),
+                    None => format!("  {line}"),
+                },
+                None => line.clone(),
+            })
+            .collect();
+        if let Some(buf) = &self.run_input {
+            lines.push(String::new());
+            lines.push(format!("run id: {buf}_"));
+        }
+        lines
+    }
+}
+
+/// State glyph for an overlaid node, derived from the backend's `NodeRunState`.
+fn state_marker(state: &str) -> &'static str {
+    match state {
+        "active" => ">>",
+        "completed" => "ok",
+        "failed" => "xx",
+        "skipped" => "--",
+        _ => "..",
+    }
+}
+
+/// The leading step number of a graph line formatted as `N. title ...`.
+fn leading_step(line: &str) -> Option<u64> {
+    line.split_once('.')
+        .and_then(|(head, _)| head.trim().parse().ok())
+}
+
+/// Parse the `sops/run-overlay` projection into the pane's overlay view.
+fn parse_overlay(value: &serde_json::Value) -> RunOverlayView {
+    let states = value
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|node| {
+                    let step = node.get("step").and_then(serde_json::Value::as_u64)?;
+                    let state = node.get("state").and_then(|s| s.as_str())?.to_string();
+                    Some((step, state))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    RunOverlayView {
+        status: value
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        current_step: value
+            .get("current_step")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        total_steps: value
+            .get("total_steps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        waiting: value
+            .get("waiting")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        paused: value
+            .get("paused")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        states,
     }
 }
 
@@ -284,6 +447,70 @@ mod tests {
         });
         let req = next_request(&mut rx).await;
         assert_eq!(req["method"], method::SOPS_LIST);
+        task.abort();
+    }
+
+    #[test]
+    fn leading_step_parses_graph_line() {
+        assert_eq!(leading_step("3. do thing -> 4"), Some(3));
+        assert_eq!(leading_step("  diagnostics:"), None);
+    }
+
+    #[test]
+    fn parse_overlay_extracts_states_and_status() {
+        let v = serde_json::json!({
+            "run_id": "run-1",
+            "sop_name": "alpha",
+            "status": "running",
+            "current_step": 2,
+            "total_steps": 3,
+            "waiting": false,
+            "paused": false,
+            "nodes": [
+                { "step": 1, "state": "completed" },
+                { "step": 2, "state": "active" }
+            ]
+        });
+        let o = parse_overlay(&v);
+        assert_eq!(o.status, "running");
+        assert_eq!(o.current_step, 2);
+        assert_eq!(o.total_steps, 3);
+        assert_eq!(o.states.get(&1).map(String::as_str), Some("completed"));
+        assert_eq!(o.states.get(&2).map(String::as_str), Some("active"));
+    }
+
+    #[tokio::test]
+    async fn body_lines_prefix_state_markers_when_overlaid() {
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.graph_lines = vec!["1. a -> 2".into(), "2. b".into()];
+        let v = serde_json::json!({
+            "status": "running", "current_step": 2, "total_steps": 2,
+            "waiting": false, "paused": false,
+            "nodes": [
+                { "step": 1, "state": "completed" },
+                { "step": 2, "state": "active" }
+            ]
+        });
+        pane.overlay = Some(parse_overlay(&v));
+        let lines = pane.body_lines();
+        assert_eq!(lines[0], "ok 1. a -> 2");
+        assert_eq!(lines[1], ">> 2. b");
+    }
+
+    #[tokio::test]
+    async fn load_run_overlay_calls_rpc() {
+        let (client, mut rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.names = vec!["alpha".into()];
+        pane.list_state.select(Some(0));
+        let task = tokio::spawn(async move {
+            pane.load_run_overlay("run-1").await;
+        });
+        let req = next_request(&mut rx).await;
+        assert_eq!(req["method"], method::SOPS_RUN_OVERLAY);
+        assert_eq!(req["params"]["name"], "alpha");
+        assert_eq!(req["params"]["run_id"], "run-1");
         task.abort();
     }
 }

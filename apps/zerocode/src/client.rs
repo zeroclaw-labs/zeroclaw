@@ -112,6 +112,7 @@ pub mod method {
     // SOP authoring
     pub const SOPS_LIST: &str = "sops/list";
     pub const SOPS_GRAPH: &str = "sops/graph";
+    pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1194,6 +1195,14 @@ impl RpcClient {
     pub async fn sops_graph(&self, name: &str) -> Result<Value> {
         self.call(method::SOPS_GRAPH, serde_json::json!({ "name": name }))
             .await
+    }
+
+    pub async fn sops_run_overlay(&self, name: &str, run_id: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RUN_OVERLAY,
+            serde_json::json!({ "name": name, "run_id": run_id }),
+        )
+        .await
     }
 
     // ── Session methods ──────────────────────────────────────────

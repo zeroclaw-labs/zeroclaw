@@ -5,12 +5,43 @@ import { t } from '@/lib/i18n';
 import {
   listSops,
   getSopGraph,
+  getRunOverlay,
   type SopSummary,
   type SopGraph,
   type GraphNode,
   type GraphPin,
   type GraphWire,
+  type RunOverlay,
+  type NodeRunState,
 } from '@/lib/sops';
+
+function nodeStateTone(state: NodeRunState | undefined): string {
+  switch (state) {
+    case 'active':
+      return 'border-pc-accent ring-2 ring-pc-accent';
+    case 'completed':
+      return 'border-emerald-500';
+    case 'failed':
+      return 'border-rose-500';
+    case 'skipped':
+      return 'border-amber-500 opacity-70';
+    default:
+      return 'border-pc-border';
+  }
+}
+
+function nodeStateBadgeTone(state: NodeRunState): 'ok' | 'error' | 'warn' | 'neutral' {
+  switch (state) {
+    case 'completed':
+      return 'ok';
+    case 'failed':
+      return 'error';
+    case 'skipped':
+      return 'warn';
+    default:
+      return 'neutral';
+  }
+}
 
 function pinTypeLabel(pin: GraphPin): string {
   if (pin.class === 'flow') return 'flow';
@@ -36,14 +67,21 @@ function wireLabel(wire: GraphWire): string {
   return wire.flow_role ?? 'sequence';
 }
 
-function NodeCard({ node }: { node: GraphNode }) {
+function NodeCard({ node, state }: { node: GraphNode; state?: NodeRunState }) {
   return (
-    <div className="w-full max-w-xl rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface shadow-sm">
+    <div
+      className={`w-full max-w-xl rounded-[var(--radius-lg)] border bg-pc-surface shadow-sm ${nodeStateTone(state)}`}
+    >
       <div className="flex items-center gap-2 border-b border-pc-border px-3 py-2">
         <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
           {node.step}
         </span>
         <span className="font-medium text-pc-text">{node.title}</span>
+        {state ? (
+          <span className="ml-auto">
+            <Badge tone={nodeStateBadgeTone(state)}>{t(`sops.run_state.${state}`)}</Badge>
+          </span>
+        ) : null}
       </div>
       <div className="grid grid-cols-2 gap-3 px-3 py-2 text-xs">
         <div>
@@ -98,11 +136,16 @@ function NodeCard({ node }: { node: GraphNode }) {
   );
 }
 
-function GraphCanvas({ graph }: { graph: SopGraph }) {
+function GraphCanvas({ graph, overlay }: { graph: SopGraph; overlay?: RunOverlay | null }) {
   const ordered = useMemo(
     () => [...graph.nodes].sort((a, b) => a.step - b.step),
     [graph.nodes],
   );
+  const stateByStep = useMemo(() => {
+    const map = new Map<number, NodeRunState>();
+    for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
+    return map;
+  }, [overlay]);
   const wiresByFrom = useMemo(() => {
     const map = new Map<number, GraphWire[]>();
     for (const w of graph.wires) {
@@ -123,7 +166,7 @@ function GraphCanvas({ graph }: { graph: SopGraph }) {
         const outbound = wiresByFrom.get(node.step) ?? [];
         return (
           <div key={node.step} className="flex w-full flex-col items-center">
-            <NodeCard node={node} />
+            <NodeCard node={node} state={stateByStep.get(node.step)} />
             {idx < ordered.length - 1 || outbound.length > 0 ? (
               <div className="flex flex-col items-center py-1">
                 <ArrowDown className="h-4 w-4 text-pc-text-muted" aria-hidden />
@@ -174,6 +217,9 @@ export default function Sops() {
   const [loading, setLoading] = useState(true);
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runId, setRunId] = useState('');
+  const [overlay, setOverlay] = useState<RunOverlay | null>(null);
+  const [overlayError, setOverlayError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -213,6 +259,39 @@ export default function Sops() {
   useEffect(() => {
     if (selected) loadGraph(selected);
   }, [selected, loadGraph]);
+
+  useEffect(() => {
+    setRunId('');
+    setOverlay(null);
+    setOverlayError(null);
+  }, [selected]);
+
+  useEffect(() => {
+    if (!selected || !runId) {
+      setOverlay(null);
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      getRunOverlay(selected, runId)
+        .then((o) => {
+          if (!active) return;
+          setOverlay(o);
+          setOverlayError(null);
+        })
+        .catch((e: unknown) => {
+          if (!active) return;
+          setOverlay(null);
+          setOverlayError(e instanceof Error ? e.message : String(e));
+        });
+    };
+    poll();
+    const id = window.setInterval(poll, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [selected, runId]);
 
   return (
     <div className="space-y-4">
@@ -263,11 +342,27 @@ export default function Sops() {
                 </Badge>
               ) : null}
             </div>
+            <div className="mb-3 flex items-center gap-2">
+              <input
+                type="text"
+                value={runId}
+                onChange={(e) => setRunId(e.target.value.trim())}
+                placeholder={t('sops.run_id_placeholder')}
+                className="w-64 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+              />
+              {overlay ? (
+                <Badge tone={overlay.status === 'failed' ? 'error' : 'ok'}>
+                  {t(`sops.run_status.${overlay.status}`)} · {overlay.current_step}/
+                  {overlay.total_steps}
+                </Badge>
+              ) : null}
+              {overlayError ? <span className="text-xs text-rose-500">{overlayError}</span> : null}
+            </div>
             {graphLoading ? (
               <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
             ) : graph ? (
               <>
-                <GraphCanvas graph={graph} />
+                <GraphCanvas graph={graph} overlay={overlay} />
                 <DiagnosticsPanel graph={graph} />
               </>
             ) : null}
