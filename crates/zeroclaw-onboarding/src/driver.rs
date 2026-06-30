@@ -108,8 +108,16 @@ pub async fn run_flow(
             request.section_prefix,
             request.instance,
             config,
-            success,
+            success.clone(),
         );
+    }
+    if request.section_prefix.starts_with("agents.") {
+        let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
+            agent: request.instance.to_string(),
+            ..Default::default()
+        };
+        spec =
+            crate::spec_builder::append_personality_branch(spec, request.instance, &ctx, success);
     }
     Ok(spec.walk(transport, config).await?)
 }

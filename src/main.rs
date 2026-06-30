@@ -1447,8 +1447,19 @@ async fn run_onboard_flow(
         })?;
         if create && section.starts_with("channels.") {
             spec = zeroclaw_onboarding::append_peer_group_branch(
-                spec, section, instance, &config, success,
+                spec,
+                section,
+                instance,
+                &config,
+                success.clone(),
             );
+        }
+        if section.starts_with("agents.") {
+            let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
+                agent: instance.to_string(),
+                ..Default::default()
+            };
+            spec = zeroclaw_onboarding::append_personality_branch(spec, instance, &ctx, success);
         }
         let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
             .with_locale(selected_locale.clone());

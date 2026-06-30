@@ -17,8 +17,8 @@ pub use phrasing::{
     AgentPhraser, DescriptionPhraser, FieldPhrasingContext, PromptPhraser, phrase_spec,
 };
 pub use spec_builder::{
-    FieldScope, append_peer_group_branch, build_spec, build_spec_scoped, required_fields,
-    response_type_for, section_fields,
+    FieldScope, append_peer_group_branch, append_personality_branch, build_spec, build_spec_scoped,
+    required_fields, response_type_for, section_fields,
 };
 pub use zeroclaw_runtime::flow::{
     ConfiguredItem, FlowTransport, Node, NodeId, Outcome, Prompt, Spec, Step,

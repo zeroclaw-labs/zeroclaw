@@ -1,4 +1,4 @@
-use crate::flow::config_write::{WriteError, write_response};
+use crate::flow::config_write::{WriteError, WriteTarget, write_response, write_to_target};
 use crate::flow::transport::{FlowTransport, Outcome, Prompt};
 use crate::response_type::ResponseValue;
 use std::collections::BTreeMap;
@@ -42,6 +42,10 @@ pub struct Node {
     /// entry exists (`create_map_key(section, key)`), so a node can write into a
     /// freshly created group/alias. Idempotent; `None` for plain field nodes.
     pub ensure_map_key: Option<(String, String)>,
+    /// Where the validated response is written. `None` writes the config prop at
+    /// `prop` (the default). `Some` routes through `write_to_target`, letting a
+    /// node write a personality file into the agent workspace instead of config.
+    pub write_target: Option<WriteTarget>,
     pub validate: Box<dyn Fn(&ResponseValue) -> EdgeChoice + Send + Sync>,
 }
 
@@ -123,13 +127,17 @@ impl Spec {
             }
 
             let succeeded = (node.validate)(&response).is_ok();
-            if succeeded && !node.prop.is_empty() {
+            if succeeded {
                 if let Some((section, key)) = &node.ensure_map_key {
                     config
                         .create_map_key(section, key)
                         .map_err(|reason| WriteError::Config(anyhow::Error::msg(reason)))?;
                 }
-                write_response(config, &node.prop, &response)?;
+                if let Some(target) = &node.write_target {
+                    write_to_target(config, target, &response)?;
+                } else if !node.prop.is_empty() {
+                    write_response(config, &node.prop, &response)?;
+                }
             }
 
             match node.resolve(&response) {
@@ -312,6 +320,7 @@ mod tests {
             on_failure: Step::Terminal(Outcome::Cancelled),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(|response| match response {
                 ResponseValue::YesNo(true) => Ok(()),
                 _ => Err(()),
@@ -331,6 +340,7 @@ mod tests {
             on_failure: Step::Node(NodeId::new("token")),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(|response| match response {
                 ResponseValue::Secret(secret) if !secret.expose().is_empty() => Ok(()),
                 _ => Err(()),
@@ -409,6 +419,7 @@ mod tests {
             on_failure: Step::Node(NodeId::new("homeserver")),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(|_| Ok(())),
         };
         nodes.insert(optional.id.clone(), optional);
@@ -449,6 +460,7 @@ mod tests {
             on_failure: Step::Node(NodeId::new("homeserver")),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(|_| Ok(())),
         };
         nodes.insert(optional.id.clone(), optional);
@@ -464,6 +476,50 @@ mod tests {
             config.channels.matrix.get("home").unwrap().homeserver,
             "https://example.org"
         );
+    }
+
+    #[tokio::test]
+    async fn write_target_node_writes_personality_file_to_workspace() {
+        use crate::flow::config_write::WriteTarget;
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut nodes = BTreeMap::new();
+        let author = Node {
+            id: NodeId::new("soul"),
+            layer: "agent".into(),
+            instance: "scout".into(),
+            prop: String::new(),
+            optional: false,
+            prompt: Prompt::new("Author SOUL.md", ResponseType::FreeformText),
+            on_success: Step::Terminal(completed()),
+            on_failure: Step::Node(NodeId::new("soul")),
+            branches: Vec::new(),
+            ensure_map_key: None,
+            write_target: Some(WriteTarget::WorkspaceFileFromResponse {
+                agent_alias: "scout".into(),
+                filename: "SOUL.md".into(),
+            }),
+            validate: Box::new(|response| match response {
+                ResponseValue::FreeformText(text) if !text.is_empty() => Ok(()),
+                _ => Err(()),
+            }),
+        };
+        nodes.insert(author.id.clone(), author);
+        let spec = Spec {
+            start: NodeId::new("soul"),
+            nodes,
+        };
+        let mut transport =
+            ScriptedTransport::new(vec![ResponseValue::FreeformText("this is my soul".into())]);
+        let outcome = spec.walk(&mut transport, &mut config).await.unwrap();
+        assert_eq!(outcome, completed());
+        let written =
+            std::fs::read_to_string(config.agent_workspace_dir("scout").join("SOUL.md")).unwrap();
+        assert_eq!(written, "this is my soul");
     }
 
     #[test]

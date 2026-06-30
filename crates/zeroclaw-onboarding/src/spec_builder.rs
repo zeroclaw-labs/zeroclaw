@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::traits::{PropFieldInfo, PropKind};
-use zeroclaw_runtime::flow::{Localizable, Node, NodeId, Outcome, Prompt, Spec, Step};
+use zeroclaw_runtime::agent::personality::EDITABLE_PERSONALITY_FILES;
+use zeroclaw_runtime::agent::personality_templates::{TemplateContext, render};
+use zeroclaw_runtime::flow::{Localizable, Node, NodeId, Outcome, Prompt, Spec, Step, WriteTarget};
 use zeroclaw_runtime::response_type::{ChoiceOption, ResponseType, ResponseValue};
 
 const OPTION_PREFIX: &str = "Option<";
@@ -139,6 +141,7 @@ pub fn build_spec_scoped(
             on_failure: Step::Node(id.clone()),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(validate_response),
         };
         nodes.insert(id, node);
@@ -274,6 +277,7 @@ pub fn append_peer_group_branch(
         on_failure: Step::Node(decision_id.clone()),
         branches,
         ensure_map_key: None,
+        write_target: None,
         validate: Box::new(validate_response),
     };
     spec.nodes.insert(decision_id, decision);
@@ -321,6 +325,7 @@ fn bind_channel_node(
         on_failure: Step::Terminal(Outcome::Cancelled),
         branches: Vec::new(),
         ensure_map_key: None,
+        write_target: None,
         validate: Box::new(validate_response),
     }
 }
@@ -379,6 +384,7 @@ fn new_group_field_chain(
         on_failure: Step::Terminal(Outcome::Cancelled),
         branches: Vec::new(),
         ensure_map_key: Some(("peer_groups".to_string(), group.to_string())),
+        write_target: None,
         validate: Box::new(validate_response),
     });
 
@@ -401,6 +407,7 @@ fn new_group_field_chain(
             on_failure: Step::Node(id.clone()),
             branches: Vec::new(),
             ensure_map_key: None,
+            write_target: None,
             validate: Box::new(validate_response),
         });
     }
@@ -415,6 +422,177 @@ fn repoint_terminal_to(spec: &mut Spec, target: &NodeId) {
         if matches!(node.on_success, Step::Terminal(_)) {
             node.on_success = Step::Node(target.clone());
         }
+    }
+}
+
+const PERSONALITY_DECISION_PREFIX: &str = "personality.decision";
+const PERSONALITY_AUTHOR_NODE_PREFIX: &str = "personality.author";
+const PERSONALITY_TEMPLATE_NODE_PREFIX: &str = "personality.template";
+const PERSONALITY_AUTHOR_VALUE: &str = "author";
+const PERSONALITY_TEMPLATE_VALUE: &str = "template";
+const PERSONALITY_SKIP_VALUE: &str = "skip";
+
+/// Splice a per-file personality decision chain onto a spec. Each editable
+/// personality file gets a real `Choice` decision node (author / use-template /
+/// skip) whose branches route to a freeform author node writing the response
+/// into the agent workspace, a literal node writing the pre-rendered template,
+/// or straight on to the next file. The file list is the canonical registry,
+/// never hardcoded; a file with no template offers only author / skip. The base
+/// spec's terminal edges repoint into the first file's decision.
+pub fn append_personality_branch(
+    mut spec: Spec,
+    agent_alias: &str,
+    ctx: &TemplateContext,
+    success: Outcome,
+) -> Spec {
+    let base_ids: Vec<NodeId> = spec.nodes.keys().cloned().collect();
+    let files: Vec<&'static str> = EDITABLE_PERSONALITY_FILES.to_vec();
+    let mut next_step = Step::Terminal(success);
+
+    for filename in files.iter().rev() {
+        let decision_id = NodeId::new(format!("{PERSONALITY_DECISION_PREFIX}.{filename}"));
+        let rendered = render(filename, ctx);
+
+        let mut options = vec![ChoiceOption {
+            value: PERSONALITY_AUTHOR_VALUE.to_string(),
+            label: format!("Author {filename}"),
+        }];
+        if rendered.is_some() {
+            options.push(ChoiceOption {
+                value: PERSONALITY_TEMPLATE_VALUE.to_string(),
+                label: format!("Use the {filename} template"),
+            });
+        }
+        options.push(ChoiceOption {
+            value: PERSONALITY_SKIP_VALUE.to_string(),
+            label: format!("Skip {filename}"),
+        });
+
+        let author_id = NodeId::new(format!("{PERSONALITY_AUTHOR_NODE_PREFIX}.{filename}"));
+        spec.nodes.insert(
+            author_id.clone(),
+            personality_author_node(author_id.clone(), agent_alias, filename, next_step.clone()),
+        );
+
+        let mut branches: Vec<(ResponseValue, Step)> = vec![
+            (
+                ResponseValue::Choice(PERSONALITY_AUTHOR_VALUE.to_string()),
+                Step::Node(author_id),
+            ),
+            (
+                ResponseValue::Choice(PERSONALITY_SKIP_VALUE.to_string()),
+                next_step.clone(),
+            ),
+        ];
+
+        if let Some(content) = rendered {
+            let template_id = NodeId::new(format!("{PERSONALITY_TEMPLATE_NODE_PREFIX}.{filename}"));
+            spec.nodes.insert(
+                template_id.clone(),
+                personality_template_node(
+                    template_id.clone(),
+                    agent_alias,
+                    filename,
+                    content,
+                    next_step.clone(),
+                ),
+            );
+            branches.push((
+                ResponseValue::Choice(PERSONALITY_TEMPLATE_VALUE.to_string()),
+                Step::Node(template_id),
+            ));
+        }
+
+        let decision = Node {
+            id: decision_id.clone(),
+            layer: "agent".to_string(),
+            instance: agent_alias.to_string(),
+            prop: String::new(),
+            optional: false,
+            prompt: Prompt::new(
+                format!("Set up {filename}?"),
+                ResponseType::Choice { options },
+            ),
+            on_success: next_step.clone(),
+            on_failure: Step::Node(decision_id.clone()),
+            branches,
+            ensure_map_key: None,
+            write_target: None,
+            validate: Box::new(validate_response),
+        };
+        spec.nodes.insert(decision_id.clone(), decision);
+        next_step = Step::Node(decision_id);
+    }
+
+    if let Step::Node(first) = &next_step {
+        let first = first.clone();
+        repoint_personality_entry(&mut spec, &base_ids, &first);
+        spec.start = first;
+    }
+
+    spec
+}
+
+fn repoint_personality_entry(spec: &mut Spec, base_ids: &[NodeId], target: &NodeId) {
+    for id in base_ids {
+        if let Some(node) = spec.nodes.get_mut(id)
+            && matches!(&node.on_success, Step::Terminal(_))
+        {
+            node.on_success = Step::Node(target.clone());
+        }
+    }
+}
+
+fn personality_author_node(id: NodeId, agent_alias: &str, filename: &str, next: Step) -> Node {
+    Node {
+        id: id.clone(),
+        layer: "agent".to_string(),
+        instance: agent_alias.to_string(),
+        prop: String::new(),
+        optional: false,
+        prompt: Prompt::new(
+            format!("Write the contents of {filename}"),
+            ResponseType::FreeformText,
+        ),
+        on_success: next,
+        on_failure: Step::Node(id),
+        branches: Vec::new(),
+        ensure_map_key: None,
+        write_target: Some(WriteTarget::WorkspaceFileFromResponse {
+            agent_alias: agent_alias.to_string(),
+            filename: filename.to_string(),
+        }),
+        validate: Box::new(validate_response),
+    }
+}
+
+fn personality_template_node(
+    id: NodeId,
+    agent_alias: &str,
+    filename: &str,
+    content: String,
+    next: Step,
+) -> Node {
+    Node {
+        id: id.clone(),
+        layer: "agent".to_string(),
+        instance: agent_alias.to_string(),
+        prop: String::new(),
+        optional: false,
+        prompt: Prompt::new(
+            format!("Write the {filename} template to the workspace?"),
+            ResponseType::YesNo,
+        ),
+        on_success: next,
+        on_failure: Step::Node(id),
+        branches: Vec::new(),
+        ensure_map_key: None,
+        write_target: Some(WriteTarget::WorkspaceFileLiteral {
+            agent_alias: agent_alias.to_string(),
+            filename: filename.to_string(),
+            content,
+        }),
+        validate: Box::new(validate_response),
     }
 }
 
@@ -708,5 +886,136 @@ mod tests {
         assert!(values.contains(&"attach:beta"));
         assert!(values.contains(&PG_SKIP_VALUE));
         assert!(values.contains(&PG_NEW_VALUE));
+    }
+
+    struct PersonalitySteeredTransport {
+        decision: String,
+        authored: String,
+        emitted: Vec<Outcome>,
+        asks: Vec<String>,
+    }
+
+    impl PersonalitySteeredTransport {
+        fn new(decision: &str, authored: &str) -> Self {
+            Self {
+                decision: decision.to_string(),
+                authored: authored.to_string(),
+                emitted: Vec::new(),
+                asks: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FlowTransport for PersonalitySteeredTransport {
+        async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+            self.asks.push(prompt.text.clone());
+            Ok(match &prompt.response_type {
+                ResponseType::Choice { options } => {
+                    let chosen = options
+                        .iter()
+                        .find(|option| option.value == self.decision)
+                        .map(|option| option.value.clone())
+                        .unwrap_or_else(|| options[0].value.clone());
+                    ResponseValue::Choice(chosen)
+                }
+                ResponseType::FreeformText => ResponseValue::FreeformText(self.authored.clone()),
+                ResponseType::YesNo => ResponseValue::YesNo(true),
+                ResponseType::Number => ResponseValue::Number("1".into()),
+                ResponseType::Secret => ResponseValue::Secret(SecretValue::new("tok".into())),
+            })
+        }
+
+        async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()> {
+            self.emitted.push(outcome.clone());
+            Ok(())
+        }
+    }
+
+    fn agent_config() -> (tempfile::TempDir, Config) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        (tmp, config)
+    }
+
+    fn personality_spec(_config: &Config) -> Spec {
+        let base = Spec {
+            start: NodeId::new(PERSONALITY_DECISION_PREFIX),
+            nodes: BTreeMap::new(),
+        };
+        append_personality_branch(
+            base,
+            "scout",
+            &TemplateContext::default(),
+            Outcome::Completed { configured: vec![] },
+        )
+    }
+
+    #[tokio::test]
+    async fn skip_all_personality_files_writes_nothing_and_completes() {
+        let (_tmp, mut config) = agent_config();
+        let spec = personality_spec(&config);
+        let mut transport = PersonalitySteeredTransport::new(PERSONALITY_SKIP_VALUE, "");
+        let outcome = spec.walk(&mut transport, &mut config).await.unwrap();
+        assert!(matches!(outcome, Outcome::Completed { .. }));
+        let workspace = config.agent_workspace_dir("scout");
+        for filename in EDITABLE_PERSONALITY_FILES {
+            assert!(
+                !workspace.join(filename).exists(),
+                "skip must not write {filename}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn author_branch_writes_response_text_to_each_file() {
+        let (_tmp, mut config) = agent_config();
+        let spec = personality_spec(&config);
+        let mut transport =
+            PersonalitySteeredTransport::new(PERSONALITY_AUTHOR_VALUE, "hand authored");
+        spec.walk(&mut transport, &mut config).await.unwrap();
+        let workspace = config.agent_workspace_dir("scout");
+        let written = std::fs::read_to_string(workspace.join("SOUL.md")).unwrap();
+        assert_eq!(written, "hand authored");
+    }
+
+    #[tokio::test]
+    async fn template_branch_writes_rendered_template_to_each_file() {
+        let (_tmp, mut config) = agent_config();
+        let spec = personality_spec(&config);
+        let mut transport = PersonalitySteeredTransport::new(PERSONALITY_TEMPLATE_VALUE, "");
+        spec.walk(&mut transport, &mut config).await.unwrap();
+        let workspace = config.agent_workspace_dir("scout");
+        let rendered = zeroclaw_runtime::agent::personality_templates::render(
+            "SOUL.md",
+            &TemplateContext::default(),
+        )
+        .expect("SOUL.md renders");
+        let written = std::fs::read_to_string(workspace.join("SOUL.md")).unwrap();
+        assert_eq!(written, rendered);
+    }
+
+    #[test]
+    fn every_editable_file_gets_a_decision_node_from_the_registry() {
+        let (_tmp, config) = agent_config();
+        let spec = personality_spec(&config);
+        for filename in EDITABLE_PERSONALITY_FILES {
+            let decision_id = NodeId::new(format!("{PERSONALITY_DECISION_PREFIX}.{filename}"));
+            let node = spec
+                .nodes
+                .get(&decision_id)
+                .unwrap_or_else(|| panic!("missing decision node for {filename}"));
+            let ResponseType::Choice { options } = &node.prompt.response_type else {
+                panic!("personality decision for {filename} must be a Choice");
+            };
+            let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+            assert!(values.contains(&PERSONALITY_AUTHOR_VALUE));
+            assert!(values.contains(&PERSONALITY_TEMPLATE_VALUE));
+            assert!(values.contains(&PERSONALITY_SKIP_VALUE));
+        }
     }
 }
