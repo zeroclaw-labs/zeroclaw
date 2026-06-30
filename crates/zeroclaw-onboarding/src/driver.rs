@@ -93,15 +93,24 @@ pub async fn run_flow(
             instance: request.instance.to_string(),
         }],
     };
-    let spec = build_spec_scoped(
+    let mut spec = build_spec_scoped(
         config.prop_fields(),
         request.section_prefix,
         request.layer,
         request.instance,
-        success,
+        success.clone(),
         request.scope,
     )
     .ok_or_else(|| DriverError::EmptySection(request.section_prefix.to_string()))?;
+    if request.create && request.section_prefix.starts_with("channels.") {
+        spec = crate::spec_builder::append_peer_group_branch(
+            spec,
+            request.section_prefix,
+            request.instance,
+            config,
+            success,
+        );
+    }
     Ok(spec.walk(transport, config).await?)
 }
 

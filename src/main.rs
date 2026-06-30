@@ -1439,12 +1439,17 @@ async fn run_onboard_flow(
             section,
             layer,
             instance,
-            success,
+            success.clone(),
             scope,
         )
         .ok_or_else(|| {
             anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
         })?;
+        if create && section.starts_with("channels.") {
+            spec = zeroclaw_onboarding::append_peer_group_branch(
+                spec, section, instance, &config, success,
+            );
+        }
         let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
             .with_locale(selected_locale.clone());
         phrase_spec(&mut spec, &mut phraser).await?;

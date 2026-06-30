@@ -1,4 +1,4 @@
-use crate::flow::config_write::write_response;
+use crate::flow::config_write::{WriteError, write_response};
 use crate::flow::transport::{FlowTransport, Outcome, Prompt};
 use crate::response_type::ResponseValue;
 use std::collections::BTreeMap;
@@ -31,6 +31,17 @@ pub struct Node {
     pub prompt: Prompt,
     pub on_success: Step,
     pub on_failure: Step,
+    /// Value-keyed edges taken before `on_success` when the response validates.
+    /// The first branch whose `ResponseValue` equals the response wins; an empty
+    /// list keeps the node a plain linear/binary step. Lets a `Choice` node route
+    /// each option to its own next node, so a decision (e.g. peer-group
+    /// create-new vs attach vs skip) is a real spec node rather than an ad-hoc
+    /// prompt.
+    pub branches: Vec<(ResponseValue, Step)>,
+    /// Side-effect run before the response write: ensure a map-keyed section
+    /// entry exists (`create_map_key(section, key)`), so a node can write into a
+    /// freshly created group/alias. Idempotent; `None` for plain field nodes.
+    pub ensure_map_key: Option<(String, String)>,
     pub validate: Box<dyn Fn(&ResponseValue) -> EdgeChoice + Send + Sync>,
 }
 
@@ -48,7 +59,12 @@ impl Node {
     #[must_use]
     pub fn resolve(&self, response: &ResponseValue) -> Step {
         match (self.validate)(response) {
-            Ok(()) => self.on_success.clone(),
+            Ok(()) => self
+                .branches
+                .iter()
+                .find(|(value, _)| value == response)
+                .map(|(_, step)| step.clone())
+                .unwrap_or_else(|| self.on_success.clone()),
             Err(()) => self.on_failure.clone(),
         }
     }
@@ -108,6 +124,11 @@ impl Spec {
 
             let succeeded = (node.validate)(&response).is_ok();
             if succeeded && !node.prop.is_empty() {
+                if let Some((section, key)) = &node.ensure_map_key {
+                    config
+                        .create_map_key(section, key)
+                        .map_err(|reason| WriteError::Config(anyhow::Error::msg(reason)))?;
+                }
                 write_response(config, &node.prop, &response)?;
             }
 
@@ -289,6 +310,8 @@ mod tests {
             prompt: Prompt::new("Proceed?", ResponseType::YesNo),
             on_success: Step::Node(NodeId::new("token")),
             on_failure: Step::Terminal(Outcome::Cancelled),
+            branches: Vec::new(),
+            ensure_map_key: None,
             validate: Box::new(|response| match response {
                 ResponseValue::YesNo(true) => Ok(()),
                 _ => Err(()),
@@ -306,6 +329,8 @@ mod tests {
             prompt: Prompt::new("Access token", ResponseType::Secret),
             on_success: Step::Terminal(completed()),
             on_failure: Step::Node(NodeId::new("token")),
+            branches: Vec::new(),
+            ensure_map_key: None,
             validate: Box::new(|response| match response {
                 ResponseValue::Secret(secret) if !secret.expose().is_empty() => Ok(()),
                 _ => Err(()),
@@ -382,6 +407,8 @@ mod tests {
             prompt: Prompt::new("Homeserver", ResponseType::FreeformText),
             on_success: Step::Terminal(completed()),
             on_failure: Step::Node(NodeId::new("homeserver")),
+            branches: Vec::new(),
+            ensure_map_key: None,
             validate: Box::new(|_| Ok(())),
         };
         nodes.insert(optional.id.clone(), optional);
@@ -420,6 +447,8 @@ mod tests {
             prompt: Prompt::new("Homeserver", ResponseType::FreeformText),
             on_success: Step::Terminal(completed()),
             on_failure: Step::Node(NodeId::new("homeserver")),
+            branches: Vec::new(),
+            ensure_map_key: None,
             validate: Box::new(|_| Ok(())),
         };
         nodes.insert(optional.id.clone(), optional);

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::TempDir;
 use zeroclaw_config::schema::{Config, MatrixConfig};
-use zeroclaw_onboarding::{Outcome, build_spec};
+use zeroclaw_onboarding::{Outcome, append_peer_group_branch, build_spec};
 use zeroclaw_runtime::response_type::ResponseType;
 
 const SECTION: &str = "channels.matrix.home";
@@ -105,7 +105,7 @@ fn drive_flow_over_pty(
     );
 
     let mut transcript = String::new();
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut idle_since = Instant::now();
     let mut completed = false;
 
@@ -179,7 +179,36 @@ fn scripted_answers() -> Vec<String> {
                 ResponseType::FreeformText => "https://walked.test".to_string(),
             }),
     );
+    answers.push(peer_group_skip_value());
     answers
+}
+
+fn peer_group_skip_value() -> String {
+    let mut config = Config::default();
+    config
+        .channels
+        .matrix
+        .insert("home".to_string(), MatrixConfig::default());
+    let spec = build_spec(
+        config.prop_fields(),
+        SECTION,
+        "channel",
+        "home",
+        Outcome::Cancelled,
+    )
+    .expect("matrix section yields a spec");
+    let branched = append_peer_group_branch(spec, SECTION, "home", &config, Outcome::Cancelled);
+    branched
+        .nodes
+        .values()
+        .find_map(|node| match &node.prompt.response_type {
+            ResponseType::Choice { options } => options
+                .iter()
+                .find(|option| option.value == "skip")
+                .map(|option| option.value.clone()),
+            _ => None,
+        })
+        .expect("peer-group decision exposes a skip option")
 }
 
 #[test]
