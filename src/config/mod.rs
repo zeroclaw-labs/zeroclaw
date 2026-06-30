@@ -97,6 +97,7 @@ mod tests {
             api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
