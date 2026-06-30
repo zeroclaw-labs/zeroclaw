@@ -328,14 +328,6 @@ cli-completions-long-about =
       zeroclaw completions zsh > ~/.zfunc/_zeroclaw
       zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
 
-    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
-
-    Use --install to download the pre-built companion app for your platform.
-
-    Examples:
-      zeroclaw desktop              # launch the companion app
-      zeroclaw desktop --install    # download and install it
-
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
 # webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).

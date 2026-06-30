@@ -65,7 +65,7 @@ The duplication has a subtler cost beyond compute minutes: when a check fails in
 
 The release automation, `release-stable-manual.yml`, `release-beta-on-push.yml`, `publish-crates.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml`, was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.
 
-The architecture RFC defines a distribution model with five distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, WASM plugin files, and the Tauri desktop installer. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change, unless they are redesigned now with that model in mind.
+The architecture RFC defines a distribution model with four distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, and WASM plugin files. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change, unless they are redesigned now with that model in mind.
 
 ### 2.3 Security Scanning Without a Lifecycle
 
@@ -273,8 +273,7 @@ version-bump (release-plz PR merged)
     ├── build-kernel-standard (matrix: 6 targets)
     ├── build-kernel-hardware (matrix: 2 ARM targets + hardware flags)
     ├── build-gateway (matrix: 6 targets)
-    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip2)
-    └── build-desktop (matrix: macOS, Windows, Linux AppImage/deb)
+    └── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip2)
             │
             ├── publish-github-release (attaches all kernel + gateway binaries)
             ├── publish-plugin-registry (uploads WASM files)
@@ -501,7 +500,7 @@ Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.ym
 
 **Theme:** The pipeline ships the platform, not just the binary.
 
-**Why this phase:** v1.0.0 is when WASM plugins become publishable. The pipeline must handle plugin publishing, registry upload, and the Tauri desktop installer as first-class release artifacts.
+**Why this phase:** v1.0.0 is when WASM plugins become publishable. The pipeline must handle plugin publishing and registry upload as first-class release artifacts.
 
 #### Phase 4 Deliverables
 
@@ -509,15 +508,11 @@ Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.ym
 
 Implement `build-plugins-wasm` in the release pipeline. Each plugin crate builds to `wasm32-wasip2` in a dedicated job. Plugin manifests are generated and signed. The `publish-plugin-registry` job uploads signed WASM files to the plugin registry.
 
-##### D2: Desktop installer build and publish
-
-Complete the Tauri build jobs for macOS, Windows, and Linux. The installer bundles the kernel and gateway binaries. Code signing credentials for macOS and Windows are documented as required repository secrets with a setup guide.
-
-##### D3: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`
+##### D2: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`
 
 The action pinning policy, advisory triage process, conventional commit requirements, and release pipeline structure defined in this RFC are extracted to `docs/book/src/maintainers/ci-and-actions.md` as a standing reference. This RFC remains the historical record of the decisions; the extracted document is what contributors look up day-to-day.
 
-##### D4: Contributor onboarding for the pipeline
+##### D3: Contributor onboarding for the pipeline
 
 Add a `Running CI Locally` section to the contributing documentation that shows contributors how to replicate the CI checks on their own machine before pushing:
 
@@ -538,7 +533,6 @@ cargo deny check
 #### Success Metrics for Phase 4
 
 - WASM plugin files are published to the registry as part of the release pipeline
-- Tauri desktop installer is built and published automatically on release
 - `docs/book/src/maintainers/ci-and-actions.md` exists and covers action pinning, advisory triage, and conventional commits
 - A contributor can replicate all CI checks locally with four commands
 
