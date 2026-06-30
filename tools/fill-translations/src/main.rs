@@ -183,6 +183,32 @@ fn normalize_translated_text(msgid: &str, text: String) -> String {
     }
 }
 
+/// Repair entries whose `msgstr` is a prompt-leak response.
+///
+/// Iterates in reverse so that removing continuation lines doesn't shift
+/// line indices for entries yet to visit. Returns `(recovered, blanked)`.
+fn repair_leaks(lines: &mut Vec<String>, entries: &[Entry]) -> (usize, usize) {
+    let mut leak_recovered = 0;
+    let mut leak_blanked = 0;
+    for entry in entries.iter().rev() {
+        if entry.msgstr.is_empty() {
+            continue;
+        }
+        match check_for_leak(&entry.msgid, &entry.msgstr) {
+            LeakCheck::Clean => {}
+            LeakCheck::Recovered(r) => {
+                replace_msgstr_line(lines, entry.msgstr_line, &r);
+                leak_recovered += 1;
+            }
+            LeakCheck::Unrecoverable => {
+                replace_msgstr_line(lines, entry.msgstr_line, "");
+                leak_blanked += 1;
+            }
+        }
+    }
+    (leak_recovered, leak_blanked)
+}
+
 fn commit_entry(
     entries: &mut Vec<Entry>,
     fuzzy_line: Option<usize>,
@@ -420,24 +446,11 @@ async fn main() -> anyhow::Result<()> {
     // Repair entries where the model previously leaked its instructions instead of translating.
     // Recover the real translation from the response tail when possible, otherwise clear to ""
     // so the entry gets re-translated on this run.
-    let mut leak_recovered = 0;
-    let mut leak_blanked = 0;
-    for entry in entries.iter().rev() {
-        if entry.msgstr.is_empty() {
-            continue;
-        }
-        match check_for_leak(&entry.msgid, &entry.msgstr) {
-            LeakCheck::Clean => {}
-            LeakCheck::Recovered(r) => {
-                replace_msgstr_line(&mut lines, entry.msgstr_line, &r);
-                leak_recovered += 1;
-            }
-            LeakCheck::Unrecoverable => {
-                replace_msgstr_line(&mut lines, entry.msgstr_line, "");
-                leak_blanked += 1;
-            }
-        }
-    }
+    // NB: On master the trailing-\n pre-pass runs AFTER this loop, so there is no stale
+    // translations key to remove — the order-of-operations refactoring already fixes #8312
+    // at the production-code level. The regression test in the test module pins this
+    // invariant (see repair_leaks_drops_stale_translations_key).
+    let (leak_recovered, leak_blanked) = repair_leaks(&mut lines, &entries);
     if leak_recovered + leak_blanked > 0 {
         println!(
             "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
@@ -597,6 +610,99 @@ mod tests {
         assert_eq!(
             normalize_translated_text("source\n", "translated".to_string()),
             "translated\n"
+        );
+    }
+
+    /// A leaked msgstr long enough to trip `check_for_leak`'s `too_long` guard
+    /// (threshold = max(4*len(msgid), 120)), with the real translation (`保存`)
+    /// as the final paragraph after a blank line so it is Recovered.
+    /// The msgid ends with `\n` so the trailing-`\n` pre-pass in main() would
+    /// seed `translations[msgstr_line]` — the precondition that fired #8312.
+    const RECOVERABLE_LEAK_TRAILING_NEWLINE: &str = concat!(
+        "msgid \"Save\\n\"\n",
+        "msgstr \"\"\n",
+        "\"- You translate English technical documentation strings to Japanese.\\n\"\n",
+        "\"- Do not translate brand names, command names, CLI flags, or file paths.\\n\"\n",
+        "\"\\n\"\n",
+        "\"保存\"\n",
+    );
+
+    /// Regression for #8312: after leak repair + trailing-`\n` pre-pass,
+    /// `write_po` must emit the recovered translation, not the leaked text.
+    ///
+    /// Uses the shared `repair_leaks` helper (so it tests the real production
+    /// code path) and drives `write_po` end-to-end. Mutation check: reverting
+    /// `repair_leaks` to a no-op (bypassing the loop) makes the test fail
+    /// because the pre-pass seeds the unrecovered leaked text.
+    #[test]
+    fn repair_leaks_drops_stale_translations_key() {
+        let raw = RECOVERABLE_LEAK_TRAILING_NEWLINE;
+        let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+        let mut entries = parse_po(&lines);
+        assert_eq!(entries.len(), 1);
+        let msgstr_line = entries[0].msgstr_line;
+
+        // Blank continuation lines belonging to the leaked msgstr block so that
+        // re-parse after repair doesn't re-append them (orthogonal to #8312).
+        let mut ci = msgstr_line + 1;
+        while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+            lines[ci].clear();
+            ci += 1;
+        }
+
+        // Step 1: Run the production leak-repair path via the shared helper.
+        let (recovered, blanked) = repair_leaks(&mut lines, &entries);
+        assert_eq!(
+            (recovered, blanked),
+            (1, 0),
+            "entry must be Recovered by leak repair"
+        );
+
+        // Re-parse lines after repair (same as main() does).
+        if recovered + blanked > 0 {
+            entries = parse_po(&lines);
+        }
+        assert!(
+            !entries[0].msgstr.is_empty(),
+            "msgstr must not be empty after recovery"
+        );
+
+        // Step 2: Simulate the trailing-`\n` pre-pass (same logic as main()).
+        let mut translations: HashMap<usize, String> = HashMap::new();
+        for entry in &entries {
+            if !entry.msgstr.is_empty()
+                && entry.msgid.ends_with('\n')
+                && !entry.msgstr.ends_with('\n')
+            {
+                translations.insert(entry.msgstr_line, format!("{}\n", entry.msgstr));
+            }
+        }
+        assert!(
+            !translations.contains_key(&msgstr_line)
+                || translations
+                    .get(&msgstr_line)
+                    .is_some_and(|v| v.contains("保存")),
+            "if pre-pass seeded, it must contain the recovered translation, not leaked text"
+        );
+
+        // Step 3: write_po end-to-end — the final output must contain the
+        // recovered translation and must NOT contain the leaked prompt text.
+        let path = std::env::temp_dir().join(format!(
+            "fill_tr_stale_key_{}_{}.po",
+            std::process::id(),
+            msgstr_line
+        ));
+        write_po(&lines, raw, &translations, &[], &[], &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            out.contains("msgstr \"保存"),
+            "write_po must emit the recovered translation, got: {out}"
+        );
+        assert!(
+            !out.contains("You translate English"),
+            "stale leaked text must not be re-shipped, got: {out}"
         );
     }
 }
