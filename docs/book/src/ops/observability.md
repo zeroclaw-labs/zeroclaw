@@ -87,8 +87,8 @@ JSONL: one event per line, UTF-8, `0o600` permissions on Unix. The
 hot path is non-blocking: `record_event` hands the serialized event
 to a dedicated background thread (`zeroclaw-log-writer`) via a bounded
 channel and returns immediately. The worker calls `sync_all` on a
-periodic cadence — every 100 writes or every 1 second of wall-clock
-time, whichever fires first — plus a final `sync_all` when the channel
+periodic cadence: every 100 writes or every 1 second of wall-clock
+time, whichever fires first, plus a final `sync_all` when the channel
 closes on normal shutdown. This trades per-event durability (the prior
 synchronous behaviour) for bounded write latency: a process crash may
 lose up to one sync interval of pending writes. If the worker falls
