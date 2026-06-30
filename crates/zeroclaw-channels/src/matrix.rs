@@ -617,6 +617,16 @@ mod streaming {
         now.saturating_duration_since(existing.last_edit) >= min_interval
     }
 
+    /// Only thinking/reasoning entries use the Matrix edit debounce. Tool
+    /// progress, denials, replacements, and other durable entries edit the
+    /// existing draft immediately so fast operations do not look buffered.
+    pub(super) fn single_progress_uses_edit_interval(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        trimmed.starts_with("\u{1f914} ") // thinking status, U+1F914
+            || trimmed.starts_with("\u{1f9e0} ") // reasoning/full thinking, U+1F9E0
+            || trimmed.starts_with("\u{1f4ad} ") // thought bubble reasoning, U+1F4AD
+    }
+
     /// Avoid duplicate Matrix edits after rendering confirms that the visible
     /// transcript is unchanged.
     pub(super) fn single_render_changed(existing: &SingleDraft, new_text: &str) -> bool {
@@ -3731,7 +3741,9 @@ impl MatrixChannel {
 
             let now = Instant::now();
             let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
-            if !streaming::single_edit_interval_elapsed(draft, now, interval) {
+            if streaming::single_progress_uses_edit_interval(text)
+                && !streaming::single_edit_interval_elapsed(draft, now, interval)
+            {
                 return Ok(());
             }
 
@@ -4796,8 +4808,8 @@ mod tests {
             SingleRetainedDraftAction, State, decide_partial_finalize_action,
             mark_single_edit_delivered, normalize_matrix_progress_line, partial_should_edit,
             partial_visible_text, push_single_progress_line, single_cancel_deletes_draft,
-            single_edit_interval_elapsed, single_finalize_plan, single_render_changed,
-            single_retained_draft_action, single_visible_text_with_budget,
+            single_edit_interval_elapsed, single_finalize_plan, single_progress_uses_edit_interval,
+            single_render_changed, single_retained_draft_action, single_visible_text_with_budget,
         };
         use matrix_sdk::config::SyncSettings;
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
@@ -4970,6 +4982,35 @@ mod tests {
                 now,
                 Duration::from_millis(500)
             ));
+        }
+
+        #[test]
+        fn single_only_thinking_progress_uses_edit_debounce() {
+            for line in [
+                "\u{1f914} Thinking...\n",
+                "\u{1f914} Thinking (round 2)...\n",
+                "\u{1f9e0} considering options\n",
+                "\u{1f4ad} considering options\n",
+            ] {
+                assert!(
+                    single_progress_uses_edit_interval(line),
+                    "expected debounced thinking/reasoning progress for {line:?}"
+                );
+            }
+
+            for line in [
+                "\u{1f4ac} Got 2 tool call(s) (1s)\n",
+                "\u{23f3} shell: command=uname -a\n",
+                "\u{2705} shell: command=uname -a (0s)\n",
+                "\u{274c} shell: command=false (0s): failed\n",
+                "\u{270f} shell: replaced by user\n",
+                "plain durable progress\n",
+            ] {
+                assert!(
+                    !single_progress_uses_edit_interval(line),
+                    "expected immediate durable progress edit for {line:?}"
+                );
+            }
         }
 
         #[test]
