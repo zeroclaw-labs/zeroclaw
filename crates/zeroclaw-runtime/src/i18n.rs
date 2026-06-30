@@ -398,6 +398,55 @@ mod tests {
     }
 
     #[test]
+    fn status_cli_strings_format_dynamic_entries() {
+        let keys = [
+            (
+                "cli-status-agent-risk-profile",
+                &[("alias", "ops"), ("level", "High")][..],
+                ["ops=High"].as_slice(),
+            ),
+            (
+                "cli-status-agent-no-risk-profile-summary",
+                &[("alias", "ops")][..],
+                ["ops", "risk_profile"].as_slice(),
+            ),
+            (
+                "cli-status-channel-configured",
+                &[("status", "configured")][..],
+                ["✅ configured"].as_slice(),
+            ),
+            (
+                "cli-status-channel-not-configured",
+                &[("status", "not configured")][..],
+                ["❌ not configured"].as_slice(),
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in keys {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected_part in expected_parts {
+                    assert!(
+                        value.contains(expected_part),
+                        "{key} in {locale} should contain {expected_part:?}, got {value:?}"
+                    );
+                }
+                assert!(
+                    !value.contains('{'),
+                    "{key} in {locale} should not leak a missing Fluent placeholder: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zh_cn_wechat_translations_preserve_machine_facing_tokens() {
         let zh_cn = include_str!("../locales/zh-CN/cli.ftl");
         let bind = format_ftl_message(
