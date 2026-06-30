@@ -216,6 +216,8 @@ const MAX_CHANNEL_HISTORY: usize = 50;
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 const CURRENT_DATE_HEADING: &str = "## Current Date\n\n";
 const LEGACY_CURRENT_DATE_TIME_HEADING: &str = "## Current Date & Time\n\n";
+const WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL: &str = "Observed WhatsApp group message";
+const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group message";
 
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
@@ -597,9 +599,19 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         Some(_) if is_matrix_channel_name(&msg.channel) => None,
         other => other,
     };
-    let raw = match thread_scope {
-        Some(tid) => format!("{channel_scope}_{}_{tid}_{}", msg.reply_target, msg.sender),
-        None => format!("{channel_scope}_{}_{}", msg.reply_target, msg.sender),
+    let raw = match (msg.conversation_scope, thread_scope) {
+        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(tid)) => {
+            format!("{channel_scope}_{}_{tid}", msg.reply_target)
+        }
+        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
+            format!("{channel_scope}_{}", msg.reply_target)
+        }
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(tid)) => {
+            format!("{channel_scope}_{}_{tid}_{}", msg.reply_target, msg.sender)
+        }
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
+            format!("{channel_scope}_{}_{}", msg.reply_target, msg.sender)
+        }
     };
     sanitize_session_key(&raw)
 }
@@ -1149,6 +1161,35 @@ fn compose_outgoing_user_turn_with_context(
 fn timestamp_channel_user_content(content: &str) -> String {
     let now = chrono::Local::now();
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
+}
+
+fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        format!("[{label}]\n{content}")
+    } else {
+        format!("[{label} from {sender}]\n{content}")
+    }
+}
+
+fn attributed_whatsapp_group_user_turn(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    label: &str,
+    content: &str,
+) -> String {
+    if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
+        format_whatsapp_group_history_turn(label, &msg.sender, content)
+    } else {
+        content.to_string()
+    }
+}
+
+fn timestamped_channel_user_history_content(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    label: &str,
+) -> String {
+    let timestamped_content = timestamp_channel_user_content(&msg.content);
+    attributed_whatsapp_group_user_turn(msg, label, &timestamped_content)
 }
 
 /// Collapse only heavy inline `data:` image payloads in historical turns while
@@ -4184,6 +4225,63 @@ async fn reconcile_early_ack(
     }
 }
 
+fn stamp_session_routing_context(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    history_key: &str,
+) {
+    let Some(ref store) = ctx.session_store else {
+        return;
+    };
+
+    let channel_id = msg
+        .channel_alias
+        .as_deref()
+        .map(|alias| format!("{}.{alias}", msg.channel));
+    let room_id = msg
+        .thread_ts
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let target = msg.reply_target.trim();
+            if target.is_empty() {
+                None
+            } else {
+                Some(target)
+            }
+        });
+    let context = zeroclaw_infra::session_backend::SessionContext {
+        channel_id: channel_id.as_deref(),
+        room_id,
+        sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
+    };
+    if let Err(e) = store.set_session_context(history_key, context) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"history_key": history_key, "e": e.to_string()})),
+            "Failed to stamp session routing context"
+        );
+    }
+}
+
+fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
+    let timestamped_content =
+        timestamped_channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
+    append_sender_turn(ctx, history_key, ChatMessage::user(&timestamped_content));
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "message_id": msg.id,
+                "history_key": history_key,
+            })
+        ),
+        "recorded passive channel context"
+    );
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4200,6 +4298,7 @@ async fn process_channel_message_body(
                 "thread_ts": msg.thread_ts,
                 "content": msg.content,
                 "attachments_count": msg.attachments.len(),
+                "passive_context": msg.passive_context,
             })
         ),
         "channel inbound message"
@@ -4261,6 +4360,13 @@ async fn process_channel_message_body(
         }
     }
 
+    let history_key = conversation_history_key(&msg);
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
+    if msg.passive_context {
+        record_passive_context(ctx.as_ref(), &msg, &history_key);
+        return;
+    }
+
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
     // any early-return reconciliation can await the add before removing the 👀,
@@ -4303,7 +4409,6 @@ async fn process_channel_message_body(
             None
         };
 
-    let history_key = conversation_history_key(&msg);
     let thinking_override = ctx
         .thinking_overrides
         .lock()
@@ -4328,7 +4433,8 @@ async fn process_channel_message_body(
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = ctx.model_provider.supports_vision();
+        let vision =
+            ctx.model_provider.supports_vision() || ctx.multimodal.vision_model_provider.is_some();
         // Build from legacy config; if that fails (e.g. no legacy api_key
         // but typed providers are configured), fall back to an empty shell
         // so with_typed_providers() can still populate the registry.
@@ -4393,40 +4499,6 @@ async fn process_channel_message_body(
         return;
     }
 
-    if let Some(ref store) = ctx.session_store {
-        let channel_id = msg
-            .channel_alias
-            .as_deref()
-            .map(|alias| format!("{}.{alias}", msg.channel));
-        let room_id = msg
-            .thread_ts
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let target = msg.reply_target.trim();
-                if target.is_empty() {
-                    None
-                } else {
-                    Some(target)
-                }
-            });
-        let context = zeroclaw_infra::session_backend::SessionContext {
-            channel_id: channel_id.as_deref(),
-            room_id,
-            sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
-        };
-        if let Err(e) = store.set_session_context(&history_key, context) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"history_key": history_key, "e": e.to_string()})
-                    ),
-                "Failed to stamp session routing context"
-            );
-        }
-    }
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
@@ -4533,7 +4605,8 @@ async fn process_channel_message_body(
     // Preserve the dated user turn verbatim before the LLM call so interrupted
     // requests keep the same temporal context as CLI turns. History stores the
     // full content for every marker type so a later turn can re-load it.
-    let timestamped_content = timestamp_channel_user_content(&msg.content);
+    let timestamped_content =
+        timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
@@ -5757,7 +5830,7 @@ async fn dispatch_worker(
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-    let register_in_flight = msg.channel != "cli";
+    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
 
     if register_in_flight {
         let previous = {
@@ -10638,6 +10711,7 @@ temperature = 0.3
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         }
     }
 
@@ -13048,6 +13122,98 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[tokio::test]
+    async fn passive_context_records_history_without_channel_or_model_side_effects() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+        );
+
+        let passive_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "passive-1".into(),
+            sender: "bob".into(),
+            reply_target: "group-1@g.us".into(),
+            content: "the release codename is quartz".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            passive_context: true,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..Default::default()
+        };
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            passive_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "passive context must not call the provider"
+        );
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert!(channel_impl.reactions_added.lock().await.is_empty());
+        assert!(channel_impl.reactions_removed.lock().await.is_empty());
+        assert_eq!(channel_impl.start_typing_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(channel_impl.stop_typing_calls.load(Ordering::SeqCst), 0);
+
+        let active_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "active-1".into(),
+            sender: "alice".into(),
+            content: "what is the release codename?".into(),
+            timestamp: 2,
+            passive_context: false,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..passive_msg.clone()
+        };
+        assert_eq!(
+            conversation_history_key(&active_msg),
+            conversation_history_key(&passive_msg)
+        );
+
+        process_channel_message(runtime_ctx, active_msg, CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let user_history = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            user_history.contains("the release codename is quartz"),
+            "active turn should see passive group context, got: {user_history}"
+        );
+        assert!(
+            user_history.contains("[Observed WhatsApp group message from bob]"),
+            "passive group context should preserve observed sender attribution, got: {user_history}"
+        );
+        assert!(
+            user_history.contains("what is the release codename?"),
+            "active turn should still include current message, got: {user_history}"
+        );
+        assert!(
+            user_history.contains("[Current WhatsApp group message from alice]"),
+            "active group turn should preserve current sender attribution, got: {user_history}"
+        );
+    }
+
     struct DelayedHistoryCaptureModelProvider {
         delay: Duration,
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -13554,6 +13720,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -13672,6 +13840,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -13800,6 +13970,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -13951,6 +14123,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14071,6 +14245,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14207,6 +14383,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14331,6 +14509,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14440,6 +14620,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14569,6 +14751,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14715,6 +14899,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14790,6 +14976,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -14924,6 +15112,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -15031,6 +15221,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -15145,6 +15337,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -15514,6 +15708,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -15529,6 +15725,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -15658,6 +15856,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -15674,6 +15874,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -15811,6 +16013,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -15827,6 +16031,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -15967,6 +16173,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -15983,6 +16191,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -16113,6 +16323,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -16129,6 +16341,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -16241,6 +16455,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -16350,6 +16566,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -16473,6 +16691,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -16644,6 +16864,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -17247,6 +17469,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -17266,6 +17490,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_eq!(
@@ -17288,6 +17514,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -17307,6 +17535,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_eq!(followup_thread_id(&msg), None);
@@ -17326,6 +17556,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let second = zeroclaw_api::channel::ChannelMessage {
             id: "$second:server".into(),
@@ -17354,6 +17586,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: Some("$first:server".into()),
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let second = zeroclaw_api::channel::ChannelMessage {
             id: "$second:server".into(),
@@ -17384,6 +17618,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: Some("$root:server".into()),
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let follow_up = zeroclaw_api::channel::ChannelMessage {
             id: "$reply:server".into(),
@@ -17401,6 +17637,33 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn reply_target_conversation_scope_omits_sender_from_history_key() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".into(),
+            sender: "alice".into(),
+            reply_target: "123456@g.us".into(),
+            content: "group context".into(),
+            channel: "whatsapp".into(),
+            channel_alias: Some("main".into()),
+            timestamp: 1,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..Default::default()
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-2".into(),
+            sender: "bob".into(),
+            content: "follow up".into(),
+            timestamp: 2,
+            ..first.clone()
+        };
+
+        let key = conversation_history_key(&first);
+        assert_eq!(key, conversation_history_key(&second));
+        assert!(!key.contains("alice"));
+        assert!(!key.contains("bob"));
+    }
+
+    #[test]
     fn wecom_ws_conversation_history_key_uses_reply_target_scope() {
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "msg_wecom_ws".into(),
@@ -17414,6 +17677,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_eq!(
@@ -17860,6 +18125,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -17873,6 +18140,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         assert_ne!(
@@ -17898,6 +18167,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -17911,6 +18182,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         mem.store(
@@ -17965,6 +18238,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let history_key = conversation_history_key(&msg);
 
@@ -18005,6 +18280,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let group_b_msg = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -18018,6 +18295,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let group_a_history_key = conversation_history_key(&group_a_msg);
         let group_b_history_key = conversation_history_key(&group_b_msg);
@@ -18090,6 +18369,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         let history_key = conversation_history_key(&msg);
         let session_ids = sender_memory_session_ids(&msg, &history_key);
@@ -18246,6 +18527,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18265,6 +18548,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18415,6 +18700,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18451,6 +18738,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18492,6 +18781,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18614,6 +18905,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -18814,6 +19107,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -19187,6 +19481,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -19308,6 +19604,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -19448,6 +19746,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -20834,6 +21134,121 @@ This is an example JSON object for profile settings."#;
     /// marker) sent through `process_channel_message` with a non-vision
     /// model_provider must produce a `"⚠️ Error: …does not support vision"` reply
     /// on the recording channel — no real Telegram or LLM API required.
+
+    #[tokio::test]
+    async fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let vision_server = MockServer::start().await;
+        let _vision_mock = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "vision saw bytes"
+                        }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&vision_server)
+            .await;
+
+        let base_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            Arc::new(vec![]),
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            multimodal: zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some(format!("custom:{}", vision_server.uri())),
+                vision_model: Some("test-vision-model".to_string()),
+                ..Default::default()
+            },
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-route".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image-route".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "route.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let calls = provider_impl.calls.lock().unwrap();
+            assert!(
+                calls.is_empty(),
+                "default non-vision provider must not receive an image-bearing turn: {calls:?}"
+            );
+        }
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "vision route should send exactly one assistant reply: {sent_messages:?}"
+        );
+        assert!(
+            sent_messages[0].contains("vision saw bytes"),
+            "reply should come from the mock vision provider: {sent_messages:?}"
+        );
+        drop(sent_messages);
+
+        let vision_requests = vision_server
+            .received_requests()
+            .await
+            .expect("mock server should record vision provider requests");
+        assert_eq!(
+            vision_requests.len(),
+            1,
+            "vision provider should receive exactly one request"
+        );
+        let vision_body: serde_json::Value = vision_requests[0]
+            .body_json()
+            .expect("vision provider request should be JSON");
+        assert_eq!(vision_body["model"], "test-vision-model");
+        assert!(
+            vision_body
+                .to_string()
+                .contains("data:image/png;base64,AQIDBA=="),
+            "vision provider request must contain the preserved attachment bytes: {vision_body}"
+        );
+    }
+
     #[tokio::test]
     async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -20932,6 +21347,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21047,6 +21464,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21066,6 +21485,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21203,6 +21624,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21222,6 +21645,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21432,6 +21857,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21581,6 +22008,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21722,6 +22151,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21883,6 +22314,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -22144,6 +22577,8 @@ This is an example JSON object for profile settings."#;
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
     }
@@ -22162,6 +22597,8 @@ This is an example JSON object for profile settings."#;
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
     }
@@ -22181,6 +22618,8 @@ This is an example JSON object for profile settings."#;
             interruption_scope_id: None,                 // but NOT a thread reply
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
@@ -22285,6 +22724,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -22301,6 +22742,8 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             })
             .await
             .unwrap();

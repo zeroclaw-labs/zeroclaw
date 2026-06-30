@@ -222,6 +222,48 @@ jobs:
       - name: Check
         run: cargo check --locked ${{ matrix.args }}
 
+  check-plugin-backends:
+    name: Check (${{ matrix.name }})
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plugins cranelift backend
+            features: plugins-wasm-cranelift
+          - name: plugins pulley backend
+            features: plugins-wasm-pulley
+          - name: plugins runtime-only backend
+            features: plugins-wasmtime
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect plugin backend changes
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^Cargo\.(toml|lock)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check
+        if: steps.changed.outputs.run == 'true'
+        run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
+
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]

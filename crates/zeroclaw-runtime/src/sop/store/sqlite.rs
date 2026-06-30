@@ -529,6 +529,7 @@ mod tests {
                 payload: None,
                 timestamp: "t".to_string(),
             },
+            frame_marker_id: format!("marker-{id}"),
             status,
             current_step: 0,
             total_steps: 1,

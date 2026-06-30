@@ -83,12 +83,12 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    `missing_pricing` warn so silent zero-cost records show up in logs.
 
 4. **CostTracker is a process-global singleton** (`OnceLock` in
-   `crates/zeroclaw-config/src/cost/tracker.rs`). Its `CostConfig` is
-   frozen at first init; if the operator flips `cost.enabled` after
-   that, the daemon must restart for the tracker to honor the new
-   value. The orchestrator's pricing map, in contrast, is rebuilt on
-   every daemon reload from the live config, so rate edits take
-   effect on the next request after reload.
+   `crates/zeroclaw-config/src/cost/tracker.rs`). Reload applies the
+   latest `CostConfig` to the existing tracker, and if cost tracking
+   was disabled at boot, a later reload with `cost.enabled = true`
+   constructs the tracker on demand. The orchestrator's pricing map is
+   also rebuilt on every daemon reload from the live config, so rate
+   edits take effect on the next request after reload.
 
 ## Persistence
 

@@ -1937,6 +1937,8 @@ mod inbound {
             interruption_scope_id: interruption_scope,
             attachments,
             subject: None,
+
+            ..Default::default()
         };
 
         if let Err(e) = ctx.tx.send(msg).await {
