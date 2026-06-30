@@ -130,8 +130,8 @@ mod tests {
     use super::*;
     use crate::sop::metrics::SopMetricsCollector;
     use crate::sop::types::{
-        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopStepResult,
-        SopStepStatus, SopTrigger, SopTriggerSource,
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepResult, SopStepStatus,
+        SopTrigger, SopTriggerSource,
     };
     use serde_json::json;
     use zeroclaw_config::schema::SopConfig;
@@ -148,10 +148,7 @@ mod tests {
                 number: 1,
                 title: "Step one".to_string(),
                 body: "Complete the step".to_string(),
-                suggested_tools: Vec::new(),
-                requires_confirmation: false,
-                kind: SopStepKind::Execute,
-                schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,

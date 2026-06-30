@@ -4,6 +4,13 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 
 const MAX_ROUND_DECIMALS: i64 = 15;
 
+/// Maximum number of entries in the `values` array passed to array-shaped
+/// calculator operations. Caps the pre-allocated `Vec<f64>` so a caller
+/// cannot OOM the host process by passing a multi-million-element array.
+/// 10 000 f64 = 80 KiB — large enough for realistic statistical workloads,
+/// small enough to keep memory bounded under hostile or buggy input.
+const MAX_VALUES_LEN: usize = 10_000;
+
 pub struct CalculatorTool;
 
 impl CalculatorTool {
@@ -171,6 +178,12 @@ fn extract_values(args: &serde_json::Value, min_len: usize) -> Result<Vec<f64>, 
     if values.len() < min_len {
         return Err(format!(
             "Expected at least {min_len} value(s), got {}",
+            values.len()
+        ));
+    }
+    if values.len() > MAX_VALUES_LEN {
+        return Err(format!(
+            "values array must be at most {MAX_VALUES_LEN} entries, got {}",
             values.len()
         ));
     }
@@ -591,6 +604,49 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_rejects_oversized_array() {
+        // Regression for audit OOM: a hostile or buggy caller passing a
+        // million-entry `values` array would pre-allocate ~8 MiB and burn
+        // CPU on f64 reductions. The cap is enforced at the shared
+        // `extract_values` helper so all 15 array-shaped operations
+        // (add, subtract, divide, multiply, sum, average, median, mode,
+        // min, max, range, variance, stdev, percentile, count) inherit it.
+        let tool = CalculatorTool::new();
+        let oversized: Vec<f64> = (0..(MAX_VALUES_LEN + 1)).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": oversized}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.as_ref().unwrap();
+        assert!(
+            err.contains("must be at most 10000 entries"),
+            "expected cap-rejection error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_accepts_exact_cap() {
+        // Boundary: an array of exactly `MAX_VALUES_LEN` entries must
+        // succeed. Off-by-one protection: the cap is inclusive, not
+        // exclusive. Matches the boundary-test pattern from PR #8463
+        // (`read_capped_line_at_exact_cap_is_not_truncated`).
+        let tool = CalculatorTool::new();
+        let at_cap: Vec<f64> = (0..MAX_VALUES_LEN).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": at_cap}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "exact-cap array should succeed: {:?}",
+            result.error
+        );
+        // 0 + 1 + ... + 9999 = 9999 * 10000 / 2 = 49_995_000
+        assert_eq!(result.output, "49995000");
     }
 
     #[tokio::test]

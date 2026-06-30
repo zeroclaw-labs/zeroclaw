@@ -107,3 +107,4 @@ web/src/lib/api-generated.ts
 target/openapi.json
 /v[0-9]*.toml
 .worktrees/
+.zero-to-5/

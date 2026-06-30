@@ -156,6 +156,14 @@ impl Tool for SopExecuteTool {
                             step.title
                         )
                     }
+                    SopRunAction::Pending {
+                        run_id,
+                        step,
+                        reason,
+                        ..
+                    } => {
+                        format!("SOP run {run_id} pending before step {step}: {reason}")
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
@@ -180,7 +188,8 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Failed { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
-        | SopRunAction::CheckpointWait { run_id, .. } => Some(run_id),
+        | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. } => Some(run_id),
     }
 }
 
@@ -210,6 +219,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -219,6 +229,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,
