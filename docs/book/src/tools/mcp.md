@@ -147,14 +147,12 @@ against them return a clear "does not support" error.
 
 ### Pinning resources into context
 
-Set `pinned_resources` on a server to read specific resources once at startup and
-inject them into the system prompt:
-
-```toml
-[mcp.servers.docs]
-command = "my-docs-mcp"
-pinned_resources = ["file:///handbook.md", "file:///policies.md"]
-```
+Each MCP server entry accepts an optional `pinned_resources` field: a list of
+resource URIs to read once at startup and inject into the system prompt. Set it
+through the same config surfaces used to define the server (the gateway, zerocode,
+or `zeroclaw config set`, as shown under [Configure MCP](#configure-mcp)), naming
+the resources you want the agent to always have on hand. See the
+[Config reference](../reference/config.md#mcp) for the field and its default.
 
 Pinned content is read once per run (no live refresh) and is labeled
 `trust="untrusted-external"` so the model treats it as data, not instructions.
