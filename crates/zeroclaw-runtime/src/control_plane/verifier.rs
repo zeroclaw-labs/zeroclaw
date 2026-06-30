@@ -262,6 +262,9 @@ mod tests {
                         crate::control_plane::ControlPlaneHandle {
                             store: std::sync::Arc::clone(&store),
                             boot_id: "test-boot".into(),
+                            recovered_goal_ids: std::sync::Arc::new(std::sync::Mutex::new(
+                                Vec::new(),
+                            )),
                         },
                     );
                     std::sync::Arc::clone(&crate::control_plane::control_plane().unwrap().store)

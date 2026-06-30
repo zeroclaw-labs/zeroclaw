@@ -17,11 +17,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{
-    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind, TaskRecord,
-    TaskRegistry, TaskStatus,
+    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskContinuationContext,
+    TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 4;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 5;
 
 /// The durable task registry. `tasks.db` lives beside the other workspace DBs.
 pub struct SqliteTaskStore {
@@ -177,6 +177,17 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         )
         .context("apply control-plane schema v4")?;
     }
+    if version < 5 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_continuation_contexts (
+                 task_id      TEXT PRIMARY KEY
+                              REFERENCES tasks(id) ON DELETE CASCADE,
+                 context_json TEXT NOT NULL
+             );
+             PRAGMA user_version = 5;",
+        )
+        .context("apply control-plane schema v5")?;
+    }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -259,6 +270,16 @@ fn blockers_to_db(blockers: &[GoalBlocker]) -> Result<String> {
 }
 
 fn blockers_from_db(value: String) -> rusqlite::Result<Vec<GoalBlocker>> {
+    serde_json::from_str(&value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+    })
+}
+
+fn continuation_context_to_db(context: &TaskContinuationContext) -> Result<String> {
+    serde_json::to_string(context).context("serialize task continuation context")
+}
+
+fn continuation_context_from_db(value: String) -> rusqlite::Result<TaskContinuationContext> {
     serde_json::from_str(&value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     })
@@ -394,6 +415,22 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
     Ok(())
 }
 
+fn upsert_continuation_context(
+    conn: &Connection,
+    task_id: &str,
+    context: &TaskContinuationContext,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO task_continuation_contexts (task_id, context_json)
+         VALUES (?1, ?2)
+         ON CONFLICT(task_id) DO UPDATE
+             SET context_json = excluded.context_json",
+        params![task_id, continuation_context_to_db(context)?],
+    )
+    .context("upsert task continuation context")?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
@@ -402,13 +439,22 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
-    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> Result<()> {
+    async fn create_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+        continuation_context: Option<TaskContinuationContext>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("start create goal transaction")?;
+        let task_id = goal.task_id.clone();
         insert_task_record(&tx, task)?;
         insert_goal_task_record(&tx, goal)?;
+        if let Some(context) = continuation_context {
+            upsert_continuation_context(&tx, &task_id, &context)?;
+        }
         tx.commit().context("commit create goal transaction")?;
         Ok(())
     }
@@ -624,6 +670,40 @@ impl TaskRegistry for SqliteTaskStore {
         )
         .context("update goal pause state")?;
         Ok(())
+    }
+
+    async fn set_continuation_context(
+        &self,
+        task_id: &str,
+        context: Option<TaskContinuationContext>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        match context {
+            Some(context) => upsert_continuation_context(&conn, task_id, &context)?,
+            None => {
+                conn.execute(
+                    "DELETE FROM task_continuation_contexts WHERE task_id = ?1",
+                    params![task_id],
+                )
+                .context("delete task continuation context")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_continuation_context(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskContinuationContext>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT context_json
+             FROM task_continuation_contexts WHERE task_id = ?1",
+            params![task_id],
+            |row| continuation_context_from_db(row.get("context_json")?),
+        )
+        .optional()
+        .context("get task continuation context")
     }
 
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
@@ -909,6 +989,7 @@ mod tests {
                     pause_description: None,
                     blockers: Vec::new(),
                 },
+                None,
             )
             .await
             .expect_err("goal extension FK failure should abort transaction");

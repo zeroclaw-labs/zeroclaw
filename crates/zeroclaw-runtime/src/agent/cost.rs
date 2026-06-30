@@ -909,6 +909,7 @@ mod tests {
                             crate::control_plane::ControlPlaneHandle {
                                 store: Arc::clone(&store),
                                 boot_id: "test-boot".into(),
+                                recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
                             },
                         );
                         Arc::clone(&crate::control_plane::control_plane().unwrap().store)

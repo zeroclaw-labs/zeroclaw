@@ -12,8 +12,8 @@ use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
 use super::global::control_plane;
 use super::task_registry::{
-    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind,
-    TaskRecord, TaskRegistry, TaskStatus,
+    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+    TaskContinuationContext, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 use super::verifier::{GoalVerifierDecision, verifier_outage_pause, verify_goal_completion};
 
@@ -155,6 +155,7 @@ pub struct GoalAdmissionContext {
     pub channel_type: Option<String>,
     pub originator_route: Option<String>,
     pub principal_id: Option<String>,
+    pub continuation_context: Option<TaskContinuationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +190,7 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            continuation_context: None,
         }
     }
 
@@ -213,6 +215,12 @@ impl GoalAdmissionContext {
     #[must_use]
     pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
         self.principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_continuation_context(mut self, context: Option<TaskContinuationContext>) -> Self {
+        self.continuation_context = context;
         self
     }
 }
@@ -716,6 +724,7 @@ async fn start_goal(
     token_limit: Option<u64>,
     cost_limit_usd: Option<f64>,
 ) -> Result<GoalAdmission> {
+    let continuation_context = ctx.continuation_context.clone();
     if let Some(active) = store
         .latest_active_goal_for_context(
             &ctx.agent_alias,
@@ -766,6 +775,7 @@ async fn start_goal(
                 finished_at: None,
             },
             goal,
+            continuation_context,
         )
         .await
         .map_err(|error| {
@@ -964,6 +974,12 @@ async fn resume_goal(
             )
         );
     }
+    if let Some(context) = ctx.continuation_context.clone() {
+        store
+            .set_continuation_context(&task.id, Some(context))
+            .await
+            .with_context(|| msg("goal-command-error-resume-failed", &[("task_id", &task.id)]))?;
+    }
     store
         .update_goal_pause(&task.id, None)
         .await
@@ -1125,6 +1141,7 @@ fn nonempty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::TaskContinuationConversationScope;
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
     use std::sync::Arc;
 
@@ -1145,6 +1162,7 @@ mod tests {
                     crate::control_plane::ControlPlaneHandle {
                         store: Arc::clone(&store),
                         boot_id: "test-boot".into(),
+                        recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
                     },
                 );
                 Arc::clone(&crate::control_plane::control_plane().unwrap().store)
@@ -1303,6 +1321,7 @@ mod tests {
                     pause_description: None,
                     blockers: Vec::new(),
                 },
+                None,
             )
             .await
             .unwrap();
@@ -1358,6 +1377,35 @@ mod tests {
         let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
         assert_eq!(goal.effective_token_limit, None);
         assert_eq!(goal.effective_cost_limit_usd, Some(3.25));
+    }
+
+    #[tokio::test]
+    async fn goal_start_persists_restart_continuation_context() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let continuation_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: Some("work".into()),
+            reply_target: "!room:example.org".into(),
+            sender: "@operator:example.org".into(),
+            thread_ts: Some("$root".into()),
+            interruption_scope_id: Some("$root".into()),
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some("matrix_work__room_example_org".into()))
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation_context.clone()));
+
+        let started = start_goal(&store, "boot-a", ctx, "ship it".into(), None, None)
+            .await
+            .unwrap();
+        let task_id = started.task_id.unwrap();
+
+        assert_eq!(
+            store.get_continuation_context(&task_id).await.unwrap(),
+            Some(continuation_context)
+        );
     }
 
     #[tokio::test]

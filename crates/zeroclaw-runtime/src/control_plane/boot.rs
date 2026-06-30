@@ -5,7 +5,7 @@
 //! orphans). `DaemonRegistry` owns the spawned reaper task's lifetime via its cancel.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tokio::task::JoinHandle;
@@ -22,6 +22,7 @@ use super::task_store_sqlite::SqliteTaskStore;
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
     pub boot_id: String,
+    pub(crate) recovered_goal_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl ControlPlaneHandle {
@@ -54,19 +55,39 @@ impl ControlPlaneHandle {
         goal_restart_recovery: GoalRestartRecovery,
     ) -> Result<Self> {
         let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
-        let recovered =
+        let recovery =
             reaper::recovery_pass(store.as_ref(), &boot_id, goal_restart_recovery).await?;
-        if recovered > 0 {
+        if recovery.recovered > 0 {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(
-                        ::serde_json::json!({ "recovered": recovered, "boot_id": boot_id })
-                    ),
+                    .with_attrs(::serde_json::json!({
+                        "recovered": recovery.recovered,
+                        "restart_goal_count": recovery.restart_goal_ids.len(),
+                        "boot_id": boot_id,
+                    })),
                 "control-plane: recovered prior-boot tasks at startup"
             );
         }
-        Ok(Self { store, boot_id })
+        Ok(Self {
+            store,
+            boot_id,
+            recovered_goal_ids: Arc::new(Mutex::new(recovery.restart_goal_ids)),
+        })
+    }
+
+    /// Drain goal IDs recovered by this boot's `last_state` policy.
+    ///
+    /// This is an in-memory startup work queue, not canonical lifecycle state.
+    /// If the process crashes before the channel loop consumes it, the next boot
+    /// will recover the goal again under its new `boot_id`.
+    pub fn take_recovered_goal_ids(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .recovered_goal_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`

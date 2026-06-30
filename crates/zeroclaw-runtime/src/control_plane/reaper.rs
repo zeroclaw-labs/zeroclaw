@@ -30,6 +30,12 @@ pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// Default grace before a same-boot task with a stale/absent heartbeat is timed out.
 pub const DEFAULT_MAX_RUNTIME_SECS: i64 = 3600;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryPassReport {
+    pub recovered: usize,
+    pub restart_goal_ids: Vec<String>,
+}
+
 /// Age in seconds of an RFC3339 instant, or `None` if it cannot be parsed. We NEVER
 /// reap on a timestamp we could not read — a corrupt `heartbeat_at` must not kill a
 /// task (review finding #9).
@@ -49,16 +55,20 @@ pub async fn recovery_pass(
     store: &dyn TaskRegistry,
     boot_id: &str,
     goal_restart_recovery: GoalRestartRecovery,
-) -> anyhow::Result<usize> {
-    let mut recovered = 0usize;
+) -> anyhow::Result<RecoveryPassReport> {
+    let mut report = RecoveryPassReport::default();
     for rec in store.list_running().await? {
         if rec.owner_boot_id != boot_id
             && recover_prior_boot_running(store, &rec, boot_id, goal_restart_recovery).await?
         {
-            recovered += 1;
+            report.recovered += 1;
+            if rec.kind == TaskKind::Goal && goal_restart_recovery == GoalRestartRecovery::LastState
+            {
+                report.restart_goal_ids.push(rec.id);
+            }
         }
     }
-    Ok(recovered)
+    Ok(report)
 }
 
 /// The periodic supervision loop. Runs until `cancel` is triggered. Each tick:
@@ -239,10 +249,11 @@ mod tests {
         s.create(rec("mine", "boot-NEW", std::process::id(), Some(0)))
             .await
             .unwrap();
-        let n = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::default())
+        let report = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::default())
             .await
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(report.recovered, 1);
+        assert!(report.restart_goal_ids.is_empty());
         assert_eq!(
             s.get("orphan").await.unwrap().unwrap().status,
             TaskStatus::Lost
@@ -269,15 +280,17 @@ mod tests {
                 pause_description: None,
                 blockers: Vec::new(),
             },
+            None,
         )
         .await
         .unwrap();
 
-        let n = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::default())
+        let report = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::default())
             .await
             .unwrap();
 
-        assert_eq!(n, 1);
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.restart_goal_ids, vec!["goal"]);
         let recovered = s.get("goal").await.unwrap().unwrap();
         assert_eq!(recovered.status, TaskStatus::Running);
         assert_eq!(recovered.owner_boot_id, "boot-NEW");
@@ -303,15 +316,17 @@ mod tests {
                 pause_description: None,
                 blockers: Vec::new(),
             },
+            None,
         )
         .await
         .unwrap();
 
-        let n = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::Paused)
+        let report = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::Paused)
             .await
             .unwrap();
 
-        assert_eq!(n, 1);
+        assert_eq!(report.recovered, 1);
+        assert!(report.restart_goal_ids.is_empty());
         assert_eq!(
             s.get("goal").await.unwrap().unwrap().status,
             TaskStatus::Paused

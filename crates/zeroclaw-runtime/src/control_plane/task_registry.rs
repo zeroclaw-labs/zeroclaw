@@ -110,6 +110,37 @@ pub struct GoalPauseState {
     pub blockers: Vec<GoalBlocker>,
 }
 
+/// Persisted channel scope needed to synthesize a trusted goal continuation
+/// turn after daemon restart.
+///
+/// This is intentionally narrower than `ChannelMessage`: it owns only delivery
+/// and history-routing facts that cannot be reconstructed from
+/// [`TaskRecord::originator_route`]. User text, attachments, and other
+/// transient message data stay out of the durable control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContinuationContext {
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_alias: Option<String>,
+    pub reply_target: String,
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_scope_id: Option<String>,
+    pub conversation_scope: TaskContinuationConversationScope,
+}
+
+/// Durable representation of the channel history scope for a continuation
+/// prompt. Kept local to the control plane so the store does not depend on
+/// channel transport structs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskContinuationConversationScope {
+    Sender,
+    ReplyTarget,
+}
+
 impl TaskStatus {
     /// A task is terminal once it can no longer transition. The reaper only
     /// reconciles non-terminal records.
@@ -182,7 +213,12 @@ pub trait TaskRegistry: Send + Sync {
     /// `TaskRecord` remains the canonical lifecycle/route/principal record;
     /// `GoalTaskRecord` remains the goal-only extension. This method only owns
     /// the transaction boundary between those two source-of-truth rows.
-    async fn create_goal(&self, task: TaskRecord, goal: GoalTaskRecord) -> anyhow::Result<()>;
+    async fn create_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+        continuation_context: Option<TaskContinuationContext>,
+    ) -> anyhow::Result<()>;
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;
     /// Transition `id` to `status`, optionally recording terminal output/error.
@@ -239,6 +275,20 @@ pub trait TaskRegistry: Send + Sync {
         task_id: &str,
         pause: Option<GoalPauseState>,
     ) -> anyhow::Result<()>;
+    /// Replace or clear the restart continuation delivery context for a task.
+    ///
+    /// The context is control-plane-owned delivery state, not lifecycle state.
+    /// It is consumed only when restart recovery needs to enqueue a trusted
+    /// continuation prompt after the channel registry has come online.
+    async fn set_continuation_context(
+        &self,
+        task_id: &str,
+        context: Option<TaskContinuationContext>,
+    ) -> anyhow::Result<()>;
+    async fn get_continuation_context(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<TaskContinuationContext>>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is
     /// authoritative for it. Returns `false` (no write) when another live daemon
     /// owns it. See [`crate::control_plane::authority::is_authoritative`].

@@ -34,7 +34,10 @@ pub use goal::{
     scope_goal_admission_context, scope_goal_state_updates,
 };
 pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
-pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+pub use task_registry::{
+    TaskContinuationContext, TaskContinuationConversationScope, TaskKind, TaskRecord, TaskRegistry,
+    TaskStatus,
+};
 pub use task_store_sqlite::SqliteTaskStore;
 pub use verifier::{
     GoalVerifierDecision, ensure_verifier_allows_completion, verifier_outage_pause,

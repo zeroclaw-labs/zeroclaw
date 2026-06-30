@@ -112,8 +112,9 @@ impl Tool for GoalStartTool {
 mod tests {
     use super::*;
     use crate::control_plane::{
-        GoalAdmissionContext, GoalCommand, GoalCommandAction, TaskRegistry, admit_goal_command,
-        control_plane, init_control_plane, scope_goal_admission_context,
+        GoalAdmissionContext, GoalCommand, GoalCommandAction, TaskContinuationContext,
+        TaskContinuationConversationScope, TaskRegistry, admit_goal_command, control_plane,
+        init_control_plane, scope_goal_admission_context,
     };
     use std::sync::Arc;
 
@@ -138,6 +139,7 @@ mod tests {
                 let _ = init_control_plane(crate::control_plane::ControlPlaneHandle {
                     store: Arc::clone(&store),
                     boot_id: "test-boot".into(),
+                    recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
                 });
                 Arc::clone(&control_plane().unwrap().store)
             }
@@ -145,9 +147,19 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config::default();
         config.goal.allowed_channel_types.push("channel".into());
         let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config.clone()));
+        let continuation_context = TaskContinuationContext {
+            channel: "channel".into(),
+            channel_alias: Some("default".into()),
+            reply_target: "room-a".into(),
+            sender: "operator-a".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
         let owner = GoalAdmissionContext::new(agent.clone())
             .with_originator_route(Some("channel:route-a".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation_context.clone()));
 
         let result = scope_goal_admission_context(
             Some(owner.clone()),
@@ -164,6 +176,10 @@ mod tests {
             .unwrap();
         assert_eq!(task.originator_route.as_deref(), Some("channel:route-a"));
         assert_eq!(task.principal_id.as_deref(), Some("principal-a"));
+        assert_eq!(
+            store.get_continuation_context(&task.id).await.unwrap(),
+            Some(continuation_context)
+        );
 
         let wrong_route = GoalAdmissionContext::new(agent)
             .with_originator_route(Some("channel:route-b".into()))
