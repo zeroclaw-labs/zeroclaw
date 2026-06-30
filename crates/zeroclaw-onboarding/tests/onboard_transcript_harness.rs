@@ -497,16 +497,75 @@ impl<S: SecretReader> SecretReader for RecordingSecretReader<S> {
 /// `AgentResponder -> LlmTransport -> spec.walk` stack the live agent drives,
 /// with no parallel responder. It holds conversation memory: every message it
 /// receives is appended to `history`, proving the walk is one continuous
-/// exchange rather than isolated one-shot questions. Answers are served
-/// positionally from the spec so each parses for its field's type, and the
-/// first field gets a mid-field clarification turn before its real answer so the
-/// recorded transcript captures genuine back-and-forth. It can never loop
-/// forever because each served answer parses.
+/// exchange rather than isolated one-shot questions. Answers are field-aware:
+/// each is a realistic value chosen by the field's `prop` so the transcript
+/// reads like a real operator being guided (a homeserver URL for `homeserver`,
+/// `@bot:matrix.org` for `user_id`, an in-range number for a pacing field),
+/// while still parsing for its field's type. The first field gets a mid-field
+/// clarification turn before its real answer so the recorded transcript captures
+/// genuine back-and-forth. It can never loop forever because each served answer
+/// parses.
 struct MemoryScriptedTurn {
     answers: std::collections::VecDeque<String>,
     pending: std::collections::VecDeque<String>,
     history: Vec<String>,
     injected_clarification: bool,
+}
+
+/// Realistic fixture values keyed by the field's leaf name (the last
+/// dot-segment of the fully-qualified `prop`, e.g. `homeserver` from
+/// `channels.matrix.homeserver`), walked as a table so there is no
+/// string-literal match and a field is one row to add. Yes/no and number
+/// fields fall back to a generic type-valid value when absent.
+const FREEFORM_ANSWERS: &[(&str, &str)] = &[
+    ("homeserver", "https://matrix.org"),
+    ("user_id", "@bot:matrix.org"),
+    ("device_id", "ZEROCLAW01"),
+    ("allowed_rooms", "!ops:matrix.org"),
+    ("excluded_tools", "shell"),
+    ("stream_mode", "off"),
+];
+const NUMBER_ANSWERS: &[(&str, &str)] = &[
+    ("approval_timeout_secs", "60"),
+    ("reply_min_interval_secs", "2"),
+    ("reply_queue_depth_max", "16"),
+    ("draft_update_interval_ms", "500"),
+    ("multi_message_delay_ms", "250"),
+];
+const NO_ANSWER_FIELDS: &[&str] = &["mention_only"];
+
+fn prop_leaf(prop: &str) -> &str {
+    prop.rsplit_once('.').map_or(prop, |(_, leaf)| leaf)
+}
+
+fn lookup(table: &[(&str, &str)], leaf: &str, fallback: &str) -> String {
+    table
+        .iter()
+        .find(|(key, _)| *key == leaf)
+        .map_or_else(|| fallback.to_string(), |(_, value)| (*value).to_string())
+}
+
+/// Pick a realistic, type-valid answer for a field from its `prop` so the
+/// transcript demonstrates a representative end-user conversation rather than
+/// type-stub filler. The value obeys the strict transport parse contract (a
+/// yes/no field gets `yes`/`no`, a number gets a bare in-range number, a choice
+/// gets an exact option), matching the bare-value reply the live guide is
+/// briefed to produce.
+fn realistic_answer(prop: &str, response_type: &ResponseType) -> String {
+    let leaf = prop_leaf(prop);
+    match response_type {
+        ResponseType::YesNo => {
+            if NO_ANSWER_FIELDS.contains(&leaf) {
+                "no".to_string()
+            } else {
+                "yes".to_string()
+            }
+        }
+        ResponseType::Number => lookup(NUMBER_ANSWERS, leaf, "10"),
+        ResponseType::Choice { options } => options[0].value.clone(),
+        ResponseType::FreeformText => lookup(FREEFORM_ANSWERS, leaf, "default"),
+        ResponseType::Secret => unreachable!("secret filtered above"),
+    }
 }
 
 impl MemoryScriptedTurn {
@@ -526,14 +585,7 @@ impl MemoryScriptedTurn {
                 break;
             };
             if !matches!(node.prompt.response_type, ResponseType::Secret) {
-                let answer = match &node.prompt.response_type {
-                    ResponseType::YesNo => "yes".to_string(),
-                    ResponseType::Number => "100".to_string(),
-                    ResponseType::Choice { options } => options[0].value.clone(),
-                    ResponseType::FreeformText => "https://walked.test".to_string(),
-                    ResponseType::Secret => unreachable!("secret filtered above"),
-                };
-                answers.push_back(answer);
+                answers.push_back(realistic_answer(&node.prop, &node.prompt.response_type));
             }
             current = match &node.on_success {
                 zeroclaw_runtime::flow::Step::Node(next) => Some(next.clone()),
@@ -623,6 +675,30 @@ async fn run_guided_offline_cell(base: &Path) {
     };
 
     let transcript = log.lock().unwrap().clone();
+
+    let walked = config
+        .channels
+        .matrix
+        .get(INSTANCE)
+        .expect("walked matrix instance present");
+    let walked_table = toml::Value::try_from(walked).expect("serialize walked matrix instance");
+    let mut instance_table = walked_table
+        .as_table()
+        .expect("matrix instance serializes to a table")
+        .clone();
+    for secret_key in ["access_token", "password", "recovery_key"] {
+        if instance_table.contains_key(secret_key) {
+            instance_table.insert(
+                secret_key.to_string(),
+                toml::Value::String("<redacted>".to_string()),
+            );
+        }
+    }
+    let rendered_config = format!(
+        "schema_version = 3\n\n[channels.matrix.{INSTANCE}]\n{}",
+        toml::to_string_pretty(&instance_table).expect("render walked config")
+    );
+
     let mut meta = BTreeMap::new();
     meta.insert("transport", "inproc".to_string());
     meta.insert("mode", "guided".to_string());
@@ -635,6 +711,7 @@ async fn run_guided_offline_cell(base: &Path) {
     let dir = base.join("inproc").join("guided").join("happy");
     std::fs::create_dir_all(&dir).expect("create guided cell folder");
     std::fs::write(dir.join("transcript.txt"), &transcript).expect("write transcript");
+    std::fs::write(dir.join("config.toml"), &rendered_config).expect("write walked config");
     write_meta(&dir, &meta);
 
     assert_eq!(
