@@ -565,10 +565,15 @@ pub fn render_steps(steps: &[SopStep]) -> String {
 /// Serialize a `Sop` to its on-disk pair (`SOP.toml`, `SOP.md`) under
 /// `<sops_dir>/<name>/`. Reuses the manifest serde and the `render_steps`
 /// Markdown projection. No parallel format.
+///
+/// STRICT: validates first and writes NOTHING if any blocking violation is
+/// present. Warnings do not block. Returns the blocking list on rejection.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
-    if sop.name.trim().is_empty() {
-        anyhow::bail!("SOP name is empty");
+    let validation = validate_sop_strict(sop);
+    if !validation.is_ok() {
+        anyhow::bail!("SOP rejected: {}", validation.blocking.join("; "));
     }
+
     let sop_dir = sops_dir.join(&sop.name);
     std::fs::create_dir_all(&sop_dir)?;
 
@@ -614,6 +619,66 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     }
 
     warnings
+}
+
+// ── Validation engine (one rule set, two severities) ────────────
+
+/// The outcome of validating a `Sop` against the one rule set. Blocking
+/// violations reject a save; warnings never block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SopValidation {
+    pub blocking: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl SopValidation {
+    pub fn is_ok(&self) -> bool {
+        self.blocking.is_empty()
+    }
+}
+
+/// Validate a `Sop` with both severities. Folds three sources:
+/// 1. save-only hard constraints (blocking): non-empty name, non-empty step
+///    titles, unique step number (the on-disk routing key).
+/// 2. `SopGraph` structural diagnostics by severity (Error -> blocking,
+///    Warning -> advisory).
+/// 3. `validate_sop` advisory checks (warnings).
+///
+/// NOTE: dup detection keys on step NUMBER, the current on-disk routing key.
+/// Keying by a title-slug would require a model change and is out of scope.
+pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
+    let mut blocking = Vec::new();
+
+    if sop.name.trim().is_empty() {
+        blocking.push("SOP name is empty".into());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for step in &sop.steps {
+        if step.title.trim().is_empty() {
+            blocking.push(format!("Step {} has an empty title", step.number));
+        }
+        if !seen.insert(step.number) {
+            blocking.push(format!("Duplicate step number {}", step.number));
+        }
+    }
+
+    let graph = SopGraph::from_sop(sop);
+    let mut warnings = Vec::new();
+    for diag in &graph.diagnostics {
+        match diag.severity {
+            GraphSeverity::Error => {
+                blocking.push(format!("Step {}: {}", diag.step, diag.message));
+            }
+            GraphSeverity::Warning => {
+                warnings.push(format!("Step {}: {}", diag.step, diag.message));
+            }
+        }
+    }
+
+    warnings.extend(validate_sop(sop));
+
+    SopValidation { blocking, warnings }
 }
 
 #[cfg(test)]
@@ -766,5 +831,127 @@ mod tests {
         assert!(save_sop(tmp.path(), &sop).is_err());
         sop.name = "ok".to_string();
         assert!(save_sop(tmp.path(), &sop).is_ok());
+    }
+
+    fn minimal_sop(name: &str, steps: Vec<SopStep>) -> Sop {
+        Sop {
+            name: name.to_string(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: Vec::new(),
+            steps,
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    #[test]
+    fn strict_save_rejects_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two steps sharing number 1 → duplicate (blocking).
+        let dup = minimal_sop(
+            "dupe",
+            vec![
+                SopStep {
+                    number: 1,
+                    title: "a".to_string(),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 1,
+                    title: "b".to_string(),
+                    ..SopStep::default()
+                },
+            ],
+        );
+        let result = save_sop(tmp.path(), &dup);
+        assert!(result.is_err());
+        assert!(
+            !tmp.path().join("dupe").exists(),
+            "strict save must write nothing on rejection"
+        );
+    }
+
+    #[test]
+    fn strict_save_reports_structured_blocking() {
+        let v = validate_sop_strict(&minimal_sop(
+            "",
+            vec![SopStep {
+                number: 1,
+                title: String::new(),
+                ..SopStep::default()
+            }],
+        ));
+        assert!(!v.is_ok());
+        assert!(v.blocking.iter().any(|b| b.contains("name is empty")));
+        assert!(v.blocking.iter().any(|b| b.contains("empty title")));
+    }
+
+    #[test]
+    fn warnings_do_not_block_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No triggers, no steps → only warnings from validate_sop. Name set.
+        let warn_only = minimal_sop("warns", Vec::new());
+        let v = validate_sop_strict(&warn_only);
+        assert!(v.is_ok(), "warnings alone must not block");
+        assert!(!v.warnings.is_empty());
+        assert!(save_sop(tmp.path(), &warn_only).is_ok());
+        assert!(tmp.path().join("warns").exists());
+    }
+
+    #[test]
+    fn load_is_lenient_for_imperfect_sop() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a SOP with a dangling next ref directly, bypassing strict save.
+        let dir = tmp.path().join("lenient");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SOP.toml"),
+            "[sop]\nname = \"lenient\"\ndescription = \"d\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("SOP.md"),
+            "## Steps\n1. **only step**\n   - next: 99\n",
+        )
+        .unwrap();
+        let loaded = load_sop(&dir, SopExecutionMode::Supervised);
+        assert!(loaded.is_ok(), "load must be lenient and not reject");
+        let v = validate_sop_strict(&loaded.unwrap());
+        assert!(
+            v.blocking.iter().any(|b| b.contains("does not exist")),
+            "the dangling ref surfaces as a blocking diagnostic for repair"
+        );
+    }
+
+    #[test]
+    fn graph_error_folds_to_blocking_warning_folds_to_advisory() {
+        // mismatch (warning) + required unsatisfied (error) in one SOP.
+        let to_frag = |t: &str| serde_json::json!({"type": t});
+        let producer = SopStep {
+            number: 1,
+            title: "p".to_string(),
+            schema: Some(StepSchema {
+                input: None,
+                output: Some(to_frag("number")),
+            }),
+            ..SopStep::default()
+        };
+        let consumer = SopStep {
+            number: 2,
+            title: "c".to_string(),
+            schema: Some(StepSchema {
+                input: Some(to_frag("string")),
+                output: None,
+            }),
+            ..SopStep::default()
+        };
+        let v = validate_sop_strict(&minimal_sop("folds", vec![producer, consumer]));
+        assert!(v.blocking.iter().any(|b| b.contains("required input")));
+        assert!(v.warnings.iter().any(|w| w.contains("mismatch")));
     }
 }
