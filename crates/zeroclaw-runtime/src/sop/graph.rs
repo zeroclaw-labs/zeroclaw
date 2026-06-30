@@ -97,6 +97,84 @@ pub trait GraphRender {
     fn render(&self, graph: &SopGraph) -> Self::Output;
 }
 
+/// Text renderers over the projection. Surfaces that want plain text reuse
+/// these instead of hand-walking the graph.
+pub enum TextGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
+}
+
+/// Render the projection to text in the requested format. Diagnostics, when
+/// present, are appended under a `diagnostics:` section (Json embeds them in
+/// the serialized graph instead).
+pub fn render_graph_text(graph: &SopGraph, format: &TextGraphFormat) -> String {
+    match format {
+        TextGraphFormat::Json => {
+            serde_json::to_string_pretty(graph).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        }
+        TextGraphFormat::Adjacency => {
+            let mut out = String::new();
+            for wire in &graph.wires {
+                let label = match (wire.class, wire.flow_role) {
+                    (PinClass::Flow, Some(role)) => format!("{role:?}").to_lowercase(),
+                    (PinClass::Data, _) => "data".to_string(),
+                    (PinClass::Flow, None) => "flow".to_string(),
+                };
+                out.push_str(&format!(
+                    "{} -> {} [{}]\n",
+                    wire.from_step, wire.to_step, label
+                ));
+            }
+            append_diagnostics(graph, &mut out);
+            out
+        }
+        TextGraphFormat::Outline => {
+            let mut out = String::new();
+            for node in &graph.nodes {
+                let outs: Vec<String> = graph
+                    .wires
+                    .iter()
+                    .filter(|w| w.from_step == node.step && w.class == PinClass::Flow)
+                    .map(|w| w.to_step.to_string())
+                    .collect();
+                if outs.is_empty() {
+                    out.push_str(&format!("{}. {}\n", node.step, node.title));
+                } else {
+                    out.push_str(&format!(
+                        "{}. {} -> {}\n",
+                        node.step,
+                        node.title,
+                        outs.join(", ")
+                    ));
+                }
+            }
+            append_diagnostics(graph, &mut out);
+            out
+        }
+    }
+}
+
+fn append_diagnostics(graph: &SopGraph, out: &mut String) {
+    if graph.diagnostics.is_empty() {
+        return;
+    }
+    out.push_str("\ndiagnostics:\n");
+    for diag in &graph.diagnostics {
+        let sev = match diag.severity {
+            GraphSeverity::Error => "error",
+            GraphSeverity::Warning => "warning",
+        };
+        out.push_str(&format!(
+            "  [{}] step {}: {}\n",
+            sev, diag.step, diag.message
+        ));
+    }
+}
+
 /// Extract the JSON Schema `type` string from a schema fragment. A bare
 /// string fragment (the parser's fallback) is treated as that type name.
 fn schema_type(fragment: &serde_json::Value) -> Option<String> {
@@ -566,5 +644,41 @@ mod tests {
         let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a")]));
         let json = serde_json::to_string(&graph).unwrap();
         assert!(json.contains("\"nodes\""));
+    }
+
+    #[test]
+    fn text_outline_lists_nodes_and_flow_edges() {
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b")]));
+        let out = render_graph_text(&graph, &TextGraphFormat::Outline);
+        assert!(out.contains("1. a -> 2"));
+        assert!(out.contains("2. b"));
+    }
+
+    #[test]
+    fn text_adjacency_one_edge_per_line() {
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b")]));
+        let out = render_graph_text(&graph, &TextGraphFormat::Adjacency);
+        assert!(out.contains("1 -> 2 [sequence]"));
+    }
+
+    #[test]
+    fn text_json_is_parseable_projection() {
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a")]));
+        let out = render_graph_text(&graph, &TextGraphFormat::Json);
+        let back: SopGraph = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.nodes.len(), 1);
+    }
+
+    #[test]
+    fn text_renderers_append_diagnostics() {
+        let mut s1 = step(1, "a");
+        s1.routing = StepRouting {
+            next: Some(99),
+            ..StepRouting::default()
+        };
+        let graph = SopGraph::from_sop(&sop_with(vec![s1]));
+        let out = render_graph_text(&graph, &TextGraphFormat::Outline);
+        assert!(out.contains("diagnostics:"));
+        assert!(out.contains("[error]"));
     }
 }

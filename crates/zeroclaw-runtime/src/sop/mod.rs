@@ -19,7 +19,7 @@ pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphNode, GraphPin, GraphRender, GraphSeverity, GraphWire,
-    PinClass, SopGraph,
+    PinClass, SopGraph, TextGraphFormat, render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;

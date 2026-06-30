@@ -199,6 +199,26 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             "This command talks to the running daemon over the gateway; \
              it is not handled by the local SOP CLI."
         ),
+        crate::SopCommands::Graph { name, format } => {
+            let sop = sops
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| anyhow::Error::msg(format!("SOP not found: {name}")))?;
+            let graph = SopGraph::from_sop(sop);
+            let fmt = match format {
+                crate::SopGraphFormat::Outline => TextGraphFormat::Outline,
+                crate::SopGraphFormat::Adjacency => TextGraphFormat::Adjacency,
+                crate::SopGraphFormat::Json => TextGraphFormat::Json,
+            };
+            print!("{}", render_graph_text(&graph, &fmt));
+            Ok(())
+        }
+        crate::SopCommands::Delete { name } => {
+            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            delete_sop(&dir, &name)?;
+            println!("Deleted SOP: {name}");
+            Ok(())
+        }
     }
 }
 
@@ -591,5 +611,100 @@ type = "manual"
         assert_eq!(steps[1].kind, SopStepKind::Checkpoint);
         // Default kind should be Execute
         assert_eq!(steps[2].kind, SopStepKind::Execute);
+    }
+
+    fn config_with_sops_dir(dir: &Path) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.sop.sops_dir = Some(dir.to_string_lossy().into_owned());
+        config
+    }
+
+    fn sample_sop(name: &str) -> Sop {
+        Sop {
+            name: name.to_string(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "first".to_string(),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "second".to_string(),
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    #[test]
+    fn cli_graph_renders_each_format() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sop(dir.path(), &sample_sop("g")).unwrap();
+        let config = config_with_sops_dir(dir.path());
+
+        for format in [
+            crate::SopGraphFormat::Outline,
+            crate::SopGraphFormat::Adjacency,
+            crate::SopGraphFormat::Json,
+        ] {
+            let r = handle_command(
+                crate::SopCommands::Graph {
+                    name: "g".to_string(),
+                    format,
+                },
+                &config,
+            );
+            assert!(r.is_ok(), "graph {format:?} should render");
+        }
+    }
+
+    #[test]
+    fn cli_graph_unknown_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_sops_dir(dir.path());
+        let r = handle_command(
+            crate::SopCommands::Graph {
+                name: "missing".to_string(),
+                format: crate::SopGraphFormat::Outline,
+            },
+            &config,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn cli_delete_removes_sop() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sop(dir.path(), &sample_sop("victim")).unwrap();
+        assert!(dir.path().join("victim").exists());
+        let config = config_with_sops_dir(dir.path());
+
+        let r = handle_command(
+            crate::SopCommands::Delete {
+                name: "victim".to_string(),
+            },
+            &config,
+        );
+        assert!(r.is_ok());
+        assert!(!dir.path().join("victim").exists());
+
+        // Deleting a missing SOP errors.
+        let r2 = handle_command(
+            crate::SopCommands::Delete {
+                name: "victim".to_string(),
+            },
+            &config,
+        );
+        assert!(r2.is_err());
     }
 }
