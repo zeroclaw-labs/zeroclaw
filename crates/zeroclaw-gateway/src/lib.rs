@@ -707,12 +707,40 @@ pub struct AppState {
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+/// Resolve the gateway origin that runtime code should treat as the address
+/// clients can actually reach, given the bound listener.
+///
+/// The listener is the source of truth. `actual_port` is the port the OS
+/// assigned — the configured port normally, or an ephemeral port when the
+/// operator ran `--port 0`. A wildcard bind (`0.0.0.0` / `::`) is not a valid
+/// address to advertise, so the operator's `configured_host` wins in that
+/// case; otherwise the bound IP (which reflects a `--host` CLI override) is
+/// the reachable host.
+///
+/// `run_gateway` writes this back into `config.gateway` before the config is
+/// shared, so A2A discovery cards and every other reader of
+/// `config.gateway.host`/`port` advertise the live listener rather than the
+/// file default. The daemon path already does the equivalent (`daemon::run`);
+/// this extends it to standalone `gateway start` (see #8530).
+fn effective_gateway_origin(
+    actual_port: u16,
+    configured_host: &str,
+    addr: SocketAddr,
+) -> (String, u16) {
+    let host = if addr.ip().is_unspecified() {
+        configured_host.to_string()
+    } else {
+        addr.ip().to_string()
+    };
+    (host, actual_port)
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
-    config: Config,
+    mut config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
     // Reload controls owned by the daemon for supervised runs. RPC reloads
     // write to `shutdown_tx` before signalling daemon reload so the listener
@@ -741,7 +769,6 @@ pub async fn run_gateway(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
@@ -775,6 +802,18 @@ pub async fn run_gateway(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
+
+    // Normalize the gateway origin to the address the listener is actually
+    // reachable on. The CLI `--host`/`--port` override (and the OS-assigned
+    // port when `--port 0`) is the real origin; without this, A2A discovery
+    // cards advertise the stale file-configured port (#8530). Done before the
+    // config is shared so every reader of `config.gateway.host`/`port` agrees.
+    let (origin_host, origin_port) =
+        effective_gateway_origin(actual_port, &config.gateway.host, addr);
+    config.gateway.host = origin_host;
+    config.gateway.port = origin_port;
+
+    let config_state = Arc::new(RwLock::new(config.clone()));
 
     let (boot_family, boot_alias, boot_entry) = config
         .providers
@@ -5358,6 +5397,126 @@ mod tests {
 
         std::net::TcpListener::bind(("127.0.0.1", port))
             .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[test]
+    fn effective_gateway_origin_uses_actual_listener_port() {
+        // A real (non-wildcard) bind advertises the bound IP and the real
+        // listener port — here an override of a differently-configured port.
+        let addr: SocketAddr = "127.0.0.1:42629".parse().unwrap();
+        let (host, port) = effective_gateway_origin(42629, "127.0.0.1", addr);
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 42629);
+    }
+
+    #[test]
+    fn effective_gateway_origin_keeps_configured_host_on_wildcard_bind() {
+        // A wildcard bind is not a valid advertise address; the operator's
+        // configured host wins. The port is still the real listener port.
+        let addr: SocketAddr = "0.0.0.0:42629".parse().unwrap();
+        let (host, port) = effective_gateway_origin(42629, "127.0.0.1", addr);
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 42629);
+    }
+
+    #[test]
+    fn effective_gateway_origin_reflects_host_override() {
+        // `--host` override to a real address is what gets advertised.
+        let addr: SocketAddr = "192.168.1.5:9000".parse().unwrap();
+        let (host, port) = effective_gateway_origin(9000, "127.0.0.1", addr);
+        assert_eq!(host, "192.168.1.5");
+        assert_eq!(port, 9000);
+    }
+
+    // Regression for #8530: starting the gateway with a `--port` override must
+    // advertise the actual listener port in A2A discovery cards, not the stale
+    // `[gateway] port` from config. Without the normalization in `run_gateway`
+    // the card below would advertise `127.0.0.1:42617`.
+    #[tokio::test]
+    async fn run_gateway_a2a_card_advertises_actual_listener_port() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let actual_listener_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // Stale configured port that must NOT appear in the advertised card.
+        config.gateway.port = 42617;
+        config.a2a.server.enabled = true;
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                actual_listener_port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let addr = format!("127.0.0.1:{actual_listener_port}");
+        // Wait for the listener to accept connections.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        // Fetch the catalog card via raw HTTP/1.0 (no client dependency; the
+        // body is delivered until connection close with no chunked encoding).
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(&addr)
+                .await
+                .expect("connect");
+            stream
+                .write_all(b"GET /.well-known/agents-card.json HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .expect("write");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            String::from_utf8_lossy(&buf).to_string()
+        })
+        .await
+        .expect("fetch catalog card should complete");
+
+        shutdown_tx
+            .send(true)
+            .expect("external shutdown sender should stay connected");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        // The advertised URL must use the actual listener port ...
+        assert!(
+            body.contains(&format!("127.0.0.1:{actual_listener_port}")),
+            "card should advertise actual listener port {actual_listener_port}; got: {body}"
+        );
+        // ... and must NOT advertise the stale configured port.
+        assert!(
+            !body.contains("127.0.0.1:42617"),
+            "card must not advertise stale configured port 42617; got: {body}"
+        );
     }
 
     #[tokio::test]
