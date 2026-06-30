@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::component::{Component, ResourceTable};
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
@@ -63,6 +63,18 @@ impl InboundQueue {
     }
 }
 
+/// Resolved per-call execution limits applied to a plugin store. The host
+/// builds this from `[plugins.limits]` config and hands it to `new_store`.
+/// There is deliberately no `Default`: limits always come from the config
+/// registry so no code path can construct an unsandboxed store by accident.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginLimits {
+    pub call_fuel: u64,
+    pub max_memory_bytes: usize,
+    pub max_table_elements: usize,
+    pub max_instances: usize,
+}
+
 pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
@@ -100,28 +112,29 @@ pub struct PluginState {
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
     inbound: InboundQueue,
-}
-
-impl Default for PluginState {
-    fn default() -> Self {
-        Self::new(&[])
-    }
+    limits: StoreLimits,
+    fuel_per_call: u64,
 }
 
 impl PluginState {
-    /// Build store state for a plugin holding `permissions`. `HttpClient` is the
-    /// only permission that widens the host surface here: it attaches a
-    /// `WasiHttpCtx` so the gated `wasi:http` import can be linked. Every other
-    /// permission resolves elsewhere (config jail, memory bridge) and leaves the
-    /// WASI sandbox closed.
-    pub fn new(permissions: &[PluginPermission]) -> Self {
-        Self::with_inbound(permissions, InboundQueue::default())
+    /// Build store state for a plugin holding `permissions` under `limits`.
+    /// `HttpClient` is the only permission that widens the host surface here: it
+    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
+    /// Every other permission resolves elsewhere (config jail, memory bridge)
+    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
+    /// the memory/table/instance ceilings the store limiter enforces.
+    pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
+        Self::with_inbound(permissions, InboundQueue::default(), limits)
     }
 
     /// Build store state with a caller-supplied inbound queue. A channel plugin
     /// whose host listener feeds it inbound traffic shares the listener's queue
     /// handle here, so `inbound-poll` drains what the listener enqueued.
-    pub fn with_inbound(permissions: &[PluginPermission], inbound: InboundQueue) -> Self {
+    pub fn with_inbound(
+        permissions: &[PluginPermission],
+        inbound: InboundQueue,
+        limits: PluginLimits,
+    ) -> Self {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
@@ -130,6 +143,12 @@ impl PluginState {
             table: ResourceTable::new(),
             http,
             inbound,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(limits.max_memory_bytes)
+                .table_elements(limits.max_table_elements)
+                .instances(limits.max_instances)
+                .build(),
+            fuel_per_call: limits.call_fuel,
         }
     }
 
@@ -189,9 +208,42 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
 pub fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
-        let config = Config::new();
+        let mut config = Config::new();
+        config.consume_fuel(true);
         Engine::new(&config).expect("async-capable wasmtime engine")
     })
+}
+
+pub fn new_store(permissions: &[PluginPermission], limits: PluginLimits) -> Store<PluginState> {
+    new_store_with_inbound(permissions, InboundQueue::default(), limits)
+}
+
+/// Like [`new_store`], but the resulting state shares `inbound` so a host
+/// listener can enqueue traffic the plugin drains. The limiter and per-call
+/// fuel are wired identically to [`new_store`].
+pub fn new_store_with_inbound(
+    permissions: &[PluginPermission],
+    inbound: InboundQueue,
+    limits: PluginLimits,
+) -> Store<PluginState> {
+    let state = PluginState::with_inbound(permissions, inbound, limits);
+    let mut store = Store::new(engine(), state);
+    store.limiter(|state| &mut state.limits);
+    set_call_fuel(&mut store, limits.call_fuel);
+    store
+}
+
+fn set_call_fuel(store: &mut Store<PluginState>, call_fuel: u64) {
+    store
+        .set_fuel(call_fuel)
+        .expect("fuel is enabled on the plugin engine");
+}
+
+/// Reset a warm store's fuel before a call so reused channel/memory stores get
+/// a fresh per-call budget instead of draining across their lifetime.
+pub fn refuel(store: &mut Store<PluginState>) {
+    let call_fuel = store.data().fuel_per_call;
+    set_call_fuel(store, call_fuel);
 }
 
 pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
@@ -223,6 +275,7 @@ macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{
         let mut guard = $self.state.lock().await;
         let (ref mut store, ref mut bindings) = *guard;
+        crate::component::refuel(store);
         let f = $body;
         f(store, bindings).await
     }};
@@ -233,9 +286,18 @@ pub(crate) use call_plugin;
 mod tests {
     use super::*;
 
+    fn limits(call_fuel: u64) -> PluginLimits {
+        PluginLimits {
+            call_fuel,
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 64,
+        }
+    }
+
     #[test]
     fn http_absent_without_permission() {
-        let state = PluginState::new(&[]);
+        let state = PluginState::new(&[], limits(0));
         assert!(
             !state.http_enabled(),
             "no HttpClient permission means no outbound HTTP context"
@@ -244,11 +306,14 @@ mod tests {
 
     #[test]
     fn http_absent_for_unrelated_permissions() {
-        let state = PluginState::new(&[
-            PluginPermission::ConfigRead,
-            PluginPermission::MemoryRead,
-            PluginPermission::FileRead,
-        ]);
+        let state = PluginState::new(
+            &[
+                PluginPermission::ConfigRead,
+                PluginPermission::MemoryRead,
+                PluginPermission::FileRead,
+            ],
+            limits(0),
+        );
         assert!(
             !state.http_enabled(),
             "only HttpClient attaches the HTTP context"
@@ -257,7 +322,7 @@ mod tests {
 
     #[test]
     fn http_present_with_permission() {
-        let state = PluginState::new(&[PluginPermission::HttpClient]);
+        let state = PluginState::new(&[PluginPermission::HttpClient], limits(0));
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
@@ -325,12 +390,50 @@ mod tests {
     #[test]
     fn plugin_state_exposes_its_inbound_queue() {
         let q = InboundQueue::default();
-        let state = PluginState::with_inbound(&[], q.clone());
+        let state = PluginState::with_inbound(&[], q.clone(), limits(0));
         q.enqueue(sample_inbound("y"));
         assert_eq!(
             state.inbound().pending(),
             1,
             "state shares the supplied queue"
+        );
+    }
+
+    #[test]
+    fn engine_enables_fuel_metering() {
+        let mut store = Store::new(engine(), PluginState::new(&[], limits(0)));
+        store
+            .set_fuel(123)
+            .expect("fuel must be enabled on the shared plugin engine");
+        assert_eq!(store.get_fuel().expect("get_fuel"), 123);
+    }
+
+    #[test]
+    fn new_store_seeds_configured_budget() {
+        let store = new_store(&[], limits(777));
+        assert_eq!(store.get_fuel().expect("get_fuel"), 777);
+    }
+
+    #[test]
+    fn zero_budget_traps_before_any_work() {
+        let store = new_store(&[], limits(0));
+        assert_eq!(
+            store.get_fuel().expect("get_fuel"),
+            0,
+            "a zero budget leaves no fuel, so the first consuming instruction traps"
+        );
+    }
+
+    #[test]
+    fn refuel_restores_per_call_budget_on_a_warm_store() {
+        let mut store = new_store(&[], limits(500));
+        store.set_fuel(3).expect("set_fuel");
+        assert_eq!(store.get_fuel().expect("get_fuel"), 3);
+        refuel(&mut store);
+        assert_eq!(
+            store.get_fuel().expect("get_fuel"),
+            500,
+            "refuel must reset a drained warm store to the configured per-call budget"
         );
     }
 }

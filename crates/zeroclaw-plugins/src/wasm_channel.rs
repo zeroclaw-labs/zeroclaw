@@ -102,18 +102,20 @@ impl WasmChannel {
     /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
     /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
     /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
-    /// the plugin's `poll-message` to drain.
+    /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
+    /// and the memory/table/instance ceilings.
     pub async fn from_wasm(
         alias: impl Into<String>,
         wasm_path: &Path,
         permissions: &[PluginPermission],
         config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
     ) -> Result<Self> {
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
-        let state = PluginState::with_inbound(permissions, inbound.clone());
-        let linker = build_linker(state.http_enabled())?;
-        let mut store = Store::new(engine(), state);
+        let mut store =
+            crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
+        let linker = build_linker(store.data().http_enabled())?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",

@@ -62,12 +62,17 @@ fn tool_linker_http() -> &'static Linker<PluginState> {
     })
 }
 
-/// Compile and instantiate a tool plugin. The permission set decides whether
-/// the store carries an outbound-HTTP context and whether the linker exposes
-/// `wasi:http`; the two must agree, so both are derived from `permissions` here.
-pub async fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Result<Plugin> {
+/// Compile and instantiate a tool plugin under `limits`. The permission set
+/// decides whether the store carries an outbound-HTTP context and whether the
+/// linker exposes `wasi:http`; the two must agree, so both are derived from
+/// `permissions` here.
+pub async fn create_plugin(
+    wasm_path: &Path,
+    permissions: &[PluginPermission],
+    limits: crate::component::PluginLimits,
+) -> Result<Plugin> {
     let component = load_component(wasm_path)?;
-    let mut store = Store::new(engine(), PluginState::new(permissions));
+    let mut store = crate::component::new_store(permissions, limits);
     let linker = if store.data().http_enabled() {
         tool_linker_http()
     } else {
