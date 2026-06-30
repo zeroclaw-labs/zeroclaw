@@ -151,8 +151,8 @@ Each MCP server entry accepts an optional `pinned_resources` field: a list of
 resource URIs to read once at startup and inject into the system prompt. Set it
 through the same config surfaces used to define the server (the gateway, zerocode,
 or `zeroclaw config set`, as shown under [Configure MCP](#configure-mcp)), naming
-the resources you want the agent to always have on hand. See the
-[Config reference](../reference/config.md#mcp) for the field and its default.
+the resources you want the agent to always have on hand. The field defaults to
+empty, so servers without it are unaffected.
 
 Pinned content is read once per run (no live refresh) and is labeled
 `trust="untrusted-external"` so the model treats it as data, not instructions.
