@@ -111,6 +111,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(input),
             output_tokens: Some(output),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
