@@ -151,6 +151,9 @@ pub struct RpcContext {
     /// `None` when standalone — sessions build their own.
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+
+    /// Lifecycle hook runner. `None` when hooks are disabled in config.
+    pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl RpcContext {
@@ -180,6 +183,7 @@ impl RpcContext {
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -199,6 +203,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -222,6 +227,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -246,6 +252,7 @@ impl RpcContext {
             acp_session_store,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -270,6 +277,7 @@ impl RpcContext {
             acp_session_store: None,
             sop_engine: None,
             sop_audit: None,
+            hooks: None,
         })
     }
 }
