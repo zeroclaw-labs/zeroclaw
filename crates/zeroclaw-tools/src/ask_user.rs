@@ -216,17 +216,19 @@ impl Tool for AskUserTool {
                 }
             }
         } else if !channel.supports_free_form_ask() {
-            // Free-form ask_user has no first-class ACP method yet. The ACP
-            // elicitation RFD is the future fix — until it lands, agents
+            // Free-form ask_user has no first-class ACP method yet. Phase 1
+            // of the elicitation rollout shipped multiple-choice; free-form
+            // text is Phase 2 of that spec. Until Phase 2 lands, agents
             // talking to ACP clients must supply `choices` so we can route
-            // through `session/request_permission`.
-            // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+            // through `request_choice` → `elicitation/create` (or the
+            // legacy `session/request_permission` fallback for older clients).
+            // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Channel '{channel_name}' requires `choices` for ask_user \
-                     (free-form questions await ACP elicitation RFD)"
+                     (free-form questions await ACP elicitation Phase 2)"
                 )),
             });
         }
@@ -384,6 +386,8 @@ mod tests {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
             let _ = tx.send(msg).await;
             Ok(())
