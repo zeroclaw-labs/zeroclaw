@@ -408,6 +408,99 @@ impl SopGraph {
     }
 }
 
+// ── Run overlay projection (slice 8) ─────────────────────────────
+
+/// Per-node execution state, projected from a `SopRun` onto a `SopGraph`.
+/// An immutable snapshot for watching a run progress, like a Blueprint
+/// executing. Inferred on demand; never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRunState {
+    /// Not yet reached by the run.
+    Pending,
+    /// The step the run is currently on (running, waiting, or paused).
+    Active,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+/// Run state for one graph node, keyed by the node's step number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRunOverlay {
+    pub step: u32,
+    pub state: NodeRunState,
+}
+
+/// The full run overlay: the run-level status plus per-node states. Surfaces
+/// align each entry to its `SopGraph` node by `step` and highlight it. The
+/// `waiting` / `paused` flags let a surface show why an Active node is held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOverlay {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: super::types::SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub waiting: bool,
+    pub paused: bool,
+    pub nodes: Vec<NodeRunOverlay>,
+}
+
+impl RunOverlay {
+    /// Project a run onto a graph. Each node's state is derived from the run's
+    /// recorded step results first (terminal states win), then the run's
+    /// current position (the live step is Active while the run is non-terminal),
+    /// then Pending for anything not yet reached. Step results are authoritative
+    /// because a step can be Skipped without advancing `current_step` linearly.
+    pub fn project(graph: &SopGraph, run: &super::types::SopRun) -> Self {
+        use super::types::{SopRunStatus, SopStepStatus};
+
+        let terminal_run = matches!(
+            run.status,
+            SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+        );
+        let waiting = run.status == SopRunStatus::WaitingApproval;
+        let paused = run.status == SopRunStatus::PausedCheckpoint;
+
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| {
+                let recorded = run
+                    .step_results
+                    .iter()
+                    .find(|r| r.step_number == node.step)
+                    .map(|r| match r.status {
+                        SopStepStatus::Completed => NodeRunState::Completed,
+                        SopStepStatus::Failed => NodeRunState::Failed,
+                        SopStepStatus::Skipped => NodeRunState::Skipped,
+                    });
+                let state = match recorded {
+                    Some(s) => s,
+                    None if !terminal_run && node.step == run.current_step => NodeRunState::Active,
+                    None => NodeRunState::Pending,
+                };
+                NodeRunOverlay {
+                    step: node.step,
+                    state,
+                }
+            })
+            .collect();
+
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            waiting,
+            paused,
+            nodes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +773,147 @@ mod tests {
         let out = render_graph_text(&graph, &TextGraphFormat::Outline);
         assert!(out.contains("diagnostics:"));
         assert!(out.contains("[error]"));
+    }
+
+    // ── Run overlay (slice 8) ────────────────────────────────────
+
+    fn step_result(
+        number: u32,
+        status: super::super::types::SopStepStatus,
+    ) -> super::super::types::SopStepResult {
+        super::super::types::SopStepResult {
+            step_number: number,
+            status,
+            output: String::new(),
+            started_at: "t".into(),
+            completed_at: None,
+        }
+    }
+
+    fn run_with(
+        status: super::super::types::SopRunStatus,
+        current_step: u32,
+        total_steps: u32,
+        results: Vec<super::super::types::SopStepResult>,
+    ) -> super::super::types::SopRun {
+        super::super::types::SopRun {
+            run_id: "run-1".into(),
+            sop_name: "g".into(),
+            trigger_event: super::super::types::SopEvent {
+                source: super::super::types::SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: "t".into(),
+            },
+            frame_marker_id: "m".into(),
+            status,
+            current_step,
+            total_steps,
+            started_at: "t".into(),
+            completed_at: None,
+            step_results: results,
+            waiting_since: None,
+            llm_calls_saved: 0,
+        }
+    }
+
+    fn state_for(overlay: &RunOverlay, step: u32) -> NodeRunState {
+        overlay
+            .nodes
+            .iter()
+            .find(|n| n.step == step)
+            .expect("node present")
+            .state
+    }
+
+    #[test]
+    fn overlay_marks_current_step_active_mid_run() {
+        use super::super::types::{SopRunStatus, SopStepStatus};
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b"), step(3, "c")]));
+        let run = run_with(
+            SopRunStatus::Running,
+            2,
+            3,
+            vec![step_result(1, SopStepStatus::Completed)],
+        );
+        let overlay = RunOverlay::project(&graph, &run);
+        assert_eq!(state_for(&overlay, 1), NodeRunState::Completed);
+        assert_eq!(state_for(&overlay, 2), NodeRunState::Active);
+        assert_eq!(state_for(&overlay, 3), NodeRunState::Pending);
+        assert!(!overlay.waiting);
+        assert!(!overlay.paused);
+    }
+
+    #[test]
+    fn overlay_projects_step_result_states() {
+        use super::super::types::{SopRunStatus, SopStepStatus};
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b"), step(3, "c")]));
+        let run = run_with(
+            SopRunStatus::Running,
+            3,
+            3,
+            vec![
+                step_result(1, SopStepStatus::Completed),
+                step_result(2, SopStepStatus::Skipped),
+            ],
+        );
+        let overlay = RunOverlay::project(&graph, &run);
+        assert_eq!(state_for(&overlay, 1), NodeRunState::Completed);
+        assert_eq!(state_for(&overlay, 2), NodeRunState::Skipped);
+        assert_eq!(state_for(&overlay, 3), NodeRunState::Active);
+    }
+
+    #[test]
+    fn overlay_terminal_run_has_no_active_node() {
+        use super::super::types::{SopRunStatus, SopStepStatus};
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b")]));
+        let run = run_with(
+            SopRunStatus::Failed,
+            2,
+            2,
+            vec![
+                step_result(1, SopStepStatus::Completed),
+                step_result(2, SopStepStatus::Failed),
+            ],
+        );
+        let overlay = RunOverlay::project(&graph, &run);
+        assert_eq!(state_for(&overlay, 1), NodeRunState::Completed);
+        assert_eq!(state_for(&overlay, 2), NodeRunState::Failed);
+        assert!(
+            overlay
+                .nodes
+                .iter()
+                .all(|n| n.state != NodeRunState::Active)
+        );
+    }
+
+    #[test]
+    fn overlay_surfaces_waiting_and_paused() {
+        use super::super::types::SopRunStatus;
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b")]));
+
+        let waiting = RunOverlay::project(
+            &graph,
+            &run_with(SopRunStatus::WaitingApproval, 1, 2, vec![]),
+        );
+        assert!(waiting.waiting);
+        assert_eq!(state_for(&waiting, 1), NodeRunState::Active);
+
+        let paused = RunOverlay::project(
+            &graph,
+            &run_with(SopRunStatus::PausedCheckpoint, 2, 2, vec![]),
+        );
+        assert!(paused.paused);
+        assert_eq!(state_for(&paused, 2), NodeRunState::Active);
+    }
+
+    #[test]
+    fn overlay_round_trips_through_serde() {
+        use super::super::types::SopRunStatus;
+        let graph = SopGraph::from_sop(&sop_with(vec![step(1, "a"), step(2, "b")]));
+        let overlay = RunOverlay::project(&graph, &run_with(SopRunStatus::Running, 1, 2, vec![]));
+        let json = serde_json::to_string(&overlay).unwrap();
+        let back: RunOverlay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, overlay);
     }
 }
