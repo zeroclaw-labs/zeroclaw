@@ -285,15 +285,15 @@ fn default_max_concurrent() -> u32 {
 // ── TOML manifest (internal parse target) ───────────────────────
 
 /// Top-level SOP.toml structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopManifest {
     pub sop: SopMeta,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<SopTrigger>,
 }
 
 /// The `[sop]` table in SOP.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopMeta {
     pub name: String,
     pub description: String,
@@ -301,7 +301,7 @@ pub struct SopMeta {
     pub version: String,
     #[serde(default)]
     pub priority: SopPriority,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<SopExecutionMode>,
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
@@ -310,6 +310,27 @@ pub struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+}
+
+impl SopManifest {
+    /// Build the on-disk manifest from a `Sop`. Inverse of the loader's
+    /// destructure. `execution_mode` is emitted as `Some` so the round-trip
+    /// is faithful; `deterministic` is preserved as-is.
+    pub fn from_sop(sop: &Sop) -> Self {
+        Self {
+            sop: SopMeta {
+                name: sop.name.clone(),
+                description: sop.description.clone(),
+                version: sop.version.clone(),
+                priority: sop.priority,
+                execution_mode: Some(sop.execution_mode),
+                cooldown_secs: sop.cooldown_secs,
+                max_concurrent: sop.max_concurrent,
+                deterministic: sop.deterministic,
+            },
+            triggers: sop.triggers.clone(),
+        }
+    }
 }
 
 fn default_sop_version() -> String {

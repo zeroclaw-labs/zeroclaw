@@ -467,6 +467,114 @@ pub fn extract_bold_title(text: &str) -> Option<(String, String)> {
     Some((title, rest.to_string()))
 }
 
+// ── Markdown step renderer (inverse of parse_steps) ─────────────
+
+fn render_step_failure(failure: &StepFailure) -> String {
+    match failure {
+        StepFailure::Fail => "fail".to_string(),
+        StepFailure::Retry { max } => format!("retry: {max}"),
+        StepFailure::Goto { step } => format!("goto: {step}"),
+    }
+}
+
+fn render_step_bullets(step: &SopStep) -> Vec<String> {
+    let mut bullets = Vec::new();
+
+    if !step.suggested_tools.is_empty() {
+        bullets.push(format!("tools: {}", step.suggested_tools.join(", ")));
+    }
+    if let Some(scope) = &step.scope {
+        if let Some(allow) = &scope.allow {
+            bullets.push(format!("allow-tools: {}", allow.join(", ")));
+        }
+        if !scope.deny.is_empty() {
+            bullets.push(format!("deny-tools: {}", scope.deny.join(", ")));
+        }
+    }
+    if step.requires_confirmation {
+        bullets.push("requires_confirmation: true".to_string());
+    }
+    if step.kind == SopStepKind::Checkpoint {
+        bullets.push("kind: checkpoint".to_string());
+    }
+    if let Some(schema) = &step.schema {
+        if let Some(input) = &schema.input {
+            bullets.push(format!("input: {input}"));
+        }
+        if let Some(output) = &schema.output {
+            bullets.push(format!("output: {output}"));
+        }
+    }
+    if let Some(when) = &step.routing.when {
+        bullets.push(format!("when: {when}"));
+    }
+    if let Some(next) = step.routing.next {
+        bullets.push(format!("next: {next}"));
+    }
+    if !step.routing.depends_on.is_empty() {
+        let csv = step
+            .routing
+            .depends_on
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bullets.push(format!("depends_on: {csv}"));
+    }
+    if !step.on_failure.is_fail() {
+        bullets.push(format!(
+            "on_failure: {}",
+            render_step_failure(&step.on_failure)
+        ));
+    }
+    if let Some(mode) = step.mode {
+        bullets.push(format!("mode: {mode}"));
+    }
+
+    bullets
+}
+
+/// Render procedure steps to SOP.md, the exact inverse of `parse_steps`:
+/// a `## Steps` heading, numbered items with a bold title, optional body,
+/// and the per-step sub-bullets in a stable order.
+pub fn render_steps(steps: &[SopStep]) -> String {
+    let mut out = String::from("## Steps\n\n");
+    for step in steps {
+        if step.body.is_empty() {
+            out.push_str(&format!("{}. **{}**\n", step.number, step.title));
+        } else {
+            out.push_str(&format!(
+                "{}. **{}** - {}\n",
+                step.number, step.title, step.body
+            ));
+        }
+        for bullet in render_step_bullets(step) {
+            out.push_str(&format!("   - {bullet}\n"));
+        }
+    }
+    out
+}
+
+// ── SOP save (round-trip back to disk) ──────────────────────────
+
+/// Serialize a `Sop` to its on-disk pair (`SOP.toml`, `SOP.md`) under
+/// `<sops_dir>/<name>/`. Reuses the manifest serde and the `render_steps`
+/// Markdown projection. No parallel format.
+pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    if sop.name.trim().is_empty() {
+        anyhow::bail!("SOP name is empty");
+    }
+    let sop_dir = sops_dir.join(&sop.name);
+    std::fs::create_dir_all(&sop_dir)?;
+
+    let manifest = SopManifest::from_sop(sop);
+    let toml_content = toml::to_string_pretty(&manifest)?;
+    std::fs::write(sop_dir.join("SOP.toml"), toml_content)?;
+    std::fs::write(sop_dir.join("SOP.md"), render_steps(&sop.steps))?;
+
+    Ok(())
+}
+
 // ── Validation ──────────────────────────────────────────────────
 
 /// Validate a loaded SOP and return a list of warnings.
@@ -575,5 +683,83 @@ mod tests {
         assert_eq!(step.routing.depends_on, vec![1, 2]);
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    #[test]
+    fn save_sop_round_trips_through_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path();
+
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **First** - do the first thing
+   - tools: shell, file_read
+   - requires_confirmation: true
+   - next: 2
+2. **Second** - then the second
+   - allow-tools: shell
+   - deny-tools: browser
+   - kind: checkpoint
+   - depends_on: 1
+   - on_failure: retry: 3
+   - mode: auto
+"#,
+        );
+
+        let original = Sop {
+            name: "roundtrip".to_string(),
+            description: "exercises every field path".to_string(),
+            version: "2.3.4".to_string(),
+            priority: SopPriority::High,
+            execution_mode: SopExecutionMode::StepByStep,
+            triggers: vec![
+                SopTrigger::Manual,
+                SopTrigger::Cron {
+                    expression: "0 9 * * *".to_string(),
+                },
+            ],
+            steps,
+            cooldown_secs: 30,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+        };
+
+        save_sop(sops_dir, &original).expect("save");
+        let reloaded =
+            load_sop(&sops_dir.join("roundtrip"), SopExecutionMode::Supervised).expect("load");
+
+        assert_eq!(reloaded.name, original.name);
+        assert_eq!(reloaded.description, original.description);
+        assert_eq!(reloaded.version, original.version);
+        assert_eq!(reloaded.priority, original.priority);
+        assert_eq!(reloaded.execution_mode, original.execution_mode);
+        assert_eq!(reloaded.triggers, original.triggers);
+        assert_eq!(reloaded.cooldown_secs, original.cooldown_secs);
+        assert_eq!(reloaded.max_concurrent, original.max_concurrent);
+        assert_eq!(reloaded.deterministic, original.deterministic);
+        assert_eq!(reloaded.steps, original.steps);
+    }
+
+    #[test]
+    fn save_sop_rejects_empty_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sop = Sop {
+            name: String::new(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: Vec::new(),
+            steps: Vec::new(),
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        assert!(save_sop(tmp.path(), &sop).is_err());
+        sop.name = "ok".to_string();
+        assert!(save_sop(tmp.path(), &sop).is_ok());
     }
 }
