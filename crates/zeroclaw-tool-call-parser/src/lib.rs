@@ -1185,6 +1185,37 @@ fn file_write_content_tail_is_unambiguous(input: &str, after_quote: usize) -> bo
         || tail.starts_with("```")
 }
 
+fn file_write_content_quote_starts_additional_final_field(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with(',') {
+        return false;
+    }
+
+    idx += ','.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let Some(field_end) = find_json_string_end(input, idx) else {
+        return false;
+    };
+
+    idx = skip_json_ws(input, field_end + 1);
+    if !input[idx..].starts_with(':') {
+        return false;
+    }
+
+    idx += ':'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let mut stream =
+        serde_json::Deserializer::from_str(&input[idx..]).into_iter::<serde_json::Value>();
+    let Some(Ok(_)) = stream.next() else {
+        return false;
+    };
+
+    let consumed = stream.byte_offset();
+    consumed > 0 && file_write_content_tail_is_unambiguous(input, idx + consumed)
+}
+
 fn parse_malformed_file_write_content_after(input: &str, start: usize) -> Option<String> {
     let value_start = skip_json_ws(input, find_json_field_value_start(input, "content", start)?);
     if !input[value_start..].starts_with('"') {
@@ -1204,6 +1235,9 @@ fn parse_malformed_file_write_content_after(input: &str, start: usize) -> Option
             '"' if file_write_content_tail_is_unambiguous(input, idx + 1) => {
                 let raw = &input[value_start + 1..idx];
                 return Some(decode_recovered_json_string_fragment(raw));
+            }
+            '"' if file_write_content_quote_starts_additional_final_field(input, idx + 1) => {
+                return None;
             }
             '"' => {}
             _ => {}
