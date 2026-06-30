@@ -8184,27 +8184,43 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("amqp", &alias))
         };
+        let amqp_channel = match AmqpChannel::new(crate::amqp::AmqpChannelConfig {
+            amqp_url: amqp.amqp_url.clone(),
+            exchange: amqp.exchange.clone(),
+            routing_keys: amqp.routing_keys.clone(),
+            queue: amqp.queue.clone(),
+            ca_cert: amqp.ca_cert.clone(),
+            client_cert: amqp.client_cert.clone(),
+            client_key: amqp.client_key.clone(),
+            sender_label: amqp.sender_label.clone(),
+            content_template: amqp.content_template.clone(),
+            thread_id_field: amqp.thread_id_field.clone(),
+            durable_ack: amqp.durable_ack,
+            dispatch: amqp.dispatch,
+            engine: sop_engine.clone(),
+            audit: sop_audit.clone(),
+            alias: alias.clone(),
+            peer_resolver,
+        }) {
+            Ok(ch) => ch,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": err.to_string(),
+                        })),
+                    "skipping AMQP channel: SOP dispatch without engine/audit handles"
+                );
+                continue;
+            }
+        };
         channels.push(ConfiguredChannel {
             display_name: "AMQP",
             alias: Some(alias.clone()),
-            channel: Arc::new(AmqpChannel::new(crate::amqp::AmqpChannelConfig {
-                amqp_url: amqp.amqp_url.clone(),
-                exchange: amqp.exchange.clone(),
-                routing_keys: amqp.routing_keys.clone(),
-                queue: amqp.queue.clone(),
-                ca_cert: amqp.ca_cert.clone(),
-                client_cert: amqp.client_cert.clone(),
-                client_key: amqp.client_key.clone(),
-                sender_label: amqp.sender_label.clone(),
-                content_template: amqp.content_template.clone(),
-                thread_id_field: amqp.thread_id_field.clone(),
-                durable_ack: amqp.durable_ack,
-                dispatch: amqp.dispatch,
-                engine: sop_engine.clone(),
-                audit: sop_audit.clone(),
-                alias: alias.clone(),
-                peer_resolver,
-            })),
+            channel: Arc::new(amqp_channel),
         });
     }
 
