@@ -32,10 +32,10 @@ pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         let path_str = path.to_string_lossy();
-        if path_str.starts_with(r"\\?\") {
+        if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
             // Check if it's a local drive path (e.g. \\?\C:\...) by checking if the 6th char is ':'
             if path_str.chars().nth(5) == Some(':') {
-                return std::path::PathBuf::from(&path_str[4..]);
+                return std::path::PathBuf::from(stripped);
             }
         }
     }
