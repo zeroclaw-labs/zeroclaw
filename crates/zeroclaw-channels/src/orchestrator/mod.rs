@@ -6303,7 +6303,11 @@ fn build_channel_by_id(
                 .with_persistence(config_arc.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_streaming(
+                    tg.stream_mode,
+                    tg.draft_update_interval_ms,
+                    tg.multi_message_delay_ms,
+                )
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
@@ -7409,7 +7413,11 @@ fn collect_configured_channels(
                     .with_persistence(config_arc.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_streaming(
+                        tg.stream_mode,
+                        tg.draft_update_interval_ms,
+                        tg.multi_message_delay_ms,
+                    )
                     .with_transcription(config.transcription.clone())
                     .with_agent_transcription_provider(agent_transcription_provider.clone())
                     .with_typed_transcription_providers(
@@ -22538,6 +22546,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,
