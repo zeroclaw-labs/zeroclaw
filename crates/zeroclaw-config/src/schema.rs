@@ -14211,7 +14211,9 @@ pub struct AmqpConfig {
     pub enabled: bool,
     /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
     /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub amqp_url: String,
     /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
     #[tab(Advanced)]
@@ -14231,10 +14233,14 @@ pub struct AmqpConfig {
     pub ca_cert: Option<PathBuf>,
     /// Path to the client certificate for broker mutual-TLS auth
     /// (Fedora Messaging requires a client cert).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_cert: Option<PathBuf>,
     /// Path to the client private key matching `client_cert`.
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_key: Option<PathBuf>,
     /// Value placed in `ChannelMessage.sender` for every delivery from this
     /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
