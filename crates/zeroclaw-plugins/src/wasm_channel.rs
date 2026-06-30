@@ -826,8 +826,14 @@ mod tests {
             subject: None,
         });
 
-        assert_eq!(queue.pending(), 1, "host enqueue is visible on the drain side");
-        let drained = queue.poll().expect("the plugin-side drain sees the message");
+        assert_eq!(
+            queue.pending(),
+            1,
+            "host enqueue is visible on the drain side"
+        );
+        let drained = queue
+            .poll()
+            .expect("the plugin-side drain sees the message");
         assert_eq!(drained.id, "evt-1");
         assert_eq!(drained.content, "inbound sms");
         assert_eq!(queue.pending(), 0, "draining empties the shared queue");
