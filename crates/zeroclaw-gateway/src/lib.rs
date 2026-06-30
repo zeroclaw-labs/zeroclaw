@@ -1801,6 +1801,10 @@ pub async fn run_gateway(
             "/api/sops/{name}/graph",
             get(api_sop_author::handle_sop_graph),
         )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",

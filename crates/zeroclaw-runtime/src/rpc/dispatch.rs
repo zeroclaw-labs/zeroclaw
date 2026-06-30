@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopSaveRequest, SopSelectRequest,
+    RpcOutbound, SopRunOverlayRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -149,6 +149,7 @@ pub enum Method {
     SopsList,
     SopsGet,
     SopsGraph,
+    SopsRunOverlay,
     SopsValidate,
     SopsSave,
     SopsCreate,
@@ -250,6 +251,7 @@ impl Method {
         (Method::SopsList, "sops/list"),
         (Method::SopsGet, "sops/get"),
         (Method::SopsGraph, "sops/graph"),
+        (Method::SopsRunOverlay, "sops/run-overlay"),
         (Method::SopsValidate, "sops/validate"),
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
@@ -705,6 +707,7 @@ impl RpcDispatcher {
             Method::SopsList => self.handle_sops_list(),
             Method::SopsGet => self.handle_sops_get(&req.params),
             Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
             Method::SopsValidate => self.handle_sops_validate(&req.params),
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
@@ -3894,6 +3897,30 @@ impl RpcDispatcher {
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
         to_result(crate::sop::SopGraph::from_sop(&sop))
+    }
+
+    /// Project a run's live state onto its SOP graph for a watch view. Loads the
+    /// SOP by name, fetches the run by id from the shared engine, and returns the
+    /// inferred overlay. Errors if the SOP subsystem is not enabled or the run is
+    /// unknown.
+    fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        let req: SopRunOverlayRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let guard = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+        let run = guard
+            .get_run(&req.run_id)
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id)))?;
+        let graph = crate::sop::SopGraph::from_sop(&sop);
+        to_result(crate::sop::RunOverlay::project(&graph, run))
     }
 
     /// Validate either a named on-disk SOP (`{ "name": ... }`) or an unsaved
@@ -7115,6 +7142,89 @@ mod tests {
                 w["flow_role"] == "sequence" && w["from_step"] == 1 && w["to_step"] == 2
             })
         );
+    }
+
+    fn make_sops_dispatcher_with_run(
+        sops_dir: &std::path::Path,
+        sop_name: &str,
+    ) -> (RpcDispatcher, String) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+
+        let sop_config = zeroclaw_config::schema::SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(sops_dir);
+        let event = crate::sop::SopEvent {
+            source: crate::sop::SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "t".into(),
+        };
+        engine.start_run(sop_name, event).expect("run starts");
+        let run_id = engine
+            .active_runs()
+            .keys()
+            .next()
+            .expect("one active run")
+            .clone();
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        (
+            RpcDispatcher::new(ctx, tx, "test-peer-sops-overlay:pid=1".into()),
+            run_id,
+        )
+    }
+
+    #[test]
+    fn sops_run_overlay_projects_active_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        d.handle_sops_create(&serde_json::json!({"sop": sample_sop_value("gamma")}))
+            .unwrap();
+        let (d, run_id) = make_sops_dispatcher_with_run(tmp.path(), "gamma");
+
+        let overlay = d
+            .handle_sops_run_overlay(&serde_json::json!({"name": "gamma", "run_id": run_id}))
+            .unwrap();
+        assert_eq!(overlay["run_id"], run_id);
+        assert!(overlay["status"] == "running" || overlay["status"] == "waiting_approval");
+        let nodes = overlay["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["state"], "active");
+        assert_eq!(nodes[1]["state"], "pending");
+    }
+
+    #[test]
+    fn sops_run_overlay_unknown_run_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        d.handle_sops_create(&serde_json::json!({"sop": sample_sop_value("gamma")}))
+            .unwrap();
+        let (d, _run_id) = make_sops_dispatcher_with_run(tmp.path(), "gamma");
+        let err = d
+            .handle_sops_run_overlay(&serde_json::json!({"name": "gamma", "run_id": "run-nope"}))
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn sops_run_overlay_engine_disabled_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        d.handle_sops_create(&serde_json::json!({"sop": sample_sop_value("gamma")}))
+            .unwrap();
+        let err = d
+            .handle_sops_run_overlay(&serde_json::json!({"name": "gamma", "run_id": "run-1"}))
+            .unwrap_err();
+        assert_eq!(err.code, INTERNAL_ERROR);
     }
 
     #[test]

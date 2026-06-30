@@ -307,6 +307,14 @@ pub struct SopSelectRequest {
     pub name: String,
 }
 
+/// Request payload for `sops/run-overlay`: project a run's state onto a SOP's
+/// graph. Selects the SOP by `name` and the run by `run_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunOverlayRequest {
+    pub name: String,
+    pub run_id: String,
+}
+
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.

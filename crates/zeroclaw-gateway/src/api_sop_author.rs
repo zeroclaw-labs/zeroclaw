@@ -57,6 +57,57 @@ pub async fn handle_sop_graph(
     }
 }
 
+/// GET /api/sops/:name/runs/:run_id/overlay - run state projected onto the graph.
+pub async fn handle_sop_run_overlay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, run_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, mode) = sops_dir_and_mode(&state);
+    let sop = match zeroclaw_runtime::sop::load_sop_by_name(&dir, &name, mode) {
+        Ok(sop) => sop,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("SOP '{name}': {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(engine) = state.sop_engine.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SOP subsystem not enabled" })),
+        )
+            .into_response();
+    };
+    let guard = match engine.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "SOP engine lock poisoned" })),
+            )
+                .into_response();
+        }
+    };
+    match guard.get_run(&run_id) {
+        Some(run) => {
+            let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&sop);
+            let overlay = zeroclaw_runtime::sop::RunOverlay::project(&graph, run);
+            Json(overlay).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("run '{run_id}' not found") })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -156,5 +207,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    fn engine_with_run(sops_dir: &std::path::Path, sop_name: &str) -> (crate::AppState, String) {
+        use std::sync::{Arc, Mutex};
+        let mut state = state_with_sops(sops_dir);
+        let config = zeroclaw_config::schema::SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut engine = zeroclaw_runtime::sop::SopEngine::new(config);
+        engine.reload(sops_dir);
+        let event = zeroclaw_runtime::sop::SopEvent {
+            source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "t".into(),
+        };
+        engine.start_run(sop_name, event).expect("run starts");
+        let run_id = engine
+            .active_runs()
+            .keys()
+            .next()
+            .expect("one active run")
+            .clone();
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        (state, run_id)
+    }
+
+    #[tokio::test]
+    async fn overlay_route_projects_run_onto_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "gamma");
+        let (state, run_id) = engine_with_run(tmp.path(), "gamma");
+        let router = axum::Router::new()
+            .route(
+                "/api/sops/{name}/runs/{run_id}/overlay",
+                get(super::handle_sop_run_overlay),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sops/gamma/runs/{run_id}/overlay"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let overlay: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(overlay["run_id"], run_id);
+        assert!(overlay["status"] == "running" || overlay["status"] == "waiting_approval");
+        let nodes = overlay["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["state"], "active");
+        assert_eq!(nodes[1]["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn overlay_route_unknown_run_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "gamma");
+        let (state, _run_id) = engine_with_run(tmp.path(), "gamma");
+        let router = axum::Router::new()
+            .route(
+                "/api/sops/{name}/runs/{run_id}/overlay",
+                get(super::handle_sop_run_overlay),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sops/gamma/runs/run-nope/overlay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn overlay_route_engine_disabled_is_503() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "gamma");
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route(
+                "/api/sops/{name}/runs/{run_id}/overlay",
+                get(super::handle_sop_run_overlay),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sops/gamma/runs/run-1/overlay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }
