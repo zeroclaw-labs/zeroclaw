@@ -14,6 +14,7 @@ pub mod memory_loader;
 pub mod memory_strategy;
 pub mod personality;
 pub mod personality_templates;
+pub mod pricing_catalog;
 pub mod prompt;
 pub mod system_prompt;
 pub mod thinking;
