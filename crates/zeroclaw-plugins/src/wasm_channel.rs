@@ -801,4 +801,35 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["identity"], "on-call", "granted section round-trips");
     }
+
+    #[test]
+    fn host_enqueued_inbound_reaches_the_drain_handle() {
+        // The inbound contract is host-fed: a listener the orchestrator owns
+        // (vendor tunnel, webhook) enqueues through the handle from
+        // `WasmChannel::inbound()`, and the plugin drains the same queue. Prove
+        // the producer side here so the transport is not just asserted at the
+        // queue type but at the handle a host listener actually holds.
+        let queue = crate::component::InboundQueue::default();
+        let listener_handle = queue.clone();
+        assert_eq!(queue.pending(), 0, "starts empty");
+
+        listener_handle.enqueue(crate::component::HostInboundMessage {
+            id: "evt-1".into(),
+            sender: "+15550100".into(),
+            reply_target: "+15550100".into(),
+            content: "inbound sms".into(),
+            channel: "inkbox".into(),
+            channel_alias: Some("on-call".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            subject: None,
+        });
+
+        assert_eq!(queue.pending(), 1, "host enqueue is visible on the drain side");
+        let drained = queue.poll().expect("the plugin-side drain sees the message");
+        assert_eq!(drained.id, "evt-1");
+        assert_eq!(drained.content, "inbound sms");
+        assert_eq!(queue.pending(), 0, "draining empties the shared queue");
+    }
 }

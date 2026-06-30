@@ -110,6 +110,16 @@ The three world bridges map each WIT world onto the runtime's native traits:
 Tool plugins use a fresh store per call (stateless). Channel and memory plugins
 hold a warm store guarded by an async mutex for the lifetime of the plugin.
 
+Tool plugins are discovered and registered end to end: the runtime walks
+`channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
+The channel host adapter (`WasmChannel`, its `wasi:http` gating, `configure`
+jail, and host-fed `inbound` queue) is complete and unit-covered, and
+`PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
+to register. Wiring those into the live orchestrator (the discovery-to-channel
+loop in the runtime, plus a per-vendor host listener that drains its transport
+into each channel's `inbound` queue) is the remaining seam and lands with the
+runtime channel-registration change, not this host slice.
+
 ## Plugin structure
 
 A plugin is a directory containing:
