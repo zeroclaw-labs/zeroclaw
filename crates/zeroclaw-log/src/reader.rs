@@ -910,7 +910,10 @@ mod tests {
         let path = tmp.path().join("trace.jsonl");
         write_jsonl(
             &path,
-            &[make_event("LlmRequest", None), make_event("tool_call", None)],
+            &[
+                make_event("LlmRequest", None),
+                make_event("tool_call", None),
+            ],
         );
         let filter = LogFilter {
             action: Some("llmrequest".into()),
