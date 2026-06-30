@@ -14,8 +14,12 @@ zeroclaw sop list
 zeroclaw sop show <name>
 ```
 
+## Approve and observe
+
+Runs that hit a checkpoint pause as `WaitingApproval`. Clear or inspect them with the CLI (`zeroclaw sop list`, `zeroclaw sop approve`) or out-of-band over the [gateway API](../../gateway/api.md) approval endpoints (`GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`).
+
 ## See also
 
 - [Worked example](../example.md): channel delivery plus `sop_execute`
 - [Fan-in overview](./overview.md)
-- [Syntax](../syntax.md)
+- [Syntax](../syntax.md): the SOP file format
