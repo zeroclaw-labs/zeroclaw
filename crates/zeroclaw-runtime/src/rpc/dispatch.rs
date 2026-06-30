@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound,
+    RpcOutbound, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -144,6 +144,15 @@ pub enum Method {
     QuickstartValidate,
     QuickstartApply,
     QuickstartDismiss,
+
+    // SOP authoring (read first, then write)
+    SopsList,
+    SopsGet,
+    SopsGraph,
+    SopsValidate,
+    SopsSave,
+    SopsCreate,
+    SopsDelete,
 }
 
 impl Method {
@@ -238,6 +247,13 @@ impl Method {
         (Method::QuickstartValidate, "quickstart/validate"),
         (Method::QuickstartApply, "quickstart/apply"),
         (Method::QuickstartDismiss, "quickstart/dismiss"),
+        (Method::SopsList, "sops/list"),
+        (Method::SopsGet, "sops/get"),
+        (Method::SopsGraph, "sops/graph"),
+        (Method::SopsValidate, "sops/validate"),
+        (Method::SopsSave, "sops/save"),
+        (Method::SopsCreate, "sops/create"),
+        (Method::SopsDelete, "sops/delete"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -684,6 +700,15 @@ impl RpcDispatcher {
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
             Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
+
+            // SOP authoring
+            Method::SopsList => self.handle_sops_list(),
+            Method::SopsGet => self.handle_sops_get(&req.params),
+            Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsValidate => self.handle_sops_validate(&req.params),
+            Method::SopsSave => self.handle_sops_save(&req.params),
+            Method::SopsCreate => self.handle_sops_create(&req.params),
+            Method::SopsDelete => self.handle_sops_delete(&req.params),
         };
 
         if is_notification {
@@ -3833,6 +3858,96 @@ impl RpcDispatcher {
         to_result(body)
     }
 
+    // ── SOP authoring handlers ──────────────────────────────────
+
+    /// Resolve the configured SOPs directory and default execution mode from
+    /// the live config, reusing the runtime's own resolvers.
+    fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
+        let config = self.ctx.config.read();
+        let workspace = config.shared_workspace_dir();
+        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
+        (dir, mode)
+    }
+
+    fn parse_sop(value: &Value) -> Result<crate::sop::Sop, JsonRpcError> {
+        serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+    }
+
+    fn handle_sops_list(&self) -> RpcResult {
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        to_result(sops)
+    }
+
+    fn handle_sops_get(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(sop)
+    }
+
+    fn handle_sops_graph(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(crate::sop::SopGraph::from_sop(&sop))
+    }
+
+    /// Validate either a named on-disk SOP (`{ "name": ... }`) or an unsaved
+    /// draft (`{ "sop": ... }`). Returns the two-severity validation result.
+    /// Validation only; writes nothing.
+    fn handle_sops_validate(&self, params: &Value) -> RpcResult {
+        let sop = if params.get("sop").is_some() {
+            let req: SopSaveRequest = parse_params(params)?;
+            Self::parse_sop(&req.sop)?
+        } else {
+            let req: SopSelectRequest = parse_params(params)?;
+            let (dir, mode) = self.sops_dir_and_mode();
+            crate::sop::load_sop_by_name(&dir, &req.name, mode)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
+        };
+        let v = crate::sop::validate_sop_strict(&sop);
+        to_result(serde_json::json!({
+            "blocking": v.blocking,
+            "warnings": v.warnings,
+            "ok": v.is_ok(),
+        }))
+    }
+
+    fn handle_sops_save(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "saved": sop.name }))
+    }
+
+    /// Create rejects an overwrite: the target must not already exist.
+    fn handle_sops_create(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        if dir.join(&sop.name).exists() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("SOP '{}' already exists", sop.name),
+            ));
+        }
+        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "created": sop.name }))
+    }
+
+    fn handle_sops_delete(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::delete_sop(&dir, &req.name)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
         // Clone out of the lock to satisfy `&mut Config`. On success
@@ -6938,5 +7053,144 @@ mod tests {
             1,
             "session_end must fire when a real session is closed"
         );
+    }
+
+    // ── SOP authoring RPC ────────────────────────────────────────
+
+    fn make_sops_test_dispatcher(sops_dir: &std::path::Path) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-sops:pid=1".into())
+    }
+
+    fn sample_sop_value(name: &str) -> Value {
+        serde_json::json!({
+            "name": name,
+            "description": "d",
+            "version": "1.0.0",
+            "priority": "normal",
+            "execution_mode": "supervised",
+            "triggers": [],
+            "steps": [
+                {"number": 1, "title": "first", "body": "do it"},
+                {"number": 2, "title": "second", "body": "then this"}
+            ],
+            "cooldown_secs": 0,
+            "max_concurrent": 1,
+            "deterministic": false
+        })
+    }
+
+    #[test]
+    fn sops_create_then_list_get_graph() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+
+        let created = d
+            .handle_sops_create(&serde_json::json!({"sop": sample_sop_value("alpha")}))
+            .unwrap();
+        assert_eq!(created["created"], "alpha");
+
+        let list = d.handle_sops_list().unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["name"], "alpha");
+
+        let got = d
+            .handle_sops_get(&serde_json::json!({"name": "alpha"}))
+            .unwrap();
+        assert_eq!(got["name"], "alpha");
+        assert_eq!(got["steps"].as_array().unwrap().len(), 2);
+
+        let graph = d
+            .handle_sops_graph(&serde_json::json!({"name": "alpha"}))
+            .unwrap();
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        assert!(
+            graph["wires"].as_array().unwrap().iter().any(|w| {
+                w["flow_role"] == "sequence" && w["from_step"] == 1 && w["to_step"] == 2
+            })
+        );
+    }
+
+    #[test]
+    fn sops_create_rejects_overwrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        d.handle_sops_create(&serde_json::json!({"sop": sample_sop_value("dup")}))
+            .unwrap();
+        let err = d
+            .handle_sops_create(&serde_json::json!({"sop": sample_sop_value("dup")}))
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("already exists"));
+    }
+
+    #[test]
+    fn sops_save_then_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        d.handle_sops_save(&serde_json::json!({"sop": sample_sop_value("beta")}))
+            .unwrap();
+        assert!(tmp.path().join("beta").exists());
+
+        let deleted = d
+            .handle_sops_delete(&serde_json::json!({"name": "beta"}))
+            .unwrap();
+        assert_eq!(deleted["deleted"], "beta");
+        assert!(!tmp.path().join("beta").exists());
+
+        let err = d
+            .handle_sops_delete(&serde_json::json!({"name": "beta"}))
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn sops_save_rejects_blocking_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+        // Two steps share number 1 → duplicate-number blocking violation.
+        let mut bad = sample_sop_value("bad");
+        bad["steps"] = serde_json::json!([
+            {"number": 1, "title": "a"},
+            {"number": 1, "title": "b"}
+        ]);
+        let err = d
+            .handle_sops_save(&serde_json::json!({"sop": bad}))
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            !tmp.path().join("bad").exists(),
+            "rejected save writes nothing"
+        );
+    }
+
+    #[test]
+    fn sops_validate_draft_and_named() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_sops_test_dispatcher(tmp.path());
+
+        // Draft form: validate an unsaved good SOP.
+        let v = d
+            .handle_sops_validate(&serde_json::json!({"sop": sample_sop_value("draft")}))
+            .unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(
+            !tmp.path().join("draft").exists(),
+            "validate writes nothing"
+        );
+
+        // Named form: save then validate by name.
+        d.handle_sops_save(&serde_json::json!({"sop": sample_sop_value("named")}))
+            .unwrap();
+        let v2 = d
+            .handle_sops_validate(&serde_json::json!({"name": "named"}))
+            .unwrap();
+        assert_eq!(v2["ok"], true);
     }
 }

@@ -122,6 +122,26 @@ pub fn load_sops(
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
+/// Load a single SOP by name from the configured directory. Lenient: returns
+/// the SOP with any diagnostics resolvable via `validate_sop_strict`.
+pub fn load_sop_by_name(
+    sops_dir: &Path,
+    name: &str,
+    default_execution_mode: SopExecutionMode,
+) -> Result<Sop> {
+    load_sop(&sops_dir.join(name), default_execution_mode)
+}
+
+/// Delete a SOP directory by name. Errors if it does not exist.
+pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
+    let dir = sops_dir.join(name);
+    if !dir.exists() {
+        anyhow::bail!("SOP '{name}' not found");
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 /// Load SOPs from a specific directory. Each subdirectory may contain
 /// `SOP.toml` (metadata + triggers) and `SOP.md` (procedure steps).
 pub fn load_sops_from_directory(

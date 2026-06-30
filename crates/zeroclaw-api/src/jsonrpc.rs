@@ -298,7 +298,22 @@ pub struct LocalesFetchResponse {
     pub skipped: Vec<String>,
 }
 
-// ── Filesystem RPC types ─────────────────────────────────────────
+// ── SOP authoring RPC types ──────────────────────────────────────
+
+/// Request payload for SOP read/delete methods that select one SOP by name:
+/// `sops/get`, `sops/graph`, `sops/validate` (by name), `sops/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopSelectRequest {
+    pub name: String,
+}
+
+/// Request payload for `sops/save` and `sops/create`. The `sop` field is the
+/// wire form of the runtime `Sop`; the daemon deserializes and validates it.
+/// `sops/validate` also accepts this form to validate an unsaved draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopSaveRequest {
+    pub sop: serde_json::Value,
+}
 
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
