@@ -152,7 +152,7 @@ static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
-    tx: tokio::sync::mpsc::Sender<String>,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
 }
 
@@ -173,6 +173,10 @@ impl Observer for ChannelNotifyObserver {
         } = event
         {
             self.tools_used.store(true, Ordering::Relaxed);
+            let Some(tx) = self.tx.as_ref() else {
+                self.inner.record_event(event);
+                return;
+            };
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
@@ -200,7 +204,7 @@ impl Observer for ChannelNotifyObserver {
             // wedge the observer hook. Live-typing notifications are
             // best-effort UX; a dropped message degrades the indicator
             // briefly but does not lose any real state.
-            let _ = self.tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
+            let _ = tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
         }
         self.inner.record_event(event);
     }
@@ -4174,6 +4178,32 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve whether this inbound message uses Matrix `single_message`
+/// streaming. This is the only Matrix-specific branch the orchestrator needs:
+/// the channel still owns draft rendering, while the orchestrator avoids
+/// sending duplicate standalone tool-notification messages.
+fn matrix_single_message_streaming_enabled_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    if msg.channel != "matrix" {
+        return false;
+    }
+    let Some(alias) = msg.channel_alias.as_ref() else {
+        return false;
+    };
+    config.channels.matrix.get(alias).is_some_and(|config| {
+        config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
+    })
+}
+
+fn matrix_single_message_streaming_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    matrix_single_message_streaming_enabled_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
 /// Resolve the effective `ack_reactions` value for a channel message.
 ///
 /// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
@@ -4915,6 +4945,8 @@ async fn process_channel_message_body(
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
+    let matrix_single_message_streaming =
+        matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
 
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
@@ -4987,6 +5019,9 @@ async fn process_channel_message_body(
                             }
                         }
                         StreamDelta::Text(text) => {
+                            if matrix_single_message_streaming {
+                                continue;
+                            }
                             accumulated.push_str(&text);
                             let visible = strip_think_tags_inline(&accumulated);
                             if let Err(e) = channel
@@ -5014,11 +5049,14 @@ async fn process_channel_message_body(
         None
     };
 
-    // Skip typing only for Partial mode — the draft message itself provides
-    // visual feedback. MultiMessage and Off both keep typing active.
+    // Preserve the historical Partial-mode typing behavior. Matrix
+    // `single_message` still gets typing until the initial progress draft or
+    // final response is delivered, because that mode uses the draft for
+    // progress only rather than answer replacement.
     let is_partial_draft = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
+        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
+        && !matrix_single_message_streaming;
     let typing_cancellation = if is_partial_draft {
         None
     } else {
@@ -5033,39 +5071,44 @@ async fn process_channel_message_body(
         _ => None,
     };
 
-    // Wrap observer to forward tool events as live thread messages
+    // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
     // without bound. See `ChannelNotifyObserver::record_event` for the
     // drop-on-full contract.
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+    let (notify_tx, notify_task) = if matrix_single_message_streaming {
+        (None, None)
+    } else {
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+        let notify_channel = target_channel.clone();
+        let notify_reply_target = msg.reply_target.clone();
+        let notify_thread_root = followup_thread_id(&msg);
+        let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
+            Some(zeroclaw_spawn::spawn!(async move {
+                while notify_rx.recv().await.is_some() {}
+            }))
+        } else {
+            Some(zeroclaw_spawn::spawn!(async move {
+                let thread_ts = notify_thread_root;
+                while let Some(text) = notify_rx.recv().await {
+                    if let Some(ref ch) = notify_channel {
+                        let _ = ch
+                            .send(
+                                &SendMessage::new(&text, &notify_reply_target)
+                                    .in_thread(thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }))
+        };
+        (Some(notify_tx), notify_task)
+    };
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
-        Some(zeroclaw_spawn::spawn!(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(zeroclaw_spawn::spawn!(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -10586,6 +10629,28 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    struct CountingObserver {
+        events: Arc<AtomicUsize>,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn flush(&self) {}
+
+        fn name(&self) -> &str {
+            "counting-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
@@ -10600,6 +10665,62 @@ mod tests {
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
         );
+    }
+
+    #[test]
+    fn matrix_single_message_streaming_resolves_from_matrix_alias_only() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        config.channels.matrix.insert(
+            "partial".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::Partial,
+                ..Default::default()
+            },
+        );
+
+        let single_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+        let partial_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("partial".to_string()),
+            ..Default::default()
+        };
+        let unknown_alias_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("missing".to_string()),
+            ..Default::default()
+        };
+        let slack_msg = ChannelMessage {
+            channel: "slack".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &single_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &partial_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &unknown_alias_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config, &slack_msg
+        ));
     }
 
     #[tokio::test]
@@ -17480,7 +17601,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -17517,7 +17638,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -17557,6 +17678,32 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn channel_notify_observer_without_sender_marks_tools_without_emitting() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(CountingObserver {
+                events: Arc::clone(&events),
+            }),
+            tx: None,
+            tools_used: AtomicBool::new(false),
+        };
+
+        observer.record_event(
+            &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                tool: "file_read".to_string(),
+                tool_call_id: None,
+                arguments: Some(r#"{"path":"/a"}"#.to_string()),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        );
+
+        assert!(observer.tools_used.load(Ordering::Relaxed));
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
     /// Regression: the bounded mpsc must drop on full rather than
     /// block. A slow downstream channel (e.g. a stalled Discord /
     /// Slack API call) must not wedge the observer hook. With a
@@ -17567,7 +17714,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
