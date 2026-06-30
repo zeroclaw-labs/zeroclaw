@@ -751,7 +751,11 @@ pub fn all_tools_with_runtime(
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
-        match BrowserOpenTool::new(security.clone(), browser_config.allowed_domains.clone()) {
+        match BrowserOpenTool::new_with_private_hosts(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.allowed_private_hosts.clone(),
+        ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(tool));
             }
@@ -784,6 +788,7 @@ pub fn all_tools_with_runtime(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
@@ -1196,7 +1201,9 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
-            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
@@ -1437,6 +1444,16 @@ pub fn all_tools_with_runtime(
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
+                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
+                        call_fuel: config.plugins.limits.call_fuel,
+                        max_memory_bytes: config
+                            .plugins
+                            .limits
+                            .max_memory_mb
+                            .saturating_mul(1024 * 1024),
+                        max_table_elements: config.plugins.limits.max_table_elements,
+                        max_instances: config.plugins.limits.max_instances,
+                    };
                     for (manifest, wasm_path) in details {
                         // SSOT: `config` is the snapshot the whole tool set is
                         // built from, identical to every other tool here. A
@@ -1457,6 +1474,7 @@ pub fn all_tools_with_runtime(
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
+                            plugin_limits,
                         )));
                     }
                     ::zeroclaw_log::record!(

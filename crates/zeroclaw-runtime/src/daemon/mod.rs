@@ -379,6 +379,14 @@ pub async fn run(
         .await;
     }
 
+    // Consume the pricing catalog (`<data_dir>/pricing.json`) if present so the
+    // cost engine can price models the operator never hand-priced in config.
+    // This is consumption only and vendor-neutral: a typical build populates the
+    // file from a public price feed, while an air-gapped build may ship no file
+    // (self-hosted/free models then stay $0). Refreshing the file is a CLI +
+    // scheduler concern, never a public-feed fetch inside this shared daemon.
+    crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
@@ -598,6 +606,14 @@ pub async fn run(
             }
         };
 
+        let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
+                &config.hooks,
+            )))
+        } else {
+            None
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
@@ -620,6 +636,7 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            hooks,
         }))
     } else {
         None
@@ -1259,7 +1276,32 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    if let Some((channel, target)) = &delivery {
+                    // Skip delivery when the heartbeat agent signalled "nothing
+                    // to report" via the quiet NO_REPLY sentinel. Without this
+                    // guard the literal sentinel string is announced to the
+                    // channel (zeroclaw-labs/zeroclaw#2128). The empty-output
+                    // branch above never produces the sentinel, so checking the
+                    // final announcement is sufficient. Failure/refusal kinds
+                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
+                    // suppressed — they carry operator-visible meaning.
+                    let suppress_delivery =
+                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                            .should_deliver();
+                    if suppress_delivery {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"task": task.text})),
+                            "Heartbeat task returned NO_REPLY sentinel — skipping delivery"
+                        );
+                    }
+                    if let Some((channel, target)) = &delivery
+                        && !suppress_delivery
+                    {
                         let delivery_result = tokio::time::timeout(
                             Duration::from_secs(30),
                             crate::cron::scheduler::deliver_announcement(

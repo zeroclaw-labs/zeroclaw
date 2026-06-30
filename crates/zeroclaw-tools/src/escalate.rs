@@ -428,6 +428,8 @@ mod tests {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
             let _ = tx.send(msg).await;
             Ok(())
