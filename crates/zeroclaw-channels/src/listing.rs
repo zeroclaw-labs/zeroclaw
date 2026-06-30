@@ -189,6 +189,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-amqp"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Filesystem"),
+        type_keys: &["filesystem"],
+        compiled: cfg!(feature = "channel-filesystem"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Webhook"),
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),

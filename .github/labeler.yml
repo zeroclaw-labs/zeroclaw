@@ -492,6 +492,11 @@
           - "crates/zeroclaw-runtime/src/tools/cron_runs.rs"
           - "crates/zeroclaw-runtime/src/tools/cron_update.rs"
 
+"tool:delegate":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/tools/delegate.rs"
+
 "tool:file":
   - changed-files:
       - any-glob-to-any-file:
@@ -611,6 +616,18 @@
       - any-glob-to-any-file:
           - "src/observability/**"
           - "crates/zeroclaw-runtime/src/observability/**"
+
+"observability:log":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-log/src/**"
+          - "crates/zeroclaw-runtime/src/observability/log.rs"
+
+"observability:otel":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/observability/otel.rs"
+          - "tests/component/otel_dependency_feature_regression.rs"
 
 "observability:prometheus":
   - changed-files:

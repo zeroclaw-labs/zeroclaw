@@ -1,0 +1,137 @@
+name: Daily npm Audit
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-npm-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  npm-audit:
+    name: npm Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run npm audit
+        id: audit
+        continue-on-error: true
+        working-directory: web
+        shell: bash
+        env:
+          AUDIT_OUTPUT: ${{ runner.temp }}/npm-audit-output.json
+          AUDIT_ERROR: ${{ runner.temp }}/npm-audit-error.txt
+        run: |
+          set +e
+          npm audit --audit-level=high --json > "$AUDIT_OUTPUT" 2> "$AUDIT_ERROR"
+          exit_code=$?
+          set -e
+
+          echo "audit_exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+          node <<'NODE'
+          const fs = require('fs');
+          const output = process.env.AUDIT_OUTPUT;
+          const githubOutput = process.env.GITHUB_OUTPUT;
+          try {
+            const report = JSON.parse(fs.readFileSync(output, 'utf8'));
+            const counts = report.metadata?.vulnerabilities ?? {};
+            const highCritical = (counts.high ?? 0) + (counts.critical ?? 0);
+            fs.appendFileSync(githubOutput, `audit_parse_ok=true\nhigh_critical_count=${highCritical}\n`);
+          } catch (_) {
+            fs.appendFileSync(githubOutput, 'audit_parse_ok=false\nhigh_critical_count=0\n');
+          }
+          NODE
+
+          cat "$AUDIT_OUTPUT"
+          if [[ -s "$AUDIT_ERROR" ]]; then
+            cat "$AUDIT_ERROR" >&2
+          fi
+          exit "$exit_code"
+
+      - name: Open issue on npm audit findings
+        id: npm_audit_issue
+        if: steps.audit.outputs.high_critical_count != '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          issues_enabled=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')
+          if [[ "$issues_enabled" != "true" ]]; then
+            echo "issue_url=" >> "$GITHUB_OUTPUT"
+            echo "::notice::Repository issues are disabled; skipping npm audit issue creation."
+            exit 0
+          fi
+
+          existing_url=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "security" \
+            --label "dependencies" \
+            --state open \
+            --search "npm audit failed in:title" \
+            --json url \
+            --jq '.[0].url // ""')
+
+          if [[ -n "$existing_url" ]]; then
+            echo "issue_url=$existing_url" >> "$GITHUB_OUTPUT"
+            echo "An open npm audit issue already exists: $existing_url"
+            exit 0
+          fi
+
+          audit_output=$(head -c 60000 "${{ runner.temp }}/npm-audit-output.json")
+
+          {
+            printf '## npm audit failed\n\n'
+            printf 'Workflow run: %s\n\n' "${RUN_URL}"
+            printf 'High/critical findings: %s\n\n' "${{ steps.audit.outputs.high_critical_count }}"
+            printf '```json\n%s\n```\n\n' "${audit_output}"
+            printf 'Review `web/package-lock.json` and update affected npm packages.\n'
+          } > "${{ runner.temp }}/issue-body.md"
+
+          issue_url=$(gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ci: npm audit failed — $(date -u +%Y-%m-%d)" \
+            --label "security" \
+            --label "dependencies" \
+            --label "risk:high" \
+            --body-file "${{ runner.temp }}/issue-body.md")
+          echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
+
+      - name: Propagate npm audit failure
+        if: steps.audit.outputs.audit_exit_code != '0'
+        env:
+          ISSUE_URL: ${{ steps.npm_audit_issue.outputs.issue_url }}
+          AUDIT_PARSE_OK: ${{ steps.audit.outputs.audit_parse_ok }}
+          HIGH_CRITICAL_COUNT: ${{ steps.audit.outputs.high_critical_count }}
+        run: |
+          if [[ "$HIGH_CRITICAL_COUNT" != "0" ]]; then
+            if [[ -n "$ISSUE_URL" ]]; then
+              echo "::error::npm audit found high/critical vulnerabilities. See $ISSUE_URL for details."
+            else
+              echo "::error::npm audit found high/critical vulnerabilities. Repository issues are disabled or issue creation was skipped; inspect this workflow log for details."
+            fi
+          elif [[ "$AUDIT_PARSE_OK" != "true" ]]; then
+            echo "::error::npm audit failed before producing a parseable report; inspect this workflow log for details."
+          else
+            echo "::error::npm audit failed without high/critical findings; inspect this workflow log for details."
+          fi
+          exit 1

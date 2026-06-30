@@ -86,7 +86,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -267,7 +267,7 @@ jobs:
     continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
@@ -385,7 +385,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.93.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -436,6 +436,10 @@ jobs:
     name: Publish Stable Release
     needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     environment:
       name: github-releases
       url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
@@ -497,10 +501,130 @@ jobs:
           echo "--- Assets ---"
           ls -lh release-assets/
 
+      - id: attest
+        name: Attach SLSA provenance attestation
+        continue-on-error: true
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-assets/*
+
+      - id: attestation_bundles
+        name: Download attestation bundles for offline verification
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release-stable-manual.yml
+        run: |
+          set -euo pipefail
+
+          cd release-assets
+          tmp_dir="$(mktemp -d ../attestation-bundles.XXXXXX)"
+          gh attestation trusted-root > "$tmp_dir/trusted_root.jsonl"
+          printf 'Artifact | SHA256 | Bundle\n' > "$tmp_dir/ATTESTATION-BUNDLES.md"
+          printf '%s\n' '--- | --- | ---' >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+
+          artifact_count=0
+          bundle_count=0
+          for artifact in *.tar.gz *.zip *.dmg SHA256SUMS install.sh; do
+            [ -f "$artifact" ] || continue
+            artifact_count=$((artifact_count + 1))
+            digest=$(sha256sum "$artifact" | awk '{print $1}')
+            bundle="sha256:${digest}.jsonl"
+            target="${artifact}.attestation.jsonl"
+
+            for attempt in 1 2 3 4 5; do
+              gh attestation download "$artifact" --repo "$GITHUB_REPOSITORY" && break
+              if [[ "$attempt" == 5 ]]; then
+                exit 1
+              fi
+              sleep 10
+            done
+
+            test -f "$bundle"
+            mv "$bundle" "$tmp_dir/$target"
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$SIGNER_WORKFLOW" \
+              --source-digest "$GITHUB_SHA" \
+              --bundle "$tmp_dir/$target" \
+              --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
+            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            bundle_count=$((bundle_count + 1))
+          done
+
+          test "$artifact_count" -gt 0
+          test "$bundle_count" -eq "$artifact_count"
+          mv "$tmp_dir"/* .
+
+          echo "--- Attestation bundles ---"
+          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+
       - name: Write release notes
         env:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Append verification instructions to release notes
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          BUNDLE_OUTCOME: ${{ steps.attestation_bundles.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DIGEST: ${{ github.sha }}
+        run: |
+          if [[ "$ATTEST_OUTCOME" == "success" ]]; then
+            cat >> release-notes.md <<VERIFY_EOF
+
+          ---
+          ### Verify SLSA Provenance
+
+          Release artifacts have GitHub artifact provenance attestations.
+
+          **Online**
+          ```bash
+          gh attestation verify <artifact> \
+            --repo zeroclaw-labs/zeroclaw \
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+            --source-digest ${SOURCE_DIGEST}
+          ```
+          VERIFY_EOF
+
+            if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
+              cat >> release-notes.md <<VERIFY_EOF
+
+          **Offline**
+          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
+          ```bash
+          gh attestation verify <artifact> \
+            --repo zeroclaw-labs/zeroclaw \
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+            --source-digest ${SOURCE_DIGEST} \
+            --bundle <artifact>.attestation.jsonl \
+            --custom-trusted-root trusted_root.jsonl
+          ```
+          VERIFY_EOF
+            else
+              cat >> release-notes.md <<VERIFY_EOF
+
+          Offline attestation bundles were unavailable in this best-effort release.
+          Inspect the release workflow run for details: ${RUN_URL}
+          VERIFY_EOF
+            fi
+
+            cat >> release-notes.md <<'VERIFY_EOF'
+
+          Install gh: https://cli.github.com/
+          VERIFY_EOF
+          else
+            cat >> release-notes.md <<VERIFY_EOF
+
+          ---
+          ### SLSA Provenance
+
+          Provenance attestation was unavailable in this best-effort Phase A release.
+          Inspect the release workflow run for details: ${RUN_URL}
+          VERIFY_EOF
+          fi
 
       - name: Create tag and release
         env:
@@ -611,7 +735,9 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: docker-ctx
-          file: docker-ctx/Dockerfile.debian
+          file: docker-ctx/Dockerfile
+          build-args: |
+            VARIANT=debian
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}-debian

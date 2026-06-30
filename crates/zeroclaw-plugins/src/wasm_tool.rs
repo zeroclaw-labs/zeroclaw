@@ -146,3 +146,35 @@ impl Tool for WasmTool {
         runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_exposes_metadata_via_tool_accessors() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let tool = WasmTool::new(
+            "my_tool".to_string(),
+            "does things".to_string(),
+            schema.clone(),
+            PathBuf::from("/tmp/plugin.wasm"),
+            Vec::new(),
+            HashMap::new(),
+        );
+        assert_eq!(tool.name(), "my_tool");
+        assert_eq!(tool.description(), "does things");
+        assert_eq!(tool.parameters_schema(), schema);
+    }
+
+    #[test]
+    fn default_schema_requires_a_string_input() {
+        let schema = default_schema();
+        assert_eq!(schema["type"].as_str(), Some("object"));
+        assert_eq!(
+            schema["properties"]["input"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(schema["required"][0].as_str(), Some("input"));
+    }
+}
