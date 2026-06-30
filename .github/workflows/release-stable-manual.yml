@@ -708,8 +708,8 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
-          # Collect all release archives and desktop artifacts; strip leading directory
-          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) \
+          # Collect all release archives; strip leading directory
+          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
             -exec sha256sum {} + \
             | sed 's|  \./[^/]*/|  |' \
             | base64 -w0)

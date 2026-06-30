@@ -259,7 +259,6 @@ The architecture RFC §4.4.2 defines the following release artifacts:
 | Kernel binary (hardware) | aarch64-linux-gnu, armv7-linux-gnueabihf | GitHub Releases |
 | Gateway binary | Same platform matrix | GitHub Releases |
 | WASM plugin files | wasm32-wasip2 | Plugin registry |
-| Desktop installer | x86_64 + aarch64, macOS/Windows/Linux | GitHub Releases, platform stores |
 
 The current release workflows know about exactly one of these: the standard binary. The rest do not exist in the automation yet. This is appropriate for now: the plugin system is not yet complete. But the release workflows should be designed with this model in mind so they do not need to be rewritten as each new artifact type is introduced.
 
