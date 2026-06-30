@@ -262,6 +262,8 @@ impl BlueskyChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 

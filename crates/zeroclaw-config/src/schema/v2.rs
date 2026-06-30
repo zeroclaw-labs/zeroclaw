@@ -114,6 +114,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "voice_duplex",
     "mqtt",
     "amqp",
+    "filesystem",
 ];
 
 impl V2Config {
