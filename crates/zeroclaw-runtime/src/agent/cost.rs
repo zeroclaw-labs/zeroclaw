@@ -26,10 +26,13 @@ pub struct TurnUsage {
 
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
+    let rate_sheet = rate_sheet_pricing_by_provider_type(config);
 
     for (type_k, alias_k, profile) in config.providers.models.iter_entries() {
         let mut slot = profile.pricing.clone();
-        apply_rate_sheet_pricing(config, type_k, &mut slot);
+        if let Some(rates) = rate_sheet.get(type_k) {
+            merge_pricing(&mut slot, rates);
+        }
         if !slot.is_empty() {
             pricing.insert(format!("{type_k}.{alias_k}"), slot);
         }
@@ -43,6 +46,7 @@ pub fn tool_loop_cost_tracking_context_for_agent(
     agent_alias: &str,
 ) -> Option<ToolLoopCostTrackingContext> {
     CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .filter(|tracker| tracker.is_enabled())
         .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
 }
 
@@ -66,9 +70,9 @@ pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProvider
         merge_pricing(slot, &profile.pricing);
     }
 
-    for (provider_type, _model_id, _rates) in config.cost.rates.providers.models.iter_entries() {
+    for (provider_type, model_id, rates) in config.cost.rates.providers.models.iter_entries() {
         let slot = pricing.entry(provider_type.to_string()).or_default();
-        apply_rate_sheet_pricing(config, provider_type, slot);
+        insert_rate_sheet_model_pricing(slot, model_id, rates);
     }
 
     pricing
@@ -118,20 +122,28 @@ pub fn provider_pricing<'a>(
     }
 }
 
-fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
-    for (rate_provider_type, model_id, rates) in config.cost.rates.providers.models.iter_entries() {
-        if rate_provider_type != provider_type {
-            continue;
-        }
-        if let Some(input) = rates.input_per_mtok {
-            slot.insert(format!("{model_id}.input"), input);
-        }
-        if let Some(output) = rates.output_per_mtok {
-            slot.insert(format!("{model_id}.output"), output);
-        }
-        if let Some(cached) = rates.cached_input_per_mtok {
-            slot.insert(format!("{model_id}.cached_input"), cached);
-        }
+fn rate_sheet_pricing_by_provider_type(config: &Config) -> HashMap<String, HashMap<String, f64>> {
+    let mut by_type = HashMap::new();
+    for (provider_type, model_id, rates) in config.cost.rates.providers.models.iter_entries() {
+        let slot = by_type.entry(provider_type.to_string()).or_default();
+        insert_rate_sheet_model_pricing(slot, model_id, rates);
+    }
+    by_type
+}
+
+fn insert_rate_sheet_model_pricing(
+    slot: &mut HashMap<String, f64>,
+    model_id: &str,
+    rates: &zeroclaw_config::schema::ModelCostRates,
+) {
+    if let Some(input) = rates.input_per_mtok {
+        slot.insert(format!("{model_id}.input"), input);
+    }
+    if let Some(output) = rates.output_per_mtok {
+        slot.insert(format!("{model_id}.output"), output);
+    }
+    if let Some(cached) = rates.cached_input_per_mtok {
+        slot.insert(format!("{model_id}.cached_input"), cached);
     }
 }
 
@@ -340,6 +352,10 @@ pub async fn record_tool_loop_cost_usage(
         cached_rate,
         output_rate,
     );
+    let tracker_enabled = ctx
+        .tracker
+        .as_ref()
+        .is_some_and(|tracker| tracker.is_enabled());
 
     // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to
@@ -347,7 +363,7 @@ pub async fn record_tool_loop_cost_usage(
     // stream doesn't get spammy. Missing pricing means either the
     // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
-    if ctx.tracker.is_some()
+    if tracker_enabled
         && !priced_from_catalog
         && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0))
     {
@@ -376,29 +392,30 @@ pub async fn record_tool_loop_cost_usage(
         turn_usage.cost_usd += cost_usage.cost_usd;
     }
 
-    let goal_task_id = match ctx.agent_alias.as_deref() {
-        Some(agent_alias) => {
-            active_goal_task_id_for_context(
-                agent_alias,
-                ctx.originator_route.as_deref(),
-                ctx.principal_id.as_deref(),
-            )
-            .await
-        }
-        None => None,
-    };
+    let returned_usage = (cost_usage.total_tokens, cost_usage.cost_usd);
 
-    if let Some(tracker) = &ctx.tracker
-        && let Err(error) = tracker.record_usage_with_attribution(
-            cost_usage.clone(),
+    if tracker_enabled && let Some(tracker) = &ctx.tracker {
+        let goal_task_id = match ctx.agent_alias.as_deref() {
+            Some(agent_alias) => {
+                active_goal_task_id_for_context(
+                    agent_alias,
+                    ctx.originator_route.as_deref(),
+                    ctx.principal_id.as_deref(),
+                )
+                .await
+            }
+            None => None,
+        };
+        if let Err(error) = tracker.record_usage_with_owned_attribution(
+            cost_usage,
             ctx.agent_alias.as_deref(),
-            goal_task_id.as_deref(),
-        )
-    {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+            goal_task_id,
+        ) {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+        }
     }
 
-    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+    Some(returned_usage)
 }
 
 async fn active_goal_task_id_for_context(
@@ -409,10 +426,10 @@ async fn active_goal_task_id_for_context(
     let control_plane = crate::control_plane::control_plane()?;
     match control_plane
         .store
-        .latest_active_goal_for_context(agent_alias, originator_route, principal_id)
+        .latest_active_goal_id_for_context(agent_alias, originator_route, principal_id)
         .await
     {
-        Ok(Some(goal)) => Some(goal.id),
+        Ok(Some(goal_id)) => Some(goal_id),
         Ok(None) => None,
         Err(error) => {
             ::zeroclaw_log::record!(

@@ -7,7 +7,6 @@
 use anyhow::{Context, Result, bail};
 use zeroclaw_commands::CommandSurface;
 use zeroclaw_config::cost::CostTracker;
-use zeroclaw_config::cost::types::CostSummary;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
 use super::global::control_plane;
@@ -71,11 +70,19 @@ fn cost_limit_label(limit: Option<f64>) -> String {
         .unwrap_or_else(|| msg("goal-budget-limit-unlimited", &[]))
 }
 
-fn goal_usage_summary(config: Option<&Config>, task_id: &str) -> Option<CostSummary> {
-    let config = config?;
-    let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)?;
-    match tracker.get_summary_for_goal(task_id) {
-        Ok(summary) => Some(summary),
+#[derive(Debug, Clone, Copy, Default)]
+struct GoalUsageTotals {
+    total_tokens: u64,
+    cost_usd: f64,
+}
+
+fn goal_usage_totals(config: Option<&Config>, task_id: &str) -> Option<GoalUsageTotals> {
+    let tracker = enabled_cost_tracker(config)?;
+    match tracker.get_usage_totals_for_goal(task_id) {
+        Ok((total_tokens, cost_usd)) => Some(GoalUsageTotals {
+            total_tokens,
+            cost_usd,
+        }),
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -92,12 +99,25 @@ fn goal_usage_summary(config: Option<&Config>, task_id: &str) -> Option<CostSumm
     }
 }
 
-fn goal_budget_summary(goal: &GoalTaskRecord, usage: Option<&CostSummary>) -> String {
+fn initial_goal_usage_totals(config: Option<&Config>) -> Option<GoalUsageTotals> {
+    if config.is_none() {
+        return Some(GoalUsageTotals::default());
+    }
+    enabled_cost_tracker(config).map(|_| GoalUsageTotals::default())
+}
+
+fn enabled_cost_tracker(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
+    let config = config?;
+    let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)?;
+    tracker.is_enabled().then_some(tracker)
+}
+
+fn goal_budget_summary(goal: &GoalTaskRecord, usage: Option<&GoalUsageTotals>) -> String {
     let token_limit = token_limit_label(goal.effective_token_limit);
     let cost_limit = cost_limit_label(goal.effective_cost_limit_usd);
     if let Some(usage) = usage {
         let tokens_used = usage.total_tokens.to_string();
-        let cost_used = formatted_cost(usage.session_cost_usd);
+        let cost_used = formatted_cost(usage.cost_usd);
         msg(
             "goal-budget-summary",
             &[
@@ -123,7 +143,7 @@ struct GoalBudgetExhaustion {
 
 fn goal_budget_exhaustion(
     goal: &GoalTaskRecord,
-    usage: Option<&CostSummary>,
+    usage: Option<&GoalUsageTotals>,
 ) -> Option<GoalBudgetExhaustion> {
     let usage = usage?;
     let tokens = goal
@@ -131,7 +151,7 @@ fn goal_budget_exhaustion(
         .is_some_and(|limit| usage.total_tokens >= limit);
     let cost = goal
         .effective_cost_limit_usd
-        .is_some_and(|limit| usage.session_cost_usd >= limit);
+        .is_some_and(|limit| usage.cost_usd >= limit);
     (tokens || cost).then_some(GoalBudgetExhaustion { tokens, cost })
 }
 
@@ -139,7 +159,10 @@ fn goal_has_effective_budget(goal: &GoalTaskRecord) -> bool {
     goal.effective_token_limit.is_some() || goal.effective_cost_limit_usd.is_some()
 }
 
-fn goal_budget_pause(goal: &GoalTaskRecord, usage: Option<&CostSummary>) -> Option<GoalPauseState> {
+fn goal_budget_pause(
+    goal: &GoalTaskRecord,
+    usage: Option<&GoalUsageTotals>,
+) -> Option<GoalPauseState> {
     let usage = usage?;
     let exhaustion = goal_budget_exhaustion(goal, Some(usage))?;
     let budget = goal_budget_summary(goal, Some(usage));
@@ -163,7 +186,7 @@ fn goal_budget_pause(goal: &GoalTaskRecord, usage: Option<&CostSummary>) -> Opti
                 },
                 "cost": {
                     "exhausted": exhaustion.cost,
-                    "used_usd": usage.session_cost_usd,
+                    "used_usd": usage.cost_usd,
                     "limit_usd": goal.effective_cost_limit_usd,
                 },
             })),
@@ -199,7 +222,7 @@ fn goal_budget_unavailable_pause(goal: &GoalTaskRecord) -> Option<GoalPauseState
 
 fn goal_budget_gate_pause(
     goal: &GoalTaskRecord,
-    usage: Option<&CostSummary>,
+    usage: Option<&GoalUsageTotals>,
 ) -> Option<GoalPauseState> {
     match usage {
         Some(usage) => goal_budget_pause(goal, Some(usage)),
@@ -419,12 +442,10 @@ fn publish_goal_state_update(admission: &GoalAdmission) {
     });
 }
 
-fn publish_goal_verifier_started(task_id: &str, goal: &GoalTaskRecord, config: &Config) {
-    let usage = goal_usage_summary(Some(config), task_id);
-    let budget = goal_budget_summary(goal, usage.as_ref());
+fn publish_goal_verifier_started(task_id: &str, budget: &str) {
     let message = msg(
         "goal-command-verifying",
-        &[("task_id", task_id), ("budget", &budget)],
+        &[("task_id", task_id), ("budget", budget)],
     );
     let _ = GOAL_STATE_UPDATE_SINK.try_with(|sink| {
         if let Some(sink) = sink {
@@ -802,28 +823,27 @@ pub async fn evaluate_goal_turn(
             )
         })?;
 
-    let usage = goal_usage_summary(Some(config), &task.id);
+    let usage = goal_usage_totals(Some(config), &task.id);
     if let Some(pause) = goal_budget_gate_pause(&goal, usage.as_ref()) {
-        let admission = pause_goal_for_blocker(
-            cp.store.as_ref(),
-            ctx,
-            Some(task.id.clone()),
-            Some(config),
-            pause,
-        )
-        .await?;
+        let task_id = task.id.clone();
+        let budget = goal_budget_summary(&goal, usage.as_ref());
+        let admission =
+            pause_goal_for_resolved_task_with_budget(cp.store.as_ref(), task, pause, budget)
+                .await?;
         publish_goal_state_update(&admission);
         return Ok(Some(GoalTurnEvaluation::Paused {
-            task_id: task.id,
+            task_id,
             message: admission.message,
         }));
     }
 
-    if config.goal.verifier.enabled {
-        publish_goal_verifier_started(&task.id, &goal, config);
+    let verifier_enabled = config.goal.verifier.enabled;
+    if verifier_enabled {
+        let budget = goal_budget_summary(&goal, usage.as_ref());
+        publish_goal_verifier_started(&task.id, &budget);
     }
 
-    match verify_goal_completion(config, &task.agent, &goal, candidate_summary).await {
+    match verify_goal_completion(config, &task.agent, ctx, &goal, candidate_summary).await {
         Ok(GoalVerifierDecision::Complete { notes: _ }) => {
             cp.store
                 .update_status(
@@ -836,8 +856,12 @@ pub async fn evaluate_goal_turn(
                 .with_context(|| {
                     msg("goal-command-error-update-failed", &[("task_id", &task.id)])
                 })?;
-            let usage = goal_usage_summary(Some(config), &task.id);
-            let budget = goal_budget_summary(&goal, usage.as_ref());
+            let final_usage = if verifier_enabled {
+                goal_usage_totals(Some(config), &task.id)
+            } else {
+                usage
+            };
+            let budget = goal_budget_summary(&goal, final_usage.as_ref());
             let admission = GoalAdmission {
                 task_id: Some(task.id.clone()),
                 status: TaskStatus::Completed,
@@ -854,7 +878,23 @@ pub async fn evaluate_goal_turn(
             }))
         }
         Ok(GoalVerifierDecision::Continue { notes }) => {
-            let usage = goal_usage_summary(Some(config), &task.id);
+            let usage = goal_usage_totals(Some(config), &task.id);
+            if let Some(pause) = goal_budget_gate_pause(&goal, usage.as_ref()) {
+                let budget = goal_budget_summary(&goal, usage.as_ref());
+                let task_id = task.id.clone();
+                let admission = pause_goal_for_resolved_task_with_budget(
+                    cp.store.as_ref(),
+                    task,
+                    pause,
+                    budget,
+                )
+                .await?;
+                publish_goal_state_update(&admission);
+                return Ok(Some(GoalTurnEvaluation::Paused {
+                    task_id,
+                    message: admission.message,
+                }));
+            }
             let budget = goal_budget_summary(&goal, usage.as_ref());
             let admission = GoalAdmission {
                 task_id: Some(task.id.clone()),
@@ -874,10 +914,10 @@ pub async fn evaluate_goal_turn(
             }))
         }
         Ok(GoalVerifierDecision::Blocked { pause }) => {
-            let admission = pause_goal_for_blocker(
+            let admission = pause_goal_for_known_blocker(
                 cp.store.as_ref(),
-                ctx,
-                Some(task.id.clone()),
+                task.clone(),
+                &goal,
                 Some(config),
                 pause,
             )
@@ -889,10 +929,10 @@ pub async fn evaluate_goal_turn(
             }))
         }
         Err(error) => {
-            let admission = pause_goal_for_blocker(
+            let admission = pause_goal_for_known_blocker(
                 cp.store.as_ref(),
-                ctx,
-                Some(task.id.clone()),
+                task.clone(),
+                &goal,
                 Some(config),
                 verifier_outage_pause(&error),
             )
@@ -944,9 +984,7 @@ async fn start_goal(
         pause_description: None,
         blockers: Vec::new(),
     };
-    let initial_usage = config
-        .and_then(|config| goal_usage_summary(Some(config), &task_id))
-        .or_else(|| config.is_none().then(CostSummary::default));
+    let initial_usage = initial_goal_usage_totals(config);
     let initial_pause = config.and_then(|_| goal_budget_gate_pause(&goal, initial_usage.as_ref()));
     let (status, continue_goal, message_key) = if let Some(pause) = initial_pause {
         goal.pause_reason = Some(pause.reason);
@@ -1016,7 +1054,7 @@ async fn status_goal(
                 &[("task_id", &task.id)],
             )
         })?;
-    let usage = goal_usage_summary(config, &task.id);
+    let usage = goal_usage_totals(config, &task.id);
     let budget = goal_budget_summary(&goal, usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task.id.clone()),
@@ -1102,7 +1140,7 @@ async fn update_goal_budget(
         effective_cost_limit_usd: cost_limit_usd,
         ..current
     };
-    let usage = goal_usage_summary(config, &task.id);
+    let usage = goal_usage_totals(config, &task.id);
     let budget = goal_budget_summary(&updated_goal, usage.as_ref());
     if let Some(budget_pause) = goal_budget_gate_pause(&updated_goal, usage.as_ref()) {
         store
@@ -1196,24 +1234,6 @@ async fn pause_goal_for_blocker(
     pause: GoalPauseState,
 ) -> Result<GoalAdmission> {
     let task = resolve_goal_task(store, ctx, task_id).await?;
-    if task.status.is_terminal() {
-        let status = enum_label(task.status);
-        bail!(
-            "{}",
-            msg(
-                "goal-command-error-already-terminal",
-                &[("task_id", &task.id), ("status", &status)]
-            )
-        );
-    }
-    store
-        .update_goal_pause(&task.id, Some(pause))
-        .await
-        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task.id)]))?;
-    store
-        .update_status(&task.id, TaskStatus::Paused, None, None)
-        .await
-        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
     let goal = store
         .get_goal_task(&task.id)
         .await
@@ -1224,8 +1244,38 @@ async fn pause_goal_for_blocker(
                 &[("task_id", &task.id)],
             )
         })?;
-    let usage = goal_usage_summary(config, &task.id);
+    let usage = goal_usage_totals(config, &task.id);
     let budget = goal_budget_summary(&goal, usage.as_ref());
+    pause_goal_for_resolved_task_with_budget(store, task, pause, budget).await
+}
+
+async fn pause_goal_for_known_blocker(
+    store: &dyn TaskRegistry,
+    task: TaskRecord,
+    goal: &GoalTaskRecord,
+    config: Option<&Config>,
+    pause: GoalPauseState,
+) -> Result<GoalAdmission> {
+    let usage = goal_usage_totals(config, &task.id);
+    let budget = goal_budget_summary(goal, usage.as_ref());
+    pause_goal_for_resolved_task_with_budget(store, task, pause, budget).await
+}
+
+async fn pause_goal_for_resolved_task_with_budget(
+    store: &dyn TaskRegistry,
+    task: TaskRecord,
+    pause: GoalPauseState,
+    budget: String,
+) -> Result<GoalAdmission> {
+    ensure_goal_not_terminal(&task)?;
+    store
+        .update_goal_pause(&task.id, Some(pause))
+        .await
+        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task.id)]))?;
+    store
+        .update_status(&task.id, TaskStatus::Paused, None, None)
+        .await
+        .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
     Ok(GoalAdmission {
         task_id: Some(task.id.clone()),
         status: TaskStatus::Paused,
@@ -1235,6 +1285,20 @@ async fn pause_goal_for_blocker(
         ),
         continue_goal: false,
     })
+}
+
+fn ensure_goal_not_terminal(task: &TaskRecord) -> Result<()> {
+    if task.status.is_terminal() {
+        let status = enum_label(task.status);
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-already-terminal",
+                &[("task_id", &task.id), ("status", &status)]
+            )
+        );
+    }
+    Ok(())
 }
 
 async fn resume_goal(
@@ -1265,12 +1329,13 @@ async fn resume_goal(
                 &[("task_id", &task.id)],
             )
         })?;
-    let current_usage = goal_usage_summary(config, &task.id);
+    let current_usage = goal_usage_totals(config, &task.id);
     if let Some(budget_pause) = goal_budget_gate_pause(&current, current_usage.as_ref()) {
         let message_key = match budget_pause.reason {
             GoalPauseReason::BudgetUnavailable => "goal-command-budget-unavailable",
             _ => "goal-command-budget-exhausted",
         };
+        let budget = goal_budget_summary(&current, current_usage.as_ref());
         store
             .update_goal_pause(&task.id, Some(merge_budget_pause(&current, budget_pause)))
             .await
@@ -1279,18 +1344,6 @@ async fn resume_goal(
             .update_status(&task.id, TaskStatus::Paused, None, None)
             .await
             .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
-        let goal = store
-            .get_goal_task(&task.id)
-            .await
-            .with_context(|| msg("goal-command-error-status-failed", &[]))?
-            .with_context(|| {
-                msg(
-                    "goal-command-error-extension-missing",
-                    &[("task_id", &task.id)],
-                )
-            })?;
-        let usage = goal_usage_summary(config, &task.id);
-        let budget = goal_budget_summary(&goal, usage.as_ref());
         return Ok(GoalAdmission {
             task_id: Some(task.id.clone()),
             status: TaskStatus::Paused,
@@ -1316,18 +1369,7 @@ async fn resume_goal(
         .update_status(&task.id, TaskStatus::Running, None, None)
         .await
         .with_context(|| msg("goal-command-error-update-failed", &[("task_id", &task.id)]))?;
-    let goal = store
-        .get_goal_task(&task.id)
-        .await
-        .with_context(|| msg("goal-command-error-status-failed", &[]))?
-        .with_context(|| {
-            msg(
-                "goal-command-error-extension-missing",
-                &[("task_id", &task.id)],
-            )
-        })?;
-    let usage = goal_usage_summary(config, &task.id);
-    let budget = goal_budget_summary(&goal, usage.as_ref());
+    let budget = goal_budget_summary(&current, current_usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task.id.clone()),
         status: TaskStatus::Running,
@@ -1375,7 +1417,7 @@ async fn cancel_goal(
                 &[("task_id", &task.id)],
             )
         })?;
-    let usage = goal_usage_summary(config, &task.id);
+    let usage = goal_usage_totals(config, &task.id);
     let budget = goal_budget_summary(&goal, usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task.id.clone()),
@@ -1542,10 +1584,10 @@ mod tests {
             pause_description: None,
             blockers: Vec::new(),
         };
-        let usage = CostSummary {
-            session_cost_usd: 0.75,
+        let usage = GoalUsageTotals {
+            cost_usd: 0.75,
             total_tokens: 1_000,
-            ..CostSummary::default()
+            ..GoalUsageTotals::default()
         };
 
         let pause = goal_budget_pause(&goal, Some(&usage)).unwrap();
@@ -1690,7 +1732,9 @@ mod tests {
         };
 
         scope_goal_state_updates(Some(GoalStateUpdateSink::new(tx)), async {
-            publish_goal_verifier_started("goal-1", &goal, &config);
+            let usage = goal_usage_totals(Some(&config), "goal-1");
+            let budget = goal_budget_summary(&goal, usage.as_ref());
+            publish_goal_verifier_started("goal-1", &budget);
         })
         .await;
 
@@ -1762,6 +1806,117 @@ mod tests {
             store.get(&task_id).await.unwrap().unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_pauses_when_verifier_continue_exhausts_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "CONTINUE\nMore work remains."
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 75,
+                    "completion_tokens": 50
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let store = global_test_store();
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let ctx = GoalAdmissionContext::new(agent.clone())
+            .with_originator_route(Some(route.clone()))
+            .with_principal_id(Some(principal.clone()));
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.clone(),
+                    kind: TaskKind::Goal,
+                    agent: agent.clone(),
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "ship it".into(),
+                    effective_token_limit: Some(100),
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..test_config()
+        };
+        config.cost.enabled = true;
+        config.goal.verifier.enabled = true;
+        config.goal.verifier.model_provider = "custom.verifier".into();
+        config.goal.verifier.model = Some("model".into());
+        config.providers.models.custom.insert(
+            "verifier".into(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".into()),
+                    uri: Some(server.uri()),
+                    model: Some("model".into()),
+                    pricing: [("model.input".into(), 1.0), ("model.output".into(), 2.0)]
+                        .into_iter()
+                        .collect(),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let outcome = evaluate_goal_turn(&ctx, &config, "looks done")
+            .await
+            .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused {
+            task_id: paused_id,
+            message,
+        }) = outcome
+        else {
+            panic!("verifier usage should exhaust the goal budget before continuation");
+        };
+        assert_eq!(paused_id, task_id);
+        assert!(message.starts_with("⏸️ Goal"));
+        assert!(message.contains("Budget:"));
+        let task = store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::BudgetExhausted));
     }
 
     #[tokio::test]

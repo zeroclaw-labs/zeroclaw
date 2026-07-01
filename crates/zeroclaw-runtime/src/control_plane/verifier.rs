@@ -15,7 +15,6 @@ use crate::agent::cost::{
     tool_loop_cost_tracking_context_from_tracker,
 };
 
-use super::global::control_plane;
 use super::goal::GoalAdmissionContext;
 use super::task_registry::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
@@ -31,6 +30,7 @@ pub enum GoalVerifierDecision {
 pub async fn verify_goal_completion(
     config: &Config,
     agent_alias: &str,
+    goal_context: &GoalAdmissionContext,
     goal: &GoalTaskRecord,
     candidate_summary: &str,
 ) -> Result<GoalVerifierDecision> {
@@ -78,18 +78,13 @@ pub async fn verify_goal_completion(
         Ok::<_, anyhow::Error>(response.text.unwrap_or_default())
     };
 
-    let text = match CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir) {
+    let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .filter(|tracker| tracker.is_enabled());
+    let text = match tracker {
         Some(tracker) => {
             let mut ctx =
                 tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker);
-            if let Some(control_plane) = control_plane()
-                && let Some(task) = control_plane.store.get(&goal.task_id).await?
-            {
-                let goal_ctx = GoalAdmissionContext::new(task.agent)
-                    .with_originator_route(task.originator_route)
-                    .with_principal_id(task.principal_id);
-                ctx = ctx.with_goal_admission_context(&goal_ctx);
-            }
+            ctx = ctx.with_goal_admission_context(goal_context);
             TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), verifier_call)
                 .await?

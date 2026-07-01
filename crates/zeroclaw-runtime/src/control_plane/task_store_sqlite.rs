@@ -556,7 +556,7 @@ impl TaskRegistry for SqliteTaskStore {
     async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT * FROM tasks
               WHERE agent = ?1
                 AND kind = 'goal'
@@ -584,7 +584,7 @@ impl TaskRegistry for SqliteTaskStore {
     ) -> Result<Option<TaskRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT * FROM tasks
               WHERE agent = ?1
                 AND kind = 'goal'
@@ -607,6 +607,17 @@ impl TaskRegistry for SqliteTaskStore {
             }
         }
         Ok(None)
+    }
+
+    async fn latest_active_goal_id_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.latest_active_goal_for_context(agent, originator_route, principal_id)
+            .await
+            .map(|task| task.map(|task| task.id))
     }
 
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> Result<()> {
@@ -866,6 +877,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.id, "wanted");
+        let got_id = s
+            .latest_active_goal_id_for_context("main", Some("route-a"), Some("principal-a"))
+            .await
+            .unwrap();
+        assert_eq!(got_id.as_deref(), Some("wanted"));
+    }
+
+    #[tokio::test]
+    async fn latest_active_goal_id_for_context_skips_unreadable_latest_candidate() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+
+        let mut older_valid_goal = rec("older-valid-goal", "main", 1, "boot-1");
+        older_valid_goal.kind = TaskKind::Goal;
+        older_valid_goal.originator_route = Some("route-a".into());
+        older_valid_goal.principal_id = Some("principal-a".into());
+        older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
+        s.create(older_valid_goal).await.unwrap();
+
+        {
+            let conn = s.conn.lock();
+            conn.execute("DROP INDEX idx_tasks_active_goal_context", [])
+                .unwrap();
+        }
+
+        let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
+        unreadable_newer_goal.kind = TaskKind::Goal;
+        unreadable_newer_goal.originator_route = Some("route-a".into());
+        unreadable_newer_goal.principal_id = Some("principal-a".into());
+        unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
+        s.create(unreadable_newer_goal).await.unwrap();
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET status = 'future_paused' WHERE id = ?1",
+                params!["unreadable-newer-goal"],
+            )
+            .unwrap();
+        }
+
+        let got = s
+            .latest_active_goal_for_context("main", Some("route-a"), Some("principal-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "older-valid-goal");
+        let got_id = s
+            .latest_active_goal_id_for_context("main", Some("route-a"), Some("principal-a"))
+            .await
+            .unwrap();
+        assert_eq!(got_id.as_deref(), Some("older-valid-goal"));
     }
 
     #[tokio::test]

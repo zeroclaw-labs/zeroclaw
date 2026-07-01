@@ -42,7 +42,7 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
     let control_plane = crate::control_plane::control_plane()?;
     control_plane
         .store
-        .latest_active_goal_for_context(
+        .latest_active_goal_id_for_context(
             agent_alias,
             ctx.originator_route.as_deref(),
             ctx.principal_id.as_deref(),
@@ -50,7 +50,28 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
         .await
         .ok()
         .flatten()
-        .map(|goal| goal.id)
+}
+
+async fn active_goal_task_id_from_runtime_context() -> Option<String> {
+    let ctx = crate::control_plane::current_goal_admission_context()?;
+    let control_plane = crate::control_plane::control_plane()?;
+    control_plane
+        .store
+        .latest_active_goal_id_for_context(
+            ctx.agent_alias.as_str(),
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn active_goal_task_id_for_delegate_policy() -> Option<String> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context().await {
+        return Some(task_id);
+    }
+    active_goal_task_id_from_cost_context().await
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -1150,7 +1171,7 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
-            if active_goal_task_id_from_cost_context().await.is_some() {
+            if active_goal_task_id_for_delegate_policy().await.is_some() {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -1789,6 +1810,7 @@ impl DelegateTool {
             .try_with(Clone::clone)
             .ok()
             .flatten();
+        let parent_goal_admission_context = crate::control_plane::current_goal_admission_context();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1819,6 +1841,7 @@ impl DelegateTool {
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let goal_cost_context = parent_goal_cost_context.clone();
+            let goal_admission_context = parent_goal_admission_context.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1857,11 +1880,14 @@ impl DelegateTool {
                                 TOOL_LOOP_COST_TRACKING_CONTEXT
                                     .scope(
                                         goal_cost_context,
-                                        Box::pin(inner.execute_sync(
-                                            &agent_name,
-                                            &prompt,
-                                            &args_clone,
-                                        )),
+                                        crate::control_plane::scope_goal_admission_context(
+                                            goal_admission_context,
+                                            Box::pin(inner.execute_sync(
+                                                &agent_name,
+                                                &prompt,
+                                                &args_clone,
+                                            )),
+                                        ),
                                     )
                                     .await
                             })
@@ -3638,6 +3664,68 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Background delegation is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegation_rejected_when_goal_context_active_without_cost_context() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let goal_context = crate::control_plane::GoalAdmissionContext::new(agent);
+        let result = crate::control_plane::scope_goal_admission_context(
+            Some(goal_context),
+            tool.execute(json!({
+                "agent": "researcher",
+                "prompt": "do detached work",
+                "background": true
+            })),
+        )
+        .await
+        .unwrap();
 
         assert!(!result.success);
         assert!(

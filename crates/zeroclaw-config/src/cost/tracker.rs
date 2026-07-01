@@ -55,6 +55,10 @@ impl CostTracker {
         self.config_snapshot()
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.config.read().enabled
+    }
+
     /// Hot-swap config so reloaded budget limits apply without a restart.
     pub fn update_config(&self, config: CostConfig) {
         *self.config.write() = config;
@@ -163,8 +167,27 @@ impl CostTracker {
         agent_alias: Option<&str>,
         goal_task_id: Option<&str>,
     ) -> Result<()> {
-        let config = self.config_snapshot();
-        if !config.enabled {
+        self.record_usage_with_owned_attribution(
+            usage,
+            agent_alias,
+            goal_task_id.map(str::to_string),
+        )
+    }
+
+    /// Record a usage event with an already-owned goal task id. Runtime goal
+    /// attribution resolves the id from durable task state, so this avoids
+    /// cloning that id again before persistence.
+    pub fn record_usage_with_owned_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        goal_task_id: Option<String>,
+    ) -> Result<()> {
+        let (enabled, track_per_agent) = {
+            let config = self.config.read();
+            (config.enabled, config.track_per_agent)
+        };
+        if !enabled {
             return Ok(());
         }
 
@@ -179,7 +202,7 @@ impl CostTracker {
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
 
-        let effective_alias = if config.track_per_agent {
+        let effective_alias = if track_per_agent {
             agent_alias.map(str::to_string)
         } else {
             None
@@ -189,7 +212,7 @@ impl CostTracker {
         let record = CostRecord::with_attribution(
             &self.session_id,
             effective_alias.clone(),
-            goal_task_id.map(str::to_string),
+            goal_task_id,
             usage,
         );
 
@@ -264,13 +287,15 @@ impl CostTracker {
     /// persisted ledger rows carrying `goal_task_id`; no consumed counters are
     /// stored on the goal record.
     pub fn get_summary_for_goal(&self, goal_task_id: &str) -> Result<CostSummary> {
-        let records = {
-            let mut storage = self.lock_storage();
-            storage.records_in_bounds(None, None)?
-        };
-        Ok(summary_for_records(records.iter().filter(|record| {
-            record.goal_task_id.as_deref() == Some(goal_task_id)
-        })))
+        let mut storage = self.lock_storage();
+        storage.summary_for_goal(goal_task_id)
+    }
+
+    /// Get usage totals for a durable goal task without building model/agent
+    /// rollups. Totals are still derived from the canonical persisted ledger.
+    pub fn get_usage_totals_for_goal(&self, goal_task_id: &str) -> Result<(u64, f64)> {
+        let mut storage = self.lock_storage();
+        storage.usage_totals_for_goal(goal_task_id)
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -359,27 +384,6 @@ impl CostTracker {
     pub fn get_monthly_cost(&self, year: i32, month: u32) -> Result<f64> {
         let storage = self.lock_storage();
         storage.get_cost_for_month(year, month)
-    }
-}
-
-fn summary_for_records<'a, I>(records: I) -> CostSummary
-where
-    I: IntoIterator<Item = &'a CostRecord>,
-{
-    let records: Vec<&CostRecord> = records.into_iter().collect();
-    let total_cost: f64 = records.iter().map(|r| r.usage.cost_usd).sum();
-    let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
-    let by_model = build_model_stats(records.iter().copied());
-    let by_agent_records: Vec<CostRecord> =
-        records.iter().map(|record| (*record).clone()).collect();
-    CostSummary {
-        session_cost_usd: total_cost,
-        daily_cost_usd: total_cost,
-        monthly_cost_usd: total_cost,
-        total_tokens,
-        request_count: records.len(),
-        by_model,
-        by_agent: build_agent_stats(&by_agent_records),
     }
 }
 
@@ -484,57 +488,110 @@ where
     let mut by_model: HashMap<String, ModelStats> = HashMap::new();
 
     for record in records {
-        let entry = by_model
-            .entry(record.usage.model.clone())
-            .or_insert_with(|| ModelStats {
-                model: record.usage.model.clone(),
-                cost_usd: 0.0,
-                total_tokens: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_input_tokens: 0,
-                request_count: 0,
-            });
-
-        entry.cost_usd += record.usage.cost_usd;
-        entry.total_tokens += record.usage.total_tokens;
-        entry.input_tokens += record.usage.input_tokens;
-        entry.output_tokens += record.usage.output_tokens;
-        entry.cached_input_tokens += record.usage.cached_input_tokens;
-        entry.request_count += 1;
+        add_model_stats(&mut by_model, record);
     }
 
     by_model
+}
+
+fn add_model_stats(by_model: &mut HashMap<String, ModelStats>, record: &CostRecord) {
+    if let Some(entry) = by_model.get_mut(record.usage.model.as_str()) {
+        add_usage_to_model_stats(entry, record);
+        return;
+    }
+    let entry = by_model
+        .entry(record.usage.model.clone())
+        .or_insert_with(|| ModelStats {
+            model: record.usage.model.clone(),
+            cost_usd: 0.0,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            request_count: 0,
+        });
+    add_usage_to_model_stats(entry, record);
+}
+
+fn add_usage_to_model_stats(entry: &mut ModelStats, record: &CostRecord) {
+    entry.cost_usd += record.usage.cost_usd;
+    entry.total_tokens += record.usage.total_tokens;
+    entry.input_tokens += record.usage.input_tokens;
+    entry.output_tokens += record.usage.output_tokens;
+    entry.cached_input_tokens += record.usage.cached_input_tokens;
+    entry.request_count += 1;
 }
 
 fn build_agent_stats(records: &[CostRecord]) -> HashMap<String, AgentCostStats> {
     let mut by_agent: HashMap<String, AgentCostStats> = HashMap::new();
 
     for record in records {
-        let Some(alias) = record.agent_alias.as_deref() else {
-            continue;
-        };
-        let entry = by_agent
-            .entry(alias.to_string())
-            .or_insert_with(|| AgentCostStats {
-                agent_alias: alias.to_string(),
-                cost_usd: 0.0,
-                total_tokens: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_input_tokens: 0,
-                request_count: 0,
-            });
-
-        entry.cost_usd += record.usage.cost_usd;
-        entry.total_tokens += record.usage.total_tokens;
-        entry.input_tokens += record.usage.input_tokens;
-        entry.output_tokens += record.usage.output_tokens;
-        entry.cached_input_tokens += record.usage.cached_input_tokens;
-        entry.request_count += 1;
+        add_agent_stats(&mut by_agent, record);
     }
 
     by_agent
+}
+
+fn add_agent_stats(by_agent: &mut HashMap<String, AgentCostStats>, record: &CostRecord) {
+    let Some(alias) = record.agent_alias.as_deref() else {
+        return;
+    };
+    if let Some(entry) = by_agent.get_mut(alias) {
+        add_usage_to_agent_stats(entry, record);
+        return;
+    }
+    let entry = by_agent
+        .entry(alias.to_string())
+        .or_insert_with(|| AgentCostStats {
+            agent_alias: alias.to_string(),
+            cost_usd: 0.0,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            request_count: 0,
+        });
+    add_usage_to_agent_stats(entry, record);
+}
+
+fn add_usage_to_agent_stats(entry: &mut AgentCostStats, record: &CostRecord) {
+    entry.cost_usd += record.usage.cost_usd;
+    entry.total_tokens += record.usage.total_tokens;
+    entry.input_tokens += record.usage.input_tokens;
+    entry.output_tokens += record.usage.output_tokens;
+    entry.cached_input_tokens += record.usage.cached_input_tokens;
+    entry.request_count += 1;
+}
+
+#[derive(Default)]
+struct CostSummaryAccumulator {
+    total_cost: f64,
+    total_tokens: u64,
+    request_count: usize,
+    by_model: HashMap<String, ModelStats>,
+    by_agent: HashMap<String, AgentCostStats>,
+}
+
+impl CostSummaryAccumulator {
+    fn record(&mut self, record: &CostRecord) {
+        self.total_cost += record.usage.cost_usd;
+        self.total_tokens += record.usage.total_tokens;
+        self.request_count += 1;
+        add_model_stats(&mut self.by_model, record);
+        add_agent_stats(&mut self.by_agent, record);
+    }
+
+    fn finish(self) -> CostSummary {
+        CostSummary {
+            session_cost_usd: self.total_cost,
+            daily_cost_usd: self.total_cost,
+            monthly_cost_usd: self.total_cost,
+            total_tokens: self.total_tokens,
+            request_count: self.request_count,
+            by_model: self.by_model,
+            by_agent: self.by_agent,
+        }
+    }
 }
 
 /// Persistent storage for cost records.
@@ -545,6 +602,7 @@ struct CostStorage {
     cached_day: NaiveDate,
     cached_year: i32,
     cached_month: u32,
+    aggregates_current: bool,
 }
 
 impl CostStorage {
@@ -559,21 +617,15 @@ impl CostStorage {
             })?;
         }
         let now = Utc::now();
-        let mut storage = Self {
+        Ok(Self {
             path: path.to_path_buf(),
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
             cached_day: now.date_naive(),
             cached_year: now.year(),
             cached_month: now.month(),
-        };
-        storage.rebuild_aggregates(
-            storage.cached_day,
-            storage.cached_year,
-            storage.cached_month,
-        )?;
-
-        Ok(storage)
+            aggregates_current: false,
+        })
     }
 
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
@@ -670,6 +722,7 @@ impl CostStorage {
         self.cached_day = day;
         self.cached_year = year;
         self.cached_month = month;
+        self.aggregates_current = true;
 
         Ok(())
     }
@@ -680,7 +733,11 @@ impl CostStorage {
         let year = now.year();
         let month = now.month();
 
-        if day != self.cached_day || year != self.cached_year || month != self.cached_month {
+        if !self.aggregates_current
+            || day != self.cached_day
+            || year != self.cached_year
+            || month != self.cached_month
+        {
             self.rebuild_aggregates(day, year, month)?;
         }
 
@@ -689,6 +746,8 @@ impl CostStorage {
 
     /// Add a new record.
     fn add_record(&mut self, record: CostRecord) -> Result<()> {
+        self.ensure_period_cache_current()?;
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -720,8 +779,6 @@ impl CostStorage {
                 self.path.display().to_string()
             )
         })?;
-
-        self.ensure_period_cache_current()?;
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -774,6 +831,28 @@ impl CostStorage {
             out.push(record);
         })?;
         Ok(out)
+    }
+
+    fn summary_for_goal(&mut self, goal_task_id: &str) -> Result<CostSummary> {
+        let mut summary = CostSummaryAccumulator::default();
+        self.for_each_record(|record| {
+            if record.goal_task_id.as_deref() == Some(goal_task_id) {
+                summary.record(&record);
+            }
+        })?;
+        Ok(summary.finish())
+    }
+
+    fn usage_totals_for_goal(&mut self, goal_task_id: &str) -> Result<(u64, f64)> {
+        let mut total_tokens = 0_u64;
+        let mut cost_usd = 0.0_f64;
+        self.for_each_record(|record| {
+            if record.goal_task_id.as_deref() == Some(goal_task_id) {
+                total_tokens = total_tokens.saturating_add(record.usage.total_tokens);
+                cost_usd += record.usage.cost_usd;
+            }
+        })?;
+        Ok((total_tokens, cost_usd))
     }
 
     /// Get cost for a specific date.
@@ -887,6 +966,20 @@ mod tests {
         assert_eq!(summary.request_count, 1);
         assert!(summary.session_cost_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    #[test]
+    fn first_record_after_lazy_init_is_counted_once() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        let usage = TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0);
+        let expected_cost = usage.cost_usd;
+        tracker.record_usage(usage).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - expected_cost).abs() < 1e-9);
+        assert!((summary.monthly_cost_usd - expected_cost).abs() < 1e-9);
     }
 
     #[test]

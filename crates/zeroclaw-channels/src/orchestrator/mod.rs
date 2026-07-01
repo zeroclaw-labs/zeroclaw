@@ -580,6 +580,7 @@ struct InFlightSenderTaskState {
     task_id: u64,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
+    predecessor: Option<Arc<InFlightSenderTaskState>>,
 }
 
 struct InFlightTaskCompletion {
@@ -601,10 +602,40 @@ impl InFlightTaskCompletion {
     }
 
     async fn wait(&self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
-        self.notify.notified().await;
+    }
+}
+
+enum InFlightPreRegistration {
+    NotNeeded,
+    Registered(InFlightSenderTaskState),
+    Queued {
+        state: InFlightSenderTaskState,
+        predecessor: InFlightSenderTaskState,
+    },
+    Abandoned,
+}
+
+impl InFlightPreRegistration {
+    fn into_registered(self) -> Option<InFlightSenderTaskState> {
+        match self {
+            Self::Registered(state) => Some(state),
+            Self::Queued { .. } | Self::NotNeeded | Self::Abandoned => None,
+        }
+    }
+}
+
+fn cancel_in_flight_chain(state: &InFlightSenderTaskState) {
+    let mut current = Some(state.clone());
+    while let Some(state) = current {
+        state.cancellation.cancel();
+        current = state.predecessor.as_deref().cloned();
     }
 }
 
@@ -1502,10 +1533,31 @@ fn goal_continuation_message_with_prompt(
     task_id: &str,
     prompt: &GoalContinuationPrompt,
 ) -> zeroclaw_api::channel::ChannelMessage {
-    let mut next = msg.clone();
-    next.id = format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4());
-    next.content = goal_continuation_prompt(task_id, prompt);
-    next.attachments.clear();
+    synthetic_goal_message_from(
+        msg,
+        format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4()),
+        goal_continuation_prompt(task_id, prompt),
+    )
+}
+
+fn synthetic_goal_message_from(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    id: String,
+    content: String,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let mut next = zeroclaw_api::channel::ChannelMessage::new(
+        id,
+        msg.sender.clone(),
+        msg.reply_target.clone(),
+        content,
+        msg.channel.clone(),
+        msg.timestamp,
+    );
+    next.channel_alias = msg.channel_alias.clone();
+    next.thread_ts = msg.thread_ts.clone();
+    next.interruption_scope_id = msg.interruption_scope_id.clone();
+    next.subject = msg.subject.clone();
+    next.conversation_scope = msg.conversation_scope;
     next.passive_context = false;
     next
 }
@@ -1566,13 +1618,11 @@ fn goal_objective_unavailable(task_id: &str, reason: &str) -> String {
 fn goal_controller_limit_pause_message(
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> zeroclaw_api::channel::ChannelMessage {
-    let mut next = msg.clone();
-    next.id = format!("{}:goal-limit:{}", msg.id, uuid::Uuid::new_v4());
-    next.content =
-        "/goal pause goal controller reached the autonomous continuation safety limit".to_string();
-    next.attachments.clear();
-    next.passive_context = false;
-    next
+    synthetic_goal_message_from(
+        msg,
+        format!("{}:goal-limit:{}", msg.id, uuid::Uuid::new_v4()),
+        "/goal pause goal controller reached the autonomous continuation safety limit".to_string(),
+    )
 }
 
 async fn send_goal_controller_update(
@@ -5483,10 +5533,8 @@ async fn process_channel_message_body(
         }))
     };
 
-    let goal_status_updates_enabled = goal_channel_status_updates_enabled(
-        runtime_defaults_snapshot(ctx.as_ref()).config.as_ref(),
-        msg.channel.as_str(),
-    );
+    let goal_status_updates_enabled =
+        goal_channel_status_updates_enabled(runtime_defaults.config.as_ref(), msg.channel.as_str());
     let (goal_state_update_scope, goal_state_update_task) =
         if goal_status_updates_enabled && let Some(channel) = target_channel.clone() {
             let (goal_state_tx, goal_state_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -6373,50 +6421,143 @@ async fn process_channel_message_body(
     }
 }
 
-/// Shared worker body extracted so both the normal path and the debounce path
-/// can reuse the same in-flight tracking / cancellation / process logic.
-async fn dispatch_worker(
-    ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
-    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
-    task_sequence: Arc<AtomicU64>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _permit = permit;
+async fn pre_register_in_flight_before_permit(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    task_sequence: &AtomicU64,
+) -> InFlightPreRegistration {
+    if msg.channel == "cli" || msg.passive_context {
+        return InFlightPreRegistration::NotNeeded;
+    }
+
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
-    let sender_scope_key = interruption_scope_key(&msg);
-    let cancellation_token = CancellationToken::new();
-    let completion = Arc::new(InFlightTaskCompletion::new());
-    let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+    let sender_scope_key = interruption_scope_key(msg);
+    let mut active = in_flight.lock().await;
+    let predecessor = active.get(&sender_scope_key).cloned();
+    let state = InFlightSenderTaskState {
+        task_id: task_sequence.fetch_add(1, Ordering::Relaxed),
+        cancellation: CancellationToken::new(),
+        completion: Arc::new(InFlightTaskCompletion::new()),
+        predecessor: predecessor.clone().map(Arc::new),
+    };
+    active.insert(sender_scope_key, state.clone());
 
-    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
-
-    if register_in_flight {
-        let previous = {
-            let mut active = in_flight.lock().await;
-            active.insert(
-                sender_scope_key.clone(),
-                InFlightSenderTaskState {
-                    task_id,
-                    cancellation: cancellation_token.clone(),
-                    completion: Arc::clone(&completion),
-                },
-            )
-        };
-
-        if interrupt_enabled && let Some(previous) = previous {
+    match predecessor {
+        Some(predecessor) if interrupt_enabled => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "interrupting previous in-flight request for sender"
             );
-            previous.cancellation.cancel();
-            previous.completion.wait().await;
+            cancel_in_flight_chain(&predecessor);
+            InFlightPreRegistration::Queued { state, predecessor }
         }
+        Some(predecessor) => InFlightPreRegistration::Queued { state, predecessor },
+        None => InFlightPreRegistration::Registered(state),
     }
+}
+
+async fn complete_pre_registered_in_flight(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    pre_registration: InFlightPreRegistration,
+) -> InFlightPreRegistration {
+    match pre_registration {
+        InFlightPreRegistration::Queued { state, predecessor } => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "waiting for previous in-flight request for sender"
+            );
+            predecessor.completion.wait().await;
+            if state.cancellation.is_cancelled() {
+                state.completion.mark_done();
+                return InFlightPreRegistration::Abandoned;
+            }
+            InFlightPreRegistration::Registered(state)
+        }
+        other => other,
+    }
+}
+
+async fn unregister_pre_registered_in_flight(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    state: InFlightSenderTaskState,
+) {
+    let scope_key = interruption_scope_key(msg);
+    let mut active = in_flight.lock().await;
+    if active
+        .get(&scope_key)
+        .is_some_and(|active| active.task_id == state.task_id)
+    {
+        active.remove(&scope_key);
+    }
+    state.completion.mark_done();
+}
+
+async fn acquire_dispatch_permit_or_cancel(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    pre_registered: &mut Option<InFlightSenderTaskState>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let cancellation = pre_registered
+        .as_ref()
+        .map(|state| state.cancellation.clone());
+
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    if let Some(state) = pre_registered.take() {
+                        unregister_pre_registered_in_flight(msg, in_flight, state).await;
+                    }
+                    None
+                }
+                permit = semaphore.acquire_owned() => match permit {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        if let Some(state) = pre_registered.take() {
+                            unregister_pre_registered_in_flight(msg, in_flight, state).await;
+                        }
+                        None
+                    }
+                },
+            }
+        }
+        None => semaphore.acquire_owned().await.ok(),
+    }
+}
+
+async fn dispatch_worker(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    task_sequence: Arc<AtomicU64>,
+    pre_registered: Option<InFlightSenderTaskState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+    let sender_scope_key = interruption_scope_key(&msg);
+    let InFlightSenderTaskState {
+        task_id,
+        cancellation: cancellation_token,
+        completion,
+        predecessor: _,
+    } = pre_registered.unwrap_or_else(|| InFlightSenderTaskState {
+        task_id: task_sequence.fetch_add(1, Ordering::Relaxed),
+        cancellation: CancellationToken::new(),
+        completion: Arc::new(InFlightTaskCompletion::new()),
+        predecessor: None,
+    });
+
+    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
 
     let mut next_message = Some(msg);
     let mut goal_continuations = 0usize;
@@ -6549,7 +6690,7 @@ async fn run_message_dispatch_loop(
                 active.remove(&scope_key)
             };
             let reply = if let Some(state) = previous {
-                state.cancellation.cancel();
+                cancel_in_flight_chain(&state);
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
@@ -6604,9 +6745,31 @@ async fn run_message_dispatch_loop(
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
-                        let permit = match debounce_semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
+                        let pre_registration = pre_register_in_flight_before_permit(
+                            debounce_ctx.as_ref(),
+                            &debounce_msg,
+                            debounce_in_flight.as_ref(),
+                            debounce_task_seq.as_ref(),
+                        )
+                        .await;
+                        let mut pre_registered = match complete_pre_registered_in_flight(
+                            &debounce_msg,
+                            pre_registration,
+                        )
+                        .await
+                        {
+                            InFlightPreRegistration::Abandoned => return,
+                            pre_registered => pre_registered.into_registered(),
+                        };
+
+                        let Some(permit) = acquire_dispatch_permit_or_cancel(
+                            &debounce_msg,
+                            debounce_in_flight.as_ref(),
+                            debounce_semaphore,
+                            &mut pre_registered,
+                        )
+                        .await else {
+                            return;
                         };
 
                         dispatch_worker(
@@ -6614,6 +6777,7 @@ async fn run_message_dispatch_loop(
                             debounce_msg,
                             debounce_in_flight,
                             debounce_task_seq,
+                            pre_registered,
                             permit,
                         )
                         .await;
@@ -6630,16 +6794,44 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
+        let worker_semaphore = Arc::clone(&semaphore);
+        let pre_registration = pre_register_in_flight_before_permit(
+            worker_ctx.as_ref(),
+            &msg,
+            in_flight.as_ref(),
+            task_sequence.as_ref(),
+        )
+        .await;
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            let mut pre_registered =
+                match complete_pre_registered_in_flight(&msg, pre_registration).await {
+                    InFlightPreRegistration::Abandoned => return,
+                    pre_registered => pre_registered.into_registered(),
+                };
+
+            let Some(permit) = acquire_dispatch_permit_or_cancel(
+                &msg,
+                in_flight.as_ref(),
+                worker_semaphore,
+                &mut pre_registered,
+            )
+            .await
+            else {
+                return;
+            };
+
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                task_sequence,
+                pre_registered,
+                permit,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -10632,6 +10824,7 @@ pub async fn start_channels(
                 config.cost.clone(),
                 &config.data_dir,
             )
+            .filter(|tracker| tracker.is_enabled())
             .map(|tracker| {
                 // The cost tracker's lookup site (`record_tool_loop_cost_usage`
                 // in zeroclaw-runtime) receives the bare provider type — the
@@ -16454,6 +16647,40 @@ BTC is currently around $65,000 based on latest tool output."#
         peak_in_flight: Arc<AtomicUsize>,
     }
 
+    struct CountingDelayProvider {
+        delay: Duration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingDelayProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(format!("echo: {message}"))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingDelayProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "CountingDelayProvider"
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for ConcurrencyTrackingProvider {
         async fn chat_with_system(
@@ -16631,6 +16858,399 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_serializes_same_sender_scope_when_interrupt_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(ConcurrencyTrackingProvider {
+                delay: Duration::from_millis(120),
+                in_flight: in_flight.clone(),
+                peak_in_flight: peak_in_flight.clone(),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1".to_string(),
+            sender: "user_a".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "first".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "2".to_string(),
+            sender: "user_a".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "second".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "same sender/scope must not start a second model call while the first is active"
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_same_sender_scope_does_not_consume_global_dispatch_permit() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(ConcurrencyTrackingProvider {
+                delay: Duration::from_millis(180),
+                in_flight: in_flight.clone(),
+                peak_in_flight: peak_in_flight.clone(),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        for (id, sender, reply_target, content) in [
+            ("1", "user_a", "chat-1", "user_a first"),
+            ("2", "user_a", "chat-1", "user_a second"),
+            ("3", "user_b", "chat-2", "user_b first"),
+        ] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.to_string(),
+                sender: sender.to_string(),
+                reply_target: reply_target.to_string(),
+                content: content.to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "user_b should run while user_a's second same-scope message waits; peak={peak}"
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_active_same_scope_and_abandons_queued_request() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(CountingDelayProvider {
+                delay: Duration::from_millis(250),
+                calls: model_calls.clone(),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        for (id, content) in [("1", "first"), ("2", "second"), ("3", "/stop")] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.to_string(),
+                sender: "user_a".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: content.to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+        let calls = model_calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= 1,
+            "/stop must cancel the active request without letting the queued same-scope request start"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages
+                .iter()
+                .any(|message| message.contains("Stop signal sent")),
+            "operator should receive an immediate stop acknowledgement"
+        );
     }
 
     #[tokio::test]
@@ -18903,7 +19523,14 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: Some("work".into()),
             thread_ts: Some("$thread".into()),
             interruption_scope_id: Some("$thread".into()),
+            subject: Some("Goal thread".into()),
             passive_context: true,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            attachments: vec![zeroclaw_api::media::MediaAttachment {
+                file_name: "snapshot.png".into(),
+                data: vec![42; 1024],
+                mime_type: Some("image/png".into()),
+            }],
             ..zeroclaw_api::channel::ChannelMessage::new(
                 "msg-1",
                 "@operator:example.org",
@@ -18923,8 +19550,16 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert_ne!(next.id, original.id);
+        assert_eq!(next.sender, original.sender);
+        assert_eq!(next.reply_target, original.reply_target);
+        assert_eq!(next.channel, original.channel);
+        assert_eq!(next.timestamp, original.timestamp);
         assert_eq!(next.channel_alias, original.channel_alias);
         assert_eq!(next.thread_ts, original.thread_ts);
+        assert_eq!(next.interruption_scope_id, original.interruption_scope_id);
+        assert_eq!(next.subject, original.subject);
+        assert_eq!(next.conversation_scope, original.conversation_scope);
+        assert!(next.attachments.is_empty());
         assert!(!next.passive_context);
         assert!(
             next.content

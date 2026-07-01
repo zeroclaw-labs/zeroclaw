@@ -261,6 +261,15 @@ pub trait TaskRegistry: Send + Sync {
         originator_route: Option<&str>,
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<TaskRecord>>;
+    /// Resolve only the id of the latest non-terminal goal for the trusted
+    /// runtime context. This is a read-only projection from `tasks.id`, used
+    /// by hot attribution paths that do not need the full task record.
+    async fn latest_active_goal_id_for_context(
+        &self,
+        agent: &str,
+        originator_route: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> anyhow::Result<Option<String>>;
     async fn create_goal_task(&self, rec: GoalTaskRecord) -> anyhow::Result<()>;
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
     /// Replace the persisted effective budget limits for a goal.
