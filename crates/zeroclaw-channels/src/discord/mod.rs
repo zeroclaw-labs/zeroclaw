@@ -1748,6 +1748,27 @@ async fn discord_thread_parent(
     result
 }
 
+/// Cache-only variant of [`discord_thread_parent`]: returns the cached parent
+/// id for `channel_id` if a prior [`discord_thread_parent`] call already
+/// populated the cache, otherwise `None`. It performs **no** Discord REST call,
+/// so it is safe on the per-keystroke autocomplete (type-4) path where an
+/// authenticated round-trip would violate the side-effect-free requirement.
+///
+/// A miss (`channel_id` never looked up, or looked up and found to be a
+/// non-thread) yields `None`, which keeps channel authorization fail-closed:
+/// the thread can only pass an allowlist via a known, already-cached parent.
+async fn discord_thread_parent_cached(
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    thread_channels
+        .lock()
+        .await
+        .get(channel_id)
+        .cloned()
+        .flatten()
+}
+
 // Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
 // exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
 const INTENT_GUILDS: u64 = 1 << 0;
@@ -2733,7 +2754,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
                                         }
@@ -2988,7 +3010,8 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
-                                        };
+
+                                            ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
                                         }
@@ -3037,6 +3060,7 @@ impl Channel for DiscordChannel {
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let resolver = self.slash_command_resolver.clone();
+                                    let thread_channels = self.thread_channels.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
                                         // Fail-closed authz, side-effect-free:
@@ -3046,12 +3070,22 @@ impl Channel for DiscordChannel {
                                         // don't make here). On denial OR no
                                         // matches we answer an empty choice set.
                                         //
-                                        // No thread-parent REST lookup: it is an
-                                        // authenticated round-trip per keystroke
-                                        // and would defeat the side-effect-free
-                                        // requirement, so a channel-filtered
-                                        // thread simply yields no completions
-                                        // (fail-closed) rather than probing.
+                                        // Thread-parent resolution is CACHE-ONLY:
+                                        // a parent populated by an earlier normal
+                                        // message in this thread lets a
+                                        // parent-allowlisted thread authorize
+                                        // autocomplete consistently with the
+                                        // message path (#6829). It reads the shared
+                                        // cache only — NO Discord REST call — so the
+                                        // per-keystroke path stays side-effect-free;
+                                        // an uncached thread still yields no
+                                        // completions (fail-closed) rather than
+                                        // probing.
+                                        let thread_parent = discord_thread_parent_cached(
+                                            &thread_channels,
+                                            &interaction_channel,
+                                        )
+                                        .await;
                                         let authorized = interaction_gate(
                                             &peers,
                                             &guild_filter,
@@ -3059,7 +3093,7 @@ impl Channel for DiscordChannel {
                                             &user_id,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
-                                            None,
+                                            thread_parent.as_deref(),
                                         )
                                         .is_ok();
 
@@ -3426,7 +3460,8 @@ impl Channel for DiscordChannel {
                         thread_ts,
                         attachments: media_attachments,
                         subject: None,
-                    };
+
+                        ..Default::default()};
 
                     if tx.send(channel_msg).await.is_err() {
                         break;
@@ -4420,6 +4455,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
@@ -7791,6 +7827,116 @@ mod tests {
         assert!(
             interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
             "empty peer list denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_parent_cached_reads_cache_without_rest() {
+        // Cache-only lookup: a thread whose parent was resolved by an earlier
+        // message returns that parent; a channel cached as a non-thread, or one
+        // never looked up, returns None. No client/token is reachable here, so a
+        // non-None result can only have come from the cache (never a REST probe).
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        {
+            let mut c = cache.lock().await;
+            c.insert("thread1".to_string(), Some("parentA".to_string()));
+            c.insert("plain1".to_string(), None);
+        }
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "thread1").await,
+            Some("parentA".to_string()),
+            "cached thread resolves to its parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "plain1").await,
+            None,
+            "channel cached as a non-thread has no parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "never_seen").await,
+            None,
+            "uncached channel yields None (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_authorizes_parent_allowlisted_thread_only_when_cached() {
+        // Regression for #8103: the type-4 arm resolves the thread parent from
+        // the shared cache (no REST) and passes it to `interaction_gate`, so a
+        // thread under an allowlisted parent authorizes autocomplete exactly as
+        // the message path does (#6829) — but only once the parent is cached.
+        // This reproduces the arm's authz step: cache-only parent → gate.
+        let peers = s(&["*"]);
+        let channel_filter = s(&["parentA"]); // allowlist the PARENT only
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        cache
+            .lock()
+            .await
+            .insert("thread_cached".to_string(), Some("parentA".to_string()));
+
+        // Thread whose parent is cached + allowlisted → autocomplete authorized.
+        let parent = discord_thread_parent_cached(&cache, "thread_cached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_cached",
+                parent.as_deref(),
+            )
+            .is_ok(),
+            "cached allowlisted parent authorizes autocomplete in the thread"
+        );
+
+        // Same allowlist, thread NOT yet cached → no parent → fail-closed,
+        // matching the pre-fix behavior and avoiding a per-keystroke REST probe.
+        let parent = discord_thread_parent_cached(&cache, "thread_uncached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_uncached",
+                parent.as_deref(),
+            )
+            .is_err(),
+            "uncached thread stays fail-closed"
+        );
+    }
+
+    #[test]
+    fn autocomplete_arm_resolves_cached_thread_parent_before_gate() {
+        // Source-level regression for #8103: within the type-4 arm, the parent
+        // is resolved from the cache (`discord_thread_parent_cached`) and that
+        // value (`thread_parent.as_deref()`) — not `None` — is passed to
+        // `interaction_gate`, with resolution preceding the gate. Reverting the
+        // arm to pass `None` removes `thread_parent.as_deref()` and fails this.
+        let src = include_str!("mod.rs");
+        let arm4 = src
+            .find("} else if itype == 4 {")
+            .expect("type-4 arm present");
+        let end = src[arm4..]
+            .find("// MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK")
+            .map(|i| arm4 + i)
+            .expect("type-4 arm end boundary present");
+        let region = &src[arm4..end];
+        let cached = region
+            .find("discord_thread_parent_cached(")
+            .expect("type-4 arm resolves the cached thread parent");
+        let gate = region.find("interaction_gate(").expect("type-4 arm gates");
+        assert!(
+            cached < gate,
+            "cached thread-parent resolution must precede the gate"
+        );
+        assert!(
+            region.contains("thread_parent.as_deref()"),
+            "the resolved cached parent (not None) is passed to interaction_gate"
         );
     }
 

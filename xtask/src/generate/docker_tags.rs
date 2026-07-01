@@ -11,7 +11,15 @@ struct TagSpec {
     stem: &'static str,
     selection: Selection,
     dockerfile: &'static str,
+    /// Build platforms the docker-publish workflow targets for this tag. Only
+    /// `Dockerfile` carries the cross-compilation logic that builds an arm64
+    /// image without emulating the Rust build under QEMU; `Containerfile` is
+    /// amd64-only until the same cross-build support lands there.
+    platforms: &'static str,
 }
+
+const MULTI_ARCH: &str = "linux/amd64,linux/arm64";
+const AMD64_ONLY: &str = "linux/amd64";
 
 /// The canonical tag set. Each selection maps to a stem + the dockerfile that
 /// realizes it. Driven by selections, not literal tag strings.
@@ -21,21 +29,25 @@ fn tag_specs() -> Vec<TagSpec> {
             stem: "minimal",
             selection: Selection::Minimal,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "default-features",
             selection: Selection::Full,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "dist",
             selection: Selection::Dist,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "all-features",
             selection: Selection::All,
             dockerfile: "Containerfile",
+            platforms: AMD64_ONLY,
         },
     ]
 }
@@ -57,6 +69,7 @@ pub fn render(root: &Path) -> anyhow::Result<String> {
         out.push_str(&format!("pinned_tag = \"{}-v{version}\"\n", ts.stem));
         out.push_str(&format!("floating_tag = \"{}\"\n", ts.stem));
         out.push_str(&format!("dockerfile = \"{}\"\n", ts.dockerfile));
+        out.push_str(&format!("platforms = \"{}\"\n", ts.platforms));
         out.push_str(&format!("flags = \"{flags}\"\n"));
         out.push_str(&format!("features = \"{features}\"\n\n"));
     }
@@ -98,6 +111,20 @@ mod tests {
             .unwrap();
         assert_eq!(dist["pinned_tag"].as_str().unwrap(), format!("dist-v{ver}"));
         assert_eq!(dist["floating_tag"].as_str().unwrap(), "dist");
+    }
+
+    #[test]
+    fn dockerfile_tags_are_multi_arch_containerfile_is_amd64_only() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        for t in v["tags"].as_array().unwrap() {
+            let platforms = t["platforms"].as_str().unwrap();
+            match t["dockerfile"].as_str().unwrap() {
+                "Dockerfile" => assert_eq!(platforms, "linux/amd64,linux/arm64"),
+                "Containerfile" => assert_eq!(platforms, "linux/amd64"),
+                other => panic!("unexpected dockerfile {other}"),
+            }
+        }
     }
 
     #[test]

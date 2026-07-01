@@ -1951,7 +1951,13 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+        // Omit tool_choice when there are no tool entries. vLLM 0.19+ and
+        // spec-compliant validators reject `tool_choice` without a non-empty
+        // `tools` field ("When using `tool_choice`, `tools` must be set."),
+        // which breaks bots running with max_tool_iterations = 0 or no MCP
+        // servers. Gate on `has_tool_entries` (Some AND non-empty), not on
+        // `tools.is_some()`.
+        let tool_choice = has_tool_entries.then(|| "auto".to_string());
 
         NativeChatRequest {
             model: model.to_string(),
@@ -2002,7 +2008,21 @@ impl OpenAiCompatibleModelProvider {
         if role != "user" || !allow_user_image_parts {
             return MessageContent::Text(content.to_string());
         }
+        Self::content_with_image_parts(content)
+    }
 
+    /// Promote inline `[IMAGE:…]` markers in `content` to OpenAI-compatible
+    /// content parts (a text part, when non-empty, plus one `image_url` part
+    /// per marker), or return plain `Text` when the content carries no
+    /// markers.
+    ///
+    /// Callers must gate this on whether the target model accepts structured
+    /// image parts (`allow_user_image_parts`). By the time content reaches
+    /// here the markers have already been normalized to safe `data:`/`http`
+    /// URIs upstream (`multimodal::prepare_messages_for_provider`, which also
+    /// rewrites native tool-result JSON via `normalize_native_tool_result_json`),
+    /// so the host-local file-path hazard of #6399 does not apply.
+    fn content_with_image_parts(content: &str) -> MessageContent {
         let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
         if image_refs.is_empty() {
             return MessageContent::Text(content.to_string());
@@ -2156,10 +2176,24 @@ impl OpenAiCompatibleModelProvider {
                     if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
                         tool_call_id = last_assistant_tool_call_ids.first().cloned();
                     }
+                    // Tool results can carry inline `[IMAGE:…]` markers (e.g. a
+                    // snapshot tool returning a base64 image). Route them through
+                    // the same marker→`image_url` promotion as user messages,
+                    // gated on the model accepting structured image parts. Without
+                    // this the markers ship as one large text blob, so vision
+                    // backends count base64 bytes as text tokens and reject the
+                    // request as over-context (#8327). Mirrors the Anthropic-side
+                    // fix in #1626.
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()))
+                        .map(|value| {
+                            if allow_user_image_parts {
+                                Self::content_with_image_parts(value)
+                            } else {
+                                MessageContent::Text(value.to_string())
+                            }
+                        })
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
                     return NativeMessage {
@@ -3028,7 +3062,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         include_usage: true,
                     }),
                     tools: tools.clone(),
-                    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                    // Guard on the converted tools being non-empty (not just
+                    // `has_tools`): convert_tool_specs_for_model can sanitize a
+                    // non-empty input down to None, and tool_choice without a
+                    // tools field is an HTTP 400 on vLLM 0.19+.
+                    tool_choice: tools
+                        .as_ref()
+                        .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
                     max_tokens: provider.max_tokens,
                     extra_body: provider.extra_body.clone(),
                 })
@@ -3440,6 +3480,56 @@ mod tests {
     fn creates_without_key() {
         let p = make_model_provider("test", "https://example.com", None);
         assert!(p.credential.is_none());
+    }
+
+    // Regression: vLLM 0.19+ and spec-compliant validators reject
+    // `tool_choice` when `tools` is absent or empty (HTTP 400:
+    // "When using `tool_choice`, `tools` must be set."). The request builders
+    // must omit `tool_choice` whenever the converted tool list is empty.
+    #[test]
+    fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+
+        // Assert on the structured value rather than substring-matching the
+        // serialized string: a JSON-shape or escaping change could otherwise
+        // flip these assertions silently. Inspect the `tool_choice` key
+        // directly.
+
+        // None tools → no tool_choice key.
+        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is None; got: {value}"
+        );
+
+        // Empty tools vec → still no tool_choice key.
+        let req_empty =
+            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let value_empty = serde_json::to_value(&req_empty).unwrap();
+        assert!(
+            value_empty.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value_empty}"
+        );
+    }
+
+    #[test]
+    fn build_native_tool_chat_request_sets_tool_choice_when_tools_present() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "description": "", "parameters": {} }
+        })];
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "tool_choice must be 'auto' when tools are present; got: {value}"
+        );
     }
 
     #[test]
@@ -4180,6 +4270,62 @@ mod tests {
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_promotes_tool_result_image_markers() {
+        // A tool result carrying an inline base64 image marker (e.g. a snapshot
+        // tool) must serialize as structured `image_url` parts, not one large
+        // text blob — vision backends count base64 bytes as text tokens and
+        // reject the request as over-context otherwise (#8327).
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+        )];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
+
+        let value = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("tool message should carry content"),
+        )
+        .unwrap();
+        let parts = value
+            .as_array()
+            .expect("tool image content should serialize as a parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "snapshot captured");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/jpeg;base64,/9j/4AAQ"
+        );
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_tool_result_image_markers_as_text_when_disabled() {
+        // Models that don't accept structured image parts (the same gate that
+        // keeps user image markers as text) must keep tool-result markers
+        // verbatim — preserving prior behavior and the #6399 safety posture.
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+        )];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, false);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value))
+                if value == "snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
         ));
     }
 

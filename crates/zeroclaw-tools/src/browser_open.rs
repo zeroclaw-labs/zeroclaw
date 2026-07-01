@@ -5,10 +5,11 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Open approved HTTPS URLs in the system default browser (no scraping, no DOM automation).
+/// Open approved HTTP/HTTPS URLs in the system default browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
 }
 
 impl BrowserOpenTool {
@@ -16,11 +17,23 @@ impl BrowserOpenTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_private_hosts(security, allowed_domains, Vec::new())
+    }
+
+    pub fn new_with_private_hosts(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
             allowed_domains: domain_guard::normalize_allowed_domains(
                 allowed_domains,
                 "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
             )?,
         })
     }
@@ -36,20 +49,27 @@ impl BrowserOpenTool {
             anyhow::bail!("URL cannot contain whitespace");
         }
 
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            anyhow::bail!("Only http:// or https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
             );
         }
 
         let host = extract_host(url)?;
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if domain_guard::is_private_or_local_host(&host) {
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if private_host_allowed {
+            return Ok(url.to_string());
         }
 
         if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
@@ -67,7 +87,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTP/HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -76,7 +96,7 @@ impl Tool for BrowserOpenTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "HTTPS URL to open in the system browser"
+                    "description": "HTTP or HTTPS URL to open in the system browser"
                 }
             },
             "required": ["url"]
@@ -245,16 +265,19 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url.strip_prefix("https://").ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"url": url})),
-            "browser_open: non-https URL rejected"
-        );
-        anyhow::Error::msg("Only https:// URLs are allowed")
-    })?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"url": url})),
+                "browser_open: unsupported URL scheme rejected"
+            );
+            anyhow::Error::msg("Only http:// or https:// URLs are allowed")
+        })?;
 
     let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
         ::zeroclaw_log::record!(
@@ -312,6 +335,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_tool_with_private(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserOpenTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        BrowserOpenTool::new_with_private_hosts(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn validate_accepts_exact_domain() {
         let tool = test_tool(vec!["example.com"]);
@@ -342,13 +384,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_http() {
+    fn validate_accepts_http() {
+        let tool = test_tool(vec!["example.com"]);
+        let got = tool.validate_url("http://example.com/docs").unwrap();
+        assert_eq!(got, "http://example.com/docs");
+    }
+
+    #[test]
+    fn validate_accepts_http_with_port() {
+        let tool = test_tool(vec!["example.com"]);
+        let got = tool
+            .validate_url("http://example.com:8080/path?q=1")
+            .unwrap();
+        assert_eq!(got, "http://example.com:8080/path?q=1");
+    }
+
+    #[test]
+    fn validate_accepts_http_for_wildcard_allowlist() {
+        // Explicit pin of the default posture: with the shipped default
+        // `browser.allowed_domains = ["*"]`, browser_open accepts plain http://
+        // to any public host. This is the same default that web_fetch,
+        // http_request, and the `browser` tool already ship (all default to
+        // `["*"]` and already accept http://); this test makes the
+        // default-posture change for browser_open conscious and reviewable.
+        let tool = test_tool(vec!["*"]);
+        let got = tool.validate_url("http://example.com/page").unwrap();
+        assert_eq!(got, "http://example.com/page");
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_scheme() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
-            .validate_url("http://example.com")
+            .validate_url("ftp://example.com")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("https://"));
+        assert!(err.contains("http://"));
     }
 
     #[test]
@@ -440,5 +511,71 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_private_ipv4() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("https://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("https://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = test_tool_with_private(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_alone_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = test_tool_with_private(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn listed_private_host_permits_http_scheme() {
+        // `browser_open` accepts `http://` (since it was relaxed to accept
+        // both schemes upstream), so a listed private host can be reached
+        // over plain HTTP — internal services frequently lack a public TLS
+        // cert. The unlisted-host SSRF guard still applies; this test just
+        // pins that the scheme guard does not pre-empt the allowlist for
+        // listed hosts.
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
     }
 }

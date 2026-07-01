@@ -33,6 +33,19 @@ impl HookRunner {
         }
     }
 
+    pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
+        let mut runner = Self::new();
+        if hooks.builtin.command_logger {
+            runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
+        }
+        if hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(super::builtin::WebhookAuditHook::new(
+                hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+        runner
+    }
+
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
         self.handlers.push(handler);
@@ -819,5 +832,99 @@ mod tests {
             0,
             "pass-through hook after the canceller must NOT run"
         );
+    }
+
+    // ── from_config and lifecycle tests ──────────────────────────
+
+    struct SessionCountingHook {
+        name: String,
+        start_count: Arc<AtomicU32>,
+        end_count: Arc<AtomicU32>,
+    }
+
+    impl SessionCountingHook {
+        fn new(name: &str) -> (Self, Arc<AtomicU32>, Arc<AtomicU32>) {
+            let start = Arc::new(AtomicU32::new(0));
+            let end = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    name: name.to_string(),
+                    start_count: start.clone(),
+                    end_count: end.clone(),
+                },
+                start,
+                end,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl HookHandler for SessionCountingHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn on_session_start(&self, _session_id: &str, _channel: &str) {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+            self.end_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn from_config_disabled_builtins_produces_empty_runner() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: false,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+            },
+        };
+        let runner = HookRunner::from_config(&config);
+        assert!(
+            runner.handlers.is_empty(),
+            "no builtins enabled → runner must be empty"
+        );
+    }
+
+    #[test]
+    fn from_config_registers_command_logger_when_enabled() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: true,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+            },
+        };
+        let runner = HookRunner::from_config(&config);
+        let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
+        assert!(
+            names.contains(&"command-logger"),
+            "command-logger enabled → must be registered; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_events_reach_registered_handler() {
+        let mut runner = HookRunner::new();
+        let (hook, start_count, end_count) = SessionCountingHook::new("session-watcher");
+        runner.register(Box::new(hook));
+
+        runner.fire_session_start("sess-1", "rpc").await;
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+        runner.fire_session_end("sess-1", "rpc").await;
+        assert_eq!(end_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_runner_lifecycle_events_are_noops() {
+        let runner = HookRunner::new();
+        // Must not panic when no handlers are registered.
+        runner.fire_session_start("sess-1", "rpc").await;
+        runner.fire_session_end("sess-1", "rpc").await;
     }
 }
