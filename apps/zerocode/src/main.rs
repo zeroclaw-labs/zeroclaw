@@ -317,9 +317,18 @@ async fn run() -> anyhow::Result<()> {
                 Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
-                    spawn_ephemeral_daemon(&config_dir)?;
+                    let mut daemon_child = spawn_ephemeral_daemon(&config_dir)?;
                     owns_ephemeral = true;
-                    await_daemon_ready(socket).await?
+                    match await_daemon_ready(socket).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // Connection failed after spawning the daemon —
+                            // terminate it to avoid leaving a zombie process.
+                            let _ = daemon_child.kill();
+                            let _ = daemon_child.wait();
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -402,7 +411,10 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
+/// Spawn an ephemeral daemon process and return its handle for cleanup.
+/// The caller is responsible for terminating the process if connection
+/// fails before the daemon becomes ready.
+pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<std::process::Child> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))
@@ -431,9 +443,7 @@ pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Re
         .stderr(std::process::Stdio::null());
 
     cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-
-    Ok(())
+        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))
 }
 
 async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::RpcClient> {
