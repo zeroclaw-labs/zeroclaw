@@ -107,12 +107,28 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
+
+/// Snapshot the live `channel_key → Arc<dyn Channel>` map from the injected
+/// channel-map factory as a [`tools::PerToolChannelHandle`], for channel-less
+/// turn paths (`process_message`) that must reach a live approver channel to
+/// honor a risk profile's cross-channel `approval_route`. Returns `None` when no
+/// factory is registered (e.g. CLI/tests) or no channels are live — callers then
+/// keep today's channel-less behavior (the gate auto-denies gated tools).
+pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
+    let factory = CHANNEL_MAP_FN.get()?;
+    let map = factory();
+    if map.is_empty() {
+        return None;
+    }
+    Some(Arc::new(parking_lot::RwLock::new(map)))
+}
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
@@ -127,9 +143,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
 };
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 #[cfg(test)]
-use zeroclaw_providers::{ChatRequest, ToolCall};
+use zeroclaw_providers::ChatRequest;
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
@@ -458,6 +474,88 @@ fn native_tool_specs_present_for_turn(
         activated_tools,
     )?;
     Ok(!iteration_tool_specs.tool_specs.is_empty())
+}
+
+/// Elide inlined base64 image data URIs from message content before export.
+/// Keeps `[IMAGE:<path>]` / `[IMAGE:https://…]` markers; replaces only
+/// `[IMAGE:data:…]` payloads (hundreds of KB of base64) with a short placeholder.
+/// (base64 and the data-URI body never contain `]`, so bounding on `]` is safe.)
+///
+/// Only `[IMAGE:data:…]` markers currently carry inline data URIs; other media
+/// markers (`[PHOTO:]`/`[VIDEO:]`/`[DOCUMENT:]`/`[FILE:]`/`[VOICE:]`/`[AUDIO:]`)
+/// carry paths/URLs, not inline bytes (verified against
+/// `prepare_messages_for_provider`). Extend this regex if that ever changes.
+static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[IMAGE:data:[^\]]*\]").unwrap());
+
+fn elide_image_data(content: &str) -> String {
+    IMAGE_DATA_URI_REGEX
+        .replace_all(content, "[IMAGE:<image data elided>]")
+        .into_owned()
+}
+
+/// Best-effort sanitize message content for trace export: elide image bytes, then
+/// run BOTH credential scrubbers. `scrub_secret_patterns` (prefix-based: sk-/ghp_/
+/// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
+/// alone covers free-form content. Residual secrets/PII may remain — this is
+/// disclosed in the PR/docs, not eliminated.
+fn scrub_for_export(content: &str) -> String {
+    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
+        &elide_image_data(content),
+    ))
+}
+
+/// Capture and sanitize the prompt/completion content for one `llm.call` so the
+/// OTel exporter can emit the GenAI message-content attributes.
+///
+/// Returns `None` unless the `observability-otel` feature is active, so non-OTel
+/// builds pay no cloning/scrubbing cost. The system message is split into
+/// `system_instructions`; the rest become `input`. Every string passes through
+/// [`scrub_for_export`] (image elision + dual credential scrub).
+pub(crate) fn capture_llm_messages(
+    messages: &[ChatMessage],
+    output_text: Option<&str>,
+    output_tool_calls: &[ToolCall],
+) -> Option<zeroclaw_api::observability_traits::LlmMessageSnapshot> {
+    if !cfg!(feature = "observability-otel") {
+        return None;
+    }
+
+    use zeroclaw_api::observability_traits::{
+        LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot,
+    };
+
+    let system_instructions = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| scrub_for_export(&m.content));
+
+    let input = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| MessageSnapshot {
+            role: m.role.clone(),
+            content: scrub_for_export(&m.content),
+        })
+        .collect();
+
+    let output_text = output_text.filter(|t| !t.is_empty()).map(scrub_for_export);
+
+    let output_tool_calls = output_tool_calls
+        .iter()
+        .map(|tc| ToolCallSnapshot {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments_json: scrub_for_export(&tc.arguments),
+        })
+        .collect();
+
+    Some(LlmMessageSnapshot {
+        input,
+        output_text,
+        output_tool_calls,
+        system_instructions,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3365,6 +3463,24 @@ pub async fn process_message(
             }
         }
 
+        // ── Cross-channel HITL on the channel-less path ───────────────────
+        // process_message (gateway chat/webhook dispatch, agent-to-agent peer
+        // messages) runs with no originating channel, so a gated tool can only
+        // reach a human through the profile's `approval_route`. When one is set
+        // and a live channel registry is available, hand the turn a route-only
+        // approval bridge: it asks the named approver alone, bounded by
+        // `timeout_secs` and fail-closed by default. Absent a route (or with no
+        // live channels) this stays `None` and the gate keeps today's
+        // non-interactive auto-deny.
+        let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
+            live_channel_registry().map(|handles| {
+                crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
+            })
+        });
+        let routed_approval_channel_ref = routed_approval_channel
+            .as_ref()
+            .map(|c| c as &dyn zeroclaw_api::channel::Channel);
+
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
@@ -3390,7 +3506,10 @@ pub async fn process_message(
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.max_context_tokens,
-                    None, // channel: process_message path has no channel ref
+                    // Cross-channel HITL: a route-only approval bridge when the
+                    // profile sets `approval_route` and channels are live, else
+                    // `None` (today's channel-less auto-deny). See above.
+                    routed_approval_channel_ref,
                 ),
             )
             .await
@@ -3410,7 +3529,7 @@ mod tests {
         seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
-    use crate::agent::tool_execution::execute_one_tool;
+    use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3418,8 +3537,35 @@ mod tests {
     use zeroclaw_api::channel::{
         Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
     };
-    use zeroclaw_providers::ChatMessage;
+    use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
+
+    fn extract_sop_started_run_id(content: &str) -> Option<String> {
+        content
+            .split("SOP run started: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(str::to_string)
+    }
+
+    fn sop_started_run_id_from_history(history: &[ChatMessage]) -> Option<String> {
+        history.iter().find_map(|msg| {
+            if let Some(content) = msg.content.strip_prefix("[Tool results]\n")
+                && let Some(run_id) = extract_sop_started_run_id(content)
+            {
+                return Some(run_id);
+            }
+
+            if msg.role == "tool"
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(content) = value.get("content").and_then(|content| content.as_str())
+            {
+                return extract_sop_started_run_id(content);
+            }
+
+            extract_sop_started_run_id(&msg.content)
+        })
+    }
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -3903,8 +4049,11 @@ mod tests {
             "unknown_tool",
             call_arguments,
             None,
-            &[],
-            None,
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -3942,8 +4091,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -3987,8 +4139,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4017,8 +4172,11 @@ mod tests {
             "empty_success",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4068,8 +4226,11 @@ mod tests {
             "credential_output",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -6082,6 +6243,286 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_executes_queued_sop_steps_after_sop_execute() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"sop_execute","arguments":{"name":"live-sop"}}
+</tool_call>"#,
+            "step one done",
+            "step two done",
+            "outer done",
+        ]);
+
+        let sop = crate::sop::Sop {
+            name: "live-sop".to_string(),
+            description: "live sop".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![
+                crate::sop::SopStep {
+                    number: 1,
+                    title: "First".to_string(),
+                    body: "Do the first step".to_string(),
+                    suggested_tools: Vec::new(),
+                    requires_confirmation: false,
+                    kind: crate::sop::SopStepKind::default(),
+                    schema: None,
+                    ..crate::sop::SopStep::default()
+                },
+                crate::sop::SopStep {
+                    number: 2,
+                    title: "Second".to_string(),
+                    body: "Do the second step".to_string(),
+                    suggested_tools: Vec::new(),
+                    requires_confirmation: false,
+                    kind: crate::sop::SopStepKind::default(),
+                    schema: None,
+                    ..crate::sop::SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::SopExecuteTool::new(
+            Arc::clone(&engine),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the live sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable after completion");
+        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+        assert_eq!(run.step_results.len(), 2);
+        assert_eq!(run.step_results[0].output, "step one done");
+        assert_eq!(run.step_results[1].output, "step two done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "outer-sop".to_string(),
+                        name: "sop_execute".to_string(),
+                        arguments: r#"{"name":"scoped-sop"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-denied".to_string(),
+                        name: "denied_tool".to_string(),
+                        arguments: r#"{"value":"blocked"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("step recovered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("outer done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let sop = crate::sop::Sop {
+            name: "scoped-sop".to_string(),
+            description: "scoped sop".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![crate::sop::SopStep {
+                number: 1,
+                title: "Scoped".to_string(),
+                body: "Use only allowed tools".to_string(),
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["allowed_tool".to_string()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+            step_scope_enforce: true,
+            ..zeroclaw_config::schema::SopConfig::default()
+        });
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let allowed_invocations = Arc::new(AtomicUsize::new(0));
+        let denied_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+            Box::new(CountingTool::new(
+                "allowed_tool",
+                Arc::clone(&allowed_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "denied_tool",
+                Arc::clone(&denied_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the scoped sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("scoped SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+        assert!(
+            history.iter().any(|msg| msg
+                .content
+                .contains("Tool not available in this turn: denied_tool")),
+            "denied tool call should be recorded as unavailable in history: {history:?}"
+        );
+
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable after completion");
+        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+        assert_eq!(run.step_results.len(), 1);
+        assert_eq!(run.step_results[0].output, "step recovered");
     }
 
     /// Regression: a native provider emitting multiple parallel tool calls
@@ -13716,6 +14157,88 @@ Let me check the result."#;
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
         );
+    }
+
+    // ── capture_llm_messages tests ────────────────────────────────
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_splits_system_scrubs_and_maps_output() {
+        // scrub_credentials catches key=value; scrub_secret_patterns catches bare token
+        // prefixes (ghp_, sk-, xoxb-). capture composes both via scrub_for_export, so
+        // assert each field == scrub_for_export(raw) (robust regardless of exact regex).
+        let sys_raw = "You are helpful. api_key=SUPERSECRETVALUE123";
+        let user_raw = "deploy token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let messages = vec![
+            ChatMessage::system(sys_raw),
+            ChatMessage::user(user_raw),
+            ChatMessage::assistant("earlier reply"),
+        ];
+        let tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: r#"{"cmd":"echo api_key=ANOTHERSECRET99"}"#.into(),
+            extra_content: None,
+        }];
+
+        let snap = super::capture_llm_messages(&messages, Some("final answer"), &tool_calls)
+            .expect("Some under observability-otel");
+
+        // System split out and routed through the composed scrubber.
+        assert_eq!(
+            snap.system_instructions.as_deref(),
+            Some(super::scrub_for_export(sys_raw).as_str())
+        );
+        assert_ne!(snap.system_instructions.as_deref(), Some(sys_raw)); // proves scrubbing ran
+
+        // input excludes system, preserves order; bare ghp_ token must be scrubbed.
+        assert_eq!(snap.input.len(), 2);
+        assert!(snap.input.iter().all(|m| m.role != "system"));
+        assert_eq!(snap.input[0].role, "user");
+        assert_eq!(snap.input[0].content, super::scrub_for_export(user_raw));
+        assert_ne!(snap.input[0].content, user_raw); // proves the bare-prefix scrubber fired
+
+        // output text + scrubbed tool-call arguments.
+        assert_eq!(snap.output_text.as_deref(), Some("final answer"));
+        assert_eq!(snap.output_tool_calls.len(), 1);
+        assert_eq!(snap.output_tool_calls[0].name, "shell");
+        assert_eq!(
+            snap.output_tool_calls[0].arguments_json,
+            super::scrub_for_export(r#"{"cmd":"echo api_key=ANOTHERSECRET99"}"#)
+        );
+        assert!(
+            !snap.output_tool_calls[0]
+                .arguments_json
+                .contains("ANOTHERSECRET99")
+        );
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_elides_image_data_uris() {
+        let raw = "see [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB] here";
+        let messages = vec![ChatMessage::user(raw)];
+        let snap = super::capture_llm_messages(&messages, None, &[]).expect("Some");
+        let content = &snap.input[0].content;
+        assert!(
+            !content.contains("base64,iVBOR"),
+            "image bytes not elided: {content}"
+        );
+        assert!(
+            content.contains("[IMAGE:<image data elided>]"),
+            "placeholder missing: {content}"
+        );
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_empty_output_and_no_system() {
+        let messages = vec![ChatMessage::user("hi")];
+        let snap = super::capture_llm_messages(&messages, Some(""), &[]).expect("Some");
+        assert_eq!(snap.system_instructions, None);
+        assert_eq!(snap.output_text, None); // empty string captured as None
+        assert!(snap.output_tool_calls.is_empty());
+        assert_eq!(snap.input.len(), 1);
     }
 
     #[test]

@@ -90,8 +90,15 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
         return None
 
     # Keep this changed-line gate aligned with the built-book link checker:
-    # site-absolute links and generated rustdoc API paths are assembled outside
-    # authored Markdown, so this script should not fail CI before mdBook builds.
+    # site-absolute links and generated paths are assembled outside authored
+    # Markdown, so this script should not fail CI before mdBook builds. The
+    # rustdoc API tree (api/...) and the reference pages generated from live
+    # code (reference/config.md, reference/cli.md) only exist after the
+    # docs-deploy generation step, not in the source tree this gate sees.
+    generated_targets = {
+        "docs/book/src/reference/config.md",
+        "docs/book/src/reference/cli.md",
+    }
     if (
         path_without_fragment.startswith("/")
         or path_without_fragment.startswith("api/")
@@ -104,6 +111,9 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
     )
 
     if not resolved or resolved == ".":
+        return None
+
+    if resolved in generated_targets:
         return None
 
     return resolved
