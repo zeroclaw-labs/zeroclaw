@@ -55,9 +55,9 @@ Docs: [Sandboxing](./sandboxing.md).
 
 ## Tool receipts
 
-Every tool invocation, whether it executed, was blocked, or required approval, produces a signed receipt in a chain. Each receipt includes the hash of the previous one, so tampering with any receipt invalidates the rest.
+Every tool invocation, whether it executed, was blocked, or required approval, produces a signed receipt: an HMAC-SHA256 digest over the call and its result, keyed by an ephemeral per-daemon-process key. Receipts are independent: each one covers only the call it was computed for, so they are not chained, and tampering with one does not invalidate the others.
 
-Receipts are the source of truth for "what did the agent do yesterday". They're readable, greppable, and durable.
+Receipts are readable and greppable within a daemon session. They do not persist across daemon restarts (the key rotates on every start; a durable audit store is planned).
 
 Docs: [Tool receipts](./tool-receipts.md).
 
