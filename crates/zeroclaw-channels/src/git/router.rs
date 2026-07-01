@@ -21,9 +21,8 @@ pub enum RouteAction {
     /// Deliver as a channel message with the conversational filters
     /// (mention gate under `mention_only`).
     Message,
-    /// Emit a channel-sourced SOP event. `then_message` is reserved for a
-    /// later SOP-completion fan-out and is not a chat fallback.
-    Sop { sop: String, then_message: bool },
+    /// Emit a channel-sourced SOP event.
+    Sop { sop: String },
 }
 
 /// Resolve one event type against the routing table. Event types absent
@@ -42,7 +41,6 @@ pub fn resolve_route(event_type: &str, table: &HashMap<String, GitEventRoute>) -
             {
                 RouteAction::Sop {
                     sop: sop.to_string(),
-                    then_message: route.then_message,
                 }
             } else if route.message {
                 RouteAction::Message
@@ -121,11 +119,10 @@ impl TransportPlan {
 mod tests {
     use super::*;
 
-    fn route(message: bool, sop: Option<&str>, then_message: bool) -> GitEventRoute {
+    fn route(message: bool, sop: Option<&str>) -> GitEventRoute {
         GitEventRoute {
             message,
             sop: sop.map(str::to_string),
-            then_message,
         }
     }
 
@@ -164,15 +161,9 @@ mod tests {
     fn explicit_entries_override_defaults_either_way() {
         let mut table = HashMap::new();
         // Opting OUT of a default…
-        table.insert(
-            EVT_ISSUE_COMMENT_CREATED.to_string(),
-            route(false, None, false),
-        );
+        table.insert(EVT_ISSUE_COMMENT_CREATED.to_string(), route(false, None));
         // …and opting IN to a non-default.
-        table.insert(
-            EVT_WORKFLOW_RUN_FAILED.to_string(),
-            route(true, None, false),
-        );
+        table.insert(EVT_WORKFLOW_RUN_FAILED.to_string(), route(true, None));
         assert_eq!(
             resolve_route(EVT_ISSUE_COMMENT_CREATED, &table),
             RouteAction::Ignore
@@ -188,13 +179,12 @@ mod tests {
         let mut table = HashMap::new();
         table.insert(
             EVT_PULL_REQUEST_OPENED.to_string(),
-            route(true, Some(" pr-triage "), true),
+            route(true, Some(" pr-triage ")),
         );
         assert_eq!(
             resolve_route(EVT_PULL_REQUEST_OPENED, &table),
             RouteAction::Sop {
                 sop: "pr-triage".to_string(),
-                then_message: true,
             }
         );
     }
@@ -202,13 +192,10 @@ mod tests {
     #[test]
     fn empty_sop_falls_back_to_message_flag() {
         let mut table = HashMap::new();
-        table.insert(
-            EVT_RELEASE_PUBLISHED.to_string(),
-            route(true, Some(""), false),
-        );
+        table.insert(EVT_RELEASE_PUBLISHED.to_string(), route(true, Some("")));
         table.insert(
             EVT_WORKFLOW_RUN_FAILED.to_string(),
-            route(false, Some("  "), false),
+            route(false, Some("  ")),
         );
         assert_eq!(
             resolve_route(EVT_RELEASE_PUBLISHED, &table),
@@ -223,11 +210,8 @@ mod tests {
     #[test]
     fn validate_routes_flags_typos_and_empty_sop_names() {
         let mut table = HashMap::new();
-        table.insert("pull_request.create".to_string(), route(true, None, false));
-        table.insert(
-            EVT_RELEASE_PUBLISHED.to_string(),
-            route(false, Some(" "), false),
-        );
+        table.insert("pull_request.create".to_string(), route(true, None));
+        table.insert(EVT_RELEASE_PUBLISHED.to_string(), route(false, Some(" ")));
         let problems = validate_routes(&table);
         assert_eq!(problems.len(), 2);
         assert!(problems.iter().any(|p| p.contains("pull_request.create")));
@@ -251,9 +235,9 @@ mod tests {
         let mut table = HashMap::new();
         table.insert(
             EVT_WORKFLOW_RUN_FAILED.to_string(),
-            route(false, Some("ci-failure"), false),
+            route(false, Some("ci-failure")),
         );
-        table.insert(EVT_RELEASE_PUBLISHED.to_string(), route(true, None, false));
+        table.insert(EVT_RELEASE_PUBLISHED.to_string(), route(true, None));
         let plan = TransportPlan::from_routes(&table);
         assert!(plan.workflow_runs);
         assert!(plan.releases);
@@ -271,7 +255,7 @@ mod tests {
             EVT_ISSUES_OPENED,
             EVT_PULL_REQUEST_OPENED,
         ] {
-            table.insert(evt.to_string(), route(false, None, false));
+            table.insert(evt.to_string(), route(false, None));
         }
         let plan = TransportPlan::from_routes(&table);
         assert!(!plan.any());

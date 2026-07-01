@@ -15615,7 +15615,10 @@ pub struct GitConfig {
     /// Personal access token for Gitea/Forgejo API requests. The token needs
     /// repository read access plus issue/PR comment write access for replies
     /// and reactions. Gitea/Forgejo provider only.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub access_token: String,
     /// Repositories to poll, as `owner/repo`. Empty = every repository
@@ -15715,9 +15718,8 @@ impl ChannelConfig for GitConfig {
 /// `[channels.git.<alias>.events]` by the event type string
 /// (`"pull_request.opened" = { sop = "pr-triage" }`).
 ///
-/// `message` and `sop` may be combined via `then_message`. An entry with
-/// neither `message = true` nor a `sop` explicitly ignores the event type
-/// (overriding the conversational default).
+/// An entry with neither `message = true` nor a `sop` explicitly ignores the
+/// event type (overriding the conversational default).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git.events"]
@@ -15728,10 +15730,6 @@ pub struct GitEventRoute {
     /// Route the event to the named SOP through channel-sourced SOP ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sop: Option<String>,
-    /// Reserved for future SOP-completion fan-out. Meaningful only together
-    /// with `sop`; currently not delivered as a chat fallback.
-    #[serde(default)]
-    pub then_message: bool,
 }
 
 /// Voice duplex configuration (`[channels.voice_duplex]`).
@@ -20773,7 +20771,7 @@ mod tests {
 
             [events]
             "pull_request.opened" = { sop = "pr-triage" }
-            "issues.opened" = { sop = "issue-triage", then_message = true }
+            "issues.opened" = { sop = "issue-triage" }
             "issue_comment.created" = { message = true }
             "workflow_run.failed" = { sop = "ci-failure" }
             "#,
@@ -20786,8 +20784,6 @@ mod tests {
         let pr = &cfg.events["pull_request.opened"];
         assert_eq!(pr.sop.as_deref(), Some("pr-triage"));
         assert!(!pr.message);
-        assert!(!pr.then_message);
-        assert!(cfg.events["issues.opened"].then_message);
         assert!(cfg.events["issue_comment.created"].message);
         assert!(cfg.events["issue_comment.created"].sop.is_none());
 
@@ -20821,6 +20817,23 @@ mod tests {
         );
         assert_eq!(cfg.access_token, "token-value");
         assert_eq!(cfg.repos, vec!["team/project"]);
+    }
+
+    #[test]
+    async fn git_gitea_access_token_is_secret() {
+        assert!(GitConfig::prop_is_secret("channels.git.access_token"));
+
+        let cfg = GitConfig {
+            access_token: "token-value".to_string(),
+            ..Default::default()
+        };
+        let fields = cfg.secret_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "channels.git.access_token" && field.is_set),
+            "Gitea/Forgejo access_token must be secret-classified and set"
+        );
     }
 
     #[test]

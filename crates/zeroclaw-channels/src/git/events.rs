@@ -13,17 +13,13 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use zeroclaw_api::channel::ChannelMessage;
+use zeroclaw_api::channel::{CHANNEL_SOP_SUBJECT_PREFIX, ChannelMessage};
 
 use super::types::{
     EVT_ISSUE_COMMENT_CREATED, EVT_ISSUES_OPENED, EVT_PR_REVIEW_COMMENT_CREATED,
     EVT_PULL_REQUEST_CLOSED, EVT_PULL_REQUEST_MERGED, EVT_PULL_REQUEST_OPENED,
     EVT_RELEASE_PUBLISHED, EVT_WORKFLOW_RUN_COMPLETED, EVT_WORKFLOW_RUN_FAILED, IssueRef, RepoRef,
 };
-
-/// Reserved `ChannelMessage.subject` prefix for events that should be
-/// consumed by the orchestrator's SOP ingress instead of the chat loop.
-pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
 /// The accountable actor behind an event, normalized across forges: the
 /// login used for allowlisting and self/bot filtering, plus whether the
@@ -411,7 +407,7 @@ pub fn event_to_sop_message(
     let topic = sop_topic(channel_key, alias, event.event_type());
     let payload = event_payload(event, channel_key, alias, provider, sop, &topic);
     let ctx = MessageCtx { channel_key, alias };
-    Some(message(
+    let mut msg = message(
         id,
         author.login.clone(),
         &target,
@@ -419,7 +415,13 @@ pub fn event_to_sop_message(
         timestamp,
         Some(format!("{CHANNEL_SOP_SUBJECT_PREFIX}{topic}")),
         &ctx,
-    ))
+    );
+    // Internal marker the orchestrator keys SOP routing on. Only this git
+    // producer sets it, so an inbound user/email message cannot forge a SOP
+    // event by crafting its `subject`. The subject above stays human-readable
+    // for logs and reply threading but is no longer the routing trigger.
+    msg.internal_sop_event = Some(topic);
+    Some(msg)
 }
 
 fn sop_topic(channel_key: &str, alias: &str, event_type: &str) -> String {

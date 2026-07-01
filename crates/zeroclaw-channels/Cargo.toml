@@ -168,11 +168,13 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
-# GitHub App channel — RS256 JWT signing for app authentication. The
-# `rust_crypto` backend keeps the workspace on the RustCrypto/ring stack
-# instead of pulling in aws-lc-rs.
+# GitHub App channel - RS256 JWT signing for app authentication. The
+# `aws_lc_rs` backend is required to avoid jsonwebtoken's `rust_crypto`
+# path, which pulls the unmaintained `rsa` crate (RUSTSEC-2023-0071,
+# Marvin Attack, no fixed release) and fails `cargo audit`. aws-lc-rs is
+# already in the workspace lockfile, so this adds no new heavy dependency.
 jsonwebtoken = { version = "10", optional = true, default-features = false, features = [
-  "rust_crypto",
+  "aws_lc_rs",
   "use_pem",
 ] }
 thiserror = { version = "2.0", optional = true }

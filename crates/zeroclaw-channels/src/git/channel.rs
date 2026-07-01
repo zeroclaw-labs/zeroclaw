@@ -285,18 +285,7 @@ impl GitChannel {
             RouteAction::Message => {
                 events::event_to_message(&event, filter, CHANNEL_KEY, &self.alias, true)
             }
-            RouteAction::Sop { sop, then_message } => {
-                if then_message {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "sop": sop,
-                                "event_type": event.event_type(),
-                            })),
-                        "git route requested then_message; SOP completion fan-out is not wired, emitting only the SOP event"
-                    );
-                }
+            RouteAction::Sop { sop } => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -879,7 +868,6 @@ mod tests {
                 zeroclaw_config::schema::GitEventRoute {
                     message: false,
                     sop: Some("pr-triage".to_string()),
-                    then_message: false,
                 },
             );
             let plan = TransportPlan::from_routes(&cfg.events);
@@ -1043,7 +1031,6 @@ mod tests {
                 zeroclaw_config::schema::GitEventRoute {
                     message: true,
                     sop: None,
-                    then_message: false,
                 },
             );
             let plan = TransportPlan::from_routes(&cfg.events);
