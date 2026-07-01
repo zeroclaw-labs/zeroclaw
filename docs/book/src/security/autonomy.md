@@ -96,7 +96,7 @@ WARN autonomy:approval_timeout   tool=shell command="git push" channel=telegram 
 WARN autonomy:blocked            tool=shell command="rm -rf /tmp" reason="forbidden pattern"
 ```
 
-Receipts for blocked calls are written to the [tool-receipts log](./tool-receipts.md) the same as successful calls; a denial is an event worth auditing.
+Blocked calls, denials, and timeouts are audit-worthy, but they are not tool receipts. They emit observability events; [tool receipts](./tool-receipts.md) attach to successful tool results when receipts are enabled.
 
 ## Why not just a binary "safe mode"?
 

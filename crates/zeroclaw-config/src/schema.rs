@@ -14233,6 +14233,27 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
+/// Where an AMQP delivery is routed once consumed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AmqpDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
+    /// shaped by `content_template`/`thread_id_field`. This is the default and
+    /// preserves the original AMQP consumer behavior.
+    #[default]
+    AgentLoop,
+    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
+    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
+    /// `amqp` trigger routing key matches. No agent turn is started.
+    Sop,
+    /// Do both: dispatch to the SOP engine and drive an agent turn from the
+    /// same delivery.
+    SopAndAgentLoop,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.amqp"]
@@ -14246,7 +14267,9 @@ pub struct AmqpConfig {
     pub enabled: bool,
     /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
     /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub amqp_url: String,
     /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
     #[tab(Advanced)]
@@ -14266,10 +14289,14 @@ pub struct AmqpConfig {
     pub ca_cert: Option<PathBuf>,
     /// Path to the client certificate for broker mutual-TLS auth
     /// (Fedora Messaging requires a client cert).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_cert: Option<PathBuf>,
     /// Path to the client private key matching `client_cert`.
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_key: Option<PathBuf>,
     /// Value placed in `ChannelMessage.sender` for every delivery from this
     /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
@@ -14298,6 +14325,13 @@ pub struct AmqpConfig {
     #[tab(Behavior)]
     #[serde(default = "default_amqp_durable_ack")]
     pub durable_ack: bool,
+    /// Where consumed deliveries are routed: drive an agent turn
+    /// (`agent_loop`, default), dispatch to the SOP engine (`sop`), or both
+    /// (`sop_and_agent_loop`). The `sop` and `sop_and_agent_loop` modes match
+    /// the delivery against SOP `amqp` triggers by routing key.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub dispatch: AmqpDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -20795,6 +20829,11 @@ mod tests {
             ..base
         };
         assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    async fn amqp_dispatch_defaults_to_agent_loop() {
+        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
     }
 
     #[test]
