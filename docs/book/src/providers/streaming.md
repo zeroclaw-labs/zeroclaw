@@ -46,6 +46,8 @@ stays correct as channels gain or lose streaming support:
 
 When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by `draft_update_interval_ms` in the channel config (default: 500 ms) to avoid rate-limiting.
 
+**Multi-message mode differs by channel:** Matrix and Discord split on `\n\n` paragraph boundaries. Telegram `multi_message` sends one message per completed agent text turn (text between tool calls), flushed via `Channel::flush_draft_turn` when the LLM turn ends.
+
 ## Reasoning blocks
 
 Reasoning models (OpenAI o-series, DeepSeek-R1, Qwen-thinking variants) emit `ReasoningDelta` events separate from regular text. By default the runtime strips these from outbound streams, see `<think>…</think>` handling in `crates/zeroclaw-channels/src/orchestrator/mod.rs`. Users see the final answer, not the chain-of-thought.

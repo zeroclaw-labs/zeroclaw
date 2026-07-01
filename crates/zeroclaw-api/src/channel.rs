@@ -414,6 +414,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     async fn finalize_draft(
         &self,

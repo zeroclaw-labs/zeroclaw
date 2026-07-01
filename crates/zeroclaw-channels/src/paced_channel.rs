@@ -423,6 +423,12 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn flush_draft_turn(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        self.inner
+            .flush_draft_turn(recipient, message_id, text)
+            .await
+    }
+
     async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         // Finalise is the terminal write to the draft — route it through the
         // same pacing queue as `send` so a burst of streamed replies respects
