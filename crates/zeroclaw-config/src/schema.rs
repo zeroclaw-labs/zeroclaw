@@ -4739,6 +4739,11 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Skip TLS certificate verification (insecure, use only for self-signed
+    /// or internal CA certificates). The `danger_` prefix follows reqwest's
+    /// naming convention to signal that this is a security-relevant option.
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
 }
 
 /// External MCP client configuration (`[mcp]` section).

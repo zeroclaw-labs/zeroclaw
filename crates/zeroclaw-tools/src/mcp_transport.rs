@@ -268,6 +268,7 @@ impl HttpTransport {
             .clone();
 
         let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(config.danger_accept_invalid_certs)
             .build()
             .context("failed to build HTTP client")?;
 
@@ -450,6 +451,7 @@ impl SseTransport {
             .clone();
 
         let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(config.danger_accept_invalid_certs)
             .build()
             .context("failed to build HTTP client")?;
 
