@@ -60,7 +60,7 @@ tool-file-download-error-write-body = Échec lors de l'écriture des octets tél
 tool-file-download-error-flush = Échec du vidage du fichier téléchargé : { $err }
 tool-file-download-error-move = Échec du déplacement du fichier téléchargé à sa place : { $err }
 tool-file-download-success = { $written } octets téléchargés vers { $dest_path } ({ $status })
-tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Extrait le texte des PDF ; les autres fichiers binaires sont lus avec une conversion UTF-8 lossless.
+tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Les fichiers binaires et images sont rejetés (utilisez l'outil image_info pour les images). Définissez encoding="base64" pour renvoyer les octets bruts encodés en base64 (pour les fichiers binaires tels que .pdf/.xlsx/.docx) ; offset/limit sont ignorés dans ce mode.
 tool-file-write = Écrire le contenu dans un fichier de l'espace de travail
 tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
 tool-git-operations-error-not-in-repo = Pas dans un dépôt Git à '{ $path }'. Choisissez un chemin dans un arbre de travail Git, passez 'path' pour un sous-répertoire du dépôt, ou initialisez un dépôt avant d'exécuter git_operations.

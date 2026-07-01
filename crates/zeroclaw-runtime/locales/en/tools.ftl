@@ -86,7 +86,7 @@ tool-file-download-error-flush = Failed to flush downloaded file: { $err }
 tool-file-download-error-move = Failed to move downloaded file into place: { $err }
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
-tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion.
+tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
 

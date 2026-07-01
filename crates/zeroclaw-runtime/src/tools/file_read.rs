@@ -62,7 +62,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1046,6 +1046,50 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// PDF files are now rejected as binary (rag-pdf feature removed in #8519).
+    /// They can still be read raw with encoding="base64".
+    #[tokio::test]
+    async fn file_read_rejects_pdf_without_rag_pdf() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_pdf");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Minimal PDF-looking bytes: valid header followed by invalid UTF-8 and
+        // a NUL byte so the non-UTF-8 path triggers the binary heuristic now
+        // that pdf-extract is gone.
+        let pdf: Vec<u8> =
+            b"%PDF-1.4\n\x80\x00\xFF\xFE\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        tokio::fs::write(dir.join("doc.pdf"), &pdf).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "doc.pdf"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "pdf read must fail without rag-pdf, got output: {:?}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("Binary file detected"),
+            "error must indicate binary rejection, got: {:?}",
+            result.error
+        );
+
+        // Base64 path still works.
+        let result = tool
+            .execute(json!({"path": "doc.pdf", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "base64 pdf read must succeed: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     /// PNG images are rejected with guidance toward the image_info tool.
     #[tokio::test]
     async fn file_read_rejects_png_image() {
@@ -1373,73 +1417,6 @@ mod tests {
                 tool_result_msg.content,
             );
         }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-    }
-
-    /// Live e2e: real OpenAI Codex model_provider + real FileReadTool + PDF fixture.
-    /// Verifies the model receives extracted PDF text and responds meaningfully.
-    ///
-    /// Requires valid OAuth credentials in `~/.zeroclaw/`.
-    /// Run: `cargo test --lib -- tools::file_read::tests::e2e_live_file_read_pdf --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "requires valid OpenAI Codex OAuth credentials"]
-    async fn e2e_live_file_read_pdf() {
-        use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::XmlToolDispatcher;
-        use e2e_helpers::*;
-        use zeroclaw_providers::openai_codex::OpenAiCodexModelProvider;
-        use zeroclaw_providers::{ModelProvider, ModelProviderRuntimeOptions};
-
-        // ── Set up workspace with PDF fixture ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_live_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, workspace.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        // ── Build real FileReadTool ──
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        });
-        let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
-
-        // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
-        let model_provider =
-            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
-                .expect("model_provider should initialize");
-
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
-            .memory(make_memory())
-            .observer(make_observer())
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.clone())
-            .model_name("gpt-5.3-codex".to_string())
-            .build()
-            .unwrap();
-
-        // ── Execute ──
-        let response = agent
-            .turn("Use the file_read tool to read report.pdf, then tell me what text it contains. Be concise.")
-            .await
-            .unwrap();
-
-        eprintln!("=== Live e2e response ===\n{response}\n=========================");
-
-        // ── Verify model saw the actual PDF content ("Hello PDF") ──
-        let lower = response.to_lowercase();
-        assert!(
-            lower.contains("hello"),
-            "model response must reference extracted PDF text 'Hello PDF', got: {response}",
-        );
 
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }

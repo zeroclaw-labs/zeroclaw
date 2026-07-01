@@ -60,7 +60,7 @@ tool-file-download-error-write-body = ダウンロードしたバイトの書き
 tool-file-download-error-flush = ダウンロードしたファイルのフラッシュに失敗しました: { $err }
 tool-file-download-error-move = ダウンロードしたファイルの移動に失敗しました: { $err }
 tool-file-download-success = { $written } バイトを { $dest_path } にダウンロードしました ({ $status })
-tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。PDFからテキストを抽出します。その他のバイナリファイルはロッシーUTF-8変換で読み込まれます。
+tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。バイナリファイルと画像ファイルは拒否されます（画像の場合は image_info ツールを使用）。encoding="base64" を設定すると、生のバイトをbase64エンコードして返します（.pdf/.xlsx/.docx などのバイナリファイル用）。そのモードでは offset/limit は無視されます。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み
 tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
 tool-git-operations-error-not-in-repo = '{ $path }' はGitリポジトリ内にありません。Gitワークツリー内のパスを選択し、リポジトリのサブディレクトリに 'path' を渡すか、git_operationsを実行する前にリポジトリを初期化してください。
