@@ -216,7 +216,10 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
         crate::SopCommands::Delete { name } => {
             let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
             delete_sop(&dir, &name)?;
-            println!("Deleted SOP: {name}");
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-sop-deleted", &[("name", &name)])
+            );
             Ok(())
         }
     }

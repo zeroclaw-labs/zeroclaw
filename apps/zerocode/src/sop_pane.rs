@@ -1028,10 +1028,11 @@ impl SopPane {
         *trigger = crate::client::SopTriggerDraft::default();
         if picked == "channel" {
             trigger.kind = "channel".to_string();
-            trigger.channel = self.trigger_registry.channels.first().and_then(|c| {
-                <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(&c.channel)
-                    .ok()
-            });
+            trigger.channel = self
+                .trigger_registry
+                .channels
+                .first()
+                .map(|c| c.channel.clone());
         } else {
             trigger.kind = picked;
         }
@@ -1059,19 +1060,14 @@ impl SopPane {
         if trigger.channel.is_none() {
             return;
         }
-        let cur = trigger
-            .channel
-            .map(|k| k.as_wire().to_string())
-            .unwrap_or_default();
+        let cur = trigger.channel.clone().unwrap_or_default();
         let idx = kinds.iter().position(|s| *s == cur).unwrap_or(0);
         let next = if forward {
             (idx + 1) % kinds.len()
         } else {
             (idx + kinds.len() - 1) % kinds.len()
         };
-        trigger.channel =
-            <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(&kinds[next])
-                .ok();
+        trigger.channel = Some(kinds[next].clone());
         trigger.alias = None;
     }
 
@@ -1085,10 +1081,9 @@ impl SopPane {
         let Some(trigger) = ed.draft.triggers.get(ed.trigger_cursor) else {
             return;
         };
-        let Some(kind) = trigger.channel else {
+        let Some(kind_wire) = trigger.channel.clone() else {
             return;
         };
-        let kind_wire = kind.as_wire().to_string();
         let mut aliases: Vec<Option<String>> = vec![None];
         if let Some(entry) = self
             .trigger_registry
@@ -1638,14 +1633,13 @@ impl SopPane {
                 trigger.kind.clone()
             };
             let detail = match &trigger.channel {
-                Some(kind) => {
+                Some(kind_wire) => {
                     let alias = trigger.alias.clone().unwrap_or_else(|| "any".to_string());
-                    let kind_wire = kind.as_wire();
                     let unconfigured = self
                         .trigger_registry
                         .channels
                         .iter()
-                        .find(|c| c.channel == kind_wire)
+                        .find(|c| &c.channel == kind_wire)
                         .is_some_and(|c| !c.configured);
                     let hint = if unconfigured {
                         "  (no alias configured; set up this channel first)"
@@ -2754,10 +2748,7 @@ mod tests {
         let ed = pane.editor.as_ref().unwrap();
         let tr = &ed.draft.triggers[0];
         assert_eq!(tr.kind, "channel");
-        assert_eq!(
-            tr.channel.map(|k| k.as_wire().to_string()),
-            Some("telegram".to_string())
-        );
+        assert_eq!(tr.channel.clone(), Some("telegram".to_string()));
     }
 
     #[tokio::test]
@@ -2769,10 +2760,7 @@ mod tests {
         pane.editor_cycle_trigger_source(false); // -> channel/telegram
         pane.editor_cycle_trigger_channel(true); // telegram -> discord
         let tr = &pane.editor.as_ref().unwrap().draft.triggers[0];
-        assert_eq!(
-            tr.channel.map(|k| k.as_wire().to_string()),
-            Some("discord".to_string())
-        );
+        assert_eq!(tr.channel.clone(), Some("discord".to_string()));
         // Channel change clears the alias.
         assert!(tr.alias.is_none());
     }
@@ -2797,10 +2785,7 @@ mod tests {
         ed.draft.name = "demo".to_string();
         ed.draft.triggers[0] = crate::client::SopTriggerDraft {
             kind: "channel".to_string(),
-            channel: <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(
-                "telegram",
-            )
-            .ok(),
+            channel: Some("telegram".to_string()),
             alias: Some("main".to_string()),
             ..Default::default()
         };

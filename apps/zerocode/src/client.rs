@@ -2258,12 +2258,8 @@ pub struct SopDraft {
 pub struct SopTriggerDraft {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(
-        default,
-        with = "zeroclaw_api::attribution::channel_kind_opt_serde",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub channel: Option<zeroclaw_api::attribution::ChannelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
