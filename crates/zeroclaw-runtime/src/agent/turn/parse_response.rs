@@ -171,30 +171,19 @@ pub(crate) async fn interpret_chat_response(
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
     // this ensures we support both native and prompt-guided models.
+    //
+    // Native calls are NOT filtered here against `known_tool_names`. Tools
+    // outside the request scope are rejected at the execution layer
+    // (`tool_execution.rs`: `find_tool` returns None → "Unknown tool";
+    // `is_excluded_tool` → "Tool not available"). This preserves the
+    // runtime's feedback contract (verified by `turn_handles_unknown_tool_
+    // gracefully` and `run_tool_call_loop_enforces_sop_step_tool_scope`)
+    // while still failing closed — the call never executes.
     let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
         Vec::new()
     } else {
         resp.tool_calls
             .iter()
-            .filter(|call| {
-                let known = specs
-                    .known_tool_names
-                    .contains(&call.name.to_ascii_lowercase());
-                if !known {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "tool_name": call.name,
-                                "reason": "native tool call name not in known_tool_names; dropped"
-                            })),
-                        "native tool call filtered: name outside request allow-set"
-                    );
-                }
-                known
-            })
             .map(|call| ParsedToolCall {
                 name: call.name.clone(),
                 arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
@@ -520,217 +509,5 @@ mod cost_usd_regression_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
-    }
-}
-
-#[cfg(test)]
-mod native_tool_call_filtering_tests {
-    use super::*;
-    use std::collections::HashSet;
-    use zeroclaw_api::model_provider::ToolCall;
-
-    fn make_specs(known_names: &[&str]) -> IterationToolSpecs {
-        let known_tool_names: HashSet<String> = known_names.iter().map(|s| s.to_string()).collect();
-        let tool_specs: Vec<zeroclaw_api::tool::ToolSpec> = known_names
-            .iter()
-            .map(|name| zeroclaw_api::tool::ToolSpec {
-                name: name.to_string(),
-                description: "".to_string(),
-                parameters: serde_json::json!({}),
-            })
-            .collect();
-        IterationToolSpecs {
-            tool_specs,
-            known_tool_names,
-            use_native_tools: true,
-        }
-    }
-
-    fn make_tool_call(id: &str, name: &str, args: &str) -> ToolCall {
-        ToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments: args.to_string(),
-            extra_content: None,
-        }
-    }
-
-    /// Scenario 2.1#2: Known native tool call passes through.
-    #[tokio::test]
-    async fn known_native_tool_call_passes_filter() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            observer: &crate::observability::NoopObserver,
-            provider_name: "test",
-            model: "test-model",
-            temperature: None,
-            approval: None,
-            channel_name: "",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            agent_alias: None,
-            turn_id: "turn-filter-known",
-        };
-        let specs = make_specs(&["weather_query"]);
-        let resp = ChatResponse {
-            text: Some("checking weather".to_string()),
-            tool_calls: vec![make_tool_call(
-                "call_1",
-                "weather_query",
-                r#"{"city":"Beijing"}"#,
-            )],
-            usage: None,
-            reasoning_content: None,
-        };
-
-        let now = std::time::Instant::now();
-        let result = interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
-
-        assert_eq!(
-            result.tool_calls.len(),
-            1,
-            "known tool call should pass filter"
-        );
-        assert_eq!(result.tool_calls[0].name, "weather_query");
-    }
-
-    /// Scenario 2.1#3: Unknown native tool call is filtered out.
-    #[tokio::test]
-    async fn unknown_native_tool_call_is_filtered() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            observer: &crate::observability::NoopObserver,
-            provider_name: "test",
-            model: "test-model",
-            temperature: None,
-            approval: None,
-            channel_name: "",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            agent_alias: None,
-            turn_id: "turn-filter-unknown",
-        };
-        let specs = make_specs(&["weather_query"]);
-        let resp = ChatResponse {
-            text: Some("hello".to_string()),
-            tool_calls: vec![make_tool_call("call_1", "shell", r#"{"cmd":"ls"}"#)],
-            usage: None,
-            reasoning_content: None,
-        };
-
-        let now = std::time::Instant::now();
-        let result = interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
-
-        assert!(
-            result.tool_calls.is_empty(),
-            "unknown native tool call should be filtered out"
-        );
-    }
-
-    /// Scenario 2.1#4: Mixed known and unknown — only known passes through.
-    #[tokio::test]
-    async fn mixed_native_tool_calls_filter_unknown_only() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            observer: &crate::observability::NoopObserver,
-            provider_name: "test",
-            model: "test-model",
-            temperature: None,
-            approval: None,
-            channel_name: "",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            agent_alias: None,
-            turn_id: "turn-filter-mixed",
-        };
-        let specs = make_specs(&["weather_query"]);
-        let resp = ChatResponse {
-            text: Some("mixed".to_string()),
-            tool_calls: vec![
-                make_tool_call("call_1", "shell", r#"{"cmd":"ls"}"#),
-                make_tool_call("call_2", "weather_query", r#"{"city":"Beijing"}"#),
-                make_tool_call("call_3", "file_write", r#"{"path":"/tmp/x"}"#),
-            ],
-            usage: None,
-            reasoning_content: None,
-        };
-
-        let now = std::time::Instant::now();
-        let result = interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
-
-        assert_eq!(result.tool_calls.len(), 1, "only known tool should pass");
-        assert_eq!(result.tool_calls[0].name, "weather_query");
-    }
-
-    /// Scenario 2.1#5: All native tool calls outside allow-set — all filtered.
-    #[tokio::test]
-    async fn all_native_tool_calls_outside_allow_set_are_filtered() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            observer: &crate::observability::NoopObserver,
-            provider_name: "test",
-            model: "test-model",
-            temperature: None,
-            approval: None,
-            channel_name: "",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            agent_alias: None,
-            turn_id: "turn-filter-all",
-        };
-        let specs = make_specs(&["weather_query"]);
-        let resp = ChatResponse {
-            text: Some("no tools available".to_string()),
-            tool_calls: vec![
-                make_tool_call("call_1", "shell", r#"{"cmd":"ls"}"#),
-                make_tool_call("call_2", "file_write", r#"{"path":"/tmp/x"}"#),
-            ],
-            usage: None,
-            reasoning_content: None,
-        };
-
-        let now = std::time::Instant::now();
-        let result = interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
-
-        assert!(
-            result.tool_calls.is_empty(),
-            "all native tool calls outside allow-set should be filtered"
-        );
     }
 }

@@ -417,6 +417,7 @@ The following parameters are **not supported** per-request and will return a **4
 - **Transparent execution**: ZeroClaw uses automatic tool execution mode — tool calls are transparent to the client
 - **Filtering logic**: Only tools whose names match the agent's currently configured tools take effect. Tools not in the agent's configuration are silently ignored
 - **Security**: Tools excluded by the agent's risk profile are automatically blocked, even if requested
+- **Execution enforcement**: A tool outside the requested subset will never execute. If the model returns a call for a tool that is not available in this request, the call is rejected (the model receives an "Unknown tool"/"Tool not available" result and can self-correct on the next turn). Only the requested tools can actually run.
 - **Model compatibility**: When the underlying model uses **native tool calling** (recommended), only the requested tool specs are sent as structured API parameters, and the system prompt tool catalog is suppressed. When the model uses **text-based tool protocol** (prompt-protocol), the system prompt may include descriptions for all agent-configured tools — only the structured API parameters are narrowed. Tool execution is always restricted to the requested subset regardless of model type.
 
 **Tool object structure**:
@@ -448,15 +449,16 @@ The following parameters are **not supported** per-request and will return a **4
 | Value | Description | ZeroClaw Behavior |
 |-------|-------------|-------------------|
 | `"auto"` | Model decides whether to call tools | Default behavior — model judges based on the query |
-| `"none"` | Disable all tools | Enforced at three layers: system prompt excludes tool protocol, LLM request omits tool definitions, response parser discards any tool calls. Pure text conversation |
+| `"none"` | Disable all tools | No tool definitions are sent to the model and the system prompt excludes tool protocol. Any tool call in the response is ignored — pure text conversation |
 | `"required"` | Should call a tool | Prompts the model to call at least one tool (depends on model compliance). If `tools` provided, only those tools are available |
 | `{"type":"function","function":{"name":"..."}}` | Specify a single tool | Restricts available tools to only the named function (must also provide `tools`). The function name must be in the agent's configured tools and present in the `tools` list; otherwise returns 400 |
 
 **Key behavior notes**:
-- `tool_choice: "none"` takes effect at three enforcement layers: system prompt excludes tool protocol, LLM request omits tool definitions, and response parser discards any tool calls
+- `tool_choice: "none"` disables tools entirely: the system prompt excludes tool protocol, the LLM request carries no tool definitions, and any tool calls in the response are ignored — the model produces a pure text answer
 - When `tools` is provided with `"auto"` or `"required"`, only tools matching the agent's configured tool names are activated. If none of the requested tools are configured, a 400 error is returned
 - When `tool_choice` specifies a specific function, the function must exist in the agent's configured tools and in the provided `tools` list; otherwise a 400 error is returned
 - `tool_choice: "required"` requires a non-empty `tools` list; otherwise a 400 error is returned
+- **Out-of-scope tool calls**: If the model returns a call for a tool that is not available in this request (e.g. a tool not in the requested subset), the call is rejected and never executes — the model receives a failure result it can use to self-correct on the next turn
 - **Model compatibility**: For native-tool models, only the requested tool specs are sent as structured API parameters. For text-protocol (prompt) models, the system prompt may still include descriptions for all agent-configured tools — tool execution is always restricted to the requested subset
 
 ---
@@ -917,10 +919,10 @@ Then all `usage` fields will be 0. This does not affect conversation functionali
 
 ### Q9: How does tool_choice: "none" work?
 
-**Answer**: `tool_choice: "none"` takes effect at multiple levels:
+**Answer**: `tool_choice: "none"` disables tools entirely:
 1. **System prompt**: Tool protocol descriptions are excluded from the system prompt
-2. **LLM request**: No tool definitions are sent to the model (`use_native_tools = false`)
-3. **Response parsing**: Any tool calls in the model response are discarded (three-layer guard: native tool calls dropped, text-protocol parsing skipped, empty `known_tool_names` filters all call names)
+2. **LLM request**: No tool definitions are sent to the model
+3. **Response**: No tool definitions were sent, so the model has nothing to call — any tool call in the response is ignored and a pure text answer is returned
 
 This ensures the LLM behaves as a pure text model with no tool capability for that request.
 
@@ -964,10 +966,10 @@ Exceeding the limit returns 429 with a `Retry-After` header indicating the wait 
 **Answer**: Tool control is enforced at three layers that work together:
 
 1. **Request validation** — The handler validates `tool_choice` and `tools` combinations before the turn starts. Invalid or unavailable tool configurations return a 400 error (fail-closed), never silently falling back to the full tool set.
-2. **Provider-visible specs** — Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all.
-3. **Response parsing** — Both native and text-protocol tool calls from the LLM are filtered against the request's allow-set (`known_tool_names`). Calls outside the allow-set are logged and discarded.
+2. **Provider-visible specs** — Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all. This is the primary lever: the model is only ever told about the requested tools.
+3. **Execution enforcement** — If the model still returns a call for a tool outside the requested subset, that call is rejected and never executes. The model receives a failure result ("Unknown tool" / "Tool not available") it can use to self-correct on the next turn.
 
-This ensures that a request-scoped tool restriction cannot be bypassed by the LLM returning calls for tools outside the allow-set. Tool execution is always restricted to the requested subset, regardless of model type or protocol.
+This ensures a tool outside the requested subset can never run, regardless of what the model returns. Only the requested tools can actually execute.
 
 ---
 
