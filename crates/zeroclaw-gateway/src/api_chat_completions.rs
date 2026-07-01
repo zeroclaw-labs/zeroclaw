@@ -587,31 +587,18 @@ pub async fn handle_chat_completions(
         ToolChoiceMode::None => {
             agent.disable_tools();
         }
-        ToolChoiceMode::Auto | ToolChoiceMode::Required => {
-            if let Some(ref requested_tools) = request.tools {
-                let filtered_tools: Vec<_> = requested_tools
-                    .iter()
-                    .filter(|t| configured_tools.contains(&t.function.name))
-                    .cloned()
-                    .collect();
-
-                if !filtered_tools.is_empty() {
-                    let tool_specs = convert_request_tools(&filtered_tools);
-                    agent.set_tool_specs(tool_specs);
-                }
-            }
-        }
-        ToolChoiceMode::SpecificFunction { ref name } => {
-            if configured_tools.contains(name) {
-                if let Some(ref requested_tools) = request.tools {
-                    if let Some(tool) = requested_tools.iter().find(|t| t.function.name == *name) {
-                        let tool_specs = vec![zeroclaw_runtime::tools::ToolSpec {
-                            name: tool.function.name.clone(),
-                            description: tool.function.description.clone().unwrap_or_default(),
-                            parameters: tool.function.parameters.clone(),
-                        }];
-                        agent.set_tool_specs(tool_specs);
+        _ => {
+            match resolve_tool_specs(&request.tool_choice, &request.tools, &configured_tools) {
+                Err(e) => return add_request_id_header(e, &request_id),
+                Ok(Some(specs)) => {
+                    if specs.is_empty() {
+                        agent.disable_tools();
+                    } else {
+                        agent.set_tool_specs(specs);
                     }
+                }
+                Ok(None) => {
+                    // Auto + tools=None → use default tool set
                 }
             }
         }
@@ -1081,6 +1068,111 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     }
 
     Ok(())
+}
+
+/// Resolve tool specs from request parameters, returning an error if the
+/// tool configuration is invalid (fail-closed).
+///
+/// Returns `Ok(Some(specs))` when tools should be restricted,
+/// `Ok(None)` when the default tool set should be used,
+/// `Err(response)` when the request is invalid.
+#[allow(clippy::result_large_err)]
+fn resolve_tool_specs(
+    tool_choice: &Option<serde_json::Value>,
+    tools: &Option<Vec<ChatCompletionTool>>,
+    configured_tools: &std::collections::HashSet<String>,
+) -> Result<Option<Vec<zeroclaw_runtime::tools::ToolSpec>>, Response> {
+    let mode = parse_tool_choice(tool_choice);
+    match mode {
+        ToolChoiceMode::None => {
+            // disable_tools() is handled by the caller
+            Ok(Some(Vec::new()))
+        }
+        ToolChoiceMode::Auto => {
+            match tools {
+                None => Ok(None), // Auto + no tools → use default set
+                Some(requested_tools) => {
+                    let filtered_tools: Vec<_> = requested_tools
+                        .iter()
+                        .filter(|t| configured_tools.contains(&t.function.name))
+                        .cloned()
+                        .collect();
+                    if filtered_tools.is_empty() {
+                        return Err(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "None of the requested tools are configured for this agent",
+                        ));
+                    }
+                    Ok(Some(convert_request_tools(&filtered_tools)))
+                }
+            }
+        }
+        ToolChoiceMode::Required => match tools {
+            None => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "tool_choice: \"required\" requires a non-empty tools list",
+            )),
+            Some(requested_tools) => {
+                let filtered_tools: Vec<_> = requested_tools
+                    .iter()
+                    .filter(|t| configured_tools.contains(&t.function.name))
+                    .cloned()
+                    .collect();
+                if filtered_tools.is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "None of the requested tools are configured for this agent",
+                    ));
+                }
+                Ok(Some(convert_request_tools(&filtered_tools)))
+            }
+        },
+        ToolChoiceMode::SpecificFunction { ref name } => {
+            if !configured_tools.contains(name) {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!(
+                        "tool_choice function '{}' is not configured for this agent",
+                        name
+                    ),
+                ));
+            }
+            match tools {
+                None => Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "tool_choice with a specific function requires a tools list",
+                )),
+                Some(requested_tools) => {
+                    if !requested_tools.iter().any(|t| t.function.name == *name) {
+                        return Err(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &format!(
+                                "tool_choice function '{}' not found in the provided tools list",
+                                name
+                            ),
+                        ));
+                    }
+                    if let Some(tool) = requested_tools.iter().find(|t| t.function.name == *name) {
+                        let tool_specs = vec![zeroclaw_runtime::tools::ToolSpec {
+                            name: tool.function.name.clone(),
+                            description: tool.function.description.clone().unwrap_or_default(),
+                            parameters: tool.function.parameters.clone(),
+                        }];
+                        Ok(Some(tool_specs))
+                    } else {
+                        // Should not reach here due to the .any() check above
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Reject unsupported per-request generation parameters with a clear error.
@@ -1637,5 +1729,364 @@ mod tests {
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_specific_function_unknown_tool_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!({"type":"function","function":{"name":"nonexistent"}})),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "nonexistent".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(result.is_err(), "unknown tool should be rejected");
+    }
+
+    #[test]
+    fn test_specific_function_not_in_tools_list_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!({"type":"function","function":{"name":"weather_query"}})),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "other_tool".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "function not in tools list should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_specific_function_without_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!({"type":"function","function":{"name":"weather_query"}})),
+            &None,
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "specific function without tools should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_required_without_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(&Some(serde_json::json!("required")), &None, &configured);
+        assert!(result.is_err(), "required without tools should be rejected");
+    }
+
+    #[test]
+    fn test_auto_all_unknown_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("auto")),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "nonexistent".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(result.is_err(), "all unknown tools should be rejected");
+    }
+
+    #[test]
+    fn test_required_all_unknown_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("required")),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "nonexistent".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "required with all unknown tools should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_auto_with_known_tools_succeeds() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("auto")),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "weather_query".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(result.is_ok(), "known tools should succeed");
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert_eq!(specs.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_auto_without_tools_returns_none() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(&Some(serde_json::json!("auto")), &None, &configured);
+        assert!(result.is_ok(), "auto without tools should succeed");
+        assert!(
+            result.unwrap().is_none(),
+            "auto without tools should return None"
+        );
+    }
+
+    // ── tool_choice=None (→ Auto) scenarios ─────────────────────────────
+
+    #[test]
+    fn test_none_tool_choice_with_known_tools_succeeds() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &None,
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "weather_query".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_ok(),
+            "None tool_choice with known tools should succeed"
+        );
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert_eq!(specs.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_none_tool_choice_with_unknown_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &None,
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "nonexistent".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "None tool_choice with unknown tools should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_none_tool_choice_with_mixed_tools_filters() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &None,
+            &Some(vec![
+                ChatCompletionTool {
+                    kind: "function".into(),
+                    function: ToolFunction {
+                        name: "weather_query".into(),
+                        description: None,
+                        parameters: serde_json::json!({}),
+                    },
+                },
+                ChatCompletionTool {
+                    kind: "function".into(),
+                    function: ToolFunction {
+                        name: "nonexistent".into(),
+                        description: None,
+                        parameters: serde_json::json!({}),
+                    },
+                },
+            ]),
+            &configured,
+        );
+        assert!(
+            result.is_ok(),
+            "None tool_choice with mixed tools should succeed"
+        );
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert_eq!(specs.unwrap().len(), 1, "only known tool should pass");
+    }
+
+    // ── tool_choice="none" scenarios ────────────────────────────────────
+
+    #[test]
+    fn test_none_tool_choice_disables_tools() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(&Some(serde_json::json!("none")), &None, &configured);
+        assert!(result.is_ok(), "none tool_choice should succeed");
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert!(
+            specs.unwrap().is_empty(),
+            "none tool_choice should return empty specs"
+        );
+    }
+
+    #[test]
+    fn test_none_tool_choice_ignores_tools() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("none")),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "weather_query".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_ok(),
+            "none tool_choice should succeed even with tools"
+        );
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert!(
+            specs.unwrap().is_empty(),
+            "none tool_choice should ignore tools param"
+        );
+    }
+
+    // ── tool_choice="required" + known tools ────────────────────────────
+
+    #[test]
+    fn test_required_with_known_tools_succeeds() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("required")),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "weather_query".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(result.is_ok(), "required with known tools should succeed");
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert_eq!(specs.unwrap().len(), 1);
+    }
+
+    // ── tool_choice={function} + known function succeeds ────────────────
+
+    #[test]
+    fn test_specific_function_with_known_tool_succeeds() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!({"type":"function","function":{"name":"weather_query"}})),
+            &Some(vec![ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: "weather_query".into(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            &configured,
+        );
+        assert!(
+            result.is_ok(),
+            "specific function with known tool should succeed"
+        );
+        let specs = result.unwrap();
+        assert!(specs.is_some());
+        assert_eq!(specs.unwrap().len(), 1);
+    }
+
+    // ── Empty tools array scenarios ─────────────────────────────────────
+
+    #[test]
+    fn test_auto_with_empty_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result =
+            resolve_tool_specs(&Some(serde_json::json!("auto")), &Some(vec![]), &configured);
+        assert!(result.is_err(), "auto with empty tools should be rejected");
+    }
+
+    #[test]
+    fn test_required_with_empty_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!("required")),
+            &Some(vec![]),
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "required with empty tools should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_specific_function_with_empty_tools_rejected() {
+        let configured: std::collections::HashSet<String> =
+            ["weather_query"].iter().map(|s| s.to_string()).collect();
+        let result = resolve_tool_specs(
+            &Some(serde_json::json!({"type":"function","function":{"name":"weather_query"}})),
+            &Some(vec![]),
+            &configured,
+        );
+        assert!(
+            result.is_err(),
+            "specific function with empty tools should be rejected"
+        );
     }
 }

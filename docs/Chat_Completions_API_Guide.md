@@ -417,6 +417,7 @@ The following parameters are **not supported** per-request and will return a **4
 - **Transparent execution**: ZeroClaw uses automatic tool execution mode — tool calls are transparent to the client
 - **Filtering logic**: Only tools whose names match the agent's currently configured tools take effect. Tools not in the agent's configuration are silently ignored
 - **Security**: Tools excluded by the agent's risk profile are automatically blocked, even if requested
+- **Model compatibility**: When the underlying model uses **native tool calling** (recommended), only the requested tool specs are sent as structured API parameters, and the system prompt tool catalog is suppressed. When the model uses **text-based tool protocol** (prompt-protocol), the system prompt may include descriptions for all agent-configured tools — only the structured API parameters are narrowed. Tool execution is always restricted to the requested subset regardless of model type.
 
 **Tool object structure**:
 ```json
@@ -447,14 +448,16 @@ The following parameters are **not supported** per-request and will return a **4
 | Value | Description | ZeroClaw Behavior |
 |-------|-------------|-------------------|
 | `"auto"` | Model decides whether to call tools | Default behavior — model judges based on the query |
-| `"none"` | Disable all tools | LLM receives no tool definitions and no tool protocol in system prompt. Pure text conversation |
+| `"none"` | Disable all tools | Enforced at three layers: system prompt excludes tool protocol, LLM request omits tool definitions, response parser discards any tool calls. Pure text conversation |
 | `"required"` | Should call a tool | Prompts the model to call at least one tool (depends on model compliance). If `tools` provided, only those tools are available |
-| `{"type":"function","function":{"name":"..."}}` | Specify a single tool | Restricts available tools to only the named function (must also provide `tools`). The function name must be in the agent's configured tools; otherwise it is silently ignored |
+| `{"type":"function","function":{"name":"..."}}` | Specify a single tool | Restricts available tools to only the named function (must also provide `tools`). The function name must be in the agent's configured tools and present in the `tools` list; otherwise returns 400 |
 
 **Key behavior notes**:
-- `tool_choice: "none"` takes effect at multiple levels: the system prompt excludes tool protocol, the LLM request omits tool definitions, and any tool calls in the model response are discarded
-- When `tools` is provided with `"auto"` or `"required"`, only tools matching the agent's configured tool names are activated
-- When `tool_choice` specifies a specific function, the function must exist in the agent's configured tools (security policy enforced)
+- `tool_choice: "none"` takes effect at three enforcement layers: system prompt excludes tool protocol, LLM request omits tool definitions, and response parser discards any tool calls
+- When `tools` is provided with `"auto"` or `"required"`, only tools matching the agent's configured tool names are activated. If none of the requested tools are configured, a 400 error is returned
+- When `tool_choice` specifies a specific function, the function must exist in the agent's configured tools and in the provided `tools` list; otherwise a 400 error is returned
+- `tool_choice: "required"` requires a non-empty `tools` list; otherwise a 400 error is returned
+- **Model compatibility**: For native-tool models, only the requested tool specs are sent as structured API parameters. For text-protocol (prompt) models, the system prompt may still include descriptions for all agent-configured tools — tool execution is always restricted to the requested subset
 
 ---
 
@@ -829,7 +832,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
     "tool_choice": {"type": "function", "function": {"name": "weather_query"}}
   }'
 # Only "weather_query" is available. If the function name is not in the
-# agent's configured tools, tool_choice is silently ignored.
+# agent's configured tools or the tools list, a 400 error is returned.
 ```
 
 ---
@@ -928,7 +931,10 @@ This ensures the LLM behaves as a pure text model with no tool capability for th
 **Answer**: The `tools` parameter filters against the agent's currently configured tools:
 - Only tool names present in `agent.get_configured_tool_names()` are activated
 - Tools excluded by the agent's risk profile are automatically blocked (they are removed from `configured_tools` at agent build time)
-- Unknown tool names (not in the agent's configuration) are silently ignored
+- Unknown tool names (not in the agent's configuration) return a 400 error
+- If none of the requested tools are configured, a 400 error is returned (fail-closed)
+
+**Model compatibility note**: For **native-tool models**, only the requested tool specs are sent as structured API parameters, and the system prompt tool catalog is suppressed. For **text-protocol models**, the system prompt may still include descriptions for all agent-configured tools — the prompt-level catalog is not scoped. Tool execution is always restricted to the requested subset regardless of model type.
 
 ---
 
@@ -942,6 +948,26 @@ chat_rate_limit_per_minute = 10  # Max requests per minute, default 60
 ```
 
 Exceeding the limit returns 429 with a `Retry-After` header indicating the wait time (60-second window).
+
+---
+
+### Q12: Does the tools parameter scope the system prompt tool descriptions?
+
+**Answer**: It depends on the model type:
+- **Native-tool models** (recommended): Yes — only the requested tool specs are sent as structured API parameters, and the system prompt tool catalog is suppressed
+- **Text-protocol (prompt) models**: No — the system prompt may still include descriptions for all agent-configured tools. The `tools` parameter only narrows the structured API parameters and the response-parsing allow-set. Tool execution is always restricted to the requested subset
+
+---
+
+### Q13: What is the overall tool control strategy?
+
+**Answer**: Tool control is enforced at three layers that work together:
+
+1. **Request validation** — The handler validates `tool_choice` and `tools` combinations before the turn starts. Invalid or unavailable tool configurations return a 400 error (fail-closed), never silently falling back to the full tool set.
+2. **Provider-visible specs** — Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all.
+3. **Response parsing** — Both native and text-protocol tool calls from the LLM are filtered against the request's allow-set (`known_tool_names`). Calls outside the allow-set are logged and discarded.
+
+This ensures that a request-scoped tool restriction cannot be bypassed by the LLM returning calls for tools outside the allow-set. Tool execution is always restricted to the requested subset, regardless of model type or protocol.
 
 ---
 
