@@ -416,7 +416,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                             "budget": context_token_budget,
                             "error_key": "context_floor_exceeds_budget",
                         })),
-                    crate::i18n::get_required_cli_string("history-trim-floor-exceeds-budget")
+                    crate::agent::history::context_floor_remediation(
+                        system_floor,
+                        context_token_budget,
+                    )
                 );
             }
             let taken = std::mem::take(history);
@@ -652,6 +655,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     event_tx.as_ref(),
                     observer,
+                    context_token_budget,
                 )
                 .await;
                 if recovered {

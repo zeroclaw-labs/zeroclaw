@@ -301,15 +301,35 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 /// conversation trimming can bring the request under budget — trimming only
 /// sheds whole turns, never the protected system content (#5808). Callers use
 /// this to detect that condition and surface an actionable remediation hint
-/// (raise `agent.max_context_tokens` or disable unused integrations) instead of
-/// a generic overflow error. Mirrors `estimate_history_tokens`' heuristic
-/// exactly.
+/// (raise `[runtime_profiles.<name>] max_context_tokens` or reduce the tool
+/// surface) instead of a generic overflow error. Mirrors
+/// `estimate_history_tokens`' heuristic exactly.
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
         .filter(|m| m.role == "system")
         .map(estimate_message_tokens)
         .sum()
+}
+
+/// Actionable one-line remediation for the #5808 floor-exceeds-budget
+/// condition. Names the resolved effective budget (`budget`) and the system
+/// floor (`system_floor`) the runtime actually measured, and points operators
+/// at the config surface they can change (`[runtime_profiles.<name>]
+/// max_context_tokens`) rather than the inert `agent.max_context_tokens` knob.
+///
+/// Every emission site (iteration-0 preemptive trim, the turn-boundary trim,
+/// and the in-loop reactive recovery) formats the visible message and its
+/// stderr copy through this one function, so the human-facing text and the
+/// structured log attrs can never drift and always name the same `N`.
+#[must_use]
+pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
+    let floor_s = system_floor.to_string();
+    let budget_s = budget.to_string();
+    crate::i18n::get_required_cli_string_with_args(
+        "history-trim-floor-exceeds-budget",
+        &[("floor", floor_s.as_str()), ("budget", budget_s.as_str())],
+    )
 }
 
 pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
@@ -516,6 +536,31 @@ mod tests {
         assert_eq!(estimate_system_floor_tokens(&[]), 0);
         let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
         assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn context_floor_remediation_names_budget_floor_and_runtime_profile_surface() {
+        let msg = context_floor_remediation(2000, 100);
+        // Names the resolved budget N the runtime actually used ...
+        assert!(
+            msg.contains("100"),
+            "remediation must name the resolved budget: {msg}"
+        );
+        // ... and the measured system floor ...
+        assert!(
+            msg.contains("2000"),
+            "remediation must name the system floor: {msg}"
+        );
+        // ... points at the config surface an operator can change ...
+        assert!(
+            msg.contains("[runtime_profiles"),
+            "remediation must point at the runtime-profile surface: {msg}"
+        );
+        // ... and never at the inert agent-inline knob (#6877).
+        assert!(
+            !msg.contains("agent.max_context_tokens"),
+            "remediation must not reference the inert agent.max_context_tokens: {msg}"
+        );
     }
 
     #[test]

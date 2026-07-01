@@ -66,6 +66,7 @@ pub(crate) async fn try_recover_context_overflow(
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     observer: &dyn Observer,
+    context_token_budget: usize,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -140,8 +141,14 @@ pub(crate) async fn try_recover_context_overflow(
         // remaining turn can never fit no matter how much history is dropped;
         // surface the actionable root cause and remedy instead of a generic
         // unrecoverable error (#5808).
+        // Gate on the resolved effective budget (the same `N` the message
+        // displays), not the local 2/3-of-current recovery budget — otherwise a
+        // provider whose real window is below the configured budget could fire a
+        // message stating floor >= N while numerically floor < N. The recovery
+        // trim above still uses the local `budget`; only the remediation
+        // predicate and the displayed value key on the resolved budget (#5808).
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
-        if system_floor >= budget {
+        if system_floor >= context_token_budget {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -149,10 +156,13 @@ pub(crate) async fn try_recover_context_overflow(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "system_floor": system_floor,
-                        "budget": budget,
+                        "budget": context_token_budget,
                         "error_key": "context_floor_exceeds_budget",
                     })),
-                crate::i18n::get_required_cli_string("history-trim-floor-exceeds-budget")
+                crate::agent::history::context_floor_remediation(
+                    system_floor,
+                    context_token_budget,
+                )
             );
         } else {
             ::zeroclaw_log::record!(
@@ -191,7 +201,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -236,7 +246,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
 
         assert!(
             !recovered,
@@ -263,9 +273,100 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn floor_exceeds_budget_emits_event_with_resolved_budget_and_remediation() {
+        // Serialize against the broadcast-hook tests for the whole test: we drive
+        // `record!` -> LogCaptureLayer -> broadcast hook, and a parallel
+        // `clear_broadcast_hook` would otherwise drop our event.
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        // System prompt + tool definitions dominate; a single turn means nothing
+        // can be trimmed, so the floor-dominates-budget remediation branch fires.
+        let big = "x".repeat(8000);
+        let mut history = vec![
+            ChatMessage::system(format!("system {big}").as_str()),
+            ChatMessage::user("only turn"),
+            ChatMessage::assistant("reply"),
+        ];
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+        let budget = 100usize;
+
+        // Drain any pre-existing broadcast traffic from parallel tests.
+        while rx.try_recv().is_ok() {}
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+        assert!(!recovered, "floor-dominates overflow must not recover");
+
+        // Read the emitted `context_floor_exceeds_budget` record within a 2s
+        // deadline, tolerating `Lagged` from parallel broadcast traffic.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let record = loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("did not observe the context_floor_exceeds_budget record in time");
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("attributes")
+                        .and_then(|a| a.get("error_key"))
+                        .and_then(|v| v.as_str())
+                        == Some("context_floor_exceeds_budget")
+                    {
+                        break value;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("broadcast closed before the record arrived")
+                }
+                Err(_elapsed) => {}
+            }
+        };
+
+        let attrs = record.get("attributes").expect("record carries attributes");
+        // The recorded budget is the RESOLVED budget passed in, not the local
+        // 2/3-of-current recovery budget.
+        assert_eq!(
+            attrs.get("budget").and_then(|v| v.as_u64()),
+            Some(budget as u64),
+            "emitted budget must be the resolved effective budget"
+        );
+        assert!(
+            attrs.get("system_floor").and_then(|v| v.as_u64()).unwrap() >= budget as u64,
+            "system_floor must meet or exceed the resolved budget in this branch"
+        );
+        // The visible message names the resolved budget and the runtime-profile
+        // surface, and never the inert agent.max_context_tokens wording.
+        let message = record
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("100"),
+            "remediation message must name the resolved budget: {message}"
+        );
+        assert!(
+            message.contains("[runtime_profiles"),
+            "remediation message must name the runtime-profile surface: {message}"
+        );
+        assert!(
+            !message.contains("agent.max_context_tokens"),
+            "remediation message must not reference the inert knob: {message}"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 }

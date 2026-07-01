@@ -2644,8 +2644,9 @@ pub async fn run(
                                                 "budget": eff_max_context_tokens,
                                                 "error_key": "context_floor_exceeds_budget",
                                             })),
-                                            crate::i18n::get_required_cli_string(
-                                                "history-trim-floor-exceeds-budget"
+                                            crate::agent::history::context_floor_remediation(
+                                                system_floor,
+                                                eff_max_context_tokens,
                                             )
                                         );
                                     } else {
@@ -2665,8 +2666,9 @@ pub async fn run(
                                 if floor_exceeds_budget {
                                     eprintln!(
                                         "\nError: {e}\n{}\n",
-                                        crate::i18n::get_required_cli_string(
-                                            "history-trim-floor-exceeds-budget"
+                                        crate::agent::history::context_floor_remediation(
+                                            system_floor,
+                                            eff_max_context_tokens,
                                         )
                                     );
                                     break String::new();
