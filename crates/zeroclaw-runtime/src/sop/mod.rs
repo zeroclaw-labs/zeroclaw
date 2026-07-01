@@ -336,6 +336,8 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 }
             } else if let Some(val) = bullet.strip_prefix("next:") {
                 current.routing.next = val.trim().parse::<u32>().ok();
+            } else if let Some(val) = bullet.strip_prefix("terminal:") {
+                current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
             } else if let Some(val) = bullet
                 .strip_prefix("depends_on:")
                 .or_else(|| bullet.strip_prefix("depends-on:"))
@@ -568,6 +570,9 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     }
     if let Some(next) = step.routing.next {
         bullets.push(format!("next: {next}"));
+    }
+    if step.routing.terminal {
+        bullets.push("terminal: true".to_string());
     }
     if !step.routing.depends_on.is_empty() {
         let csv = step
@@ -865,6 +870,41 @@ mod tests {
         assert!(md.contains("switch: pull_request>$.event == \"pr\">2; unknown>>3"));
         let parsed = parse_steps(&md);
         assert_eq!(parsed[0].routing.switch, original[0].routing.switch);
+    }
+
+    #[test]
+    fn terminal_survives_render_then_parse() {
+        let mut mid = SopStep {
+            number: 2,
+            title: "float".into(),
+            ..Default::default()
+        };
+        mid.routing.terminal = true;
+        let original = vec![
+            SopStep {
+                number: 1,
+                title: "start".into(),
+                ..Default::default()
+            },
+            mid,
+            SopStep {
+                number: 3,
+                title: "end".into(),
+                ..Default::default()
+            },
+        ];
+        let md = render_steps(&original);
+        assert!(
+            md.contains("terminal: true"),
+            "md must persist terminal: {md}"
+        );
+        let parsed = parse_steps(&md);
+        assert!(
+            parsed[1].routing.terminal,
+            "terminal edge deletion must survive a save/reload round trip"
+        );
+        assert!(!parsed[0].routing.terminal);
+        assert!(!parsed[2].routing.terminal);
     }
 
     #[test]

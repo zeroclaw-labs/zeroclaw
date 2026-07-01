@@ -846,6 +846,29 @@ mod tests {
     }
 
     #[test]
+    fn implicit_chain_survives_save_round_trip() {
+        let sop = sop_with(vec![step(1, "a"), step(2, "b"), step(3, "c")]);
+        let json = serde_json::to_string(&sop).expect("serialize");
+        assert!(
+            !json.contains("terminal"),
+            "implicit chain must not serialize a terminal key: {json}"
+        );
+        let reloaded: Sop = serde_json::from_str(&json).expect("deserialize");
+        let graph = SopGraph::from_sop(&reloaded);
+        let seq: Vec<(u32, u32)> = graph
+            .wires
+            .iter()
+            .filter(|w| w.flow_role == Some(FlowRole::Sequence))
+            .map(|w| (w.from_step, w.to_step))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![(1, 2), (2, 3)],
+            "sequence edges must survive a save/reload round trip"
+        );
+    }
+
+    #[test]
     fn terminal_suppresses_implicit_sequence_edge() {
         let mut s1 = step(1, "a");
         s1.routing = StepRouting {
