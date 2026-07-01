@@ -1,5 +1,8 @@
 /target
 /target-*/
+
+# Desktop installer build artifacts
+*.dmg
 /docs/book/book/
 /docs/book/po/messages.pot
 /docs/book/po/*.failures.log
