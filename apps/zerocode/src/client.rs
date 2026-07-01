@@ -2129,12 +2129,22 @@ pub struct ChannelTriggerKindView {
     pub setup_path: String,
 }
 
+/// Mirror of `zeroclaw_runtime::sop::TriggerField`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TriggerFieldView {
+    pub name: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub multi: bool,
+}
+
 /// Mirror of `zeroclaw_runtime::sop::BoundTriggerSource`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoundTriggerSourceView {
     pub source: String,
     #[serde(default)]
-    pub fields: Vec<String>,
+    pub fields: Vec<TriggerFieldView>,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::TriggerSourceRegistry`: the trigger-source
@@ -2167,6 +2177,8 @@ pub struct StepRouting {
     pub when: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3016,6 +3028,7 @@ mod sop_mirror_tests {
                     routing: StepRouting {
                         when: Some("$.ok".to_string()),
                         next: Some(2),
+                        terminal: false,
                         depends_on: vec![],
                         switch: vec![SwitchRule {
                             name: "pr".to_string(),
@@ -3036,6 +3049,7 @@ mod sop_mirror_tests {
                     routing: StepRouting {
                         when: None,
                         next: None,
+                        terminal: false,
                         depends_on: vec![1],
                         switch: vec![],
                     },

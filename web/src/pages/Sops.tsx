@@ -3,6 +3,7 @@ import { AlertTriangle, XCircle, Loader2, ArrowDown, Plus, Save, Trash2, X } fro
 import { Link } from 'react-router-dom';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import SopCanvas from './SopCanvas';
+import ToolPicker from '@/components/ToolPicker';
 import { t } from '@/lib/i18n';
 import {
   listSops,
@@ -29,6 +30,7 @@ import {
   type StepFailure,
   type TriggerSourceRegistry,
   type BoundTriggerSource,
+  type TriggerField,
 } from '@/lib/sops';
 
 function blankStep(number: number): SopStep {
@@ -424,21 +426,14 @@ function StepEditor({
         rows={2}
         className="mb-2 w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
       />
-      <div className="mb-2 flex items-center gap-3 text-xs">
-        <input
-          type="text"
-          value={(step.suggested_tools ?? []).join(', ')}
-          onChange={(e) =>
-            onChange({
-              suggested_tools: e.target.value
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean),
-            })
-          }
-          placeholder={t('sops.step_tools_placeholder')}
-          className="flex-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-        />
+      <div className="mb-2 space-y-2 text-xs">
+        <div>
+          <span className="mb-1 block text-pc-text-muted">{t('sops.step_tools_label')}</span>
+          <ToolPicker
+            value={step.suggested_tools ?? []}
+            onChange={(next) => onChange({ suggested_tools: next })}
+          />
+        </div>
         <label className="flex items-center gap-1 text-pc-text-muted">
           <input
             type="checkbox"
@@ -616,7 +611,12 @@ function blankTrigger(
   const fields = bound?.fields ?? [];
   const base: Record<string, unknown> = { type: source };
   for (const field of fields) {
-    base[field] = field === 'events' || field === 'calendar_ids' ? [] : field === 'condition' ? null : '';
+    base[field.name] =
+      field.multi || field.name === 'calendar_ids'
+        ? []
+        : field.name === 'condition'
+          ? null
+          : '';
   }
   return base as unknown as SopTrigger;
 }
@@ -646,16 +646,101 @@ function triggerFieldLabel(field: string): string {
   }
 }
 
+function triggerFieldHint(field: string): string | null {
+  switch (field) {
+    case 'condition':
+      return t('sops.trigger_condition_hint');
+    case 'expression':
+      return t('sops.trigger_expression_hint');
+    case 'path':
+      return t('sops.trigger_path_hint');
+    case 'topic':
+      return t('sops.trigger_topic_hint');
+    default:
+      return null;
+  }
+}
+
+function triggerFieldPlaceholder(field: string): string {
+  switch (field) {
+    case 'condition':
+      return t('sops.trigger_condition_placeholder');
+    case 'expression':
+      return t('sops.trigger_expression_placeholder');
+    case 'path':
+      return t('sops.trigger_path_placeholder');
+    case 'topic':
+      return t('sops.trigger_topic_placeholder');
+    default:
+      return '';
+  }
+}
+
 function TriggerFieldInput({
   field,
   value,
   onChange,
 }: {
-  field: string;
+  field: TriggerField;
   value: unknown;
   onChange: (next: unknown) => void;
 }) {
-  const isList = field === 'events' || field === 'calendar_ids';
+  const name = field.name;
+  const options = field.options ?? [];
+  const hint = triggerFieldHint(name);
+
+  if (options.length > 0) {
+    if (field.multi) {
+      const selected = new Set(Array.isArray(value) ? (value as string[]) : []);
+      const toggle = (opt: string) => {
+        const next = new Set(selected);
+        if (next.has(opt)) next.delete(opt);
+        else next.add(opt);
+        onChange(options.filter((o) => next.has(o)));
+      };
+      return (
+        <fieldset className="block text-sm">
+          <legend className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</legend>
+          <div className="flex flex-wrap gap-2">
+            {options.map((opt) => (
+              <label
+                key={opt}
+                className="inline-flex items-center gap-1.5 rounded border border-pc-border px-2 py-1 text-xs text-pc-text"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(opt)}
+                  onChange={() => toggle(opt)}
+                />
+                {opt}
+              </label>
+            ))}
+          </div>
+          {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
+        </fieldset>
+      );
+    }
+    const current = typeof value === 'string' ? value : '';
+    return (
+      <label className="block text-sm">
+        <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</span>
+        <select
+          value={current}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+        >
+          {options.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+        {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
+      </label>
+    );
+  }
+
+  const isList = name === 'calendar_ids';
   const text = isList
     ? Array.isArray(value)
       ? value.join(', ')
@@ -665,10 +750,11 @@ function TriggerFieldInput({
       : '';
   return (
     <label className="block text-sm">
-      <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(field)}</span>
+      <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</span>
       <input
         type="text"
         value={text}
+        placeholder={triggerFieldPlaceholder(name)}
         onChange={(e) => {
           const raw = e.target.value;
           if (isList) {
@@ -678,7 +764,7 @@ function TriggerFieldInput({
                 .map((s) => s.trim())
                 .filter((s) => s.length > 0),
             );
-          } else if (field === 'condition') {
+          } else if (name === 'condition') {
             onChange(raw.length > 0 ? raw : null);
           } else {
             onChange(raw);
@@ -686,6 +772,7 @@ function TriggerFieldInput({
         }}
         className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
       />
+      {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
     </label>
   );
 }
@@ -748,7 +835,7 @@ function ChannelTriggerFields({
         </div>
       ) : null}
       <TriggerFieldInput
-        field="condition"
+        field={{ name: 'condition', options: [], multi: false }}
         value={trigger.condition}
         onChange={(next) => onChange({ condition: (next as string | null) ?? null })}
       />
@@ -773,7 +860,7 @@ function TriggerEditor({
 }) {
   const source = triggerSource(trigger);
   const bound = registry?.bound ?? [];
-  const boundFields: string[] =
+  const boundFields: TriggerField[] =
     source === CHANNEL_SOURCE || source === MANUAL_SOURCE
       ? []
       : (bound.find((b) => b.source === source)?.fields ?? []);
@@ -825,13 +912,13 @@ function TriggerEditor({
         <div className="space-y-2">
           {boundFields.map((field) => (
             <TriggerFieldInput
-              key={field}
+              key={field.name}
               field={field}
-              value={(trigger as unknown as Record<string, unknown>)[field]}
+              value={(trigger as unknown as Record<string, unknown>)[field.name]}
               onChange={(next) =>
                 onChange({
                   ...(trigger as unknown as Record<string, unknown>),
-                  [field]: next,
+                  [field.name]: next,
                 } as unknown as SopTrigger)
               }
             />
@@ -1257,32 +1344,37 @@ export default function Sops() {
     return map;
   }, [overlay]);
 
+  const mutateDraft = useCallback((updater: (d: Sop) => Sop) => {
+    setSaveError(null);
+    setDraft((d) => (d ? updater(d) : d));
+  }, []);
+
   const editorHandlers = draft
     ? {
-        onField: (patch: Partial<Sop>) => setDraft((d) => (d ? { ...d, ...patch } : d)),
+        onField: (patch: Partial<Sop>) => mutateDraft((d) => ({ ...d, ...patch })),
         onTrigger: (i: number, next: SopTrigger) =>
-          setDraft((d) =>
-            d ? { ...d, triggers: d.triggers.map((tr, j) => (j === i ? next : tr)) } : d,
-          ),
+          mutateDraft((d) => ({
+            ...d,
+            triggers: d.triggers.map((tr, j) => (j === i ? next : tr)),
+          })),
         onAddTrigger: () =>
-          setDraft((d) =>
-            d ? { ...d, triggers: [...d.triggers, blankTrigger(MANUAL_SOURCE, triggerRegistry)] } : d,
-          ),
+          mutateDraft((d) => ({
+            ...d,
+            triggers: [...d.triggers, blankTrigger(MANUAL_SOURCE, triggerRegistry)],
+          })),
         onRemoveTrigger: (i: number) =>
-          setDraft((d) => (d ? { ...d, triggers: d.triggers.filter((_, j) => j !== i) } : d)),
+          mutateDraft((d) => ({ ...d, triggers: d.triggers.filter((_, j) => j !== i) })),
         onStep: (i: number, patch: Partial<SopStep>) =>
-          setDraft((d) =>
-            d ? { ...d, steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)) } : d,
-          ),
+          mutateDraft((d) => ({
+            ...d,
+            steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)),
+          })),
         onAddStep: () =>
-          setDraft((d) =>
-            d ? { ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] } : d,
-          ),
+          mutateDraft((d) => ({ ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] })),
         onRemoveStep: (i: number) =>
-          setDraft((d) => (d ? { ...d, steps: d.steps.filter((_, j) => j !== i) } : d)),
+          mutateDraft((d) => ({ ...d, steps: d.steps.filter((_, j) => j !== i) })),
         onMoveStep: (i: number, dir: -1 | 1) =>
-          setDraft((d) => {
-            if (!d) return d;
+          mutateDraft((d) => {
             const j = i + dir;
             if (j < 0 || j >= d.steps.length) return d;
             const steps = [...d.steps];

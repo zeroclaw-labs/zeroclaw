@@ -89,11 +89,15 @@ fn step_mut(sop: &mut Sop, number: u32) -> &mut super::types::SopStep {
 fn apply_sequence(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     let step = step_mut(sop, edit.from);
     match edit.op {
-        WireOp::Connect => step.routing.next = Some(edit.to),
+        WireOp::Connect => {
+            step.routing.next = Some(edit.to);
+            step.routing.terminal = false;
+        }
         WireOp::Disconnect => {
             if step.routing.next == Some(edit.to) {
                 step.routing.next = None;
             }
+            step.routing.terminal = true;
         }
     }
     Ok(())
@@ -203,12 +207,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sop.steps[0].routing.next, Some(2));
+        assert!(!sop.steps[0].routing.terminal);
         apply_wire(
             &mut sop,
             &edit(WireOp::Disconnect, 1, 2, FlowRole::Sequence, None),
         )
         .unwrap();
         assert_eq!(sop.steps[0].routing.next, None);
+        assert!(sop.steps[0].routing.terminal);
     }
 
     #[test]

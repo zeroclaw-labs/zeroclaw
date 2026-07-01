@@ -407,7 +407,9 @@ impl SopGraph {
                     }
                 }
                 None => {
-                    if let Some(following) = sop.steps.get(idx + 1) {
+                    if !step.routing.terminal
+                        && let Some(following) = sop.steps.get(idx + 1)
+                    {
                         wires.push(GraphWire {
                             class: PinClass::Flow,
                             from_step: step.number,
@@ -841,6 +843,25 @@ mod tests {
             .map(|w| (w.from_step, w.to_step))
             .collect();
         assert_eq!(seq, vec![(1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn terminal_suppresses_implicit_sequence_edge() {
+        let mut s1 = step(1, "a");
+        s1.routing = StepRouting {
+            terminal: true,
+            ..StepRouting::default()
+        };
+        let graph = SopGraph::from_sop(&sop_with(vec![s1, step(2, "b")]));
+        assert!(
+            !graph
+                .wires
+                .iter()
+                .any(|w| w.flow_role == Some(FlowRole::Sequence)
+                    && w.from_step == 1
+                    && w.to_step == 2),
+            "terminal step must not derive the implicit fallthrough edge"
+        );
     }
 
     #[test]

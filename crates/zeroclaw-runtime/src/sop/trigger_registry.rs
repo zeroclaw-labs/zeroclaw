@@ -37,14 +37,41 @@ pub struct ChannelTriggerKind {
     pub setup_path: String,
 }
 
+/// A single bindable field on a trigger source. Surfaces render an input for
+/// each: a select when `options` is non-empty, otherwise a free-text field.
+/// `multi` marks a field that accepts a list of the option values (rendered as
+/// a multi-select) rather than a single value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct TriggerField {
+    /// Field key (e.g. `path`, `events`, `condition`).
+    pub name: String,
+    /// Allowed values when the field is enum-backed; empty means free text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// Whether the field accepts multiple option values.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi: bool,
+}
+
+impl TriggerField {
+    fn text(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            options: Vec::new(),
+            multi: false,
+        }
+    }
+}
+
 /// A bound (non-channel) trigger source and the fields it needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BoundTriggerSource {
     /// Trigger `type` tag (e.g. `webhook`, `cron`, `filesystem`).
     pub source: String,
-    /// Field names this source binds (e.g. `["path"]`, `["expression"]`).
-    pub fields: Vec<String>,
+    /// Fields this source binds, in render order.
+    pub fields: Vec<TriggerField>,
 }
 
 /// The full trigger-source registry for the authoring surfaces.
@@ -74,38 +101,52 @@ fn setup_path_for(channel: &str) -> String {
 /// instance (from `Config::channels_by_alias()`); the bound sources are fixed.
 #[must_use]
 pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry {
+    let filesystem_events: Vec<String> = crate::sop::types::FilesystemEventKind::iter()
+        .map(|k| {
+            let s: &'static str = k.into();
+            s.to_string()
+        })
+        .collect();
+
     let bound = vec![
         BoundTriggerSource {
             source: "webhook".to_string(),
-            fields: vec!["path".to_string()],
+            fields: vec![TriggerField::text("path")],
         },
         BoundTriggerSource {
             source: "cron".to_string(),
-            fields: vec!["expression".to_string()],
+            fields: vec![TriggerField::text("expression")],
         },
         BoundTriggerSource {
             source: "mqtt".to_string(),
-            fields: vec!["topic".to_string(), "condition".to_string()],
+            fields: vec![TriggerField::text("topic"), TriggerField::text("condition")],
         },
         BoundTriggerSource {
             source: "filesystem".to_string(),
             fields: vec![
-                "path".to_string(),
-                "events".to_string(),
-                "condition".to_string(),
+                TriggerField::text("path"),
+                TriggerField {
+                    name: "events".to_string(),
+                    options: filesystem_events,
+                    multi: true,
+                },
+                TriggerField::text("condition"),
             ],
         },
         BoundTriggerSource {
             source: "peripheral".to_string(),
             fields: vec![
-                "board".to_string(),
-                "signal".to_string(),
-                "condition".to_string(),
+                TriggerField::text("board"),
+                TriggerField::text("signal"),
+                TriggerField::text("condition"),
             ],
         },
         BoundTriggerSource {
             source: "calendar".to_string(),
-            fields: vec!["calendar_source".to_string(), "calendar_ids".to_string()],
+            fields: vec![
+                TriggerField::text("calendar_source"),
+                TriggerField::text("calendar_ids"),
+            ],
         },
         BoundTriggerSource {
             source: "manual".to_string(),
@@ -161,7 +202,33 @@ mod tests {
             .iter()
             .find(|b| b.source == "cron")
             .expect("cron bound source");
-        assert_eq!(cron.fields, vec!["expression".to_string()]);
+        assert_eq!(
+            cron.fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expression"]
+        );
+    }
+
+    #[test]
+    fn filesystem_events_field_carries_enum_options() {
+        let reg = build_registry(&[]);
+        let fs = reg
+            .bound
+            .iter()
+            .find(|b| b.source == "filesystem")
+            .expect("filesystem bound source");
+        let events = fs
+            .fields
+            .iter()
+            .find(|f| f.name == "events")
+            .expect("events field");
+        assert!(events.multi);
+        assert_eq!(
+            events.options,
+            vec!["created", "modified", "deleted", "renamed"]
+        );
     }
 
     #[test]

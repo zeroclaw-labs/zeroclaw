@@ -2717,11 +2717,19 @@ mod tests {
             bound: vec![
                 crate::client::BoundTriggerSourceView {
                     source: "webhook".to_string(),
-                    fields: vec!["path".to_string()],
+                    fields: vec![crate::client::TriggerFieldView {
+                        name: "path".to_string(),
+                        options: Vec::new(),
+                        multi: false,
+                    }],
                 },
                 crate::client::BoundTriggerSourceView {
                     source: "cron".to_string(),
-                    fields: vec!["expression".to_string()],
+                    fields: vec![crate::client::TriggerFieldView {
+                        name: "expression".to_string(),
+                        options: Vec::new(),
+                        multi: false,
+                    }],
                 },
             ],
             channels: channels

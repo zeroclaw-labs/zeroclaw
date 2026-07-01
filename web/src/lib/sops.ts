@@ -30,6 +30,7 @@ export type GraphSeverity = GraphDiagnostic['severity'];
 export type RunOverlay = Schemas['RunOverlay'];
 export type TriggerSourceRegistry = Schemas['TriggerSourceRegistry'];
 export type BoundTriggerSource = Schemas['BoundTriggerSource'];
+export type TriggerField = Schemas['TriggerField'];
 export type ChannelTriggerKind = Schemas['ChannelTriggerKind'];
 export type ChannelAlias = Schemas['ChannelAlias'];
 export type NodeRunOverlay = Schemas['NodeRunOverlay'];

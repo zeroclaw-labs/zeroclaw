@@ -74,6 +74,9 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
     }
 
     let explicit_next = current.routing.next;
+    if explicit_next.is_none() && current.routing.terminal {
+        return NextStep::Complete;
+    }
     let next_step = explicit_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
     let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
         return if explicit_next.is_none() && next_step > ctx.run.total_steps {
@@ -227,6 +230,23 @@ mod tests {
         };
 
         assert_eq!(resolve_next(&ctx), NextStep::Step(2));
+    }
+
+    #[test]
+    fn terminal_step_completes_instead_of_falling_through() {
+        let mut sop = sop();
+        sop.steps[0].routing.terminal = true;
+        let run = run();
+        let run_data = RunData::default();
+        let ctx = RouteCtx {
+            sop: &sop,
+            run: &run,
+            run_data: &run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
+        };
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
     #[test]

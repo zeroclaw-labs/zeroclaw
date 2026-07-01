@@ -273,11 +273,11 @@ export default function SopCanvas({
                       : kind === 'dependency'
                         ? '5 4'
                         : kind === 'trigger'
-                          ? '2 3'
+                          ? '4 3'
                           : undefined
                   }
                   markerEnd="url(#sop-arrow)"
-                  opacity={active ? 1 : hovered ? 1 : 0.85}
+                  opacity={active ? 1 : hovered ? 1 : kind === 'trigger' ? 1 : 0.85}
                   pointerEvents="none"
                 >
                   {active ? (
@@ -305,16 +305,36 @@ export default function SopCanvas({
                     </text>
                   </g>
                 ) : wireLabel ? (
-                  <text
-                    x={(a.x + NODE_W + b.x) / 2}
-                    y={(a.y + b.y) / 2 + NODE_H / 2 - 6}
-                    fill={wireStroke(kind)}
-                    fontSize="10"
-                    textAnchor="middle"
-                    pointerEvents="none"
-                  >
-                    {wireLabel}
-                  </text>
+                  (() => {
+                    const cx = (a.x + NODE_W + b.x) / 2;
+                    const cy = (a.y + b.y) / 2 + NODE_H / 2 - 10;
+                    const label = wireLabel.length > 28 ? `${wireLabel.slice(0, 27)}…` : wireLabel;
+                    const chipW = label.length * 5.6 + 12;
+                    return (
+                      <g pointerEvents="none">
+                        <rect
+                          x={cx - chipW / 2}
+                          y={cy - 10}
+                          width={chipW}
+                          height={15}
+                          rx={4}
+                          fill="var(--pc-bg-base)"
+                          stroke={wireStroke(kind)}
+                          strokeOpacity={0.4}
+                        />
+                        <text
+                          x={cx}
+                          y={cy + 1}
+                          fill={wireStroke(kind)}
+                          fontSize="10"
+                          textAnchor="middle"
+                          dominantBaseline="middle"
+                        >
+                          {label}
+                        </text>
+                      </g>
+                    );
+                  })()
                 ) : null}
               </g>
             );

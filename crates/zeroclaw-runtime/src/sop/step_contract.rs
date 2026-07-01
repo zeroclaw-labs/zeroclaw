@@ -27,6 +27,11 @@ pub struct StepRouting {
     /// Explicit successor step number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<u32>,
+    /// When true, this step ends its branch: no implicit fallthrough to the
+    /// following step is derived. Lets an authoring surface delete the default
+    /// sequence edge and leave a node free-floating between saves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
     /// Step numbers that must have completed before this step can run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<u32>,

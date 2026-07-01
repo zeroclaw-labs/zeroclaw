@@ -68,9 +68,21 @@ impl fmt::Display for SopExecutionMode {
 // ── Filesystem event kind ───────────────────────────────────────
 
 /// A normalized filesystem change kind reported by the watcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum FilesystemEventKind {
     Created,
     Modified,
