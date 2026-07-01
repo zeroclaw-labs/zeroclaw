@@ -47,6 +47,7 @@ const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
 const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+const MAX_CLAWHUB_ERROR_BODY_CHARS: usize = 512;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -1880,36 +1881,86 @@ pub fn is_clawhub_source(source: &str) -> bool {
     parse_clawhub_url(source).is_some()
 }
 
-fn clawhub_download_url(source: &str) -> Result<String> {
-    // Short prefix: clawhub:<slug>
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        if slug.is_empty() || slug.contains('/') {
-            anyhow::bail!(
-                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
-                source
-            );
-        }
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
+fn build_clawhub_download_url(slug: &str, owner: Option<&str>) -> Result<String> {
+    let slug = slug.trim();
+    if slug.is_empty() || slug.contains('/') {
+        anyhow::bail!("invalid ClawHub slug: {slug:?}");
     }
 
-    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
+    let owner = owner.map(str::trim).filter(|value| !value.is_empty());
+    if owner.is_some_and(|owner| owner.contains('/')) {
+        anyhow::bail!("invalid ClawHub owner handle: {owner:?}");
+    }
+
+    let mut url = Url::parse(CLAWHUB_DOWNLOAD_API)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("slug", slug);
+        if let Some(owner) = owner {
+            query.append_pair("ownerHandle", owner);
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn clawhub_download_url(source: &str) -> Result<String> {
+    // Short prefixes: clawhub:<slug> or clawhub:<owner>/<slug>
+    if let Some(slug) = source.strip_prefix("clawhub:") {
+        let slug = slug.trim().trim_end_matches('/');
+        let parts = slug.split('/').collect::<Vec<_>>();
+        return match parts.as_slice() {
+            [slug] if !slug.is_empty() => build_clawhub_download_url(slug, None),
+            [owner, slug] if !owner.is_empty() && !slug.is_empty() => {
+                build_clawhub_download_url(slug, Some(owner))
+            }
+            _ => {
+                anyhow::bail!(
+                    "invalid clawhub source '{}': expected 'clawhub:<slug>' or 'clawhub:<owner>/<slug>'",
+                    source
+                );
+            }
+        };
+    }
+
+    // Profile URLs:
+    // - https://clawhub.ai/<slug>
+    // - https://clawhub.ai/<owner>/<slug>
+    // - https://clawhub.ai/<owner>/skills/<slug>
     if let Some(parsed) = parse_clawhub_url(source) {
-        let path = parsed
+        let segments = parsed
             .path_segments()
             .into_iter()
             .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
 
-        if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
-        }
-
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
+        return match segments.as_slice() {
+            [slug] => build_clawhub_download_url(slug, None),
+            [owner, slug] => build_clawhub_download_url(slug, Some(owner)),
+            [owner, "skills", slug] => build_clawhub_download_url(slug, Some(owner)),
+            _ => {
+                anyhow::bail!("could not extract ClawHub owner/slug from URL: {source}");
+            }
+        };
     }
 
     anyhow::bail!("unrecognised ClawHub source format: {source}")
+}
+
+fn format_clawhub_download_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return format!("ClawHub download failed (HTTP {status})");
+    }
+
+    let mut truncated = body
+        .chars()
+        .take(MAX_CLAWHUB_ERROR_BODY_CHARS)
+        .collect::<String>();
+    if body.chars().count() > MAX_CLAWHUB_ERROR_BODY_CHARS {
+        truncated.push_str("...");
+    }
+    format!("ClawHub download failed (HTTP {status}): {truncated}")
 }
 
 fn normalize_skill_name(s: &str) -> String {
@@ -2275,7 +2326,12 @@ pub async fn install_clawhub_skill_source(
         anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
     }
     if !resp.status().is_success() {
-        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+        anyhow::bail!("{}", format_clawhub_download_failure(status, &body));
     }
 
     let bytes = resp.bytes().await?.to_vec();
@@ -2762,6 +2818,71 @@ mod registry_tests {
     #[test]
     fn test_is_registry_source_rejects_clawhub() {
         assert!(!is_registry_source("clawhub:my-skill"));
+    }
+
+    #[test]
+    fn clawhub_download_url_accepts_owner_qualified_short_form() {
+        assert_eq!(
+            clawhub_download_url("clawhub:acme/obsidian").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian&ownerHandle=acme"
+        );
+    }
+
+    #[test]
+    fn clawhub_download_url_preserves_unqualified_short_form() {
+        assert_eq!(
+            clawhub_download_url("clawhub:obsidian").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian"
+        );
+    }
+
+    #[test]
+    fn clawhub_download_url_accepts_public_skill_page_url() {
+        assert_eq!(
+            clawhub_download_url("https://clawhub.ai/acme/skills/obsidian").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian&ownerHandle=acme"
+        );
+        assert_eq!(
+            clawhub_download_url("https://www.clawhub.ai/acme/skills/obsidian/").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian&ownerHandle=acme"
+        );
+    }
+
+    #[test]
+    fn clawhub_download_url_preserves_profile_url_forms() {
+        assert_eq!(
+            clawhub_download_url("https://clawhub.ai/obsidian").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian"
+        );
+        assert_eq!(
+            clawhub_download_url("https://clawhub.ai/acme/obsidian").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=obsidian&ownerHandle=acme"
+        );
+    }
+
+    #[test]
+    fn clawhub_download_url_rejects_malformed_owner_qualified_sources() {
+        let err = clawhub_download_url("clawhub:acme/skills/obsidian").unwrap_err();
+        assert!(
+            err.to_string().contains("clawhub:<owner>/<slug>"),
+            "got: {err}"
+        );
+
+        let err =
+            clawhub_download_url("https://clawhub.ai/acme/skills/obsidian/extra").unwrap_err();
+        assert!(err.to_string().contains("could not extract"), "got: {err}");
+    }
+
+    #[test]
+    fn clawhub_download_failure_includes_response_body() {
+        let message = format_clawhub_download_failure(
+            reqwest::StatusCode::CONFLICT,
+            r#"{"error":"ambiguous slug; pass ownerHandle"}"#,
+        );
+
+        assert!(message.contains("HTTP 409 Conflict"), "got: {message}");
+        assert!(message.contains("ambiguous slug"), "got: {message}");
+        assert!(message.contains("ownerHandle"), "got: {message}");
     }
 
     #[test]
