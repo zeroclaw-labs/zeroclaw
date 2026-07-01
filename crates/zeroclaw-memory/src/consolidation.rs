@@ -9,9 +9,14 @@
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
 use crate::conflict;
+use crate::dedup::{self, DedupAction};
 use crate::importance;
-use crate::traits::{Memory, MemoryCategory};
+use crate::merge;
+use crate::policy::PolicyEnforcer;
+use crate::policy_gate;
+use crate::traits::{Memory, MemoryCategory, StoreOptions};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 
 /// Output of consolidation extraction.
@@ -59,6 +64,7 @@ pub async fn consolidate_turn(
     model: &str,
     temperature: Option<f64>,
     memory: &dyn Memory,
+    memory_config: &MemoryConfig,
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
@@ -114,35 +120,100 @@ pub async fn consolidate_turn(
         // Compute importance score heuristically.
         let imp = importance::compute_importance(update, &MemoryCategory::Core);
 
-        // Check for conflicts with existing Core memories.
-        if let Err(e) = conflict::check_and_resolve_conflicts(
+        // A: fail-closed policy write-gate on the autonomous consolidation path.
+        let policy = PolicyEnforcer::new(&memory_config.policy);
+        if let Err(e) =
+            policy_gate::validate_store(memory, &policy, "default", &MemoryCategory::Core).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory consolidation write denied by policy"
+            );
+            anyhow::bail!("memory consolidation write denied by policy: {e}");
+        }
+
+        // A: write-time near-duplicate detection.
+        let candidates = memory.recall(update, 10, None, None, None).await?;
+        let candidates = dedup::core_candidates(candidates);
+        match dedup::dedup_gate(&candidates, update, memory_config) {
+            DedupAction::Insert => {}
+            DedupAction::Reject { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory consolidation skipped duplicate core update"
+                );
+                return Ok(());
+            }
+            DedupAction::Merge { into } => {
+                if let Some(survivor) = candidates.iter().find(|entry| entry.id == into) {
+                    let merged = merge::merge_into_survivor(survivor, update);
+                    let options = StoreOptions {
+                        namespace: Some(survivor.namespace.clone()),
+                        importance: merged.importance,
+                        ..StoreOptions::default()
+                    };
+                    memory
+                        .store_with_options(
+                            &survivor.key,
+                            &merged.content,
+                            MemoryCategory::Core,
+                            survivor.session_id.as_deref(),
+                            options,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // A: detect conflicts, store, then reversibly supersede the losers.
+        let superseded_ids = match conflict::check_and_resolve_conflicts(
             memory,
             &mem_key,
             update,
             &MemoryCategory::Core,
-            0.85,
+            memory_config.conflict_threshold,
         )
         .await
         {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "conflict check skipped"
-            );
-        }
+            Ok(ids) => ids,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "conflict check skipped"
+                );
+                Vec::new()
+            }
+        };
 
         // Store with importance metadata.
+        let options = StoreOptions {
+            importance: Some(imp),
+            ..StoreOptions::default()
+        };
         memory
-            .store_with_metadata(
-                &mem_key,
-                update,
-                MemoryCategory::Core,
-                None,
-                None,
-                Some(imp),
-            )
+            .store_with_options(&mem_key, update, MemoryCategory::Core, None, options)
             .await?;
+
+        // A: reversible soft-hide of superseded rows (gated, default-on).
+        if memory_config.conflict_supersede_enabled
+            && let Err(e) = memory.supersede(&superseded_ids, &mem_key).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "memory supersede skipped"
+            );
+        }
     }
 
     Ok(())
