@@ -68,6 +68,32 @@ export function deleteSop(name: string): Promise<{ deleted: string }> {
   });
 }
 
+export type WireOp = 'connect' | 'disconnect';
+export type WireRole = FlowRole;
+
+export interface WireEdit {
+  op: WireOp;
+  from: number;
+  to: number;
+  role: WireRole;
+  port?: number;
+}
+
+export interface WireResult {
+  sop: Sop;
+  graph: SopGraph;
+}
+
+/// Edge mutation against an unsaved draft. Writes nothing; returns the mutated
+/// draft. The backend `apply_wire` mapping is the single source of truth for
+/// how each edge kind maps onto step routing.
+export function wireDraft(sop: Sop, edit: WireEdit): Promise<WireResult> {
+  return apiFetch<WireResult>('/api/sops/wire-draft', {
+    method: 'POST',
+    body: JSON.stringify({ sop, edit }),
+  });
+}
+
 export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> {
   return apiFetch<RunOverlay>(
     `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/overlay`,

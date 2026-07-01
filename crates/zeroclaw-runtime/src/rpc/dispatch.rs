@@ -154,6 +154,8 @@ pub enum Method {
     SopsSave,
     SopsCreate,
     SopsDelete,
+    SopsWireDraft,
+    SopsGraphDraft,
 }
 
 impl Method {
@@ -256,6 +258,8 @@ impl Method {
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
         (Method::SopsDelete, "sops/delete"),
+        (Method::SopsWireDraft, "sops/wire-draft"),
+        (Method::SopsGraphDraft, "sops/graph-draft"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -712,6 +716,8 @@ impl RpcDispatcher {
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
             Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
+            Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
         };
 
         if is_notification {
@@ -3973,6 +3979,39 @@ impl RpcDispatcher {
         crate::sop::delete_sop(&dir, &req.name)
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    /// Apply one edge mutation to an in-memory SOP draft (`{ sop, edit }`) and
+    /// return the mutated draft plus its reprojected graph. Writes nothing. The
+    /// edge-kind-to-routing mapping lives solely in `crate::sop::apply_wire`;
+    /// both authoring surfaces wire their unsaved drafts through here.
+    fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let edit_val = params
+            .get("edit")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'edit'"))?;
+        let mut sop = Self::parse_sop(sop_val)?;
+        let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
+        crate::sop::apply_wire(&mut sop, &edit)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({
+            "sop": sop,
+            "graph": crate::sop::SopGraph::from_sop(&sop),
+        }))
+    }
+
+    /// Project an in-memory SOP draft (`{ sop }`) to its graph without saving.
+    /// The read-only counterpart to `sops/wire-draft`; the authoring surfaces
+    /// use it to refresh the visual canvas after non-wire field edits.
+    fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(sop_val)?;
+        to_result(crate::sop::SopGraph::from_sop(&sop))
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {

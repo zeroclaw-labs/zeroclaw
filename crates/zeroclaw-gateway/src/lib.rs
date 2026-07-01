@@ -1813,6 +1813,10 @@ pub async fn run_gateway(
             get(api_sop_author::handle_sop_full),
         )
         .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
             "/api/sops/{name}/runs/{run_id}/overlay",
             get(api_sop_author::handle_sop_run_overlay),
         )

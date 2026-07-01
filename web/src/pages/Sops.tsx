@@ -11,6 +11,8 @@ import {
   createSop,
   saveSop,
   deleteSop,
+  wireDraft,
+  type WireRole,
   type SopSummary,
   type SopGraph,
   type GraphNode,
@@ -722,30 +724,31 @@ export default function Sops() {
   const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
 
-  const onConnect = useCallback((from: number, to: number, kind: 'sequence' | 'dependency' | 'failure' | 'switch', portIndex?: number) => {
-    setDraft((d) => {
-      if (!d) return d;
-      const steps = d.steps.map((s) => {
-        if (kind === 'sequence' && s.number === from) {
-          return { ...s, routing: { ...(s.routing ?? {}), next: to } };
-        }
-        if (kind === 'dependency' && s.number === to) {
-          const dep = new Set([...(s.routing?.depends_on ?? []), from]);
-          return { ...s, routing: { ...(s.routing ?? {}), depends_on: [...dep] } };
-        }
-        if (kind === 'failure' && s.number === from) {
-          return { ...s, on_failure: { goto: { step: to } } };
-        }
-        if (kind === 'switch' && s.number === from && portIndex !== undefined) {
-          const rules = [...(s.routing?.switch ?? [])];
-          if (rules[portIndex]) rules[portIndex] = { ...rules[portIndex], goto: to };
-          return { ...s, routing: { ...(s.routing ?? {}), switch: rules } };
-        }
-        return s;
+  const onConnect = useCallback(
+    (from: number, to: number, kind: WireRole, portIndex?: number) => {
+      setDraft((d) => {
+        if (!d) return d;
+        wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
+          .then((res) => setDraft(res.sop))
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return d;
       });
-      return { ...d, steps };
-    });
-  }, []);
+    },
+    [],
+  );
+
+  const onDisconnect = useCallback(
+    (from: number, to: number, kind: WireRole, portIndex?: number) => {
+      setDraft((d) => {
+        if (!d) return d;
+        wireDraft(d, { op: 'disconnect', from, to, role: kind, port: portIndex })
+          .then((res) => setDraft(res.sop))
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return d;
+      });
+    },
+    [],
+  );
 
   const refreshList = useCallback((selectName?: string) => {
     return listSops()
@@ -937,6 +940,7 @@ export default function Sops() {
             onSelectStep={setSelectedStep}
             onAddStep={editorHandlers.onAddStep}
             onConnect={onConnect}
+            onDisconnect={onDisconnect}
           />
           <SopEditor
             draft={draft}

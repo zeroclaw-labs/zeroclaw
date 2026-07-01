@@ -202,6 +202,39 @@ pub async fn handle_sop_delete(
     }
 }
 
+/// Request body for `POST /api/sops/wire-draft`: an unsaved SOP draft plus one
+/// edge mutation. The visual editor wires a draft that has not been persisted
+/// yet, so the mutation applies in memory and nothing is written to disk.
+#[derive(serde::Deserialize)]
+pub struct WireDraftRequest {
+    pub sop: zeroclaw_runtime::sop::Sop,
+    pub edit: zeroclaw_runtime::sop::WireEdit,
+}
+
+/// POST /api/sops/wire-draft - apply one edge mutation to an in-memory SOP
+/// draft and return the mutated draft plus its reprojected graph. Writes
+/// nothing. The edge-kind-to-routing mapping is owned solely by
+/// `zeroclaw_runtime::sop::apply_wire`; this handler only applies and reprojects.
+pub async fn handle_sop_wire_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<WireDraftRequest>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut sop = req.sop;
+    if let Err(e) = zeroclaw_runtime::sop::apply_wire(&mut sop, &req.edit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&sop);
+    Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -577,5 +610,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wire_draft_route_connects_sequence_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/wire-draft", post(super::handle_sop_wire_draft))
+            .with_state(state);
+        let sop = zeroclaw_runtime::sop::Sop {
+            name: "theta".to_string(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: zeroclaw_runtime::sop::SopPriority::High,
+            execution_mode: zeroclaw_runtime::sop::SopExecutionMode::Auto,
+            triggers: vec![zeroclaw_runtime::sop::SopTrigger::Manual],
+            steps: vec![
+                zeroclaw_runtime::sop::SopStep {
+                    number: 1,
+                    title: "One".to_string(),
+                    body: "do".to_string(),
+                    ..Default::default()
+                },
+                zeroclaw_runtime::sop::SopStep {
+                    number: 2,
+                    title: "Two".to_string(),
+                    body: "done".to_string(),
+                    ..Default::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let draft = serde_json::to_string(&sop).unwrap();
+        let body = format!(
+            r#"{{"sop":{draft},"edit":{{"op":"connect","from":1,"to":2,"role":"sequence"}}}}"#
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sops/wire-draft")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["sop"]["steps"][0]["routing"]["next"], 2);
+        assert!(out["graph"]["wires"].is_array());
+        assert!(!tmp.path().join("theta").exists());
     }
 }

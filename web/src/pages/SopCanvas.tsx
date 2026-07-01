@@ -157,6 +157,7 @@ interface Props {
   onSelectStep: (n: number) => void;
   onAddStep: () => void;
   onConnect: (from: number, to: number, kind: WireKind, portIndex?: number) => void;
+  onDisconnect: (from: number, to: number, kind: WireKind, portIndex?: number) => void;
 }
 
 export default function SopCanvas({
@@ -166,6 +167,7 @@ export default function SopCanvas({
   onSelectStep,
   onAddStep,
   onConnect,
+  onDisconnect,
 }: Props) {
   const [pos, setPos] = useState<Map<number, XY>>(() => autoLayout(draft.steps));
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
@@ -173,6 +175,7 @@ export default function SopCanvas({
   const [linkKind, setLinkKind] = useState<WireKind>('sequence');
   const [linkPort, setLinkPort] = useState<number | undefined>(undefined);
   const [cursor, setCursor] = useState<XY | null>(null);
+  const [hoverWire, setHoverWire] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   useEffect(() => {
@@ -292,16 +295,35 @@ export default function SopCanvas({
             w.kind === 'switch' && w.portIndex !== undefined
               ? switchPortY(a.y, w.portIndex)
               : undefined;
+          const d = edgePath(a, b, srcY);
+          const hovered = hoverWire === i;
           return (
             <g key={`wire-${i}`}>
               <path
-                d={edgePath(a, b, srcY)}
+                d={d}
                 fill="none"
-                stroke={wireStroke(w.kind)}
-                strokeWidth={active ? 3 : 1.75}
-                strokeDasharray={w.kind === 'dependency' ? '5 4' : undefined}
+                stroke="transparent"
+                strokeWidth={14}
+                pointerEvents="stroke"
+                className="cursor-pointer"
+                onPointerEnter={() => setHoverWire(i)}
+                onPointerLeave={() => setHoverWire((h) => (h === i ? null : h))}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  onDisconnect(w.from, w.to, w.kind, w.portIndex);
+                }}
+              >
+                <title>{t('sops.wire_delete_hint')}</title>
+              </path>
+              <path
+                d={d}
+                fill="none"
+                stroke={hovered ? 'var(--pc-danger, #f43f5e)' : wireStroke(w.kind)}
+                strokeWidth={active ? 3 : hovered ? 2.5 : 1.75}
+                strokeDasharray={hovered ? '6 3' : w.kind === 'dependency' ? '5 4' : undefined}
                 markerEnd="url(#sop-arrow)"
-                opacity={active ? 1 : 0.85}
+                opacity={active ? 1 : hovered ? 1 : 0.85}
+                pointerEvents="none"
               >
                 {active ? (
                   <animate
@@ -313,13 +335,28 @@ export default function SopCanvas({
                   />
                 ) : null}
               </path>
-              {w.label ? (
+              {hovered ? (
+                <g pointerEvents="none">
+                  <circle cx={(a.x + NODE_W + b.x) / 2} cy={(a.y + b.y) / 2 + NODE_H / 2} r={8} fill="var(--pc-danger, #f43f5e)" />
+                  <text
+                    x={(a.x + NODE_W + b.x) / 2}
+                    y={(a.y + b.y) / 2 + NODE_H / 2 + 3}
+                    fill="#fff"
+                    fontSize="11"
+                    fontWeight="bold"
+                    textAnchor="middle"
+                  >
+                    ×
+                  </text>
+                </g>
+              ) : w.label ? (
                 <text
                   x={(a.x + NODE_W + b.x) / 2}
                   y={(a.y + b.y) / 2 + NODE_H / 2 - 6}
                   fill={wireStroke(w.kind)}
                   fontSize="10"
                   textAnchor="middle"
+                  pointerEvents="none"
                 >
                   {w.label}
                 </text>

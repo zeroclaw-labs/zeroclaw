@@ -1029,6 +1029,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.handle_dependency': 'Drag to add a dependency (fan-in)',
     'sops.handle_failure': 'Drag to set on-failure goto',
     'sops.handle_switch': 'Drag to set this port target',
+    'sops.wire_delete_hint': 'Click wire to remove this connection',
     'sops.switch': 'switch',
     'sops.switch_ports': 'Switch ports (if-this-then-that)',
     'sops.add_port': 'Add port',

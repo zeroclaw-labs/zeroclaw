@@ -14,6 +14,7 @@ pub mod scope;
 pub mod step_contract;
 pub mod store;
 pub mod types;
+pub mod wire;
 
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
@@ -24,7 +25,8 @@ pub use graph::{
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
-pub use step_contract::{StepFailure, StepRouting};
+pub use step_contract::{StepFailure, StepRouting, SwitchRule};
+pub use wire::{WireEdit, WireError, WireOp, apply_wire};
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
     SqliteRunStore, StoreError, build_run_store,
@@ -334,6 +336,8 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 .or_else(|| bullet.strip_prefix("depends-on:"))
             {
                 current.routing.depends_on = parse_u32_list(val);
+            } else if let Some(val) = bullet.strip_prefix("switch:") {
+                current.routing.switch = parse_switch_rules(val);
             } else if let Some(val) = bullet
                 .strip_prefix("on_failure:")
                 .or_else(|| bullet.strip_prefix("on-failure:"))
@@ -422,6 +426,29 @@ fn parse_u32_list(value: &str) -> Vec<u32> {
     value
         .split(',')
         .filter_map(|item| item.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Parse a `name>when>goto; name>when>goto` switch bullet. Each segment needs
+/// a non-empty name; an empty `when` field is the catch-all. Segments without
+/// a usable name are dropped.
+fn parse_switch_rules(value: &str) -> Vec<SwitchRule> {
+    value
+        .split(';')
+        .filter_map(|seg| {
+            let mut parts = seg.splitn(3, '>');
+            let name = parts.next().unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let when = parts.next().unwrap_or("").trim();
+            let goto = parts.next().unwrap_or("").trim();
+            Some(SwitchRule {
+                name,
+                when: (!when.is_empty()).then(|| when.to_string()),
+                goto: goto.parse::<u32>().ok(),
+            })
+        })
         .collect()
 }
 
@@ -546,6 +573,20 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", ");
         bullets.push(format!("depends_on: {csv}"));
+    }
+    if !step.routing.switch.is_empty() {
+        let rendered = step
+            .routing
+            .switch
+            .iter()
+            .map(|rule| {
+                let when = rule.when.as_deref().unwrap_or("");
+                let goto = rule.goto.map(|g| g.to_string()).unwrap_or_default();
+                format!("{}>{}>{}", rule.name, when, goto)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bullets.push(format!("switch: {rendered}"));
     }
     if !step.on_failure.is_fail() {
         bullets.push(format!(
@@ -745,6 +786,7 @@ mod tests {
    - when: $.steps.1.ok == true
    - next: 3
    - depends_on: 1, 2
+   - switch: pull_request>$.event>3; catch_all>>2
    - on_failure: retry:2
    - mode: auto
 "#,
@@ -772,8 +814,52 @@ mod tests {
         assert_eq!(step.routing.when.as_deref(), Some("$.steps.1.ok == true"));
         assert_eq!(step.routing.next, Some(3));
         assert_eq!(step.routing.depends_on, vec![1, 2]);
+        assert_eq!(
+            step.routing.switch,
+            vec![
+                SwitchRule {
+                    name: "pull_request".into(),
+                    when: Some("$.event".into()),
+                    goto: Some(3),
+                },
+                SwitchRule {
+                    name: "catch_all".into(),
+                    when: None,
+                    goto: Some(2),
+                },
+            ]
+        );
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    #[test]
+    fn switch_survives_render_then_parse() {
+        let original = vec![SopStep {
+            number: 1,
+            title: "gate".into(),
+            body: "route on event".into(),
+            routing: StepRouting {
+                switch: vec![
+                    SwitchRule {
+                        name: "pull_request".into(),
+                        when: Some("$.event == \"pr\"".into()),
+                        goto: Some(2),
+                    },
+                    SwitchRule {
+                        name: "unknown".into(),
+                        when: None,
+                        goto: Some(3),
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let md = render_steps(&original);
+        assert!(md.contains("switch: pull_request>$.event == \"pr\">2; unknown>>3"));
+        let parsed = parse_steps(&md);
+        assert_eq!(parsed[0].routing.switch, original[0].routing.switch);
     }
 
     #[test]

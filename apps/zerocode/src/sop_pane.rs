@@ -32,6 +32,19 @@ pub(crate) struct SopPane {
     animation_origin: std::time::Instant,
     list_row_rects: Vec<Rect>,
     node_rects: Vec<(u32, Rect)>,
+    /// Output-handle click zones captured each render: (source step, role,
+    /// optional switch-port index, rect). Clicking one starts a link of that
+    /// role from that step; the daemon owns the edge-to-routing mapping.
+    handle_rects: Vec<(u32, FlowRole, Option<usize>, Rect)>,
+    /// Wire-line click zones: (from, to, role, optional port, rect). Clicking
+    /// deletes that edge via the draft-wire RPC.
+    wire_rects: Vec<(u32, u32, FlowRole, Option<usize>, Rect)>,
+    /// Active link source while wiring: (from step, role, optional port).
+    link_from: Option<(u32, FlowRole, Option<usize>)>,
+    /// Graph projection of the current editor draft, refreshed from the daemon
+    /// on editor open and after each wire edit. Drives the interactive canvas's
+    /// wire lines without the pane reprojecting the graph itself.
+    editor_graph: SopGraphView,
 }
 
 /// Which rendering layer the SOP surface presents. The visual node-card editor
@@ -405,6 +418,10 @@ impl SopPane {
             animation_origin: std::time::Instant::now(),
             list_row_rects: Vec::new(),
             node_rects: Vec::new(),
+            handle_rects: Vec::new(),
+            wire_rects: Vec::new(),
+            link_from: None,
+            editor_graph: SopGraphView::default(),
         }
     }
 
@@ -521,8 +538,11 @@ impl SopPane {
     }
 
     /// Mouse support for the canon visual editor. Left-click a SOP row selects
-    /// and loads it; left-click a node card selects that SOP and opens its
-    /// editor; scroll moves the list selection. Rects are captured each render.
+    /// and loads it. While the editor is open, the visual layer is interactive:
+    /// clicking an output handle starts a wire of that role, clicking a target
+    /// node completes it, and clicking an existing wire line deletes that edge.
+    /// Outside the editor, clicking a node card opens the editor on that step.
+    /// Scroll moves the list selection. All rects are captured each render.
     pub(crate) async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let (col, row) = (mouse.column, mouse.row);
@@ -536,6 +556,45 @@ impl SopPane {
                     self.list_state.select(Some(idx));
                     self.load_selected_graph().await;
                     return;
+                }
+                // Interactive wiring only while an editor draft is open.
+                if self.editor.is_some() {
+                    // A link in progress: any node click completes it.
+                    if self.link_from.is_some() {
+                        if let Some((step, _)) = self
+                            .node_rects
+                            .iter()
+                            .find(|(_, r)| in_rect(col, row, *r))
+                            .copied()
+                        {
+                            self.complete_link(step).await;
+                            return;
+                        }
+                        // Click off any node cancels the pending link.
+                        self.link_from = None;
+                        self.status = None;
+                        return;
+                    }
+                    // Start a link from a clicked output handle.
+                    if let Some((step, role, port, _)) = self
+                        .handle_rects
+                        .iter()
+                        .find(|(_, _, _, r)| in_rect(col, row, *r))
+                        .copied()
+                    {
+                        self.start_link(step, role, port);
+                        return;
+                    }
+                    // Delete an edge by clicking its wire line.
+                    if let Some((from, to, role, port, _)) = self
+                        .wire_rects
+                        .iter()
+                        .find(|(_, _, _, _, r)| in_rect(col, row, *r))
+                        .copied()
+                    {
+                        self.delete_wire(from, to, role, port).await;
+                        return;
+                    }
                 }
                 if let Some((step, _)) = self
                     .node_rects
@@ -565,6 +624,7 @@ impl SopPane {
                 Ok(draft) => {
                     self.editor = Some(SopEditorState::from_draft(false, draft));
                     self.error = None;
+                    self.refresh_editor_graph().await;
                 }
                 Err(e) => self.error = Some(format!("parse SOP '{name}': {e}")),
             },
@@ -587,6 +647,107 @@ impl SopPane {
     async fn open_editor_for_step(&mut self, step: u32) {
         self.open_editor_for_selected().await;
         self.focus_editor_step(step);
+    }
+
+    /// Reproject the current editor draft's graph from the daemon so the visual
+    /// canvas reflects field edits (next/depends_on/switch/on_failure typed in
+    /// the field editor) without the pane reprojecting the graph itself.
+    async fn refresh_editor_graph(&mut self) {
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let sop = editor.to_sop_json();
+        if let Ok(view) = self.rpc.sops_graph_draft(sop).await {
+            self.editor_graph = view;
+        }
+    }
+
+    /// Begin a link from `step`'s output handle of the given `role`/`port`.
+    /// The next node click completes it. Only meaningful while the editor is
+    /// open (wiring mutates the draft).
+    fn start_link(&mut self, step: u32, role: FlowRole, port: Option<usize>) {
+        if self.editor.is_some() {
+            self.link_from = Some((step, role, port));
+            self.status = Some("wiring: click a target node (Esc to cancel)".into());
+        }
+    }
+
+    /// Complete an in-progress link to `target`, applying a connect edge via the
+    /// draft-wire RPC and replacing the draft with the mutated result. The
+    /// edge-to-routing mapping lives in the daemon, not here.
+    async fn complete_link(&mut self, target: u32) {
+        let Some((from, role, port)) = self.link_from.take() else {
+            return;
+        };
+        self.status = None;
+        if from == target {
+            return;
+        }
+        self.apply_wire_edit("connect", from, target, role, port)
+            .await;
+    }
+
+    /// Delete an existing edge via the draft-wire RPC.
+    async fn delete_wire(&mut self, from: u32, to: u32, role: FlowRole, port: Option<usize>) {
+        self.apply_wire_edit("disconnect", from, to, role, port)
+            .await;
+    }
+
+    /// Build the opaque `WireEdit` JSON from a visual interaction and send it to
+    /// the daemon's draft-wire RPC, then swap the editor draft for the returned
+    /// mutated draft and refresh the projected graph. Zerocode carries no
+    /// edge-to-routing logic: it only forwards the interaction and renders the
+    /// daemon's answer.
+    async fn apply_wire_edit(
+        &mut self,
+        op: &str,
+        from: u32,
+        to: u32,
+        role: FlowRole,
+        port: Option<usize>,
+    ) {
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let sop = editor.to_sop_json();
+        let mut edit = serde_json::json!({
+            "op": op,
+            "from": from,
+            "to": to,
+            "role": role,
+        });
+        if let Some(port_index) = port {
+            edit["port"] = serde_json::json!(port_index);
+        }
+        match self.rpc.sops_wire_draft(sop, edit).await {
+            Ok(value) => {
+                let Some(sop_value) = value.get("sop") else {
+                    self.error = Some("wire: daemon returned no sop".into());
+                    return;
+                };
+                match serde_json::from_value::<SopDraft>(sop_value.clone()) {
+                    Ok(draft) => {
+                        if let Some(editor) = self.editor.as_mut() {
+                            let cursor =
+                                editor.step_cursor.min(draft.steps.len().saturating_sub(1));
+                            editor.draft = draft;
+                            editor.step_cursor = cursor;
+                        }
+                        if let Some(graph_value) = value.get("graph")
+                            && let Ok(view) =
+                                serde_json::from_value::<SopGraphView>(graph_value.clone())
+                        {
+                            self.editor_graph = view;
+                        }
+                        self.error = None;
+                    }
+                    Err(parse_error) => {
+                        self.error = Some(format!("wire: parse draft: {parse_error}"))
+                    }
+                }
+            }
+            Err(rpc_error) => self.error = Some(rpc_error.to_string()),
+        }
     }
 
     async fn delete_selected(&mut self) {
@@ -625,6 +786,12 @@ impl SopPane {
             KeyCode::Backspace => self.editor_backspace(), // keyguard: text-entry edit
             KeyCode::Char(c) if !ctrl => self.editor_push_char(c), // keyguard: text-entry char input
             _ => {}
+        }
+        // Refresh the visual canvas projection after any edit that may have
+        // changed routing (next/depends_on/switch/on_failure). Cheap and keeps
+        // the graph the pane draws in sync with the field editor.
+        if self.editor.is_some() {
+            self.refresh_editor_graph().await;
         }
     }
 
@@ -864,13 +1031,21 @@ impl SopPane {
         let visual = self.layer == RenderLayer::Visual;
         let title = self.right_title();
 
-        // The visual node-card layer is canon for viewing the graph. The field
-        // editor and the fallback text layer share the paragraph path.
-        if visual && !editing && self.error.is_none() {
-            self.render_nodes(f, cols[1], &title);
+        // Visual layer is canon. When viewing, render the projected graph cards.
+        // When editing, render the interactive draft canvas (cards + output
+        // handles + clickable wires) so edges are authorable by click-wiring at
+        // parity with the web canvas. The field editor remains one Toggle away.
+        if visual && self.error.is_none() {
+            if editing {
+                self.render_editor_canvas(f, cols[1], &title);
+            } else {
+                self.render_nodes(f, cols[1], &title);
+            }
             return;
         }
         self.node_rects.clear();
+        self.handle_rects.clear();
+        self.wire_rects.clear();
 
         let body = if let Some(err) = &self.error {
             err.clone()
@@ -931,6 +1106,8 @@ impl SopPane {
         let inner = block.inner(area);
         f.render_widget(block, area);
         self.node_rects.clear();
+        self.handle_rects.clear();
+        self.wire_rects.clear();
 
         if self.graph.nodes.is_empty() {
             let para = Paragraph::new("(no nodes; press n to author, e to edit)")
@@ -971,6 +1148,158 @@ impl SopPane {
                 ));
                 f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
                 y = y.saturating_add(1);
+            }
+        }
+    }
+
+    fn render_editor_canvas(&mut self, frame: &mut Frame, area: Rect, title: &str) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.node_rects.clear();
+        self.handle_rects.clear();
+        self.wire_rects.clear();
+
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        if editor.draft.steps.is_empty() {
+            let empty = Paragraph::new("(no steps; Ctrl+n to add, then click handles to wire)")
+                .wrap(Wrap { trim: false });
+            frame.render_widget(empty, inner);
+            return;
+        }
+
+        let linking = self.link_from;
+        let selected_number = editor
+            .draft
+            .steps
+            .get(editor.step_cursor)
+            .map(|step| step.number);
+        let mut cursor_y = inner.y;
+        let bottom = inner.y.saturating_add(inner.height);
+
+        for step in &editor.draft.steps {
+            if cursor_y >= bottom {
+                break;
+            }
+            let heading = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", step.number),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    if step.title.is_empty() {
+                        "(untitled)".to_string()
+                    } else {
+                        step.title.clone()
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            let card_height = 3u16.min(bottom - cursor_y);
+            let card_rect = Rect::new(inner.x, cursor_y, inner.width, card_height);
+            let border_color = if selected_number == Some(step.number) {
+                Color::Cyan
+            } else {
+                Color::Gray
+            };
+            let card = Paragraph::new(vec![heading])
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border_color)),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(card, card_rect);
+            self.node_rects.push((step.number, card_rect));
+            cursor_y = cursor_y.saturating_add(card_height);
+
+            if cursor_y < bottom {
+                let handle_row = Rect::new(inner.x, cursor_y, inner.width, 1);
+                let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
+                let mut handle_x = inner.x.saturating_add(3);
+
+                let handles: Vec<(FlowRole, Option<usize>, String, Color)> =
+                    if step.routing.switch.is_empty() {
+                        vec![
+                            (FlowRole::Sequence, None, "○next".to_string(), Color::Green),
+                            (FlowRole::Dependency, None, "○dep".to_string(), Color::Yellow),
+                            (FlowRole::Failure, None, "○fail".to_string(), Color::Red),
+                        ]
+                    } else {
+                        step.routing
+                            .switch
+                            .iter()
+                            .enumerate()
+                            .map(|(port, rule)| {
+                                let name = if rule.name.is_empty() {
+                                    format!("port{}", port + 1)
+                                } else {
+                                    rule.name.clone()
+                                };
+                                (
+                                    FlowRole::Switch,
+                                    Some(port),
+                                    format!("○{name}"),
+                                    Color::Magenta,
+                                )
+                            })
+                            .collect()
+                    };
+
+                for (role, port, label, color) in handles {
+                    let label_width = label.len() as u16;
+                    let zone = Rect::new(handle_x, cursor_y, label_width, 1);
+                    spans.push(Span::styled(label, Style::default().fg(color)));
+                    spans.push(Span::raw(" "));
+                    handle_x = handle_x.saturating_add(label_width + 1);
+                    self.handle_rects.push((step.number, role, port, zone));
+                }
+
+                if let Some((from, role, _)) = linking
+                    && from == step.number
+                {
+                    spans.push(Span::styled(
+                        format!("  wiring {role:?} → click target"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                frame.render_widget(Paragraph::new(Line::from(spans)), handle_row);
+                cursor_y = cursor_y.saturating_add(1);
+            }
+
+            for wire in self
+                .editor_graph
+                .wires
+                .iter()
+                .filter(|wire| wire.from_step == step.number && wire.class == PinClass::Flow)
+            {
+                if cursor_y >= bottom {
+                    break;
+                }
+                let Some(role) = wire.flow_role else { continue };
+                let port = match role {
+                    FlowRole::Switch => wire.from_pin.as_ref().and_then(|label| {
+                        step.routing.switch.iter().position(|rule| &rule.name == label)
+                    }),
+                    _ => None,
+                };
+                let line = Line::from(vec![
+                    Span::styled("  ✕ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} → {} [{}]", wire.from_step, wire.to_step, wire_label(wire)),
+                        Style::default().fg(wire_color(wire)),
+                    ),
+                ]);
+                let wire_rect = Rect::new(inner.x, cursor_y, inner.width, 1);
+                frame.render_widget(Paragraph::new(line), wire_rect);
+                self.wire_rects
+                    .push((wire.from_step, wire.to_step, role, port, wire_rect));
+                cursor_y = cursor_y.saturating_add(1);
             }
         }
     }

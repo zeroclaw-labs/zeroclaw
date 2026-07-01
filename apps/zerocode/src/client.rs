@@ -117,6 +117,8 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
+    pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1234,6 +1236,26 @@ impl RpcClient {
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {
         self.call(method::SOPS_DELETE, serde_json::json!({ "name": name }))
             .await
+    }
+
+    /// Apply one edge mutation to an unsaved SOP draft (`{ sop, edit }`) without
+    /// persisting. Returns the mutated `{ sop, graph }`. The daemon owns the
+    /// edge-to-routing mapping; used while authoring a draft not yet saved.
+    pub async fn sops_wire_draft(&self, sop: Value, edit: Value) -> Result<Value> {
+        self.call(
+            method::SOPS_WIRE_DRAFT,
+            serde_json::json!({ "sop": sop, "edit": edit }),
+        )
+        .await
+    }
+
+    /// Project an unsaved SOP draft to its graph (read-only). Used to refresh
+    /// the visual canvas after non-wire field edits. Returns the `SopGraphView`.
+    pub async fn sops_graph_draft(&self, sop: Value) -> Result<SopGraphView> {
+        let value = self
+            .call(method::SOPS_GRAPH_DRAFT, serde_json::json!({ "sop": sop }))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
     }
 
     // ── Session methods ──────────────────────────────────────────
