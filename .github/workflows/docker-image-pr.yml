@@ -7,7 +7,6 @@ on:
       - Dockerfile
       - Dockerfile.debian
       - Dockerfile.ci
-      - Dockerfile.debian.ci
       - .dockerignore
       - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
@@ -56,7 +55,7 @@ jobs:
           severity: HIGH,CRITICAL
 
       - name: Build Debian compatibility image
-        run: docker build -f docker-ctx/Dockerfile.debian -t zeroclaw-pr-debian:smoke docker-ctx
+        run: docker build -f docker-ctx/Dockerfile --build-arg VARIANT=debian -t zeroclaw-pr-debian:smoke docker-ctx
 
       - name: Scan Debian image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

@@ -49,21 +49,6 @@ for readme in README.md docs/i18n/*/README.md; do
     "version-v${VERSION}-blue\" alt=\"Version v${VERSION}\""
 done
 
-# ── Tauri desktop app config ───────────────────────────────────────
-echo "Tauri config..."
-TAURI_CONF="$REPO_ROOT/apps/tauri/tauri.conf.json"
-if [[ -f "$TAURI_CONF" ]]; then
-  if command -v jq >/dev/null 2>&1; then
-    jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$TAURI_CONF.tmp" \
-      && mv "$TAURI_CONF.tmp" "$TAURI_CONF"
-  else
-    sed -i '' -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF" 2>/dev/null \
-      || sed -i -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF"
-  fi
-  echo "  updated: apps/tauri/tauri.conf.json"
-  changed=$((changed + 1))
-fi
-
 # ── Windows installer (setup.bat) ──────────────────────────────────
 echo "Windows setup.bat..."
 bump "setup.bat" \
@@ -191,6 +176,24 @@ else
   printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
   echo "  created: docs/book/stable-version.txt"
   changed=$((changed + 1))
+fi
+
+# ── Nix git-dep hashes ──────────────────────────────────────────
+# Refresh NAR hashes for git-sourced dependencies so the flake can
+# resolve them.  Skips gracefully if the script or its prerequisites
+# (nix-prefetch-git, jq) are missing.
+echo "Nix git-dep hashes..."
+REFRESH_SCRIPT="$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh"
+if [[ -x "$REFRESH_SCRIPT" ]]; then
+  if command -v nix-prefetch-git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ) \
+      && echo "  refreshed nix/hashes.json" \
+      || echo "  warn: refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+  else
+    echo "  skip: nix-prefetch-git or jq not on PATH"
+  fi
+else
+  echo "  skip: scripts/dev/refresh-nix-hashes.sh not found"
 fi
 
 # ── Generated install surfaces (single source of truth) ───────────
