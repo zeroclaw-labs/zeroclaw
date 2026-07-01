@@ -210,6 +210,25 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
     )
 }
 
+/// Assert that a store and the linker chosen for it agree on the `wasi:http`
+/// surface before instantiation. The store carries a `WasiHttpCtx` only when
+/// its manifest granted `HttpClient`; `linker_has_http` is whether the linker
+/// picked for it wired `wasi:http`. A registration path that pairs an
+/// http-linked linker with a store lacking the context (or the reverse) gets a
+/// named startup error here instead of a `WasiHttpView::http` panic at the
+/// first outbound call, so a misconfigured wiring cannot crash a live task and
+/// cannot silently link a surface the store cannot back.
+pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -> Result<()> {
+    let store_has_http = store.data().http_enabled();
+    if store_has_http != linker_has_http {
+        anyhow::bail!(
+            "plugin store/linker http mismatch: store HttpClient={store_has_http}, \
+             linker wasi:http={linker_has_http}; refusing to instantiate"
+        );
+    }
+    Ok(())
+}
+
 pub fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -331,6 +350,37 @@ mod tests {
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
+        );
+    }
+
+    #[test]
+    fn http_coherence_accepts_matching_store_and_linker() {
+        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        assert!(
+            ensure_http_coherent(&granted, true).is_ok(),
+            "granted store paired with an http linker is coherent"
+        );
+        let plain = new_store(&[], limits(0));
+        assert!(
+            ensure_http_coherent(&plain, false).is_ok(),
+            "ungranted store paired with a plain linker is coherent"
+        );
+    }
+
+    #[test]
+    fn http_coherence_rejects_a_store_linker_mismatch() {
+        // A registration path that links wasi:http against a store with no
+        // HttpClient context (or the reverse) is refused at instantiate time
+        // with a named error, not a WasiHttpView::http panic on first call.
+        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        assert!(
+            ensure_http_coherent(&granted, false).is_err(),
+            "granted store with a plain linker cannot back its own permission"
+        );
+        let plain = new_store(&[], limits(0));
+        assert!(
+            ensure_http_coherent(&plain, true).is_err(),
+            "plain store with an http linker would panic on first outbound call"
         );
     }
 

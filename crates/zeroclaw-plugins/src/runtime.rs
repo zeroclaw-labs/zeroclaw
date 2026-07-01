@@ -73,11 +73,13 @@ pub async fn create_plugin(
 ) -> Result<Plugin> {
     let component = load_component(wasm_path)?;
     let mut store = crate::component::new_store(permissions, limits);
-    let linker = if store.data().http_enabled() {
+    let http = store.data().http_enabled();
+    let linker = if http {
         tool_linker_http()
     } else {
         tool_linker()
     };
+    crate::component::ensure_http_coherent(&store, http)?;
     let bindings = wt(
         ToolPlugin::instantiate_async(&mut store, &component, linker).await,
         "failed to instantiate tool plugin",

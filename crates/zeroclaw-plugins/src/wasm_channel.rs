@@ -115,7 +115,9 @@ impl WasmChannel {
         let inbound = InboundQueue::default();
         let mut store =
             crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
-        let linker = build_linker(store.data().http_enabled())?;
+        let http = store.data().http_enabled();
+        let linker = build_linker(http)?;
+        crate::component::ensure_http_coherent(&store, http)?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",
