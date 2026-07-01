@@ -104,13 +104,33 @@ impl SopEngine {
             Ok(runs) => {
                 let mut restored = 0usize;
                 for pr in runs {
-                    if let Some(sop) = self.sops.iter().find(|s| s.name == pr.run.sop_name) {
-                        let _ = self.store.try_claim_run(
-                            &pr.run.run_id,
-                            &pr.run.sop_name,
-                            sop.max_concurrent as usize,
-                            self.config.max_concurrent_total,
+                    // Re-establish the claim WITHOUT admission caps: a restored run
+                    // was already admitted before the restart, so reconstruction is
+                    // not new admission. This keeps `active_runs` and the live-claim
+                    // count aligned 1:1 even for an over-cap restored set (the old
+                    // capped `try_claim_run` silently dropped the claim over cap,
+                    // leaving a locally active run with no store claim). On a renew
+                    // error the run is left out of `active_runs` rather than cached
+                    // orphaned, and the failure is logged loudly.
+                    if let Err(e) = self
+                        .store
+                        .renew_claim_for_restore(&pr.run.run_id, &pr.run.sop_name)
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": pr.run.run_id.as_str(),
+                                "sop_name": pr.run.sop_name.as_str(),
+                                "error": e.to_string(),
+                            })),
+                            "SOP engine: dropping restored run, could not re-establish its store claim"
                         );
+                        continue;
                     }
                     if self
                         .active_runs
@@ -368,13 +388,23 @@ impl SopEngine {
             return false;
         }
 
-        // Cooldown: check most recent finished run for this SOP
-        if sop.cooldown_secs > 0
-            && let Some(last) = self.last_finished_run(sop_name)
-            && let Some(ref completed_at) = last.completed_at
-            && !cooldown_elapsed(completed_at, sop.cooldown_secs)
-        {
-            return false;
+        // Cooldown: the last terminal completion is read from the shared store so
+        // every engine holder observes the same marker (an engine that did not run
+        // the SOP has no local finished entry). Fall back to the in-memory
+        // `last_finished_run` only if the store call errors - mirrors the
+        // claim-counts store->memory fallback above.
+        if sop.cooldown_secs > 0 {
+            let last_completed = match self.store.last_terminal_completed_at(sop_name) {
+                Ok(completed) => completed,
+                Err(_) => self
+                    .last_finished_run(sop_name)
+                    .and_then(|last| last.completed_at.clone()),
+            };
+            if let Some(completed_at) = last_completed
+                && !cooldown_elapsed(&completed_at, sop.cooldown_secs)
+            {
+                return false;
+            }
         }
 
         true
@@ -3447,6 +3477,108 @@ mod tests {
 
         // Cooldown not elapsed — should block
         assert!(!engine.can_start("s1"));
+    }
+
+    #[test]
+    fn cooldown_is_shared_across_engine_instances() {
+        // Two engines share ONE store. Engine A runs and finishes a run; the
+        // cooldown marker lives only in A's local `finished_runs`, but B must still
+        // honor the cooldown because it reads the last terminal completion from the
+        // shared store. Without FIX 1 (store-backed cooldown), B sees no local
+        // finished run and admits early - this test fails.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.cooldown_secs = 3600; // 1 hour
+        let sops = vec![sop];
+        let mut engine_a = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut engine_b = engine_with_sops(sops).with_store(store.clone());
+
+        // Engine A starts and finishes a run (writes a terminal row to the store).
+        let action = engine_a.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a.finish_run(&run_id, SopRunStatus::Completed, None);
+
+        // Engine B never ran this SOP, so it has no local finished entry. It must
+        // still see the cooldown via the shared store.
+        assert!(
+            !engine_b.can_start("s1"),
+            "a second engine must observe the cooldown from the shared store"
+        );
+        assert!(
+            engine_b.start_run("s1", manual_event()).is_err(),
+            "start_run must bail while the shared-store cooldown is active"
+        );
+
+        // Advance the stored completion past the cooldown window (supersede the
+        // same run's terminal row with an older completed_at, newer revision). The
+        // store now reports an elapsed cooldown, so B may start.
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        let mut aged = stored.clone();
+        aged.revision = stored.revision + 1;
+        aged.run.completed_at = Some("2000-01-01T00:00:00Z".to_string());
+        store.finish_run(&run_id, &aged).unwrap();
+
+        assert!(
+            engine_b.can_start("s1"),
+            "once the shared-store cooldown window passes, the second engine may start"
+        );
+        assert!(
+            engine_b.start_run("s1", manual_event()).is_ok(),
+            "start_run succeeds after the shared-store cooldown elapses"
+        );
+    }
+
+    #[test]
+    fn restore_runs_keeps_active_and_claims_aligned_over_cap() {
+        // Pre-seed the shared store with non-terminal runs OVER the per-SOP cap,
+        // then restore onto a fresh engine. FIX 2 re-establishes a claim for every
+        // restored run without applying admission caps, so `active_runs` and the
+        // live-claim total stay aligned 1:1 (the old capped path silently dropped
+        // the over-cap claim, leaving a locally active run with no store claim).
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.max_concurrent = 1; // cap of 1, but seed 3 already-running runs
+        let now = now_iso8601();
+        for i in 0..3 {
+            let run = SopRun {
+                run_id: format!("restore-{i}"),
+                sop_name: "s1".to_string(),
+                trigger_event: manual_event(),
+                frame_marker_id: format!("marker-{i}"),
+                status: SopRunStatus::Running,
+                current_step: 1,
+                total_steps: 2,
+                started_at: now.clone(),
+                completed_at: None,
+                step_results: Vec::new(),
+                waiting_since: None,
+                llm_calls_saved: 0,
+            };
+            store
+                .save_run(&PersistedRun::new(
+                    run,
+                    now.clone(),
+                    SopTriggerSource::Manual,
+                ))
+                .unwrap();
+        }
+
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        engine.restore_runs();
+
+        // Every restored run is active...
+        assert_eq!(engine.active_runs().len(), 3, "all over-cap runs restored");
+        // ...and each has a live store claim (counts == active_runs.len()).
+        let (per_sop, total) = store.claim_counts("s1").unwrap();
+        assert_eq!(
+            total,
+            engine.active_runs().len(),
+            "every active restored run must hold a live store claim"
+        );
+        assert_eq!(
+            per_sop, 3,
+            "all three claims are accounted for under the SOP"
+        );
     }
 
     // ── Execution modes ─────────────────────────────────
