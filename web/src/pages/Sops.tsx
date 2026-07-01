@@ -351,9 +351,6 @@ function StepEditor({
   onMove: (dir: -1 | 1) => void;
 }) {
   const rowRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (selected) rowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  }, [selected]);
   const routing = step.routing ?? {};
   const fkind = failureKind(step.on_failure);
   const setFailure = (kind: 'fail' | 'retry' | 'goto') => {
