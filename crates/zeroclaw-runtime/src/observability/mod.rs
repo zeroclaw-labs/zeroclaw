@@ -4,6 +4,8 @@ pub mod multi;
 pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
+#[cfg(feature = "observability-otel")]
+pub mod otel_config;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
@@ -14,6 +16,8 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+#[cfg(feature = "observability-otel")]
+use self::otel_config::{OtelContentConfig, set_otel_content_config};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -232,6 +236,67 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 config.otel_headers.clone(),
             ) {
                 Ok(obs) => {
+                    // Normalize: max_chars == 0 → treat as Off
+                    let genai_policy = if config.otel_genai_content_max_chars == 0 {
+                        zeroclaw_config::schema::OtelContentPolicy::Off
+                    } else {
+                        config.otel_genai_content
+                    };
+                    let tool_io_policy = if config.otel_tool_io_max_chars == 0 {
+                        zeroclaw_config::schema::OtelContentPolicy::Off
+                    } else {
+                        config.otel_tool_io
+                    };
+
+                    // Emit startup warnings for non-off policies
+                    if genai_policy != zeroclaw_config::schema::OtelContentPolicy::Off {
+                        let msg = match genai_policy {
+                            zeroclaw_config::schema::OtelContentPolicy::Redacted => {
+                                "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+                            }
+                            zeroclaw_config::schema::OtelContentPolicy::Full => {
+                                "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+                            }
+                            _ => unreachable!(),
+                        };
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            msg
+                        );
+                    }
+                    if tool_io_policy != zeroclaw_config::schema::OtelContentPolicy::Off {
+                        let msg = match tool_io_policy {
+                            zeroclaw_config::schema::OtelContentPolicy::Redacted => {
+                                "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+                            }
+                            zeroclaw_config::schema::OtelContentPolicy::Full => {
+                                "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+                            }
+                            _ => unreachable!(),
+                        };
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            msg
+                        );
+                    }
+
+                    set_otel_content_config(OtelContentConfig {
+                        genai_policy,
+                        genai_max_chars: config.otel_genai_content_max_chars,
+                        tool_io_policy,
+                        tool_io_max_chars: config.otel_tool_io_max_chars,
+                    });
+
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

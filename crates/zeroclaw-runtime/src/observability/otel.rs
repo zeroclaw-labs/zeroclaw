@@ -1,4 +1,7 @@
 use super::traits::{LlmMessageSnapshot, Observer, ObserverEvent, ObserverMetric};
+use crate::agent::loop_::scrub_for_export;
+use crate::observability::otel_config::otel_content_config;
+use crate::util::{truncate_field, truncate_json_leaves};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
 use opentelemetry::{Context, KeyValue, global};
@@ -9,6 +12,14 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
+use zeroclaw_config::schema::OtelContentPolicy;
+
+struct ActiveAgentSpan {
+    span: global::BoxedSpan,
+    context: Context,
+    first_user_input: Option<String>,
+    last_output_text: Option<String>,
+}
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -36,7 +47,7 @@ pub struct OtelObserver {
     rag_retrieve_duration: Histogram<f64>,
 
     // Turn span tracking for parent/child correlation
-    active_agent_spans: Mutex<HashMap<String, (global::BoxedSpan, Context)>>,
+    active_agent_spans: Mutex<HashMap<String, ActiveAgentSpan>>,
 }
 
 impl OtelObserver {
@@ -233,13 +244,13 @@ impl OtelObserver {
 
     fn parent_cx_for(&self, turn_id: Option<&str>) -> Context {
         if let Some(tid) = turn_id
-            && let Some((_, cx)) = self
+            && let Some(entry) = self
                 .active_agent_spans
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(tid)
         {
-            return cx.clone();
+            return entry.context.clone();
         }
         Context::current()
     }
@@ -286,7 +297,15 @@ impl Observer for OtelObserver {
                     self.active_agent_spans
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(tid.clone(), (span, parent_cx));
+                        .insert(
+                            tid.clone(),
+                            ActiveAgentSpan {
+                                span,
+                                context: parent_cx,
+                                first_user_input: None,
+                                last_output_text: None,
+                            },
+                        );
                 }
             }
             ObserverEvent::LlmRequest {
@@ -328,6 +347,9 @@ impl Observer for OtelObserver {
                 agent_alias,
                 turn_id,
             } => {
+                let config = otel_content_config();
+                let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
+
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
                     KeyValue::new("tool.name", tool.clone()),
@@ -338,9 +360,29 @@ impl Observer for OtelObserver {
                 if let Some(id) = tool_call_id {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
                 }
-                if let Some(args) = arguments {
-                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", args.clone()));
+
+                // OTel-only content processing: scrub + truncate based on policy
+                if policy != OtelContentPolicy::Off
+                    && let Some(args) = arguments
+                {
+                    let scrubbed = scrub_for_export(args);
+                    let processed = if policy == OtelContentPolicy::Redacted {
+                        // Try JSON leaf truncation first, fall back to string truncation
+                        match serde_json::from_str::<serde_json::Value>(&scrubbed) {
+                            Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
+                                .and_then(|v| serde_json::to_string(&v).ok())
+                                .unwrap_or_else(|| {
+                                    truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
+                                }),
+                            Err(_) => truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed),
+                        }
+                    } else {
+                        scrubbed
+                    };
+                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", processed.clone()));
+                    span_attrs.push(KeyValue::new("input.value", processed));
                 }
+
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("tool_call.start")
@@ -545,6 +587,31 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
                 }
                 span_attrs.extend(message_attrs(messages));
+
+                // Update agent span aggregation for turn-level input.value / output.value
+                if let Some(tid) = turn_id
+                    && let Ok(mut spans) = self.active_agent_spans.lock()
+                    && let Some(agent_span) = spans.get_mut(tid)
+                {
+                    // Capture first user input (last user message in the input)
+                    if agent_span.first_user_input.is_none()
+                        && let Some(snap) = messages
+                    {
+                        agent_span.first_user_input = snap
+                            .input
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == "user")
+                            .map(|m| m.content.clone());
+                    }
+                    // Capture last output text (overwrites on each LLM call)
+                    if let Some(snap) = messages
+                        && let Some(text) = &snap.output_text
+                    {
+                        agent_span.last_output_text = Some(text.clone());
+                    }
+                }
+
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("llm.response")
@@ -575,31 +642,69 @@ impl Observer for OtelObserver {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(tid);
-                    if let Some((mut span, _)) = entry {
+                    if let Some(mut agent_span) = entry {
                         let secs = duration.as_secs_f64();
-                        span.set_attribute(KeyValue::new("duration_s", secs));
-                        span.set_attribute(KeyValue::new(
+                        agent_span
+                            .span
+                            .set_attribute(KeyValue::new("duration_s", secs));
+                        agent_span.span.set_attribute(KeyValue::new(
                             "zeroclaw.channel",
                             channel.clone().unwrap_or_default(),
                         ));
-                        span.set_attribute(KeyValue::new(
+                        agent_span.span.set_attribute(KeyValue::new(
                             "gen_ai.agent.name",
                             agent_alias.clone().unwrap_or_default(),
                         ));
                         if let Some(usage) = tokens_used {
-                            span.set_attribute(KeyValue::new(
+                            agent_span.span.set_attribute(KeyValue::new(
                                 "gen_ai.usage.input_tokens",
                                 usage.input_tokens as i64,
                             ));
-                            span.set_attribute(KeyValue::new(
+                            agent_span.span.set_attribute(KeyValue::new(
                                 "gen_ai.usage.output_tokens",
                                 usage.output_tokens as i64,
                             ));
                         }
                         if let Some(c) = cost_usd {
-                            span.set_attribute(KeyValue::new("cost_usd", *c));
+                            agent_span.span.set_attribute(KeyValue::new("cost_usd", *c));
                         }
-                        span.end();
+
+                        // Set agent span aggregation attributes based on genai policy
+                        let config = otel_content_config();
+                        if config.genai_policy != OtelContentPolicy::Off {
+                            if let Some(input) = agent_span.first_user_input {
+                                // Clean metadata for display before truncation
+                                let cleaned = clean_for_display(&input);
+                                let processed =
+                                    if config.genai_policy == OtelContentPolicy::Redacted {
+                                        truncate_field(&cleaned, config.genai_max_chars)
+                                    } else {
+                                        Some(cleaned)
+                                    };
+                                if let Some(val) = processed {
+                                    agent_span
+                                        .span
+                                        .set_attribute(KeyValue::new("input.value", val));
+                                }
+                            }
+                            if let Some(output) = agent_span.last_output_text {
+                                // Clean metadata for display before truncation
+                                let cleaned = clean_for_display(&output);
+                                let processed =
+                                    if config.genai_policy == OtelContentPolicy::Redacted {
+                                        truncate_field(&cleaned, config.genai_max_chars)
+                                    } else {
+                                        Some(cleaned)
+                                    };
+                                if let Some(val) = processed {
+                                    agent_span
+                                        .span
+                                        .set_attribute(KeyValue::new("output.value", val));
+                                }
+                            }
+                        }
+
+                        agent_span.span.end();
                     }
                 }
 
@@ -632,6 +737,9 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
+                let config = otel_content_config();
+                let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
+
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
                     KeyValue::new("tool.name", tool.clone()),
@@ -644,13 +752,36 @@ impl Observer for OtelObserver {
                 if let Some(id) = tool_call_id {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
                 }
-                if let Some(args) = arguments {
-                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", args.clone()));
-                    span_attrs.push(KeyValue::new("input.value", args.clone()));
-                }
-                if let Some(res) = result {
-                    span_attrs.push(KeyValue::new("gen_ai.tool.result", res.clone()));
-                    span_attrs.push(KeyValue::new("output.value", res.clone()));
+
+                // OTel-only content processing: scrub + truncate based on policy
+                if policy != OtelContentPolicy::Off {
+                    if let Some(args) = arguments {
+                        let scrubbed = scrub_for_export(args);
+                        let processed = if policy == OtelContentPolicy::Redacted {
+                            match serde_json::from_str::<serde_json::Value>(&scrubbed) {
+                                Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
+                                    .and_then(|v| serde_json::to_string(&v).ok())
+                                    .unwrap_or_else(|| {
+                                        truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
+                                    }),
+                                Err(_) => truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed),
+                            }
+                        } else {
+                            scrubbed
+                        };
+                        span_attrs.push(KeyValue::new("gen_ai.tool.arguments", processed.clone()));
+                        span_attrs.push(KeyValue::new("input.value", processed));
+                    }
+                    if let Some(res) = result {
+                        let scrubbed = scrub_for_export(res);
+                        let processed = if policy == OtelContentPolicy::Redacted {
+                            truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
+                        } else {
+                            scrubbed
+                        };
+                        span_attrs.push(KeyValue::new("gen_ai.tool.result", processed.clone()));
+                        span_attrs.push(KeyValue::new("output.value", processed));
+                    }
                 }
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -732,15 +863,15 @@ impl Observer for OtelObserver {
 
     fn flush(&self) {
         // Flush orphan live spans (turns that ended without AgentEnd)
-        let orphans: Vec<(global::BoxedSpan, Context)> = self
+        let orphans: Vec<ActiveAgentSpan> = self
             .active_agent_spans
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
             .map(|(_, v)| v)
             .collect();
-        for (mut span, _) in orphans {
-            span.end();
+        for mut orphan in orphans {
+            orphan.span.end();
         }
 
         if let Err(e) = self.tracer_provider.force_flush() {
@@ -772,6 +903,84 @@ impl Observer for OtelObserver {
     }
 }
 
+/// Clean content for display in agent-level OTel traces by removing metadata
+/// that obscures the actual user input or model output.
+///
+/// Only used for agent-level input.value / output.value in gen_ai.agent.invoke,
+/// NOT for individual llm.response spans.
+///
+/// Removes (only when both start and end tags are present):
+/// - Memory context blocks (`[Memory context]`...`[/Memory context]`)
+/// - Tool result blocks (`<tool_result>...</tool_result>`)
+/// - Thinking blocks (`<thinking>...</thinking>`)
+/// - Think blocks (</think>...`)
+///
+/// Removes (regex-based, no closing tag required):
+/// - Timestamps in brackets (`[2026-06-30 16:44:51 +08:00]`)
+/// - Tool results prefix (`[Tool results]`)
+///
+/// Returns the cleaned content, or the original if no patterns match.
+fn clean_for_display(content: &str) -> String {
+    let mut cleaned = content.to_string();
+
+    // Remove memory context blocks - only if both start and end tags present
+    let memory_start = "[Memory context]";
+    let memory_end = "[/Memory context]";
+    if let Some(start) = cleaned.find(memory_start)
+        && let Some(end) = cleaned.find(memory_end)
+    {
+        cleaned.replace_range(start..(end + memory_end.len()), "");
+    }
+
+    // Remove tool result blocks - only if both start and end tags present
+    let tool_result_start = "<tool_result";
+    let tool_result_end = "</tool_result>";
+    if let Some(start) = cleaned.find(tool_result_start)
+        && let Some(end) = cleaned.find(tool_result_end)
+    {
+        cleaned.replace_range(start..(end + tool_result_end.len()), "");
+    }
+
+    // Remove thinking blocks (<thinking>...</thinking>) - only if both tags present
+    let thinking_start = "<thinking>";
+    let thinking_end = "</thinking>";
+    if let Some(start) = cleaned.find(thinking_start)
+        && let Some(end) = cleaned.find(thinking_end)
+    {
+        cleaned.replace_range(start..(end + thinking_end.len()), "");
+    }
+
+    // Remove think blocks (<think>...</think>`) - only if both tags present
+    let think_start = "<think>";
+    let think_end = "</think>";
+    if let Some(start) = cleaned.find(think_start)
+        && let Some(end) = cleaned.find(think_end)
+    {
+        cleaned.replace_range(start..(end + think_end.len()), "");
+    }
+
+    // Remove timestamp patterns like [2026-06-30 16:44:51 +08:00]
+    let timestamp_regex =
+        regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]").unwrap();
+    cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
+
+    // Remove tool results prefix
+    let tool_results_prefix_regex = regex::Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap();
+    cleaned = tool_results_prefix_regex
+        .replace_all(&cleaned, "")
+        .to_string();
+
+    // Clean up extra whitespace
+    cleaned = cleaned
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    cleaned.trim().to_string()
+}
+
 /// Build the OTel GenAI message-content attributes from a captured snapshot.
 /// Returns an empty vec when there is nothing to emit. Encoding matches the
 /// Langfuse-validated shape: system carried separately, system filtered out of
@@ -780,45 +989,77 @@ fn message_attrs(messages: &Option<LlmMessageSnapshot>) -> Vec<KeyValue> {
     let Some(snap) = messages else {
         return Vec::new();
     };
+
+    let config = otel_content_config();
+    let (policy, max_chars) = (config.genai_policy, config.genai_max_chars);
+
+    if policy == OtelContentPolicy::Off {
+        return Vec::new();
+    }
+
     let mut attrs = Vec::new();
 
-    if let Some(sys) = snap.system_instructions.as_ref() {
-        attrs.push(KeyValue::new("gen_ai.system_instructions", sys.clone()));
+    if let Some(sys) = snap.system_instructions.as_ref()
+        && let Some(truncated) = if policy == OtelContentPolicy::Redacted {
+            truncate_field(sys, max_chars)
+        } else {
+            Some(sys.clone())
+        }
+    {
+        attrs.push(KeyValue::new("gen_ai.system_instructions", truncated));
     }
 
     if !snap.input.is_empty() {
-        // `content` stays a plain string (free-form prose); only tool-call `arguments`
-        // (below) are re-parsed into a nested tree — the bce8da324 / Langfuse-validated shape.
         let input_json = serde_json::to_string(
             &snap
                 .input
                 .iter()
-                .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                .map(|m| {
+                    let content = if policy == OtelContentPolicy::Redacted {
+                        truncate_field(&m.content, max_chars).unwrap_or_else(|| m.content.clone())
+                    } else {
+                        m.content.clone()
+                    };
+                    serde_json::json!({ "role": m.role, "content": content })
+                })
                 .collect::<Vec<_>>(),
         )
         .unwrap_or_else(|_| "[]".to_string());
         attrs.push(KeyValue::new("gen_ai.input.messages", input_json));
     }
 
-    // Output is a single assistant message: text (if any) plus tool calls (if any).
     let mut output_msg = serde_json::Map::new();
     output_msg.insert("role".into(), serde_json::Value::String("assistant".into()));
-    if let Some(text) = snap.output_text.as_ref() {
-        output_msg.insert("content".into(), serde_json::Value::String(text.clone()));
+    if let Some(text) = snap.output_text.as_ref()
+        && let Some(truncated) = if policy == OtelContentPolicy::Redacted {
+            truncate_field(text, max_chars)
+        } else {
+            Some(text.clone())
+        }
+    {
+        output_msg.insert("content".into(), serde_json::Value::String(truncated));
     }
     if !snap.output_tool_calls.is_empty() {
         let calls: Vec<serde_json::Value> = snap
             .output_tool_calls
             .iter()
             .map(|tc| {
+                let arguments = if policy == OtelContentPolicy::Redacted {
+                    match serde_json::from_str::<serde_json::Value>(&tc.arguments_json) {
+                        Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or_else(|| tc.arguments_json.clone()),
+                        Err(_) => truncate_field(&tc.arguments_json, max_chars)
+                            .unwrap_or_else(|| tc.arguments_json.clone()),
+                    }
+                } else {
+                    tc.arguments_json.clone()
+                };
                 serde_json::json!({
                     "id": tc.id,
                     "name": tc.name,
-                    // arguments_json is already JSON text — re-parse so the attribute
-                    // is a nested tree, not a double-encoded string. On malformed JSON,
-                    // fall back to the (scrubbed) raw string rather than silently dropping it.
-                    "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments_json)
-                        .unwrap_or_else(|_| serde_json::Value::String(tc.arguments_json.clone())),
+                    "arguments": serde_json::from_str::<serde_json::Value>(&arguments)
+                        .unwrap_or(serde_json::Value::String(arguments)),
                 })
             })
             .collect();
@@ -846,8 +1087,24 @@ mod tests {
             .map(|kv| kv.value.as_str().to_string())
     }
 
+    /// Install a non-`off` GenAI content policy so `message_attrs` emits content.
+    /// `message_attrs` reads the process-wide `otel_content_config()`; without this
+    /// the default `Off` policy short-circuits to an empty vec and the content
+    /// assertions below would fail. Uses `Full` so truncation is a no-op and the
+    /// exact captured strings are asserted verbatim.
+    fn set_genai_full() {
+        use crate::observability::otel_config::{OtelContentConfig, set_otel_content_config};
+        set_otel_content_config(OtelContentConfig {
+            genai_policy: OtelContentPolicy::Full,
+            genai_max_chars: 10_000,
+            tool_io_policy: OtelContentPolicy::Off,
+            tool_io_max_chars: 0,
+        });
+    }
+
     #[test]
     fn message_attrs_emits_genai_semconv() {
+        set_genai_full();
         let snap = LlmMessageSnapshot {
             input: vec![MessageSnapshot {
                 role: "user".into(),
@@ -883,6 +1140,7 @@ mod tests {
 
     #[test]
     fn message_attrs_omits_empty_and_handles_none() {
+        set_genai_full();
         // Only system set: input/output omitted.
         let snap = LlmMessageSnapshot {
             input: vec![],
@@ -902,6 +1160,7 @@ mod tests {
 
     #[test]
     fn message_attrs_malformed_tool_arguments_falls_back_to_string() {
+        set_genai_full();
         let snap = LlmMessageSnapshot {
             input: vec![],
             output_text: None,
@@ -1346,5 +1605,117 @@ mod tests {
             result.is_ok(),
             "observer creation with empty headers must succeed"
         );
+    }
+
+    // ── clean_for_display tests ───────────────────────────────────────
+
+    #[test]
+    fn clean_for_display_removes_memory_context() {
+        let input =
+            "What is the weather today[Memory context]previous conversation[/Memory context]";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "What is the weather today");
+    }
+
+    #[test]
+    fn clean_for_display_removes_timestamps() {
+        let input = "Hello world[2026-06-30 16:44:51 +08:00]";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Hello world");
+    }
+
+    #[test]
+    fn clean_for_display_removes_timestamps_with_different_tz() {
+        let input = "Hello world[2026-06-30 16:44:51 UTC]";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Hello world");
+    }
+
+    #[test]
+    fn clean_for_display_removes_thinking_blocks() {
+        let input = "Answer<thinking>Let me think about this</thinking>Here is the answer";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "AnswerHere is the answer");
+    }
+
+    #[test]
+    fn clean_for_display_removes_think_blocks() {
+        let input = "Answer<think>Let me think about this</think>Here is the answer";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "AnswerHere is the answer");
+    }
+
+    #[test]
+    fn clean_for_display_removes_tool_result_blocks() {
+        let input = "Result<tool_result>some tool output</tool_result>Final answer";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "ResultFinal answer");
+    }
+
+    #[test]
+    fn clean_for_display_removes_tool_results_prefix() {
+        let input = "[Tool results]\nHere is the answer";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Here is the answer");
+    }
+
+    #[test]
+    fn clean_for_display_handles_combined_patterns() {
+        let input = "What is the weather today[Memory context]old history[/Memory context][2026-06-30 16:44:51 +08:00]";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "What is the weather today");
+    }
+
+    #[test]
+    fn clean_for_display_preserves_clean_content() {
+        let input = "This is a clean message";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "This is a clean message");
+    }
+
+    #[test]
+    fn clean_for_display_handles_empty_input() {
+        let input = "";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn clean_for_display_handles_whitespace_only() {
+        let input = "   \n\n   ";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "");
+    }
+
+    // Unclosed tags should be preserved (no removal)
+    #[test]
+    fn clean_for_display_preserves_unclosed_memory_context() {
+        let input = "What is the weather today[Memory context]some content";
+        let cleaned = clean_for_display(input);
+        assert_eq!(
+            cleaned,
+            "What is the weather today[Memory context]some content"
+        );
+    }
+
+    #[test]
+    fn clean_for_display_preserves_unclosed_thinking() {
+        let input = "Answer<thinking>Let me think";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Answer<thinking>Let me think");
+    }
+
+    #[test]
+    fn clean_for_display_preserves_unclosed_think() {
+        let input = "Answer<think>Let me think";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Answer<think>Let me think");
+    }
+
+    #[test]
+    fn clean_for_display_preserves_unclosed_tool_result() {
+        let input = "Result<tool_result>some tool output";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Result<tool_result>some tool output");
     }
 }

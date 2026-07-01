@@ -515,7 +515,7 @@ fn elide_image_data(content: &str) -> String {
 /// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
 /// alone covers free-form content. Residual secrets/PII may remain — this is
 /// disclosed in the PR/docs, not eliminated.
-fn scrub_for_export(content: &str) -> String {
+pub(crate) fn scrub_for_export(content: &str) -> String {
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
         &elide_image_data(content),
     ))
@@ -535,6 +535,16 @@ pub(crate) fn capture_llm_messages(
 ) -> Option<zeroclaw_api::observability_traits::LlmMessageSnapshot> {
     if !cfg!(feature = "observability-otel") {
         return None;
+    }
+
+    #[cfg(feature = "observability-otel")]
+    {
+        use crate::observability::otel_config::otel_content_config;
+
+        let config = otel_content_config();
+        if config.genai_policy == zeroclaw_config::schema::OtelContentPolicy::Off {
+            return None;
+        }
     }
 
     use zeroclaw_api::observability_traits::{
