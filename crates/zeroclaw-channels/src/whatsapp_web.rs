@@ -2706,11 +2706,23 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn delivery_failure_note_is_count_only() {
-        let note = whatsapp_delivery_failure_note(2).expect("note");
+        let count: usize = 2;
+        let note = whatsapp_delivery_failure_note(count).expect("note");
 
-        assert!(note.contains("2 WhatsApp media attachments"));
-        assert!(!note.contains("/"));
-        assert!(!note.contains("workspace"));
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English phrase used to live here but the assertion would break
+        // on any CI runner with a non-English `$LANG`.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(count.to_string().as_str()),
+            "note must contain the failure count"
+        );
+        assert!(!note.contains("/"), "note must not contain path separators");
+        assert!(
+            !note.contains("workspace"),
+            "note must not echo local marker targets"
+        );
     }
 
     #[test]
