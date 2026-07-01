@@ -362,6 +362,7 @@ fn trigger_labels(trigger: &super::types::SopTrigger) -> (String, String) {
         SopTrigger::Calendar { .. } => "calendar".to_string(),
         SopTrigger::Channel { channel, .. } => channel.clone(),
         SopTrigger::Manual => "manual".to_string(),
+        SopTrigger::Amqp { .. } => "amqp".to_string(),
     };
     (kind, trigger.to_string())
 }

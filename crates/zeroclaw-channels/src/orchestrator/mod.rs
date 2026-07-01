@@ -7277,7 +7277,7 @@ pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[]);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
 }
 
@@ -7297,7 +7297,7 @@ pub fn register_channels_for_tools(
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[]);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -7334,9 +7334,13 @@ fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[cfg(not(feature = "channel-amqp"))]
+    let _ = (&sop_engine, &sop_audit);
     #[allow(unused_mut)]
     let mut channels = Vec::new();
 
@@ -8180,24 +8184,43 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("amqp", &alias))
         };
+        let amqp_channel = match AmqpChannel::new(crate::amqp::AmqpChannelConfig {
+            amqp_url: amqp.amqp_url.clone(),
+            exchange: amqp.exchange.clone(),
+            routing_keys: amqp.routing_keys.clone(),
+            queue: amqp.queue.clone(),
+            ca_cert: amqp.ca_cert.clone(),
+            client_cert: amqp.client_cert.clone(),
+            client_key: amqp.client_key.clone(),
+            sender_label: amqp.sender_label.clone(),
+            content_template: amqp.content_template.clone(),
+            thread_id_field: amqp.thread_id_field.clone(),
+            durable_ack: amqp.durable_ack,
+            dispatch: amqp.dispatch,
+            engine: sop_engine.clone(),
+            audit: sop_audit.clone(),
+            alias: alias.clone(),
+            peer_resolver,
+        }) {
+            Ok(ch) => ch,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": err.to_string(),
+                        })),
+                    "skipping AMQP channel: SOP dispatch without engine/audit handles"
+                );
+                continue;
+            }
+        };
         channels.push(ConfiguredChannel {
             display_name: "AMQP",
             alias: Some(alias.clone()),
-            channel: Arc::new(AmqpChannel::new(crate::amqp::AmqpChannelConfig {
-                amqp_url: amqp.amqp_url.clone(),
-                exchange: amqp.exchange.clone(),
-                routing_keys: amqp.routing_keys.clone(),
-                queue: amqp.queue.clone(),
-                ca_cert: amqp.ca_cert.clone(),
-                client_cert: amqp.client_cert.clone(),
-                client_key: amqp.client_key.clone(),
-                sender_label: amqp.sender_label.clone(),
-                content_template: amqp.content_template.clone(),
-                thread_id_field: amqp.thread_id_field.clone(),
-                durable_ack: amqp.durable_ack,
-                alias: alias.clone(),
-                peer_resolver,
-            })),
+            channel: Arc::new(amqp_channel),
         });
     }
 
@@ -8878,7 +8901,7 @@ fn no_real_time_channels_message() -> &'static str {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[]);
+    let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
     #[cfg(feature = "channel-nostr")]
     {
@@ -9653,8 +9676,13 @@ pub async fn start_channels(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> =
-                collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
+            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
+                &config_arc,
+                "runtime startup",
+                &tool_specs,
+                sop_engine.clone(),
+                sop_audit.clone(),
+            );
 
             #[cfg(feature = "channel-nostr")]
             {
@@ -20358,7 +20386,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
             channels
@@ -20407,7 +20435,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
             channels
@@ -20451,7 +20479,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -20487,7 +20515,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
             channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -20537,7 +20565,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         let discord_channels: Vec<_> = channels
             .iter()
@@ -20724,7 +20752,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -20741,7 +20769,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels
                 .iter()
@@ -23836,7 +23864,7 @@ mod omitted_feature_tests {
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \
