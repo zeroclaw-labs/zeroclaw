@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, XCircle, Loader2, ArrowDown, Plus, Save, Trash2, X } from 'lucide-react';
 import { Badge, Card, PageHeader } from '@/components/ui';
+import SopCanvas from './SopCanvas';
 import { t } from '@/lib/i18n';
 import {
   listSops,
@@ -304,6 +305,8 @@ function StepEditor({
   step,
   index,
   count,
+  selected,
+  onSelect,
   onChange,
   onRemove,
   onMove,
@@ -311,10 +314,16 @@ function StepEditor({
   step: SopStep;
   index: number;
   count: number;
+  selected: boolean;
+  onSelect: () => void;
   onChange: (patch: Partial<SopStep>) => void;
   onRemove: () => void;
   onMove: (dir: -1 | 1) => void;
 }) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (selected) rowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [selected]);
   const routing = step.routing ?? {};
   const fkind = failureKind(step.on_failure);
   const setFailure = (kind: 'fail' | 'retry' | 'goto') => {
@@ -325,7 +334,14 @@ function StepEditor({
   const setRouting = (patch: Partial<typeof routing>) =>
     onChange({ routing: { ...routing, ...patch } });
   return (
-    <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3">
+    <div
+      ref={rowRef}
+      onFocusCapture={onSelect}
+      onClick={onSelect}
+      className={`rounded-[var(--radius-lg)] border bg-pc-surface p-3 ${
+        selected ? 'border-pc-accent ring-1 ring-pc-accent' : 'border-pc-border'
+      }`}
+    >
       <div className="mb-2 flex items-center gap-2">
         <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
           {step.number}
@@ -491,6 +507,8 @@ function SopEditor({
   draft,
   saving,
   saveError,
+  selectedStep,
+  onSelectStep,
   onField,
   onStep,
   onAddStep,
@@ -502,6 +520,8 @@ function SopEditor({
   draft: Sop;
   saving: boolean;
   saveError: string | null;
+  selectedStep: number | null;
+  onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
   onStep: (i: number, patch: Partial<SopStep>) => void;
   onAddStep: () => void;
@@ -613,6 +633,8 @@ function SopEditor({
             step={s}
             index={i}
             count={draft.steps.length}
+            selected={selectedStep === s.number}
+            onSelect={() => onSelectStep(s.number)}
             onChange={(patch) => onStep(i, patch)}
             onRemove={() => onRemoveStep(i)}
             onMove={(dir) => onMoveStep(i, dir)}
@@ -637,6 +659,27 @@ export default function Sops() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
+  const [selectedStep, setSelectedStep] = useState<number | null>(null);
+
+  const onConnect = useCallback((from: number, to: number, kind: 'sequence' | 'dependency' | 'failure') => {
+    setDraft((d) => {
+      if (!d) return d;
+      const steps = d.steps.map((s) => {
+        if (kind === 'sequence' && s.number === from) {
+          return { ...s, routing: { ...(s.routing ?? {}), next: to } };
+        }
+        if (kind === 'dependency' && s.number === to) {
+          const dep = new Set([...(s.routing?.depends_on ?? []), from]);
+          return { ...s, routing: { ...(s.routing ?? {}), depends_on: [...dep] } };
+        }
+        if (kind === 'failure' && s.number === from) {
+          return { ...s, on_failure: { goto: { step: to } } };
+        }
+        return s;
+      });
+      return { ...d, steps };
+    });
+  }, []);
 
   const refreshList = useCallback((selectName?: string) => {
     return listSops()
@@ -766,6 +809,12 @@ export default function Sops() {
     };
   }, [selected, runId]);
 
+  const runStateByStep = useMemo(() => {
+    const map = new Map<number, NodeRunState>();
+    for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
+    return map;
+  }, [overlay]);
+
   const editorHandlers = draft
     ? {
         onField: (patch: Partial<Sop>) => setDraft((d) => (d ? { ...d, ...patch } : d)),
@@ -814,18 +863,30 @@ export default function Sops() {
         </Card>
       ) : null}
       {draft && editorHandlers ? (
-        <SopEditor
-          draft={draft}
-          saving={saving}
-          saveError={saveError}
-          onField={editorHandlers.onField}
-          onStep={editorHandlers.onStep}
-          onAddStep={editorHandlers.onAddStep}
-          onRemoveStep={editorHandlers.onRemoveStep}
-          onMoveStep={editorHandlers.onMoveStep}
-          onSave={onSaveDraft}
-          onCancel={() => setDraft(null)}
-        />
+        <div className="space-y-4">
+          <SopCanvas
+            draft={draft}
+            selectedStep={selectedStep}
+            runStateByStep={runStateByStep}
+            onSelectStep={setSelectedStep}
+            onAddStep={editorHandlers.onAddStep}
+            onConnect={onConnect}
+          />
+          <SopEditor
+            draft={draft}
+            saving={saving}
+            saveError={saveError}
+            selectedStep={selectedStep}
+            onSelectStep={setSelectedStep}
+            onField={editorHandlers.onField}
+            onStep={editorHandlers.onStep}
+            onAddStep={editorHandlers.onAddStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+            onSave={onSaveDraft}
+            onCancel={() => setDraft(null)}
+          />
+        </div>
       ) : loading ? (
         <Card>
           <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />

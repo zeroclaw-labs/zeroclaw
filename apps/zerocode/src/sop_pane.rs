@@ -66,7 +66,7 @@ struct SopEditorState {
     field: StepField,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum EditorFocus {
     Name,
     Steps,
@@ -450,8 +450,17 @@ impl SopPane {
                     self.load_selected_graph().await;
                     return;
                 }
-                if self.node_rects.iter().any(|(_, r)| in_rect(col, row, *r)) {
-                    self.open_editor_for_selected().await;
+                if let Some((step, _)) = self
+                    .node_rects
+                    .iter()
+                    .find(|(_, r)| in_rect(col, row, *r))
+                    .copied()
+                {
+                    if self.editor.is_some() {
+                        self.focus_editor_step(step);
+                    } else {
+                        self.open_editor_for_step(step).await;
+                    }
                 }
             }
             MouseEventKind::ScrollUp => self.select_prev(),
@@ -474,6 +483,23 @@ impl SopPane {
             },
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    /// Move the editor's focus to the step whose `number` matches `step`, so a
+    /// click on that node's card in the visual layer selects it for editing.
+    fn focus_editor_step(&mut self, step: u32) {
+        if let Some(ed) = self.editor.as_mut()
+            && let Some(idx) = ed.draft.steps.iter().position(|s| s.number == step)
+        {
+            ed.focus = EditorFocus::Steps;
+            ed.step_cursor = idx;
+        }
+    }
+
+    /// Open the selected SOP for editing and immediately focus the clicked step.
+    async fn open_editor_for_step(&mut self, step: u32) {
+        self.open_editor_for_selected().await;
+        self.focus_editor_step(step);
     }
 
     async fn delete_selected(&mut self) {
@@ -1363,6 +1389,48 @@ mod tests {
         })
         .await;
         assert_eq!(pane.list_state.selected(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn click_node_while_editing_focuses_that_step() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        let mut draft = SopDraft::default();
+        draft.name = "demo".into();
+        draft.steps = vec![
+            SopStep {
+                number: 1,
+                title: "one".into(),
+                ..Default::default()
+            },
+            SopStep {
+                number: 2,
+                title: "two".into(),
+                ..Default::default()
+            },
+            SopStep {
+                number: 3,
+                title: "three".into(),
+                ..Default::default()
+            },
+        ];
+        pane.editor = Some(SopEditorState::from_draft(false, draft));
+        pane.node_rects = vec![
+            (1, Rect::new(1, 1, 20, 4)),
+            (2, Rect::new(1, 5, 20, 4)),
+            (3, Rect::new(1, 9, 20, 4)),
+        ];
+        pane.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 6,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+        .await;
+        let ed = pane.editor.as_ref().expect("editor open");
+        assert_eq!(ed.focus, EditorFocus::Steps);
+        assert_eq!(ed.step_cursor, 1);
     }
 
     #[test]
