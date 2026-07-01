@@ -323,6 +323,9 @@ impl PostgresMemory {
                 .unwrap_or_else(|_| "default".into()),
             importance: row.try_get("importance").ok(),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: row.try_get("agent_alias").ok(),
             agent_id: row.try_get("agent_id").ok(),
         })
