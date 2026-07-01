@@ -88,6 +88,8 @@ pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 #[cfg(feature = "channel-wecom-ws")]
 pub use crate::wecom_ws::WeComWsChannel;
+#[cfg(feature = "channel-wecom-ws")]
+use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -6648,30 +6650,26 @@ fn build_channel_by_id(
                 config.channels.wecom_ws.get(&alias).with_context(|| {
                     format!("WeCom WebSocket channel '{alias}' is not configured")
                 })?;
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
-                let configured_allowed_users = wc.allowed_users.clone();
+                let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut peers = configured_allowed_users.clone();
-                    for peer in config.channel_external_peers("wecom-ws", &alias) {
-                        if !peers.contains(&peer) {
-                            peers.push(peer);
-                        }
+                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
+                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+
+                    if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
+                        WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
+                    } else {
+                        WeComWsRuntimePolicy::from_config(&snapshot, external_peers)
                     }
-                    for peer in config.channel_external_peers("wecom_ws", &alias) {
-                        if !peers.contains(&peer) {
-                            peers.push(peer);
-                        }
-                    }
-                    peers
                 })
             };
             Ok(Arc::new(WeComWsChannel::new_with_alias(
                 wc,
                 alias.clone(),
-                peer_resolver,
+                policy_resolver,
                 &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
             )?))
         }
@@ -8537,30 +8535,26 @@ fn collect_configured_channels(
         if !wc_ws.enabled {
             continue;
         }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
-            let configured_allowed_users = wc_ws.allowed_users.clone();
+            let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut peers = configured_allowed_users.clone();
-                for peer in config.channel_external_peers("wecom-ws", &alias) {
-                    if !peers.contains(&peer) {
-                        peers.push(peer);
-                    }
+                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
+                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+
+                if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
+                    WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
+                } else {
+                    WeComWsRuntimePolicy::from_config(&snapshot, external_peers)
                 }
-                for peer in config.channel_external_peers("wecom_ws", &alias) {
-                    if !peers.contains(&peer) {
-                        peers.push(peer);
-                    }
-                }
-                peers
             })
         };
         match WeComWsChannel::new_with_alias(
             wc_ws,
             alias.clone(),
-            peer_resolver,
+            policy_resolver,
             &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
         ) {
             Ok(channel) => channels.push(ConfiguredChannel {

@@ -210,12 +210,40 @@ impl SimpleIdempotencyStore {
 #[derive(Clone)]
 struct WeComRuntimeConfig {
     workspace_dir: PathBuf,
-    allowed_groups: Vec<String>,
-    bot_name: Option<String>,
+    // Connection/resource settings are captured when the channel is built; config
+    // changes for these require a channel rebuild/reconnect to take effect.
     file_retention_days: u32,
     max_file_size_bytes: u64,
     stream_mode: StreamMode,
     proxy_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WeComWsRuntimePolicy {
+    allowed_users: Vec<String>,
+    allowed_groups: Vec<String>,
+    bot_name: Option<String>,
+}
+
+impl WeComWsRuntimePolicy {
+    pub(crate) fn from_config(
+        config: &WeComWsConfig,
+        external_peers: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut allowed_users = normalize_wecom_allowlist(config.allowed_users.clone());
+        for peer in external_peers {
+            let peer = normalize_wecom_identity(&peer);
+            if !peer.is_empty() && !allowed_users.contains(&peer) {
+                allowed_users.push(peer);
+            }
+        }
+
+        Self {
+            allowed_users,
+            allowed_groups: normalize_wecom_allowlist(config.allowed_groups.clone()),
+            bot_name: normalize_optional_wecom_identity(config.bot_name.as_deref()),
+        }
+    }
 }
 
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
@@ -263,7 +291,7 @@ pub struct WeComWsChannel {
     bot_id: String,
     secret: String,
     alias: String,
-    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync>,
     cfg: WeComRuntimeConfig,
     client: reqwest::Client,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
@@ -279,19 +307,18 @@ pub struct WeComWsChannel {
 
 impl WeComWsChannel {
     pub fn new(config: &WeComWsConfig, workspace_dir: &Path) -> Result<Self> {
-        let allowed_users = normalize_wecom_allowlist(config.allowed_users.clone());
         Self::new_with_alias(
             config,
             "default",
-            Arc::new(move || allowed_users.clone()),
+            Self::static_policy_resolver(config),
             workspace_dir,
         )
     }
 
-    pub fn new_with_alias(
+    pub(crate) fn new_with_alias(
         config: &WeComWsConfig,
         alias: impl Into<String>,
-        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync>,
         workspace_dir: &Path,
     ) -> Result<Self> {
         if config.stream_mode == StreamMode::MultiMessage {
@@ -311,11 +338,9 @@ impl WeComWsChannel {
             bot_id: config.bot_id.clone(),
             secret: config.secret.clone(),
             alias: alias.into(),
-            peer_resolver,
+            policy_resolver,
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
-                allowed_groups: normalize_wecom_allowlist(config.allowed_groups.clone()),
-                bot_name: normalize_optional_wecom_identity(config.bot_name.as_deref()),
                 file_retention_days: config.file_retention_days,
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
                 stream_mode: config.stream_mode,
@@ -329,6 +354,13 @@ impl WeComWsChannel {
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn static_policy_resolver(
+        config: &WeComWsConfig,
+    ) -> Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync> {
+        let policy = WeComWsRuntimePolicy::from_config(config, std::iter::empty());
+        Arc::new(move || policy.clone())
     }
 
     async fn wait_for_ws_sender(&self) -> Result<mpsc::Sender<WsOutbound>> {
@@ -457,8 +489,8 @@ impl WeComWsChannel {
     }
 
     fn access_decision(&self, inbound: &ParsedInbound) -> AccessDecision {
-        let allowed_users = normalize_wecom_allowlist((self.peer_resolver)());
-        evaluate_access_decision(&allowed_users, &self.cfg.allowed_groups, inbound)
+        let policy = (self.policy_resolver)();
+        evaluate_access_decision(&policy.allowed_users, &policy.allowed_groups, inbound)
     }
 
     fn compose_content_for_framework(&self, inbound: &ParsedInbound, normalized: &str) -> String {
@@ -466,7 +498,8 @@ impl WeComWsChannel {
     }
 
     fn message_explicitly_addresses_bot(&self, inbound: &ParsedInbound, normalized: &str) -> bool {
-        message_explicitly_addresses_bot(inbound, normalized, self.cfg.bot_name.as_deref())
+        let policy = (self.policy_resolver)();
+        message_explicitly_addresses_bot(inbound, normalized, policy.bot_name.as_deref())
     }
 
     async fn respond_access_denied(
@@ -3083,6 +3116,78 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
         }
+    }
+
+    #[test]
+    fn runtime_policy_normalizes_config_and_external_peers() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_users = vec![" user-1 ".to_string(), "".to_string()];
+        config.allowed_groups = vec![" group-1 ".to_string()];
+        config.bot_name = Some(" danya ".to_string());
+
+        let policy = WeComWsRuntimePolicy::from_config(
+            &config,
+            vec![
+                "user-1".to_string(),
+                " external-1 ".to_string(),
+                "".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            policy.allowed_users,
+            vec!["user-1".to_string(), "external-1".to_string()]
+        );
+        assert_eq!(policy.allowed_groups, vec!["group-1".to_string()]);
+        assert_eq!(policy.bot_name.as_deref(), Some("danya"));
+    }
+
+    #[test]
+    fn channel_access_uses_live_runtime_policy() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_users = vec!["user-1".to_string()];
+        let policy = Arc::new(Mutex::new(WeComWsRuntimePolicy::from_config(
+            &config,
+            std::iter::empty(),
+        )));
+        let policy_resolver = {
+            let policy = policy.clone();
+            Arc::new(move || policy.lock().clone())
+        };
+        let channel =
+            WeComWsChannel::new_with_alias(&config, "primary", policy_resolver, Path::new("/tmp"))
+                .unwrap();
+        let inbound = test_inbound("group", Some("group-1"), "blocked-user");
+
+        assert_eq!(channel.access_decision(&inbound), AccessDecision::Denied);
+
+        policy.lock().allowed_groups = vec!["group-1".to_string()];
+
+        assert_eq!(channel.access_decision(&inbound), AccessDecision::Allowed);
+    }
+
+    #[test]
+    fn channel_bot_addressing_uses_live_runtime_policy() {
+        let mut config = test_wecom_ws_config();
+        config.bot_name = Some("danya".to_string());
+        let policy = Arc::new(Mutex::new(WeComWsRuntimePolicy::from_config(
+            &config,
+            std::iter::empty(),
+        )));
+        let policy_resolver = {
+            let policy = policy.clone();
+            Arc::new(move || policy.lock().clone())
+        };
+        let channel =
+            WeComWsChannel::new_with_alias(&config, "primary", policy_resolver, Path::new("/tmp"))
+                .unwrap();
+        let inbound = test_inbound("group", Some("group-1"), "user-1");
+
+        assert!(channel.message_explicitly_addresses_bot(&inbound, "@danya say hi"));
+
+        policy.lock().bot_name = Some("otherbot".to_string());
+
+        assert!(!channel.message_explicitly_addresses_bot(&inbound, "@danya say hi"));
     }
 
     #[test]
