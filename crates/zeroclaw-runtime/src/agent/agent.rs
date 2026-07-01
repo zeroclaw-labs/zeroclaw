@@ -1739,16 +1739,9 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
+                Some(Arc::new(crate::hooks::HookRunner::from_config(
+                    &config.hooks,
+                )))
             } else {
                 None
             })
