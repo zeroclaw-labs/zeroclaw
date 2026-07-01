@@ -50,7 +50,7 @@ use crate::client::{
     QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
 };
 use crate::theme;
-use crate::widgets::{HelpEntry, HelpNode};
+use crate::widgets::HelpNode;
 use crate::wire::{
     AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryBackendKind as MemoryKind,
     ModelProviderChoice, SelectorChoice,
@@ -198,7 +198,7 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
 }
 
 fn synth_enter() -> KeyEvent {
-    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE) // keyguard: bridges a mouse click to the canonical submit key for replay
 }
 
 fn queue_apply_handoff(
@@ -936,18 +936,14 @@ impl QuickstartPane {
     }
 
     pub fn help_context(&self) -> HelpNode {
-        HelpNode::entries(vec![
-            HelpEntry::new(
-                vec!["j", "k", "↑/↓"],
-                crate::i18n::t("zc-quickstart-help-move"),
-            ),
-            HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
-            HelpEntry::key(
-                "c",
-                crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
-            ),
-            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
-        ])
+        use crate::keymap::QuickstartTabAction as Q;
+        HelpNode::entries(crate::help::entries_for([
+            Q::Up,
+            Q::Down,
+            Q::Enter,
+            Q::Create,
+            Q::Back,
+        ]))
     }
 
     pub fn wants_text_input(&self) -> bool {

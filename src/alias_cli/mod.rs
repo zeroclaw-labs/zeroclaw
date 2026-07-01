@@ -20,10 +20,6 @@ use zeroclaw_config::alias_refs::{
 };
 use zeroclaw_config::schema::Config;
 
-/// The agent alias reserved as the runtime fallback — protected from delete
-/// (rename is already guarded inside `rename_with_cascade`).
-const RESERVED_DEFAULT_AGENT: &str = "default";
-
 /// Resolve a `cli-*` Fluent key for alias-CRUD CLI output. Under `agent-runtime`
 /// (default + what CI/release build) this routes through Fluent; without it the
 /// runtime i18n crate is absent, so the English `fallback` is used.
@@ -117,10 +113,22 @@ fn list_section(config: &Config, section: &str) -> Result<()> {
 }
 
 fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
-    if config
-        .create_map_key(section, alias)
-        .map_err(anyhow::Error::msg)?
-    {
+    // Shared guarded boundary: refuses the reserved `default` agent here too (an
+    // operator create surface), and delegates unchanged for every other section.
+    // The Reserved rejection is localized via Fluent like the delete/rename guards
+    // below; Invalid (unknown section) keeps its pre-existing bare error.
+    let created = match alias_refs::create_map_key_checked(config, section, alias) {
+        Ok(created) => created,
+        Err(alias_refs::CreateError::Reserved(_)) => bail!(
+            "{}",
+            mt(
+                "cli-alias-create-reserved-default",
+                "the `default` agent is reserved and cannot be created"
+            )
+        ),
+        Err(alias_refs::CreateError::Invalid(msg)) => return Err(anyhow::Error::msg(msg)),
+    };
+    if created {
         config.mark_dirty(&format!("{section}.{alias}"));
         println!(
             "{}",
@@ -382,7 +390,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             dry_run,
             yes,
         } => {
-            if alias == RESERVED_DEFAULT_AGENT {
+            if alias_refs::is_reserved_agent_alias(&alias) {
                 bail!(
                     "{}",
                     mt(
@@ -448,6 +456,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
+                Some(&config.providers.models),
             )
             .context("open memory backend for the owned-state cascade")?,
         )

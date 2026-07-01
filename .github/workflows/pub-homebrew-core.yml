@@ -52,6 +52,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate Homebrew publish access
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${BOT_FORK_REPO:-}" ]]; then
+            echo "::error::Repository variable HOMEBREW_CORE_BOT_FORK_REPO is required when dry_run=false."
+            exit 1
+          fi
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Repository secret HOMEBREW_UPSTREAM_PR_TOKEN or HOMEBREW_CORE_BOT_TOKEN is required when dry_run=false."
+            exit 1
+          fi
+          if [[ "$BOT_FORK_REPO" != */* ]]; then
+            echo "::error::HOMEBREW_CORE_BOT_FORK_REPO must be in owner/repo format."
+            exit 1
+          fi
+          if ! gh api "repos/${BOT_FORK_REPO}" >/dev/null 2>&1; then
+            echo "::error::Configured Homebrew token cannot access ${BOT_FORK_REPO}."
+            exit 1
+          fi
+          if ! gh api "repos/${BOT_FORK_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
+            echo "::error::Configured Homebrew token cannot prove push access to ${BOT_FORK_REPO}. Update the token or HOMEBREW_CORE_BOT_FORK_REPO before running a non-dry-run release."
+            exit 1
+          fi
+
       - name: Validate release tag and version alignment
         id: release_meta
         shell: bash
@@ -119,7 +148,7 @@ jobs:
               exit 1
             fi
             if [[ -z "${HOMEBREW_CORE_BOT_TOKEN}" ]]; then
-              echo "::error::Repository secret HOMEBREW_CORE_BOT_TOKEN is required when dry_run=false."
+              echo "::error::Repository secret HOMEBREW_UPSTREAM_PR_TOKEN or HOMEBREW_CORE_BOT_TOKEN is required when dry_run=false."
               exit 1
             fi
             if [[ "$BOT_FORK_REPO" != */* ]]; then
@@ -127,7 +156,7 @@ jobs:
               exit 1
             fi
             if ! gh api "repos/${BOT_FORK_REPO}" >/dev/null 2>&1; then
-              echo "::error::HOMEBREW_CORE_BOT_TOKEN cannot access ${BOT_FORK_REPO}."
+              echo "::error::Configured Homebrew token cannot access ${BOT_FORK_REPO}."
               exit 1
             fi
             gh repo clone "${BOT_FORK_REPO}" "$tmp_repo/homebrew-core" -- --depth=1
@@ -211,12 +240,6 @@ jobs:
           repo_dir="${TMP_REPO}/homebrew-core"
           fork_owner="${BOT_FORK_REPO%%/*}"
           bot_email="${BOT_EMAIL:-${fork_owner}@users.noreply.github.com}"
-
-          # Pre-flight: verify token has push access to the fork
-          # Note: classic PATs may not return .permissions on forked repos; treat as warning, not hard fail.
-          if ! gh api "repos/${BOT_FORK_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
-            echo "::warning::Could not confirm push access to ${BOT_FORK_REPO} via API (classic PATs may not report fork permissions). Attempting push anyway."
-          fi
 
           git -C "$repo_dir" config user.name "$fork_owner"
           git -C "$repo_dir" config user.email "$bot_email"

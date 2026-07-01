@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
@@ -27,6 +28,7 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
+pub mod external_content;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 pub mod iam_policy;
@@ -57,6 +59,12 @@ pub use detect::{SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+#[allow(unused_imports)]
+pub use external_content::{
+    ContentSafety, FramingPolicy, OutboundPolicy, ScanOutcome, ScanPolicy, ScreenVerdict,
+    cap_untrusted, frame_untrusted, new_marker_id, sanitize_untrusted, scan_untrusted,
+    scrub_outbound,
+};
 // Universal ingress policy front door (RFC #6971)
 #[allow(unused_imports)]
 pub use ingress::{IngressPolicy, ingress_policy};
@@ -79,6 +87,17 @@ pub use nevis::{NevisAuthProvider, NevisIdentity};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
+
+/// Scrub credential leaks from arbitrary text before it crosses into a log
+/// record or any other sink. Routes through the global [`LeakDetector`] so
+/// every known credential shape is redacted in one place rather than via
+/// per-callsite regexes. Clean input is returned unchanged.
+pub fn scrub(text: &str) -> String {
+    match LeakDetector::new().scan(text) {
+        LeakResult::Clean => text.to_string(),
+        LeakResult::Detected { redacted, .. } => redacted,
+    }
+}
 
 /// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.

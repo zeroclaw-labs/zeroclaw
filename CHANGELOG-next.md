@@ -1,176 +1,234 @@
-# ZeroClaw v0.8.1
+# ZeroClaw v0.8.2
 
-ZeroClaw v0.8.1 is the first patch release on the v0.8.x line, focused on stabilizing the multi-agent runtime, channels, and provider stack that landed in v0.8.0. It spans 207 commits from 45 contributors since v0.8.0 — heavy on bug fixes (123), with substantial new features (46) including a delete/rename-with-cascade configuration story, Discord slash commands derived from installed skills, an OpenAI-compatible cached-input pricing path, and a Phase 0 agent eval harness.
-
-If you upgraded to v0.8.0 and hit rough edges with channel routing, cron delivery, provider replay, or config save round-trips, this is the release that picks those up.
+ZeroClaw v0.8.2 opens up two new front doors: **A2A agent discovery** for agent-to-agent interop and a richer **skills** story (user-configured extra registries, typed slash-command options). Underneath, the release sharpens ZeroClaw's security posture across plugins, channels, and the SOP runtime, lands a durable run/task control plane, and broadens channel surfaces (Discord interaction components, Slack attachments, WhatsApp group allowlists). It spans 152 commits from 31 contributors. Much of this is invisible at the surface and shows up as fewer leaks, fewer duplicate launches, and turns that behave the same on every transport.
 
 ## Highlights
 
-- **Cascading config edits**: `delete_with_cascade` and `rename_with_cascade` now ripple through agents, providers, channels, model providers, and skill bundles instead of leaving dangling references (#7837, #7838, #7839, #7830, #7840, #7841, #7842, #7785).
-- **Discord skill-driven slash commands**: dynamic slash commands generated from installed skills, with typed options, chunked interaction followups, edit/delete/bulk-delete archive sync, and configurable reaction recording (#7490, #7489, #7525, #7526, #7844).
-- **[Operator Console redesign](https://docs.zeroclawlabs.ai/master/en/gateway/web-dashboard.html)**: the gateway web UI ships a schema-driven config editor, multi-agent chat, read-only skills browser, and a long list of ported fixes (#7665, #6700).
-- **Cached-input pricing for OpenAI-compatible providers**: cost tracking now captures `cached_input_tokens` for any provider that reports them, including OpenRouter system-prompt caching (#7492, #7634).
-- **Phase 0 agent eval harness**: deterministic replay-driven evaluation lands as the foundation for the eval story going forward (#7067).
-- **Workflow hardening for releases and docs**: a canonical install spec drives every generated installer surface (#7558), gh-pages becomes ephemeral with bounded clone size (#7676), and rustdoc is published once and deduped per locale (#7754).
+- **A2A agent discovery** (#7763): agents can describe and discover one another over the gateway, opening up agent-to-agent interop.
+- **Richer skills story**: user-configured extra skill registries via `registry:<name>/<skill>` (#7827) and typed slash-command options in SKILL.md frontmatter (#8021).
+- Installation now adds `zeroclaw` to PATH automatically with a `--no-modify-path` opt-out (#8038).
+- Untrusted inbound content is now framed and sanitized before a model ever sees it, both through the new universal ingress policy layer and SOP trigger-payload framing.
+- A new durable run/task control plane backs SOP run-state, live run metrics, and delegate/subagent supervision in SQLite.
+- Plugins gained an SSRF guard on `zc_http_request`, per-alias config scoping, and removal of raw environment access.
+- Discord channels picked up interaction components (buttons, selects, modals, autocomplete, buttoned approval) and rich outbound embeds.
+- The Telegram bot token and similar secrets are now redacted through the canonical global leak detector instead of channel-local regexes.
 
-## What's New
+## Security
 
-### Multi-agent and config
+ZeroClaw treats every inbound payload as untrusted and tightens the seams an attacker would reach for.
 
-- Typed `delete_with_cascade` and `rename_with_cascade` for aliased entries thread through agents, channels, model providers, and skill bundles, with a `find_all_references` / `plan_delete` foundation under the hood (#7785, #7837, #7838, #7839, #7830, #7840, #7841, #7842).
-- Per-agent delegate roster with cross-profile reach (#7590).
-- Type-driven alias-ref pickers and self-declaring config enums in the Config menu, plus declarative section grouping (#7556, #7594).
-- Agent eval harness — Phase 0 with deterministic replay (#7067).
+- **Universal ingress policy layer** (#7997): every inbound turn passes one SOP-backed policy layer before a model sees it, on every transport including mid-turn steering injections. Always on, default disposition is Loop, behavior identical until a Gate is configured.
+- **SOP trigger-payload framing** (#8215): MQTT and webhook trigger topics and payloads are capped, sanitized, and framed in untrusted-content markers behind a security notice, so an injected event cannot forge instructions into the step context.
+- **Plugin SSRF guard** (#8128): `zc_http_request` now blocks SSRF, including DNS-rebinding and redirect bypasses, with the host classifier moved to infra.
+- **Plugin config isolation** (#8137): plugin config is scoped per-alias, raw env access is removed, and caller-supplied `__config` is stripped before injection.
+- **Telegram token redaction** (#8127): every Telegram error site routes through the canonical leak detector, which gained a `/bot<id>:<token>` pattern, closing token leaks via reqwest error Display.
+- **MCP tool scoping** (#8120): MCP tools are scoped per-agent and the denylist is enforced across all connect sites, including the gateway.
+- **Principal type and AuthProvider seam** (#8063): the shared authenticated-subject contract and pluggable inbound-auth seam from RFC #7141 land with no production call sites yet, so runtime behavior is unchanged.
+- **HMAC tool receipts** (#8009): HMAC tool receipts are wired through the ACP, gateway WS, and CLI turn paths.
+- **WhatsApp MAC storage** (#7912): app-state mutation MACs are stored raw rather than JSON-wrapped, fixing a verification regression.
+- **Authenticated self-test probe** (#7732): the websocket handshake probe now authenticates instead of relying on an unauthenticated path.
+- **A2A task auth** (#8274): A2A task invocation now requires auth while discovery cards stay public.
+- **Delegate sub-tool gating** (#8284): delegate sub-tools run under the parent's SecurityPolicy.
 
-### Channels
+## Gateway
 
-- **Discord**: dynamic slash commands derived from installed skills, dispatched over the existing Gateway WebSocket, with typed options and chunked interaction followups (#7489, #7490, #7844). Inbound reactions are recorded behind a scope config (#7526). Archive syncs on message edit, delete, and bulk delete (#7525). Gateway intents are derived from config instead of hardcoded (#7524). The internals were split into a module tree behind a structured outgoing payload (#7832), and Discord is now part of the default-channels bundle (#7825).
-- **Slack**: backfills thread context on first agent encounter (#6428).
-- **Email**: XOAUTH2 auth, observer mode, and read-only IMAP tools (#7021).
-- **WhatsApp**: Web media markers are sent natively (#7811).
-- **Voice pipeline facade** for channels that want to plug into audio I/O (#7394).
+- A2A agent discovery surface (#7763).
+- xAI OAuth login support (#7945).
+- Email-login subcommand for OAuth2 email channel auth (#8008).
+- Device registration on legacy `/pair` with backfill of orphaned paired tokens (#7993).
+- Agent rename is persisted before owned state is moved (#7940).
+- The gateway drains before RPC reload (#8104).
+- Dashboard Skills page reflects an agent's effective skills (#7963).
+- Provider and channel alias deletes cascade through referencing surfaces (#8074).
+- The reserved `default` agent cannot be created across operator surfaces (#8098).
+- Option-backed tunnel providers surface in the picker (#8026).
+- `enabled` is accepted on `CronPatchBody` for pause and resume, with the agent check scoped to shell-command patches (#7666).
 
-### Providers and runtime
+## Skills
 
-- Cached input token pricing surfaces for OpenAI-compatible providers (#7492); OpenRouter system prompts are cached (#7634).
-- NEAR AI Cloud provider added (#6842); Azure OpenAI gains a dedicated `reasoning_effort` wire-up (#7350); `extra_body` is supported on any OpenAI-compatible provider (#7163); custom inference providers can specify `tls_ca_cert_path` (#5797).
-- Provider Manifest is re-added under the schema v3 provider system (#7791).
-- MCP auto-reconnects on stale session or dropped stream (#7351).
-- The three legacy agent turn engines consolidate onto a single `run_tool_call_loop` path (#7540).
+- User-configured extra skill registries via `registry:<name>/<skill>` (#7827).
+- Typed slash-command options in SKILL.md frontmatter (#8021).
+- `ZEROCLAW_SESSION_ID` exposed to skill shell tools (#8035).
+- Plugin-bundled and bundled skills load via `read_skill` (#7245).
+- `truncate_output` guards against UTF-8 char boundaries (#7962).
 
-### Gateway, web, and CLI
+## Install and Update
 
-- Inbound webhooks route per channel alias (#7367).
-- Web chat input supports slash commands (#7223).
-- Agents/providers/channels CRUD lands in the CLI with skill-bundle cascade (#7842).
-- Gateway: agent owned-state rename/delete cascade and wiring (#7838, #7841).
+- `zeroclaw` is added to PATH automatically, with a `--no-modify-path` opt-out (#8038).
+- Windows self-update repaired and the update pipeline hardened (#7853).
+- Intel versus Apple Silicon detection for the prebuilt target triple (#8096).
 
-### zerocode and security
+## Runtime and Engine
 
-- New doctor pane in zerocode (#7802); session controls and provider diagnostics improvements (#7515).
-- `models list`/`doctor` lists configured models, adds `--check`, and collapses probe rows (#7450).
-- Agent posture status command (#7321).
-- Shell tools see the current session id via the `ZEROCLAW_SESSION_ID` environment variable (#7813).
+- Durable run/task control plane with delegate and subagent supervision (#8217).
+- `ResolvedAgentExecution::resolve` routes the production turn paths (#8179), with per-agent ToolLoop fields bundled into it (#8156) and the loop args bundled into a ToolLoop struct (#7969).
+- History pruning and compression were removed in favor of a single whole-turn trim with a visible RPC event (#8196).
+- Self-contained context-compression summary provider (#7973).
+- System prompt refreshes on tool dispatcher swap (#8126).
+- Native and MCP tools are presented to reasoning models in the system prompt (#8053).
+- Streamed narration no longer duplicates before native tool calls (#8014).
+- Missing-skill suggestions are based on the effective tool set in the `process_message` path (#7819).
+- Cached extra registry skills are now suggested (#8185).
+- Agent-loop log events are categorized and verb-tagged (#8067).
+- Path-listing tool results are gated from vision routing (#7345); the no-vision capability error is scoped to the latest user image (#8180).
+- Config alias renames cascade safely across referencing surfaces (#8109).
+- Channel, `agent_alias` and `turn_id` propagate to agent lifecycle observer events (#7771).
+- Repeated shell approval loops are bounded (#7901).
+- Auto-approved tools are allowed on channels at non-Full autonomy (#7959).
 
-### Skills, plugins, and memory
+## SOP
 
-- Background review fork plus the `skill_manage` tool (agentskills.io SKILL.md) (#6667).
-- Frontmatter tags surface in the skill editor with a slash-command toggle (#7734).
-- Skill-directory loads are cached, content-validated, and audit-correct (#7786).
-- Wasmtime dependency and feature flags land for the plugin host (#7429).
-- Memory hygiene extends to pruning daily and core DB rows (#7081).
-- Runtime memory ops are instrumented with OTel GenAI spans (#7570).
+- Durable SQLite run-state store with live run metrics (#8206).
+- `SopRunStore` trait plus an in-memory backend as EPIC B scaffolding (#8001).
 
-### Build, install, and docs infrastructure
+## Plugins
 
-- Canonical install spec + `cargo generate installers` drives `setup.bat`, AUR PKGBUILD, Scoop manifest, `flake.nix`, Dockerfile/Containerfile feature sets, and `dev/ci/docker-tags.toml`, with an Installer Drift CI gate (#7558).
-- gh-pages becomes ephemeral with bounded clone size (#7676); rustdoc is published once and deduped per locale, with print pages dropped (#7754).
-- macOS and Windows build legs in CI run as `cargo check` to keep the matrix fast (#7669).
+- Plugin docs aligned with the WIT target (#8061), alongside the SSRF guard and per-alias config scoping covered under Security.
 
-### Improvements (refactor)
+## Channels
 
-- Extract duplicate domain/URL validation into shared helpers in `zeroclaw-tools` (#7340).
-- `before_llm_call` now takes mutable borrows, simplifying provider implementations (#7667).
+- **Discord**: interaction components including buttons, selects, modals, buttoned approval, and autocomplete (#7965); rich outbound embeds from `[EMBED:{...}]` markers (#7833); slash command localizations and guild scope (#7922).
+- **Slack**: outbound attachment uploads (#7170).
+- **WhatsApp**: per-JID `allowed_groups` group allowlist for Web mode (#7720).
+- **Lark**: restored outbound media markers (#8113).
+- Scope-selectable `/model` overrides (user or agent) for chat channels (#7998).
+- Tool-result content is preserved when proactively trimming channel history (#8050).
+- Bound channels are suppressed when their owning agent is disabled (#8051).
+- Voice channels no longer cache config-derived `static_voice_peers` on the channel handle (#7982).
+- **Matrix**: restored room management tool (#8068).
+- Per-sender `/thinking` overrides restored (#8011).
+- Re-loadable media refs preserved in cached history (#8153).
+- `refreshed_new_session_system_prompt` loads bundled skills (#8203).
+- **ACP elicitation (multiple-choice)**: agent-driven `ask_user` and `poll` calls now use the ACP [`elicitation/create`](https://agentclientprotocol.com/protocol/schema) method (form mode, enum schema) when the client advertises `elicitation.form` in `initialize.clientCapabilities`. Clients that don't yet advertise the capability keep using the existing `session/request_permission` path with no behaviour change. The Zerocode TUI advertises the capability, and its Code tab renders an interactive single-/multi-select modal (↑/↓ to move, Space to toggle for multi-select, Enter to confirm, Esc to cancel) that answers the daemon over the same `elicitation/create` wire format — making the Code tab a strict superset of the external ACP channel. Note that multiple-choice elicitation is currently a draft in the ACP spec and no external editor (Zed included) implements the client half yet, so the external-channel path is exercised today only by the Zerocode Code tab. Free-form text and URL mode are not implemented and remain follow-up work.
 
-### Documentation
+## Web and Dashboard
 
-- First-party extension architecture guide for contributors (#7788).
-- Fluent strings and mdbook translation catalogs refreshed for v0.8.1 (#7939).
-- Discussions stewardship and issue intake forms for governance (#7654, #7652).
-- API events stream semantics for the gateway (#7474); ACP wire shape pinned to v1 spec (#7595); MCP tool control boundaries clarified (#7473).
-- Rootless Debian compose example for the container (#7475); Linux uninstall script in setup docs (#7715); OpenAI Codex over a ChatGPT subscription documented for providers (#7116).
-- README installer options synced (#7708) and the providers routing link fixed (#7185).
+- Themed click-to-open config pickers via a Select primitive (#8086).
+- Component-health fix-in-place modal (#8087).
+- Config-alias rename plus delete cascade preview (#7919).
+- Config drift conflict surfaced on the enable and disable toggle (#8042).
 
-### Performance
+## ZeroCode and TUI
 
-- Rustdoc published once with per-locale asset dedup (#7754).
-- WeChat markdown regex compilations cached via `LazyLock` (#7494).
-- Skill-directory loads cached with content validation (#7786).
+- Aliases and Costs tabs on the provider alias list (#8006).
+- Registry-driven pane help, themed code-fence syntax highlighting, per-fence copy, and unified split-pane config navigation (#8282).
+- Daemon version mismatch detection (#8192).
+- MCP initialized for Chat TUI sessions (#8199).
+- Active config directory surfaced in the Config header (#7999).
+- Approval overlay background filled (#7823).
+- Queue-paused hint skipped when the backlog is empty (#7857).
+- Chat surface refresh: mode bar and code-block chrome, browse-mode badge, and mouse click-to-copy (#8000).
+- Selected field is visually distinguished from the editable input (#7995).
+- Queue pauses when a turn is cancelled (#8214).
+- Browse mode enter/exit moved to alt+shift+up/down (#8166).
+
+## Cost and Budget
+
+- Budget config is reloadable instead of frozen at boot (#8004).
+- Model cost captured for RPC, zerocode TUI, and standalone ACP turns (#7953).
+- Agent turn costs are persisted (#7957).
+- Logs correlate by `trace_id` with per-call `cost_usd` recorded (#8065).
+- Opt-in LLM request payload capture, default off (#8066).
+
+## Knowledge and Memory
+
+- Client relationship graph actions restored (#8182).
+- Embedding key decoupled from the chat provider, surviving embed failures (#7942).
+- SQLite sessions are kept out of hygiene archives (#8318).
+
+## Presets
+
+- Balanced redefined as the trusted-local daily driver (#8133).
+- The yolo preset is fully unrestricted (#8281).
 
 ## Bug Fixes
 
 | Area | Fix |
 |---|---|
-| runtime | Route stdout diagnostics through logs (#7934); replay ACP session history in `session/messages` (#7903); credential redaction moved to the rendering layer (#7826); skip response-cache for `[IMAGE:]` multimodal markers (#7779); honor profile tool iteration limits (#7583); forward trimming budgets through the `agent_turn` wrapper (#7780); auto-include discovered MCP tools in `risk_profile.allowed_tools` (#7547); thread shared `CanvasStore` into WS chat and ACP sessions (#7678); resolve runtime profiles for direct turns (#7792); restore native sandbox hardening (#7683); detect no-progress loops across interleaved tool calls (#7681); redact unquoted base64 credentials (#7660); recover poisoned activated-tool lock reads (#7755); keep pruned tool markers out of live context (#7775); condition anti-narration on `show_tool_calls` (#7722); return no heartbeat runs for zero limit (#7721); route native tool narration to stderr (#7773); unify `SopEngine` construction (#7546); honor empty delegate allowed-tools (#7574); expose deferred MCP tools to delegates (#7608); route service commands to named instances (#7579); suppress skill suggestions for installed tools (#7406); clarify peer send targets (#6993); preserve delegate memory namespace (#7465); inherit ACP session cwd into `spawn_subagent` and `delegate` (#7517). |
-| zerocode | Refresh agent picker on Code/Chat tab re-entry (#7834); enforce RPC-only boundary by dropping `zeroclaw-providers` (#7850); grapheme-cluster cursor movement and backspace (#7765); localize config status messages (#7713); avoid hardcoded `vi` editor fallback (#7476); theme markdown body text (#7482); keep Cmd-C separate from quit on macOS (#7477). |
-| providers | Normalize Azure OpenAI credentials (#7703); retry email OAuth refresh failures (#7745); stop `reasoning_content` from leaking into response text (#7725); preserve structured Bedrock tool results (#7712); redact reliable error endpoints consistently (#7682); preserve compatible reasoning field name on multi-turn replay (#7423); cache OpenRouter system prompts (#7634); fail loudly for unusable fallback providers (#7419); resolve Gemini OAuth project from object and current-project shapes (#7560); remove dead pre-normalization image trim (#7782); honor configured OpenAI `timeout_secs` (#7504); trace native tool delivery decisions (#7933). |
-| channels | Dedupe QQ voice redeliveries (#7648); add per-channel `ack_reactions` override for Lark/Feishu (#7495); make Slack `bot_token` optional and resolve from env (#7726); persist Matrix thread history after first reply (#7705); require IRC mention boundaries (#7710); add clear-session command (#7671); Telegram base URL validation (#7697); stabilize missing email message ids (#7767); make Slack empty-peer-set rejections self-diagnose (#7567); skip reply-intent classifier on direct messages (#7564); WhatsApp as a cron delivery channel (#7562); select WhatsApp Web backend from personal/pairing config (#7565); WhatsApp Web forward quoted media attachments (#7536); telegram delivery prompt no longer discourages tool use (#7438); route cron email delivery through the no-registry fallback (#7561); AMQP `health_check` actually probes the broker (#7596); render web integration category labels (#7662); persist Discord slash reconcile state and read shared stores from `data_dir` (#7784); inject Lark/Feishu cron delivery defaults from chat context (#7448); render web agent's own model on agent chat page (#7381). |
-| acp | Surface history-pruner and turn-cancel as visible events (#7684). |
-| gateway | Suggest available port on bind conflict (#7801); surface pairing-code recovery when already paired on an alternate port (#7798); fail fast on free-form `ask_user` for the WS approval channel (#7551); route chat workspaces per agent (#7573); point paircode recovery hint at loopback for non-loopback binds (#7207). |
-| config | Align serde defaults with struct `Default` to prevent save round-trip loss (#7532); expose global channel settings in dashboard (#7651); trim legacy typed scalar strings (#7714); gate test-only `EnvValueGuard` on `cfg(unix)` (#7777); warn on extra-nested provider alias tables (#7580); redact bearer tokens in file-transfer header maps (#7566). |
-| memory | Drop postgres client on OS thread to avoid nested runtime panic (#7668); include recall windows in retrieval cache key (#7656); disable hot response cache at zero capacity (#7704); `purge_agent` resolves alias→id before deleting (#7781). |
-| tools | Reject binary/image files in default `file_read` (#7522); fix Claude Code execution on Windows (#7214); reject excessive round precision (#7716); default zero-minute polls (#7707); encode weather location path input (#7717); localize file download tool strings (#7480). |
-| skills | Parse skill review summary from tool history (#7730); distinct error when `skill_manage` patch is disabled (#6684); sanitize skill tool names to satisfy provider name regex (#7399); respect `timeout_secs` from `SKILL.toml` (#7552); update background review loop call (#7653). |
-| cron | Honor `session_target=main` with stable session path (#7731); correct weekday range normalization for Sunday-alias endpoints (#7208). |
-| i18n | Auto-detect system locale when none is configured (#7760); route remaining CLI status output through Fluent (#7499); localize remaining CLI quickstart strings (#7650) and provider selector prompts. |
-| install | Detect musl libc for Linux target triple (#7614); install web dashboard on source installs (#7554); validate agent/provider aliases at input time (#7609); bail with a clear error on non-TTY stdin (#7513). |
-| update | Accept `.zip` release assets on Windows targets (#7530); use `.tar.gz` for Windows assets in gnu-vs-android test (#7528). |
-| security | Create per-agent workspace dir in `for_agent`, plus Android shell support (#7284). |
-| docker | Include `zerocode` binary in release Docker images (#7789); add `g++` to web build layer for cc-rs C++ detection (#7534); add `vim-tiny` to runtime images for editor support (#7503). |
-| doctor | Surface `Config::collect_warnings` in diagnostics (#7727); ensure workspace doctor checks support multi-agents (#7544). |
-| daemon | Allow any configured channel as `heartbeat.target` (#7680). |
-| agent | Emit pending `tool_call` at dispatch so live cards render (#7778). |
-| sop | Wire audit logger into registered SOP tools (#7593). |
-| plugins | Align install/discovery paths and add legacy migration (#7549). |
-| whatsapp | `whatsapp_storage` returns `HashState::default()` when no app-state version row exists (#7806). |
-| cli | Preserve UTF-8 erase handling (#7672); flag configured channels missing from the binary (#7848). |
-| ci | Centralize Node.js version to `.nvmrc` with LTS 24 (#7550); narrow Kilo provider path label (#7812); unbreak master quality gate (#7696); cover Windows path and shell portability in tests (#7906). |
-| web | Force `js-yaml >=4.2.0` to patch merge-key DoS (#7761); correct chat model switcher resolution and switch timeout (#7191). |
-| docs | Clear rustdoc warnings surfaced by mdbook build (#7751); add `.nojekyll` so Pages serves `_shared/` chrome (#7568). |
-| web/integrations | Tighten Nextcloud Talk draft updates (#7572). |
+| config | Gate Android shell import on non-Windows (#8189) |
+| tools | Normalize Windows workspace-prefixed paths (#8114) |
+| tools | Resolve external coding tool `working_directory` from project root (#7967) |
+| tools/image | Expose stable attachment paths in image-generation output (#7985) |
+| tools/git_operations | Add recovery hint and path context to non-repository error (#7835) |
+| cron | Claim and release in-flight lock to prevent duplicate launches (#8107) |
+| model_switch | Resolve `list_models` from the live models.dev catalog with the hardcoded list as offline fallback (#8097) |
+| daemon | Handle file-descriptor exhaustion (EMFILE) in the IPC accept loop (#7983) |
+| providers | Strip assistant reasoning on outbound replay for Groq (#7616) |
+| providers | Enable vision support for the NVIDIA NIM provider (#8100) |
+| providers | Update the Kimi Code endpoint to api.kimi.com/coding/v1 (#8163) |
+| providers | Expose `replay_assistant_reasoning` and fallback tool-call handling (#8232) |
+| providers | Coalesce stripped compatible history roles (#7931) |
+| notion | Propagate header parse errors instead of unwrapping (#8147) |
+| browser | Repair WebDriver snapshot returns and CSS selector escaping (#7908) |
+| log | Make same-timestamp pagination deterministic via byte-offset cursor (#7921) |
+| tools | Add a content_search internal fallback (#8060) |
+| doctor | Pass Config to provider_validation_error for custom providers (#8084) |
+| config | Warn when `a2a.exposed_skills` resolves no skills (#8283) |
+| cli | Persist the model in config on `models set` instead of probing providers (#7094); refresh non-default channel guidance (#7955) |
+| web_fetch | `allowed_private_hosts = ["*"]` covers DNS-resolved private hosts (#7412) |
+| skills | Correct the "ClawhHub" typo in skill installer messages (#8262) |
+| docker | Keep Node base policy in container TOML (#8112); correct Node 24 digest pins (#7932); drop stale aardvark-sys build.rs COPY (#8092) |
 
-## Breaking Changes
+## Docs
 
-- **`feat(providers)!`: span attribution — model provider calls now route through the attribution dispatcher** (#7748). The dispatcher centralizes per-provider span attribution and is the only sanctioned path for model provider calls; downstream consumers of the provider call API may need to update if they were bypassing it.
+- Define the external integration boundary (#8184).
+- Rewrite and fix setup.bat known issues (#6102); fix dead Windows quick-start link breaking the docs build (#8085).
+- Move translation catalogues to a git submodule (#8169); avoid stale placeholder warning translations (#8194).
+- Align the extension point overview (#7880) and plugin docs with the WIT target (#8061).
+- Standardize label spelling (#8111); remove stale guild override wording (#8108).
+- Quiet rustdoc warning links (#8191).
+
+## CI and Tooling
+
+- Run the docs link gate in PR checks (#8197).
+- Build base Dockerfiles from source on container changes (#8093).
+- Drive container base pins from a canonical TOML (#8005).
+- Add an advisory cross-platform clippy workflow (#7885).
+- Stop the Kilo labeler matching shared provider files (#8106).
+- Pass the provider-dispatch gate and `--all-features` build on master (#8019).
+- Gate aardvark-sys behind the hardware feature (#8028); drop the unused rumqttc dependency (#8077); unyank bitcoin crates in Cargo.lock (#7992).
+
+## Tests
+
+- Pin hook panic recovery and cancellation propagation (#8041).
+- Regression for poisoned activated-tool lock recovery (#7845).
+- Cover blank-input turn rejection (#7859).
+- Cover storage-reader timestamp and ordering edge cases (#7916).
+- Make screenshot expectations platform-aware (#8183); make process fixtures portable on Windows (#7956).
+- Pin the system prompt in the cache-hit test to kill a date flake (#8036).
 
 ## Contributors
 
-@77382104
-@alanpjohn
-@alexandme
 @Alix-007
-@andybab
 @Audacity88
-@bheatwole
-@chengzhichao-xydt
 @ConYel
-@crh-code
 @danielO99
-@dvgamerr
-@dwc1997
-@fanchanghu
+@databillm
+@drbparadise
+@eldar702
+@FTDGRT
+@hanZeng-08
 @IftekharUddin
-@ilteoood
-@itripn
-@JieZeng1993
-@jokemanfire
+@joe2643
+@jokewithme110
 @JordanTheJet
-@jstar0
-@metalmon
-@mn13
+@legokichi
+@MaHaoHao-ch
+@mazhuima
 @mov-xound-glitch
 @Nillth
 @NiuBlibing
+@OmkumarSolanki
 @perlowja
 @Pick-cat
-@PierreLeGuen
-@rareba
-@rezigned
-@rifuki
 @RyanHoldren
 @sbenedetto
-@SebConejo
-@sentinel-nnet
-@silas-qiao
 @singlerider
-@theonlyhennygod
+@theredspoon
 @tidux
-@tmigone
-@tw-360vier
-@whiteyzy
+@wangmiao0668000666
 @xianshishan
-@Yyukan
+@yuxuan-7814
+@ZOOWH
 
----
-
-**Full diff:** [`v0.8.0...v0.8.1`](https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.0...v0.8.1)
+**Full diff:** https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.1...v0.8.2

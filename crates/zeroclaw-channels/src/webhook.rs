@@ -456,6 +456,8 @@ impl Channel for WebhookChannel {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
 
             if state.tx.send(msg).await.is_err() {
@@ -498,6 +500,15 @@ impl Channel for WebhookChannel {
         // Webhook channel is healthy if the port can be bound (basic check).
         // In practice, once listen() starts the server is running.
         true
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No back-channel to a generic webhook client for a typing signal.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

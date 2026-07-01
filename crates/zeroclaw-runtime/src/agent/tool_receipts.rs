@@ -130,6 +130,73 @@ pub struct ReceiptScope {
     pub collector: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+impl ReceiptScope {
+    /// Single source of truth for turning resolved receipt config into a live
+    /// scope. Returns `None` when receipts are disabled so each turn entrypoint
+    /// gates identically without duplicating the generator/collector glue.
+    pub fn from_config(config: &zeroclaw_config::schema::ToolReceiptsConfig) -> Option<Self> {
+        config
+            .enabled
+            .then(|| Self::with_generator(ReceiptGenerator::new()))
+    }
+
+    /// Wrap an existing generator with a fresh per-turn collector.
+    pub fn with_generator(generator: ReceiptGenerator) -> Self {
+        Self {
+            generator,
+            collector: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The generator reference for the explicit `ToolLoop.receipt_generator`
+    /// parameter. Threaded so the top-level loop signs each tool result.
+    pub fn generator(&self) -> &ReceiptGenerator {
+        &self.generator
+    }
+
+    /// The collector reference for the explicit `ToolLoop.collected_receipts`
+    /// parameter. Receives signed receipts for the duration of the turn.
+    pub fn collector(&self) -> &std::sync::Mutex<Vec<String>> {
+        &self.collector
+    }
+}
+
+/// Scope `TOOL_LOOP_RECEIPT_CONTEXT` around `fut` for the lifetime of one turn
+/// so delegate sub-loops forward receipts into the same per-turn collector.
+/// One seam shared by every entrypoint; a `None` scope is inert.
+pub async fn scope_receipts<F>(scope: Option<ReceiptScope>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_RECEIPT_CONTEXT.scope(scope, fut).await
+}
+
+/// Canonical system-prompt addendum that instructs the model to carry the
+/// `[receipt: ...]` field verbatim. Shared by every turn entrypoint so the
+/// instruction text never drifts between the channel orchestrator and the
+/// ACP/WS/CLI agent paths.
+pub const SYSTEM_PROMPT_ADDENDUM: &str = "\n## Tool Execution Receipts\n\n\
+     Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
+     signature proving the tool actually executed. You must include the receipt \
+     verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
+     A missing or invalid receipt indicates a fabricated tool call.\n\n";
+
+/// Render the trailing `Tool receipts:` block from a per-turn collector, or
+/// `None` when the collector is empty. Shared seam so the channel orchestrator
+/// and the agent turn paths emit byte-identical blocks.
+#[must_use]
+pub fn render_receipts_block(receipts: &[String]) -> Option<String> {
+    if receipts.is_empty() {
+        return None;
+    }
+    use std::fmt::Write as _;
+    let mut block = String::from("---\nTool receipts:");
+    for r in receipts {
+        let _ = write!(block, "\n  {r}");
+    }
+    Some(block)
+}
+
 tokio::task_local! {
     /// Set by the orchestrator when `[agent.tool_receipts] enabled = true`.
     /// `DelegateTool` reads this to forward receipts into sub-agent tool loops
