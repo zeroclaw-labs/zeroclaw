@@ -16,7 +16,7 @@ import { DraftContext, useDraftStore } from "./hooks/useDraft";
 import { getAdminPairCode, generatePairCode, PairCodeForbiddenError, getQuickstartState } from "./lib/api";
 import { basePath } from "./lib/basePath";
 import { ConfigDraftProvider } from "./lib/draftStore";
-import { setLocale, type Locale } from "./lib/i18n";
+import { setLocale, useLocale, type Locale } from "./lib/i18n";
 import { Router } from "./router/router";
 
 // Locale context
@@ -412,12 +412,22 @@ function AppContent() {
     <DraftContext.Provider value={draftStore}>
       <ConfigDraftProvider>
         <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <LocaleSync />
           <FreshInstallRedirect />
           <Router />
         </LocaleContext.Provider>
       </ConfigDraftProvider>
     </DraftContext.Provider>
   );
+}
+
+/**
+ * Syncs the browser locale from the server's `/api/status` on mount.
+ * Uses `useLocale()` which already handles the API call and persistence.
+ */
+function LocaleSync() {
+  useLocale();
+  return null;
 }
 
 // Redirects fresh installs (no agents yet, Quickstart never completed)
