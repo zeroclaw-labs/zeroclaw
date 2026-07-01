@@ -13045,6 +13045,7 @@ api_key = "anthropic-key"
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         }
     }
 
@@ -13591,6 +13592,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_config::schema::Config::default(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
+            None,
         );
 
         let passive_msg = zeroclaw_api::channel::ChannelMessage {
