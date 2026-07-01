@@ -12,6 +12,21 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+
+/// Prefix for synthetic draft ids returned by `send_draft` in MultiMessage mode.
+const TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MultiDraftKey {
+    recipient: String,
+    draft_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct MultiDraftState {
+    sent_so_far: usize,
+    thread_id: Option<String>,
+}
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
 const TELEGRAM_FENCE_REOPEN: &str = "```\n";
@@ -566,7 +581,10 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
+    multi_message_delay_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
+    multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
@@ -644,7 +662,9 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
+            multi_message_delay_ms: 800,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
+            multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
@@ -705,11 +725,12 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure streaming mode for progressive draft updates.
+    /// Configure streaming mode for progressive draft updates or multi-message delivery.
     pub fn with_streaming(
         mut self,
         stream_mode: StreamMode,
         draft_update_interval_ms: u64,
+        multi_message_delay_ms: u64,
     ) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = if draft_update_interval_ms == 0 {
@@ -717,7 +738,132 @@ impl TelegramChannel {
         } else {
             draft_update_interval_ms
         };
+        self.multi_message_delay_ms = multi_message_delay_ms;
         self
+    }
+
+    fn new_multi_message_draft_id() -> String {
+        format!(
+            "{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}{}",
+            uuid::Uuid::new_v4().as_simple()
+        )
+    }
+
+    fn multi_draft_key(recipient: &str, draft_id: &str) -> MultiDraftKey {
+        MultiDraftKey {
+            recipient: recipient.to_string(),
+            draft_id: draft_id.to_string(),
+        }
+    }
+
+    fn is_multi_message_synthetic_draft(message_id: &str) -> bool {
+        message_id.starts_with(TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX)
+    }
+
+    /// Send the unsent suffix of accumulated text for one agent turn. Advances
+    /// `sent_so_far` only after a successful `sendMessage`.
+    async fn flush_unsent(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if !Self::is_multi_message_synthetic_draft(message_id) {
+            return Ok(());
+        }
+
+        let key = Self::multi_draft_key(recipient, message_id);
+        let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
+
+        let (unsent, thread_id, delay) = {
+            let mut drafts = self.multi_message_drafts.lock();
+            let Some(draft) = drafts.get_mut(&key) else {
+                return Ok(());
+            };
+            if text.len() < draft.sent_so_far {
+                draft.sent_so_far = 0;
+            }
+            if text.len() <= draft.sent_so_far {
+                return Ok(());
+            }
+            let unsent = text[draft.sent_so_far..].to_string();
+            let thread_id = draft.thread_id.clone().or(parsed_thread);
+            let delay = Duration::from_millis(self.multi_message_delay_ms);
+            (unsent, thread_id, delay)
+        };
+
+        let content = unsent.trim();
+        if content.is_empty() {
+            return Ok(());
+        }
+
+        let cleaned = strip_tool_call_tags(content);
+        if let Err(e) = self
+            .send_text_chunks(&cleaned, &chat_id, thread_id.as_deref())
+            .await
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Telegram multi-message turn send failed"
+            );
+            return Ok(());
+        }
+
+        {
+            let mut drafts = self.multi_message_drafts.lock();
+            if let Some(draft) = drafts.get_mut(&key) {
+                draft.sent_so_far += unsent.len();
+            }
+        }
+
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_multi_message_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let text = strip_tool_call_tags(text);
+        let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
+
+        self.try_queue_voice_reply(recipient, &text, true);
+
+        let key = Self::multi_draft_key(recipient, message_id);
+        let (sent_so_far, thread_id) = {
+            let mut drafts = self.multi_message_drafts.lock();
+            let Some(draft) = drafts.remove(&key) else {
+                return Ok(());
+            };
+            (draft.sent_so_far, draft.thread_id.or(parsed_thread))
+        };
+        self.last_draft_edit.lock().remove(&chat_id);
+
+        let (text_without_markers, attachments) = parse_attachment_markers(&text);
+        let remainder = if text_without_markers.len() > sent_so_far {
+            text_without_markers[sent_so_far..].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        if !remainder.is_empty() {
+            self.send_text_chunks(&remainder, &chat_id, thread_id.as_deref())
+                .await?;
+        }
+
+        for attachment in &attachments {
+            self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Override the Telegram Bot API base URL.
@@ -3311,50 +3457,71 @@ impl Channel for TelegramChannel {
         self.stream_mode != StreamMode::Off
     }
 
+    fn supports_multi_message_streaming(&self) -> bool {
+        self.stream_mode == StreamMode::MultiMessage
+    }
+
+    fn multi_message_delay_ms(&self) -> u64 {
+        self.multi_message_delay_ms
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if self.stream_mode == StreamMode::Off {
-            return Ok(None);
+        match self.stream_mode {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
+                let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
+                let initial_text = if message.content.is_empty() {
+                    "...".to_string()
+                } else {
+                    message.content.clone()
+                };
+
+                let mut body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": initial_text,
+                });
+                if let Some(tid) = thread_id {
+                    body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+                }
+
+                let resp = self
+                    .client
+                    .post(self.api_url("sendMessage"))
+                    .json(&body)
+                    .send()
+                    .await?;
+
+                if !resp.status().is_success() {
+                    let err = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
+                }
+
+                let resp_json: serde_json::Value = resp.json().await?;
+                let message_id = resp_json
+                    .get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|id| id.as_i64())
+                    .map(|id| id.to_string());
+
+                self.last_draft_edit
+                    .lock()
+                    .insert(chat_id.to_string(), std::time::Instant::now());
+
+                Ok(message_id)
+            }
+            StreamMode::MultiMessage => {
+                let draft_id = Self::new_multi_message_draft_id();
+                let (_, thread_id) = Self::parse_reply_target(&message.recipient);
+                self.multi_message_drafts.lock().insert(
+                    Self::multi_draft_key(&message.recipient, &draft_id),
+                    MultiDraftState {
+                        sent_so_far: 0,
+                        thread_id,
+                    },
+                );
+                Ok(Some(draft_id))
+            }
         }
-
-        let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
-        let initial_text = if message.content.is_empty() {
-            "...".to_string()
-        } else {
-            message.content.clone()
-        };
-
-        let mut body = serde_json::json!({
-            "chat_id": chat_id,
-            "text": initial_text,
-        });
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-        }
-
-        let resp = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let message_id = resp_json
-            .get("result")
-            .and_then(|r| r.get("message_id"))
-            .and_then(|id| id.as_i64())
-            .map(|id| id.to_string());
-
-        self.last_draft_edit
-            .lock()
-            .insert(chat_id.to_string(), std::time::Instant::now());
-
-        Ok(message_id)
     }
 
     async fn update_draft(
@@ -3363,73 +3530,107 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        let (chat_id, _) = Self::parse_reply_target(recipient);
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                let (chat_id, _) = Self::parse_reply_target(recipient);
 
-        // Rate-limit edits per chat
-        {
-            let last_edits = self.last_draft_edit.lock();
-            if let Some(last_time) = last_edits.get(&chat_id) {
-                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed < self.draft_update_interval_ms {
-                    return Ok(());
+                // Rate-limit edits per chat
+                {
+                    let last_edits = self.last_draft_edit.lock();
+                    if let Some(last_time) = last_edits.get(&chat_id) {
+                        let elapsed =
+                            u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if elapsed < self.draft_update_interval_ms {
+                            return Ok(());
+                        }
+                    }
                 }
+
+                // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
+                let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+                    let mut end = 0;
+                    for (idx, ch) in text.char_indices() {
+                        let next = idx + ch.len_utf8();
+                        if next > TELEGRAM_MAX_MESSAGE_LENGTH {
+                            break;
+                        }
+                        end = next;
+                    }
+                    &text[..end]
+                } else {
+                    text
+                };
+
+                let message_id_parsed = match message_id.parse::<i64>() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(
+                                    ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
+                                ),
+                            "Invalid Telegram message_id ''"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id_parsed,
+                    "text": display_text,
+                });
+
+                let resp = self
+                    .client
+                    .post(self.api_url("editMessageText"))
+                    .json(&body)
+                    .send()
+                    .await?;
+
+                if resp.status().is_success() {
+                    self.last_draft_edit
+                        .lock()
+                        .insert(chat_id.clone(), std::time::Instant::now());
+                } else {
+                    let status = resp.status();
+                    let err = resp.text().await.unwrap_or_default();
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})), "editMessageText failed");
+                }
+
+                Ok(())
+            }
+            StreamMode::MultiMessage => {
+                let _ = (recipient, message_id, text);
+                Ok(())
             }
         }
+    }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
-            }
-            &text[..end]
-        } else {
-            text
-        };
-
-        let message_id_parsed = match message_id.parse::<i64>() {
-            Ok(id) => id,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
-                        ),
-                    "Invalid Telegram message_id ''"
-                );
-                return Ok(());
-            }
-        };
-
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id_parsed,
-            "text": display_text,
-        });
-
-        let resp = self
-            .client
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await?;
-
-        if resp.status().is_success() {
-            self.last_draft_edit
-                .lock()
-                .insert(chat_id.clone(), std::time::Instant::now());
-        } else {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})), "editMessageText failed");
+    async fn flush_draft_turn(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::MultiMessage {
+            return self.flush_unsent(recipient, message_id, text).await;
         }
+        Ok(())
+    }
 
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::Partial {
+            return self.update_draft(recipient, message_id, text).await;
+        }
         Ok(())
     }
 
@@ -3439,6 +3640,12 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::MultiMessage {
+            return self
+                .finalize_multi_message_draft(recipient, message_id, text)
+                .await;
+        }
+
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
@@ -3620,6 +3827,13 @@ impl Channel for TelegramChannel {
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         let (chat_id, _) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
+
+        if Self::is_multi_message_synthetic_draft(message_id) {
+            self.multi_message_drafts
+                .lock()
+                .remove(&Self::multi_draft_key(recipient, message_id));
+            return Ok(());
+        }
 
         let message_id = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -4575,9 +4789,277 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 750);
+        .with_streaming(StreamMode::Partial, 750, 800);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[test]
+    fn supports_multi_message_streaming_respects_stream_mode() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert!(!ch.supports_multi_message_streaming());
+
+        let multi = ch.with_streaming(StreamMode::MultiMessage, 750, 500);
+        assert!(multi.supports_multi_message_streaming());
+        assert_eq!(multi.multi_message_delay_ms(), 500);
+    }
+
+    mod multi_streaming {
+        use super::super::{MultiDraftState, TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX};
+
+        #[test]
+        fn synthetic_draft_ids_are_unique() {
+            let first = super::super::TelegramChannel::new_multi_message_draft_id();
+            let second = super::super::TelegramChannel::new_multi_message_draft_id();
+            assert_ne!(first, second);
+            assert!(first.starts_with(TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX));
+            assert!(second.starts_with(TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX));
+        }
+
+        #[test]
+        fn multi_message_lifecycle_isolates_drafts_by_message_id() {
+            let recipient = "123";
+            let first_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}first");
+            let second_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}second");
+            let first_key = super::super::TelegramChannel::multi_draft_key(recipient, &first_id);
+            let second_key = super::super::TelegramChannel::multi_draft_key(recipient, &second_id);
+
+            let mut drafts = std::collections::HashMap::new();
+            drafts.insert(
+                first_key.clone(),
+                MultiDraftState {
+                    sent_so_far: 5,
+                    thread_id: None,
+                },
+            );
+            drafts.insert(
+                second_key.clone(),
+                MultiDraftState {
+                    sent_so_far: 0,
+                    thread_id: None,
+                },
+            );
+
+            drafts
+                .get_mut(&second_key)
+                .expect("second draft")
+                .sent_so_far = 12;
+
+            assert_eq!(drafts.get(&first_key).expect("first draft").sent_so_far, 5);
+            assert_eq!(
+                drafts.get(&second_key).expect("second draft").sent_so_far,
+                12
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_draft_multi_message_returns_unique_synthetic_id() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 800);
+
+        let id = ch
+            .send_draft(&SendMessage::new("hello", "123"))
+            .await
+            .unwrap()
+            .expect("synthetic draft id");
+        assert!(TelegramChannel::is_multi_message_synthetic_draft(&id));
+        assert!(
+            ch.multi_message_drafts
+                .lock()
+                .contains_key(&TelegramChannel::multi_draft_key("123", &id))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_multi_message_synthetic_clears_only_matching_draft() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 800);
+
+        let draft_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}cancel-me");
+        let other_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}keep-me");
+        ch.multi_message_drafts.lock().insert(
+            TelegramChannel::multi_draft_key("123", &draft_id),
+            MultiDraftState {
+                sent_so_far: 42,
+                thread_id: Some("99".to_string()),
+            },
+        );
+        ch.multi_message_drafts.lock().insert(
+            TelegramChannel::multi_draft_key("123", &other_id),
+            MultiDraftState {
+                sent_so_far: 7,
+                thread_id: None,
+            },
+        );
+
+        ch.cancel_draft("123", &draft_id).await.unwrap();
+
+        assert!(
+            !ch.multi_message_drafts
+                .lock()
+                .contains_key(&TelegramChannel::multi_draft_key("123", &draft_id))
+        );
+        assert!(
+            ch.multi_message_drafts
+                .lock()
+                .contains_key(&TelegramChannel::multi_draft_key("123", &other_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_draft_turn_without_double_newline_sends_turn_text() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Searching the docs...",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.flush_draft_turn("123", &draft_id, "Searching the docs...")
+            .await
+            .unwrap();
+
+        let key = TelegramChannel::multi_draft_key("123", &draft_id);
+        assert_eq!(
+            ch.multi_message_drafts
+                .lock()
+                .get(&key)
+                .expect("draft state")
+                .sent_so_far,
+            "Searching the docs...".len()
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_draft_turn_failed_send_does_not_advance_sent_so_far() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(
+                    serde_json::json!({ "ok": false, "description": "send failed" }),
+                ),
+            )
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.flush_draft_turn("123", &draft_id, "Searching the docs...")
+            .await
+            .unwrap();
+
+        let key = TelegramChannel::multi_draft_key("123", &draft_id);
+        assert_eq!(
+            ch.multi_message_drafts
+                .lock()
+                .get(&key)
+                .expect("draft state")
+                .sent_so_far,
+            0,
+            "sent_so_far must not advance when both HTML and plain send fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_multi_message_retries_remainder_after_failed_flush() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Final answer",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 2 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.finalize_draft("123", &draft_id, "Final answer")
+            .await
+            .expect("finalize sends unsent remainder");
     }
 
     #[test]
@@ -4588,7 +5070,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_streaming(StreamMode::Partial, 0);
+        .with_streaming(StreamMode::Partial, 0, 800);
 
         assert_eq!(
             ch.draft_update_interval_ms,
@@ -4621,7 +5103,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 60_000);
+        .with_streaming(StreamMode::Partial, 60_000, 800);
         ch.last_draft_edit
             .lock()
             .insert("123".to_string(), std::time::Instant::now());
@@ -4639,7 +5121,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 0);
+        .with_streaming(StreamMode::Partial, 0, 800);
         let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
 
         // Invalid message_id returns early after building display_text.
@@ -4659,7 +5141,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_streaming(StreamMode::Partial, 0);
+        .with_streaming(StreamMode::Partial, 0, 800);
         let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
 
         // For oversized text + invalid draft message_id, finalize_draft should

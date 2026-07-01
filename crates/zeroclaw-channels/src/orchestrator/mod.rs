@@ -4964,12 +4964,32 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
+            let multi_message_flush = channel.supports_multi_message_streaming();
             Some(zeroclaw_spawn::spawn!(async move {
                 use zeroclaw_runtime::agent::loop_::StreamDelta;
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamDelta::Status(text) => {
+                            if multi_message_flush {
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .flush_draft_turn(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft turn flush failed"
+                                    );
+                                }
+                            }
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -6338,7 +6358,11 @@ fn build_channel_by_id(
                 .with_persistence(config_arc.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_streaming(
+                    tg.stream_mode,
+                    tg.draft_update_interval_ms,
+                    tg.multi_message_delay_ms,
+                )
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
@@ -7448,7 +7472,11 @@ fn collect_configured_channels(
                     .with_persistence(config_arc.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_streaming(
+                        tg.stream_mode,
+                        tg.draft_update_interval_ms,
+                        tg.multi_message_delay_ms,
+                    )
                     .with_transcription(config.transcription.clone())
                     .with_agent_transcription_provider(agent_transcription_provider.clone())
                     .with_typed_transcription_providers(
@@ -22947,6 +22975,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,
