@@ -12,6 +12,7 @@ import {
   saveSop,
   deleteSop,
   wireDraft,
+  graphDraft,
   type WireRole,
   type SopSummary,
   type SopGraph,
@@ -719,6 +720,7 @@ export default function Sops() {
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Sop | null>(null);
+  const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
@@ -729,7 +731,10 @@ export default function Sops() {
       setDraft((d) => {
         if (!d) return d;
         wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
-          .then((res) => setDraft(res.sop))
+          .then((res) => {
+            setDraft(res.sop);
+            setDraftGraph(res.graph);
+          })
           .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
         return d;
       });
@@ -742,13 +747,37 @@ export default function Sops() {
       setDraft((d) => {
         if (!d) return d;
         wireDraft(d, { op: 'disconnect', from, to, role: kind, port: portIndex })
-          .then((res) => setDraft(res.sop))
+          .then((res) => {
+            setDraft(res.sop);
+            setDraftGraph(res.graph);
+          })
           .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
         return d;
       });
     },
     [],
   );
+
+  // Reproject the draft graph from the backend whenever the draft changes so
+  // the canvas reflects trigger fan-in, data wires, pins, and layout without
+  // re-deriving graph shape client-side. Single source: `graphDraft`.
+  useEffect(() => {
+    if (!draft) {
+      setDraftGraph(null);
+      return;
+    }
+    let active = true;
+    graphDraft(draft)
+      .then((g) => {
+        if (active) setDraftGraph(g);
+      })
+      .catch((e: unknown) => {
+        if (active) setSaveError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [draft]);
 
   const refreshList = useCallback((selectName?: string) => {
     return listSops()
@@ -933,15 +962,18 @@ export default function Sops() {
       ) : null}
       {draft && editorHandlers ? (
         <div className="space-y-4">
-          <SopCanvas
-            draft={draft}
-            selectedStep={selectedStep}
-            runStateByStep={runStateByStep}
-            onSelectStep={setSelectedStep}
-            onAddStep={editorHandlers.onAddStep}
-            onConnect={onConnect}
-            onDisconnect={onDisconnect}
-          />
+          {draftGraph ? (
+            <SopCanvas
+              draft={draft}
+              graph={draftGraph}
+              selectedStep={selectedStep}
+              runStateByStep={runStateByStep}
+              onSelectStep={setSelectedStep}
+              onAddStep={editorHandlers.onAddStep}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+            />
+          ) : null}
           <SopEditor
             draft={draft}
             saving={saving}

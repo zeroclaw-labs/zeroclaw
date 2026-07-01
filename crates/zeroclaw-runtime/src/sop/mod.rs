@@ -19,14 +19,13 @@ pub mod wire;
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
-    FlowRole, GraphDiagnostic, GraphNode, GraphPin, GraphRender, GraphSeverity, GraphWire,
-    NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph, TextGraphFormat,
-    render_graph_text,
+    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphRender, GraphSeverity,
+    GraphWire, NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay,
+    SopGraph, TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
 pub use step_contract::{StepFailure, StepRouting, SwitchRule};
-pub use wire::{WireEdit, WireError, WireOp, apply_wire};
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
     SqliteRunStore, StoreError, build_run_store,
@@ -37,6 +36,7 @@ pub use types::{
     SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
     SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
 };
+pub use wire::{WireEdit, WireError, WireOp, apply_wire};
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

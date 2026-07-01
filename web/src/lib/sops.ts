@@ -20,6 +20,9 @@ export type GraphNode = Schemas['GraphNode'];
 export type GraphPin = Schemas['GraphPin'];
 export type GraphWire = Schemas['GraphWire'];
 export type GraphDiagnostic = Schemas['GraphDiagnostic'];
+export type GraphLayout = Schemas['GraphLayout'];
+export type NodePosition = Schemas['NodePosition'];
+export type NodeKind = Schemas['NodeKind'];
 export type PinClass = GraphPin['class'];
 export type FlowRole = NonNullable<GraphWire['flow_role']>;
 export type GraphSeverity = GraphDiagnostic['severity'];
@@ -91,6 +94,16 @@ export function wireDraft(sop: Sop, edit: WireEdit): Promise<WireResult> {
   return apiFetch<WireResult>('/api/sops/wire-draft', {
     method: 'POST',
     body: JSON.stringify({ sop, edit }),
+  });
+}
+
+/// Reproject an unsaved draft to its graph. Read-only counterpart to
+/// `wireDraft`: the canvas calls it after any non-wire field edit so trigger
+/// fan-in, data wires, pins, and layout stay single-sourced from the backend.
+export function graphDraft(sop: Sop): Promise<SopGraph> {
+  return apiFetch<SopGraph>('/api/sops/graph-draft', {
+    method: 'POST',
+    body: JSON.stringify({ sop }),
   });
 }
 

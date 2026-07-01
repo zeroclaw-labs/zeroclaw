@@ -33,6 +33,7 @@ pub enum WireError {
     MissingPort,
     PortOutOfRange(usize),
     SelfLoop(u32),
+    TriggerNotWirable,
 }
 
 impl std::fmt::Display for WireError {
@@ -42,6 +43,10 @@ impl std::fmt::Display for WireError {
             Self::MissingPort => write!(f, "switch edge requires a port index"),
             Self::PortOutOfRange(i) => write!(f, "switch port {i} out of range"),
             Self::SelfLoop(n) => write!(f, "step {n} cannot wire to itself"),
+            Self::TriggerNotWirable => write!(
+                f,
+                "trigger edges are derived from the SOP's triggers and cannot be wired by hand"
+            ),
         }
     }
 }
@@ -53,6 +58,9 @@ impl std::error::Error for WireError {}
 /// every authoring surface routes edge CRUD through here rather than mutating
 /// routing fields itself.
 pub fn apply_wire(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
+    if edit.role == FlowRole::Trigger {
+        return Err(WireError::TriggerNotWirable);
+    }
     if !sop.steps.iter().any(|s| s.number == edit.from) {
         return Err(WireError::UnknownStep(edit.from));
     }
@@ -67,6 +75,7 @@ pub fn apply_wire(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
         FlowRole::Dependency => apply_dependency(sop, edit),
         FlowRole::Failure => apply_failure(sop, edit),
         FlowRole::Switch => apply_switch(sop, edit),
+        FlowRole::Trigger => Err(WireError::TriggerNotWirable),
     }
 }
 
@@ -148,9 +157,7 @@ fn apply_switch(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sop::types::{
-        Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
-    };
+    use crate::sop::types::{Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger};
 
     fn sop_with(n: u32) -> Sop {
         let steps = (1..=n)
@@ -190,43 +197,83 @@ mod tests {
     #[test]
     fn sequence_connect_and_disconnect() {
         let mut sop = sop_with(2);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 2, FlowRole::Sequence, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Sequence, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].routing.next, Some(2));
-        apply_wire(&mut sop, &edit(WireOp::Disconnect, 1, 2, FlowRole::Sequence, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Sequence, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].routing.next, None);
     }
 
     #[test]
     fn dependency_dedupes_and_removes() {
         let mut sop = sop_with(2);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 2, FlowRole::Dependency, None)).unwrap();
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 2, FlowRole::Dependency, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Dependency, None),
+        )
+        .unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Dependency, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[1].routing.depends_on, vec![1]);
-        apply_wire(&mut sop, &edit(WireOp::Disconnect, 1, 2, FlowRole::Dependency, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Dependency, None),
+        )
+        .unwrap();
         assert!(sop.steps[1].routing.depends_on.is_empty());
     }
 
     #[test]
     fn failure_goto_sets_then_resets_to_fail() {
         let mut sop = sop_with(3);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 3, FlowRole::Failure, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 3, FlowRole::Failure, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].on_failure, StepFailure::Goto { step: 3 });
-        apply_wire(&mut sop, &edit(WireOp::Disconnect, 1, 3, FlowRole::Failure, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Disconnect, 1, 3, FlowRole::Failure, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].on_failure, StepFailure::Fail);
     }
 
     #[test]
     fn failure_disconnect_only_clears_matching_target() {
         let mut sop = sop_with(3);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 3, FlowRole::Failure, None)).unwrap();
-        apply_wire(&mut sop, &edit(WireOp::Disconnect, 1, 2, FlowRole::Failure, None)).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 3, FlowRole::Failure, None),
+        )
+        .unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Failure, None),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].on_failure, StepFailure::Goto { step: 3 });
     }
 
     #[test]
     fn switch_connect_grows_ports_and_sets_goto() {
         let mut sop = sop_with(3);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 3, FlowRole::Switch, Some(1))).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 3, FlowRole::Switch, Some(1)),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].routing.switch.len(), 2);
         assert_eq!(sop.steps[0].routing.switch[1].goto, Some(3));
     }
@@ -234,8 +281,16 @@ mod tests {
     #[test]
     fn switch_disconnect_clears_goto_keeps_rule() {
         let mut sop = sop_with(2);
-        apply_wire(&mut sop, &edit(WireOp::Connect, 1, 2, FlowRole::Switch, Some(0))).unwrap();
-        apply_wire(&mut sop, &edit(WireOp::Disconnect, 1, 2, FlowRole::Switch, Some(0))).unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Switch, Some(0)),
+        )
+        .unwrap();
+        apply_wire(
+            &mut sop,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Switch, Some(0)),
+        )
+        .unwrap();
         assert_eq!(sop.steps[0].routing.switch.len(), 1);
         assert_eq!(sop.steps[0].routing.switch[0].goto, None);
     }
@@ -243,7 +298,10 @@ mod tests {
     #[test]
     fn switch_requires_port() {
         let mut sop = sop_with(2);
-        let err = apply_wire(&mut sop, &edit(WireOp::Connect, 1, 2, FlowRole::Switch, None));
+        let err = apply_wire(
+            &mut sop,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Switch, None),
+        );
         assert_eq!(err, Err(WireError::MissingPort));
     }
 
@@ -251,12 +309,30 @@ mod tests {
     fn unknown_step_and_self_loop_rejected() {
         let mut sop = sop_with(2);
         assert_eq!(
-            apply_wire(&mut sop, &edit(WireOp::Connect, 1, 9, FlowRole::Sequence, None)),
+            apply_wire(
+                &mut sop,
+                &edit(WireOp::Connect, 1, 9, FlowRole::Sequence, None)
+            ),
             Err(WireError::UnknownStep(9))
         );
         assert_eq!(
-            apply_wire(&mut sop, &edit(WireOp::Connect, 1, 1, FlowRole::Sequence, None)),
+            apply_wire(
+                &mut sop,
+                &edit(WireOp::Connect, 1, 1, FlowRole::Sequence, None)
+            ),
             Err(WireError::SelfLoop(1))
+        );
+    }
+
+    #[test]
+    fn trigger_edges_are_rejected() {
+        let mut sop = sop_with(2);
+        assert_eq!(
+            apply_wire(
+                &mut sop,
+                &edit(WireOp::Connect, 1, 2, FlowRole::Trigger, None)
+            ),
+            Err(WireError::TriggerNotWirable)
         );
     }
 }

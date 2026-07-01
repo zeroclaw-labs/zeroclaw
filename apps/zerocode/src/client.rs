@@ -1998,6 +1998,16 @@ pub enum FlowRole {
     Dependency,
     Failure,
     Switch,
+    Trigger,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::NodeKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    #[default]
+    Step,
+    Trigger,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::GraphPin` (read-only projection pin).
@@ -2015,6 +2025,10 @@ pub struct GraphPin {
 pub struct GraphNode {
     pub step: u32,
     pub title: String,
+    #[serde(default)]
+    pub kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
     pub inputs: Vec<GraphPin>,
     pub outputs: Vec<GraphPin>,
 }
@@ -2049,6 +2063,26 @@ pub struct GraphDiagnostic {
     pub message: String,
 }
 
+/// Mirror of `zeroclaw_runtime::sop::NodePosition`: a node's grid slot in the
+/// layered layout the backend walks from the projected edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodePosition {
+    pub step: u32,
+    pub col: u32,
+    pub row: u32,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphLayout`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphLayout {
+    #[serde(default)]
+    pub positions: Vec<NodePosition>,
+    #[serde(default)]
+    pub columns: u32,
+    #[serde(default)]
+    pub rows: u32,
+}
+
 /// Mirror of `zeroclaw_runtime::sop::SopGraph`: the structured projection the
 /// visual node editor renders, deserialized straight from `sops/graph`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2059,6 +2093,8 @@ pub struct SopGraphView {
     pub wires: Vec<GraphWire>,
     #[serde(default)]
     pub diagnostics: Vec<GraphDiagnostic>,
+    #[serde(default)]
+    pub layout: GraphLayout,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::StepRouting`.

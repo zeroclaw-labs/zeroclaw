@@ -235,6 +235,28 @@ pub async fn handle_sop_wire_draft(
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 
+/// Request body for `POST /api/sops/graph-draft`: an unsaved SOP draft.
+#[derive(serde::Deserialize)]
+pub struct GraphDraftRequest {
+    pub sop: zeroclaw_runtime::sop::Sop,
+}
+
+/// POST /api/sops/graph-draft - reproject an in-memory SOP draft to its graph.
+/// Writes nothing. The read-only counterpart to `wire-draft`: the visual editor
+/// calls it after any non-wire field edit so the canvas reflects trigger
+/// fan-in, data connections, pins, and layout without re-deriving graph shape.
+pub async fn handle_sop_graph_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<GraphDraftRequest>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&req.sop);
+    Json(graph).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -312,9 +334,14 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let graph: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        let nodes = graph["nodes"].as_array().unwrap();
+        let steps = nodes.iter().filter(|n| n["kind"] == "step").count();
+        let triggers = nodes.iter().filter(|n| n["kind"] == "trigger").count();
+        assert_eq!(steps, 2);
+        assert_eq!(triggers, 1);
         assert!(graph["wires"].is_array());
         assert!(graph["diagnostics"].is_array());
+        assert!(graph["layout"]["positions"].is_array());
     }
 
     #[tokio::test]

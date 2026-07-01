@@ -288,6 +288,10 @@ keyactions! {
         Edit   [Chord::char('e')] => "edit sop",
         Delete [Chord::char('d')] => "delete sop",
         Toggle [Chord::char('v')] => "toggle layer",
+        PanLeft  [Chord::shift(KeyCode::Left)] => "pan left",
+        PanRight [Chord::shift(KeyCode::Right)] => "pan right",
+        PanUp    [Chord::shift(KeyCode::Up)] => "pan up",
+        PanDown  [Chord::shift(KeyCode::Down)] => "pan down",
     }
 }
 

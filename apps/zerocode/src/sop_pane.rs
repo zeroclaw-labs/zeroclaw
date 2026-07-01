@@ -9,8 +9,8 @@ use ratatui::{
 };
 
 use crate::client::{
-    FlowRole, GraphNode, GraphPin, GraphWire, NodeRunState, PinClass, RpcClient, SopDraft,
-    SopGraphView, SopStep, SopStepKind, StepFailure, SwitchRule,
+    FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
+    RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure, SwitchRule,
 };
 
 /// SOP authoring pane: lists SOPs from the daemon and renders the selected
@@ -36,6 +36,9 @@ pub(crate) struct SopPane {
     /// optional switch-port index, rect). Clicking one starts a link of that
     /// role from that step; the daemon owns the edge-to-routing mapping.
     handle_rects: Vec<(u32, FlowRole, Option<usize>, Rect)>,
+    /// Add-from click zones: (source step, role, optional port, rect). Clicking
+    /// creates a new step and wires it from that output in one draft round trip.
+    add_rects: Vec<(u32, FlowRole, Option<usize>, Rect)>,
     /// Wire-line click zones: (from, to, role, optional port, rect). Clicking
     /// deletes that edge via the draft-wire RPC.
     wire_rects: Vec<(u32, u32, FlowRole, Option<usize>, Rect)>,
@@ -45,6 +48,10 @@ pub(crate) struct SopPane {
     /// on editor open and after each wire edit. Drives the interactive canvas's
     /// wire lines without the pane reprojecting the graph itself.
     editor_graph: SopGraphView,
+    /// Camera pan offset (cells) into the 2D canvas, so a graph wider or taller
+    /// than the pane can be scrolled. Panned with h/j/k/l while viewing.
+    pan_x: u16,
+    pan_y: u16,
 }
 
 /// Which rendering layer the SOP surface presents. The visual node-card editor
@@ -419,9 +426,12 @@ impl SopPane {
             list_row_rects: Vec::new(),
             node_rects: Vec::new(),
             handle_rects: Vec::new(),
+            add_rects: Vec::new(),
             wire_rects: Vec::new(),
             link_from: None,
             editor_graph: SopGraphView::default(),
+            pan_x: 0,
+            pan_y: 0,
         }
     }
 
@@ -532,6 +542,10 @@ impl SopPane {
             Some(SopTabAction::Edit) => self.open_editor_for_selected().await,
             Some(SopTabAction::Delete) => self.delete_selected().await,
             Some(SopTabAction::Toggle) => self.toggle_layer(),
+            Some(SopTabAction::PanLeft) => self.pan_x = self.pan_x.saturating_sub(4),
+            Some(SopTabAction::PanRight) => self.pan_x = self.pan_x.saturating_add(4),
+            Some(SopTabAction::PanUp) => self.pan_y = self.pan_y.saturating_sub(2),
+            Some(SopTabAction::PanDown) => self.pan_y = self.pan_y.saturating_add(2),
             None => {}
         }
         false
@@ -573,6 +587,16 @@ impl SopPane {
                         // Click off any node cancels the pending link.
                         self.link_from = None;
                         self.status = None;
+                        return;
+                    }
+                    // Add-and-wire a new step from a clicked [+] badge.
+                    if let Some((step, role, port, _)) = self
+                        .add_rects
+                        .iter()
+                        .find(|(_, _, _, r)| in_rect(col, row, *r))
+                        .copied()
+                    {
+                        self.add_step_from(step, role, port).await;
                         return;
                     }
                     // Start a link from a clicked output handle.
@@ -814,18 +838,49 @@ impl SopPane {
     }
 
     fn editor_add_step(&mut self) {
-        if let Some(ed) = self.editor.as_mut() {
-            ed.step_cursor = (ed.step_cursor + 1).min(ed.draft.steps.len());
-            let number = ed.draft.steps.len() as u32 + 1;
-            ed.draft.steps.insert(
-                ed.step_cursor,
+        if let Some(editor) = self.editor.as_mut() {
+            editor.step_cursor = (editor.step_cursor + 1).min(editor.draft.steps.len());
+            let number = editor.draft.steps.len() as u32 + 1;
+            editor.draft.steps.insert(
+                editor.step_cursor,
                 SopStep {
                     number,
                     ..SopStep::default()
                 },
             );
-            ed.focus = EditorFocus::Steps;
-            ed.field = StepField::Title;
+            editor.focus = EditorFocus::Steps;
+            editor.field = StepField::Title;
+        }
+    }
+
+    /// Append a new step and wire it from `step`'s output of the given
+    /// `role`/`port` in one draft round trip. The new step's number is the
+    /// appended tail; the connect edit routes through `apply_wire_edit`, so the
+    /// daemon owns the edge-to-routing mapping exactly as an ordinary wire does.
+    async fn add_step_from(&mut self, step: u32, role: FlowRole, port: Option<usize>) {
+        let target = {
+            let Some(editor) = self.editor.as_mut() else {
+                return;
+            };
+            let number = editor.draft.steps.len() as u32 + 1;
+            editor.draft.steps.push(SopStep {
+                number,
+                title: format!("Step {number}"),
+                ..SopStep::default()
+            });
+            number
+        };
+        self.apply_wire_edit("connect", step, target, role, port)
+            .await;
+        if let Some(editor) = self.editor.as_mut() {
+            editor.step_cursor = editor
+                .draft
+                .steps
+                .iter()
+                .position(|candidate| candidate.number == target)
+                .unwrap_or(editor.step_cursor);
+            editor.focus = EditorFocus::Steps;
+            editor.field = StepField::Title;
         }
     }
 
@@ -1007,6 +1062,10 @@ impl SopPane {
             S::Edit,
             S::Delete,
             S::Toggle,
+            S::PanLeft,
+            S::PanRight,
+            S::PanUp,
+            S::PanDown,
         ]))
     }
 
@@ -1095,10 +1154,11 @@ impl SopPane {
         }
     }
 
-    /// Canon visual layer: render one node card per graph node (step chip,
-    /// title, kind/state badge, typed input/output pins) stacked vertically
-    /// with wire labels between them, at parity with the web `NodeCard`. Each
-    /// card's screen rect is recorded in `node_rects` for mouse hit-testing.
+    /// Canon visual layer: place one node card per graph node at its backend
+    /// col/row (x AND y), and route flow wires between cards. The layout is
+    /// single-sourced from `graph.layout`; this pane maps grid slots to terminal
+    /// cells and draws, it never derives graph shape. Trigger nodes render as
+    /// event sources feeding the entry step, matching the web canvas.
     fn render_nodes(&mut self, f: &mut Frame, area: Rect, title: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1107,6 +1167,7 @@ impl SopPane {
         f.render_widget(block, area);
         self.node_rects.clear();
         self.handle_rects.clear();
+        self.add_rects.clear();
         self.wire_rects.clear();
 
         if self.graph.nodes.is_empty() {
@@ -1120,38 +1181,53 @@ impl SopPane {
             (self.animation_origin.elapsed().as_millis() / 200) % ACTIVE_SPINNER.len() as u128;
         let active_frame = ACTIVE_SPINNER[phase as usize];
 
-        let mut y = inner.y;
-        let bottom = inner.y.saturating_add(inner.height);
-        for node in &self.graph.nodes {
-            let card_h: u16 = 4;
-            if y >= bottom {
-                break;
+        let slots = layout_slots(&self.graph.layout, inner, self.pan_x, self.pan_y);
+
+        // Draw wires first so cards paint over the line ends cleanly.
+        for wire in self
+            .graph
+            .wires
+            .iter()
+            .filter(|w| w.class == PinClass::Flow)
+        {
+            let (Some(from), Some(to)) = (slots.get(&wire.from_step), slots.get(&wire.to_step))
+            else {
+                continue;
+            };
+            draw_wire_2d(f, inner, *from, *to, wire_color(wire));
+            let (mx, my) = wire_midpoint(*from, *to);
+            if my > inner.y && in_rect(mx, my.saturating_sub(1), inner) {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        wire_label(wire),
+                        Style::default().fg(wire_color(wire)),
+                    )),
+                    Rect::new(mx, my.saturating_sub(1), inner.width.min(12), 1),
+                );
             }
-            let h = card_h.min(bottom - y);
-            let rect = Rect::new(inner.x, y, inner.width, h);
+        }
+
+        for node in &self.graph.nodes {
+            let Some(rect) = slots.get(&node.step).copied() else {
+                continue;
+            };
+            if !rects_overlap(rect, inner) {
+                continue;
+            }
+            let clipped = clip_rect(rect, inner);
             let state = self
                 .overlay
                 .as_ref()
                 .and_then(|o| o.states.get(&(node.step as u64)).copied());
-            render_node_card(f, rect, node, state, active_frame);
-            self.node_rects.push((node.step, rect));
-            y = y.saturating_add(h);
-
-            for w in self.graph.wires.iter().filter(|w| w.from_step == node.step) {
-                if y >= bottom {
-                    break;
-                }
-                let label = wire_label(w);
-                let line = Line::from(Span::styled(
-                    format!("  │ {} → {} [{}]", w.from_step, w.to_step, label),
-                    Style::default().fg(wire_color(w)),
-                ));
-                f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-                y = y.saturating_add(1);
-            }
+            render_node_card(f, clipped, node, state, active_frame);
+            self.node_rects.push((node.step, clipped));
         }
     }
 
+    /// Interactive 2D editor canvas: cards placed at backend col/row, output
+    /// handles on each card's right edge (sequence/dep/fail, or one per switch
+    /// port), clickable wires routed between cards, and an [+] add-and-wire badge
+    /// per handle. Placement is single-sourced from `editor_graph.layout`.
     fn render_editor_canvas(&mut self, frame: &mut Frame, area: Rect, title: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1160,6 +1236,7 @@ impl SopPane {
         frame.render_widget(block, area);
         self.node_rects.clear();
         self.handle_rects.clear();
+        self.add_rects.clear();
         self.wire_rects.clear();
 
         let Some(editor) = self.editor.as_ref() else {
@@ -1178,128 +1255,130 @@ impl SopPane {
             .steps
             .get(editor.step_cursor)
             .map(|step| step.number);
-        let mut cursor_y = inner.y;
-        let bottom = inner.y.saturating_add(inner.height);
 
-        for step in &editor.draft.steps {
-            if cursor_y >= bottom {
-                break;
-            }
-            let heading = Line::from(vec![
-                Span::styled(
-                    format!(" {} ", step.number),
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    if step.title.is_empty() {
-                        "(untitled)".to_string()
-                    } else {
-                        step.title.clone()
-                    },
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            let card_height = 3u16.min(bottom - cursor_y);
-            let card_rect = Rect::new(inner.x, cursor_y, inner.width, card_height);
-            let border_color = if selected_number == Some(step.number) {
-                Color::Cyan
-            } else {
-                Color::Gray
-            };
-            let card = Paragraph::new(vec![heading])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(border_color)),
+        let slots = layout_slots(&self.editor_graph.layout, inner, self.pan_x, self.pan_y);
+        let switch_by_step: std::collections::HashMap<u32, Vec<String>> = editor
+            .draft
+            .steps
+            .iter()
+            .map(|s| {
+                (
+                    s.number,
+                    s.routing.switch.iter().map(|r| r.name.clone()).collect(),
                 )
-                .wrap(Wrap { trim: false });
-            frame.render_widget(card, card_rect);
-            self.node_rects.push((step.number, card_rect));
-            cursor_y = cursor_y.saturating_add(card_height);
+            })
+            .collect();
 
-            if cursor_y < bottom {
-                let handle_row = Rect::new(inner.x, cursor_y, inner.width, 1);
-                let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
-                let mut handle_x = inner.x.saturating_add(3);
+        // Wires under cards.
+        for wire in self
+            .editor_graph
+            .wires
+            .iter()
+            .filter(|w| w.class == PinClass::Flow)
+        {
+            let (Some(from), Some(to)) = (slots.get(&wire.from_step), slots.get(&wire.to_step))
+            else {
+                continue;
+            };
+            draw_wire_2d(frame, inner, *from, *to, wire_color(wire));
+            let Some(role) = wire.flow_role else { continue };
+            if role == FlowRole::Trigger {
+                continue;
+            }
+            let port = match role {
+                FlowRole::Switch => wire.from_pin.as_ref().and_then(|label| {
+                    switch_by_step
+                        .get(&wire.from_step)
+                        .and_then(|names| names.iter().position(|n| n == label))
+                }),
+                _ => None,
+            };
+            // Delete-zone marker at the wire midpoint.
+            let (mx, my) = wire_midpoint(*from, *to);
+            if in_rect(mx, my, inner) {
+                let rect = Rect::new(mx, my, 1, 1);
+                frame.render_widget(
+                    Paragraph::new(Span::styled("✕", Style::default().fg(Color::DarkGray))),
+                    rect,
+                );
+                self.wire_rects
+                    .push((wire.from_step, wire.to_step, role, port, rect));
+            }
+        }
 
-                let handles: Vec<(FlowRole, Option<usize>, String, Color)> =
-                    if step.routing.switch.is_empty() {
-                        vec![
-                            (FlowRole::Sequence, None, "○next".to_string(), Color::Green),
-                            (FlowRole::Dependency, None, "○dep".to_string(), Color::Yellow),
-                            (FlowRole::Failure, None, "○fail".to_string(), Color::Red),
-                        ]
-                    } else {
-                        step.routing
-                            .switch
-                            .iter()
-                            .enumerate()
-                            .map(|(port, rule)| {
-                                let name = if rule.name.is_empty() {
-                                    format!("port{}", port + 1)
-                                } else {
-                                    rule.name.clone()
-                                };
-                                (
-                                    FlowRole::Switch,
-                                    Some(port),
-                                    format!("○{name}"),
-                                    Color::Magenta,
-                                )
-                            })
-                            .collect()
-                    };
+        // Cards + handles.
+        for node in &self.editor_graph.nodes {
+            let Some(rect) = slots.get(&node.step).copied() else {
+                continue;
+            };
+            if !rects_overlap(rect, inner) {
+                continue;
+            }
+            let clipped = clip_rect(rect, inner);
 
-                for (role, port, label, color) in handles {
-                    let label_width = label.len() as u16;
-                    let zone = Rect::new(handle_x, cursor_y, label_width, 1);
-                    spans.push(Span::styled(label, Style::default().fg(color)));
-                    spans.push(Span::raw(" "));
-                    handle_x = handle_x.saturating_add(label_width + 1);
-                    self.handle_rects.push((step.number, role, port, zone));
-                }
-
-                if let Some((from, role, _)) = linking
-                    && from == step.number
-                {
-                    spans.push(Span::styled(
-                        format!("  wiring {role:?} → click target"),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
-                    ));
-                }
-                frame.render_widget(Paragraph::new(Line::from(spans)), handle_row);
-                cursor_y = cursor_y.saturating_add(1);
+            if node.kind == NodeKind::Trigger {
+                render_trigger_card(frame, clipped, node);
+                self.node_rects.push((node.step, clipped));
+                continue;
             }
 
-            for wire in self
-                .editor_graph
-                .wires
-                .iter()
-                .filter(|wire| wire.from_step == step.number && wire.class == PinClass::Flow)
-            {
-                if cursor_y >= bottom {
-                    break;
+            let step = editor.draft.steps.iter().find(|s| s.number == node.step);
+            let selected = selected_number == Some(node.step);
+            render_editor_card(frame, clipped, node, step, selected);
+            self.node_rects.push((node.step, clipped));
+
+            // Output handles down the card's right edge.
+            let handle_x = rect.x.saturating_add(rect.width.saturating_sub(1));
+            let handles: Vec<(FlowRole, Option<usize>, Color)> = match step {
+                Some(s) if !s.routing.switch.is_empty() => s
+                    .routing
+                    .switch
+                    .iter()
+                    .enumerate()
+                    .map(|(port, _)| (FlowRole::Switch, Some(port), Color::Magenta))
+                    .collect(),
+                _ => vec![
+                    (FlowRole::Sequence, None, Color::Green),
+                    (FlowRole::Dependency, None, Color::Yellow),
+                    (FlowRole::Failure, None, Color::Red),
+                ],
+            };
+            let mut hy = rect.y.saturating_add(1);
+            for (role, port, color) in handles {
+                if in_rect(handle_x, hy, inner) {
+                    let zone = Rect::new(handle_x, hy, 1, 1);
+                    frame.render_widget(
+                        Paragraph::new(Span::styled("○", Style::default().fg(color))),
+                        zone,
+                    );
+                    self.handle_rects.push((node.step, role, port, zone));
+                    let add_x = handle_x.saturating_add(1);
+                    if in_rect(add_x, hy, inner) {
+                        let add_zone = Rect::new(add_x, hy, 1, 1);
+                        frame.render_widget(
+                            Paragraph::new(Span::styled("+", Style::default().fg(Color::DarkGray))),
+                            add_zone,
+                        );
+                        self.add_rects.push((node.step, role, port, add_zone));
+                    }
                 }
-                let Some(role) = wire.flow_role else { continue };
-                let port = match role {
-                    FlowRole::Switch => wire.from_pin.as_ref().and_then(|label| {
-                        step.routing.switch.iter().position(|rule| &rule.name == label)
-                    }),
-                    _ => None,
-                };
-                let line = Line::from(vec![
-                    Span::styled("  ✕ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{} → {} [{}]", wire.from_step, wire.to_step, wire_label(wire)),
-                        Style::default().fg(wire_color(wire)),
-                    ),
-                ]);
-                let wire_rect = Rect::new(inner.x, cursor_y, inner.width, 1);
-                frame.render_widget(Paragraph::new(line), wire_rect);
-                self.wire_rects
-                    .push((wire.from_step, wire.to_step, role, port, wire_rect));
-                cursor_y = cursor_y.saturating_add(1);
+                hy = hy.saturating_add(1);
+            }
+
+            if let Some((from, role, _)) = linking
+                && from == node.step
+                && rect.y > inner.y
+            {
+                let hint = Rect::new(rect.x, rect.y.saturating_sub(1), inner.width, 1);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("wiring {role:?} → click target"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::ITALIC),
+                    )),
+                    hint,
+                );
             }
         }
     }
@@ -1484,6 +1563,7 @@ fn wire_label(w: &GraphWire) -> String {
         PinClass::Flow => match w.flow_role {
             Some(FlowRole::Failure) => "failure".to_string(),
             Some(FlowRole::Dependency) => "dependency".to_string(),
+            Some(FlowRole::Trigger) => "trigger".to_string(),
             Some(FlowRole::Switch) => match &w.from_pin {
                 Some(port) => format!("switch:{port}"),
                 None => "switch".to_string(),
@@ -1500,6 +1580,7 @@ fn wire_color(w: &GraphWire) -> Color {
             Some(FlowRole::Failure) => Color::Red,
             Some(FlowRole::Dependency) => Color::Yellow,
             Some(FlowRole::Switch) => Color::Magenta,
+            Some(FlowRole::Trigger) => Color::LightBlue,
             _ => Color::Green,
         },
     }
@@ -1515,6 +1596,187 @@ fn node_border_color(state: Option<NodeRunState>) -> Color {
         Some(NodeRunState::Skipped) => Color::Yellow,
         _ => Color::Gray,
     }
+}
+
+/// Terminal-cell geometry for one node card in the 2D canvas.
+const CARD_W: u16 = 22;
+const CARD_H: u16 = 5;
+const COL_GAP: u16 = 6;
+const ROW_GAP: u16 = 2;
+
+/// Map every node's backend grid slot (col/row) to a terminal `Rect`, offset by
+/// the camera pan. Placement is single-sourced from `layout`; this only scales
+/// grid coordinates to cells. Rects may fall partly or wholly outside `inner`;
+/// callers clip and cull.
+fn layout_slots(
+    layout: &GraphLayout,
+    inner: Rect,
+    pan_x: u16,
+    pan_y: u16,
+) -> std::collections::HashMap<u32, Rect> {
+    let mut slots = std::collections::HashMap::new();
+    for p in &layout.positions {
+        let x = inner
+            .x
+            .saturating_add(p.col as u16 * (CARD_W + COL_GAP))
+            .saturating_sub(pan_x);
+        let y = inner
+            .y
+            .saturating_add(p.row as u16 * (CARD_H + ROW_GAP))
+            .saturating_sub(pan_y);
+        slots.insert(p.step, Rect::new(x, y, CARD_W, CARD_H));
+    }
+    slots
+}
+
+/// Whether two rects share any cell.
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// Intersect `r` with `bounds` so a card that runs past the pane edge paints
+/// only the visible part.
+fn clip_rect(r: Rect, bounds: Rect) -> Rect {
+    let x = r.x.max(bounds.x);
+    let y = r.y.max(bounds.y);
+    let right = (r.x + r.width).min(bounds.x + bounds.width);
+    let bottom = (r.y + r.height).min(bounds.y + bounds.height);
+    Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+}
+
+/// The cell where a wire's routed line crosses its horizontal midpoint. Used to
+/// place the clickable delete marker.
+fn wire_midpoint(from: Rect, to: Rect) -> (u16, u16) {
+    let x1 = from.x + from.width.saturating_sub(1);
+    let y1 = from.y + from.height / 2;
+    let x2 = to.x;
+    let y2 = to.y + to.height / 2;
+    ((x1 + x2) / 2, (y1 + y2) / 2)
+}
+
+/// Route a flow wire from the right edge of `from` to the left edge of `to`
+/// with an L-shaped path of box-drawing glyphs: horizontal out of the source, a
+/// vertical run at the midpoint column, then horizontal into the target. Every
+/// painted cell is clipped to `inner`.
+fn draw_wire_2d(f: &mut Frame, inner: Rect, from: Rect, to: Rect, color: Color) {
+    let x1 = from.x.saturating_add(from.width.saturating_sub(1));
+    let y1 = from.y.saturating_add(from.height / 2);
+    let x2 = to.x;
+    let y2 = to.y.saturating_add(to.height / 2);
+    if x2 <= x1 {
+        // Back-edge or same column: draw a short straight nub so it is visible.
+        put_cell(f, inner, x1, y1, "─", color);
+        return;
+    }
+    let midx = x1 + (x2 - x1) / 2;
+    let style = Style::default().fg(color);
+    // Horizontal from source to the bend column.
+    for x in x1..=midx {
+        put_cell(f, inner, x, y1, "─", color);
+    }
+    // Vertical run at the bend column between the two row centers.
+    let (top, bot) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
+    for y in top..=bot {
+        put_cell(f, inner, midx, y, "│", color);
+    }
+    // Corner glyphs.
+    if y1 != y2 {
+        let corner_top = if y1 < y2 { "╮" } else { "╯" };
+        let corner_bot = if y1 < y2 { "╰" } else { "╭" };
+        put_cell(f, inner, midx, y1, corner_top, color);
+        put_cell(f, inner, midx, y2, corner_bot, color);
+    }
+    // Horizontal from the bend column into the target, arrow at the tip.
+    for x in midx..x2 {
+        put_cell(f, inner, x, y2, "─", color);
+    }
+    let _ = style;
+    put_cell(f, inner, x2.saturating_sub(1), y2, "▶", color);
+}
+
+fn put_cell(f: &mut Frame, inner: Rect, x: u16, y: u16, glyph: &str, color: Color) {
+    if !in_rect(x, y, inner) {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(color))),
+        Rect::new(x, y, 1, 1),
+    );
+}
+
+/// Render a trigger source node: a dashed-accent card with the trigger kind and
+/// its display string, and a single event output handle on the right edge.
+fn render_trigger_card(f: &mut Frame, area: Rect, node: &GraphNode) {
+    let header = Line::from(vec![
+        Span::styled("⚡ ", Style::default().fg(Color::LightBlue)),
+        Span::styled(
+            node.title.clone(),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let sub = Line::from(Span::styled(
+        node.subtitle.clone().unwrap_or_default(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    f.render_widget(
+        Paragraph::new(vec![header, sub])
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Render an editor step card at its 2D slot: step chip + title on the header,
+/// a tools/checkpoint hint line, selected cards get a cyan border.
+fn render_editor_card(
+    f: &mut Frame,
+    area: Rect,
+    node: &GraphNode,
+    step: Option<&SopStep>,
+    selected: bool,
+) {
+    let title = if node.title.is_empty() {
+        "(untitled)".to_string()
+    } else {
+        node.title.clone()
+    };
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" {} ", node.step),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+        Span::raw(" "),
+        Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+    ]);
+    let detail = match step {
+        Some(s) if !s.routing.switch.is_empty() => Line::from(Span::styled(
+            format!("⋔ {} ports", s.routing.switch.len()),
+            Style::default().fg(Color::Magenta),
+        )),
+        Some(s) if !s.suggested_tools.is_empty() => Line::from(Span::styled(
+            s.suggested_tools.join(", "),
+            Style::default().fg(Color::DarkGray),
+        )),
+        _ => Line::from(Span::styled(
+            "no tools",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    let border = if selected { Color::Cyan } else { Color::Gray };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    f.render_widget(
+        Paragraph::new(vec![header, detail])
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Render a single node card: a bordered box with the step chip + title +
@@ -1866,6 +2128,41 @@ mod tests {
         let ed = pane.editor.as_ref().expect("editor open");
         assert_eq!(ed.focus, EditorFocus::Steps);
         assert_eq!(ed.step_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn click_add_badge_appends_step_and_wires_from_handle() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (client, mut rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        let draft = SopDraft {
+            name: "demo".into(),
+            steps: vec![SopStep {
+                number: 1,
+                title: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        pane.editor = Some(SopEditorState::from_draft(false, draft));
+        pane.add_rects = vec![(1, FlowRole::Sequence, None, Rect::new(8, 3, 3, 1))];
+        let task = tokio::spawn(async move {
+            pane.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 9,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .await;
+            pane
+        });
+        let req = next_request(&mut rx).await;
+        assert_eq!(req["method"], method::SOPS_WIRE_DRAFT);
+        assert_eq!(req["params"]["edit"]["op"], "connect");
+        assert_eq!(req["params"]["edit"]["from"], 1);
+        assert_eq!(req["params"]["edit"]["to"], 2);
+        assert_eq!(req["params"]["sop"]["steps"].as_array().unwrap().len(), 2);
+        task.abort();
     }
 
     #[test]
