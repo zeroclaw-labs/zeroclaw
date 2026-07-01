@@ -1,7 +1,6 @@
 import type { ApprovalDecision, WsMessage } from '../types/api';
 import { getToken } from './auth';
-import { apiOrigin, basePath } from './basePath';
-import { isTauri } from './tauri';
+import { basePath } from './basePath';
 import { generateUUID } from './uuid';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
@@ -59,14 +58,8 @@ export class WebSocketClient {
 
   constructor(options: WebSocketClientOptions) {
     this.agentAlias = options.agentAlias;
-    let defaultBase: string;
-    if (isTauri() && apiOrigin) {
-      // In Tauri, derive ws URL from the gateway origin.
-      defaultBase = apiOrigin.replace(/^http/, 'ws');
-    } else {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      defaultBase = `${protocol}//${window.location.host}`;
-    }
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const defaultBase = `${protocol}//${window.location.host}`;
     this.baseUrl = options.baseUrl ?? defaultBase;
     this.reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
