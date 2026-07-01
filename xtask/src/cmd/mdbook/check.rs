@@ -50,11 +50,18 @@ pub fn run() -> anyhow::Result<()> {
             );
             failed = true;
         }
+        for (entry, path) in audit_local_path_leaks(&po_entries) {
+            eprintln!(
+                "FAIL: {locale}:{}: local-path-leak translation ({path}) at {}",
+                entry.msgstr_line, entry.reference
+            );
+            failed = true;
+        }
     }
 
     if failed {
         anyhow::bail!(
-            "one or more .po files have format, generated-response, or protected-literal errors"
+            "one or more .po files have format, generated-response, protected-literal, or local-path-leak errors"
         );
     }
     println!("All .po files OK.");
@@ -75,6 +82,15 @@ fn audit_protected_literals(
         .iter()
         .filter_map(|entry| {
             missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| (entry, literal))
+        })
+        .collect()
+}
+
+fn audit_local_path_leaks(entries: &[PoEntry]) -> Vec<(&PoEntry, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            introduced_local_absolute_path(&entry.msgid, &entry.msgstr).map(|path| (entry, path))
         })
         .collect()
 }
@@ -266,6 +282,133 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
 #[cfg(test)]
 fn protected_literal_reason(entry: &PoEntry) -> Option<&'static str> {
     missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| literal.reason)
+}
+
+const LOCAL_POSIX_PATH_ROOTS: &[&str] = &[
+    "/Users",
+    "/home",
+    "/private/tmp",
+    "/private/var/folders",
+    "/tmp",
+    "/var/folders",
+    "/var/tmp",
+    "/Volumes",
+];
+
+pub fn introduced_local_absolute_path(source: &str, translation: &str) -> Option<String> {
+    let translation_paths = local_absolute_paths(translation);
+    if translation_paths.is_empty() {
+        return None;
+    }
+
+    let source_paths = local_absolute_paths(source);
+    translation_paths
+        .into_iter()
+        .find(|path| !source_paths.contains(path))
+}
+
+fn local_absolute_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for (idx, _) in text.char_indices() {
+        if (starts_local_posix_path(text, idx) || starts_windows_absolute_path(text, idx))
+            && let Some(path) = extract_path_at(text, idx)
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn starts_local_posix_path(text: &str, idx: usize) -> bool {
+    path_boundary_before(text, idx)
+        && LOCAL_POSIX_PATH_ROOTS.iter().any(|root| {
+            text[idx..].strip_prefix(root).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with('/') || path_boundary_after_root(rest)
+            })
+        })
+}
+
+fn starts_windows_absolute_path(text: &str, idx: usize) -> bool {
+    let bytes = text.as_bytes();
+    path_boundary_before(text, idx)
+        && idx + 2 < bytes.len()
+        && bytes[idx].is_ascii_alphabetic()
+        && bytes[idx + 1] == b':'
+        && matches!(bytes[idx + 2], b'\\' | b'/')
+        && !matches!(bytes.get(idx + 3), Some(b'\\' | b'/'))
+}
+
+fn path_boundary_before(text: &str, idx: usize) -> bool {
+    idx == 0
+        || text[..idx].chars().next_back().is_some_and(|c| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '(' | '[' | '{')
+        })
+}
+
+fn path_boundary_after_root(rest: &str) -> bool {
+    rest.chars().next().is_some_and(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | '<'
+                    | '>'
+                    | ')'
+                    | ']'
+                    | '}'
+                    | '.'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '。'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+            )
+    })
+}
+
+fn extract_path_at(text: &str, start: usize) -> Option<String> {
+    let mut end = text.len();
+    for (offset, c) in text[start..].char_indices() {
+        if offset == 0 {
+            continue;
+        }
+        if c.is_whitespace() {
+            let rest = &text[start + offset + c.len_utf8()..];
+            if path_continues_after_space(rest) {
+                continue;
+            }
+            end = start + offset;
+            break;
+        }
+        if matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}') {
+            end = start + offset;
+            break;
+        }
+    }
+    let path = text[start..end].trim_end_matches([
+        '.', ',', ';', ':', '!', '?', '。', '，', '；', '：', '！', '？',
+    ]);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn path_continues_after_space(rest: &str) -> bool {
+    let token = rest
+        .trim_start()
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}')
+        })
+        .next()
+        .unwrap_or_default();
+    token.contains('/') || token.contains('\\')
 }
 
 fn contains_assistant_response_phrase(text: &str) -> bool {
@@ -535,6 +678,104 @@ mod tests {
             "**Uso:** `zeroclaw [OPCIONES] <COMANDO>`",
         );
         assert_eq!(protected_literal_reason(&clean), None);
+    }
+
+    #[test]
+    fn flags_translation_introduced_posix_local_path() {
+        let issue = entry(
+            "The failure log is next to the catalog.",
+            "Le journal est dans /Users/alice/zeroclaw/docs/book/po/fr.failures.log.",
+        );
+        let entries = vec![issue];
+        let leaks = audit_local_path_leaks(&entries);
+        assert_eq!(
+            leaks[0].1.as_str(),
+            "/Users/alice/zeroclaw/docs/book/po/fr.failures.log"
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_private_tmp_and_volume_paths() {
+        let private_tmp = entry(
+            "The failure log is next to the catalog.",
+            "日志位于 /private/tmp/zeroclaw/zh-CN.failures.log。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&private_tmp.msgid, &private_tmp.msgstr).as_deref(),
+            Some("/private/tmp/zeroclaw/zh-CN.failures.log")
+        );
+
+        let volume = entry(
+            "The failure log is next to the catalog.",
+            "ログは /Volumes/Example Disk/zeroclaw/ja.failures.log にあります。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&volume.msgid, &volume.msgstr).as_deref(),
+            Some("/Volumes/Example Disk/zeroclaw/ja.failures.log")
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_windows_local_path() {
+        let issue = entry(
+            "The failure log is next to the catalog.",
+            r#"El registro está en C:\Users\Alice\zeroclaw\docs\book\po\es.failures.log."#,
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&issue.msgid, &issue.msgstr).as_deref(),
+            Some(r#"C:\Users\Alice\zeroclaw\docs\book\po\es.failures.log"#)
+        );
+    }
+
+    #[test]
+    fn allows_source_preserved_absolute_path() {
+        let clean = entry(
+            "Write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`.",
+            "Escriba `/home/alice/zeroclaw/web/dist` en lugar de `~/zeroclaw/web/dist`.",
+        );
+        assert_eq!(protected_literal_reason(&clean), None);
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn allows_urls_without_treating_them_as_local_paths() {
+        let clean = entry(
+            "Open https://example.com/docs for details.",
+            "詳細は https://example.com/docs を開いてください。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn allows_translation_introduced_urls() {
+        let clean = entry(
+            "Open the public docs site for details.",
+            "詳細は https://example.com/docs を開いてください。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_bare_local_temp_dirs() {
+        for path in ["/tmp", "/var/tmp", "/private/tmp"] {
+            let issue = entry(
+                "The failure log is next to the catalog.",
+                &format!("See `{path}` for the generated log."),
+            );
+            assert_eq!(
+                introduced_local_absolute_path(&issue.msgid, &issue.msgstr).as_deref(),
+                Some(path)
+            );
+        }
     }
 
     #[test]

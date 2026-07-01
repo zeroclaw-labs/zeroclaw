@@ -14233,6 +14233,27 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
+/// Where an AMQP delivery is routed once consumed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AmqpDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
+    /// shaped by `content_template`/`thread_id_field`. This is the default and
+    /// preserves the original AMQP consumer behavior.
+    #[default]
+    AgentLoop,
+    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
+    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
+    /// `amqp` trigger routing key matches. No agent turn is started.
+    Sop,
+    /// Do both: dispatch to the SOP engine and drive an agent turn from the
+    /// same delivery.
+    SopAndAgentLoop,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.amqp"]
@@ -14246,7 +14267,9 @@ pub struct AmqpConfig {
     pub enabled: bool,
     /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
     /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub amqp_url: String,
     /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
     #[tab(Advanced)]
@@ -14266,10 +14289,14 @@ pub struct AmqpConfig {
     pub ca_cert: Option<PathBuf>,
     /// Path to the client certificate for broker mutual-TLS auth
     /// (Fedora Messaging requires a client cert).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_cert: Option<PathBuf>,
     /// Path to the client private key matching `client_cert`.
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_key: Option<PathBuf>,
     /// Value placed in `ChannelMessage.sender` for every delivery from this
     /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
@@ -14298,6 +14325,13 @@ pub struct AmqpConfig {
     #[tab(Behavior)]
     #[serde(default = "default_amqp_durable_ack")]
     pub durable_ack: bool,
+    /// Where consumed deliveries are routed: drive an agent turn
+    /// (`agent_loop`, default), dispatch to the SOP engine (`sop`), or both
+    /// (`sop_and_agent_loop`). The `sop` and `sop_and_agent_loop` modes match
+    /// the delivery against SOP `amqp` triggers by routing key.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub dispatch: AmqpDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -17404,6 +17438,7 @@ impl Config {
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
+        self.collect_memory_semantic_search_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -17423,6 +17458,100 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface sqlite semantic/hybrid search with no effective embedder. The
+    /// runtime treats `NoopEmbedding` as dimensions 0 and silently skips the
+    /// vector path, so derive this from the canonical memory settings instead
+    /// of storing another effective-mode field.
+    fn collect_memory_semantic_search_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !Self::memory_backend_is_sqlite(&self.memory.backend) {
+            return;
+        }
+        if !matches!(
+            &self.memory.search_mode,
+            SearchMode::Embedding | SearchMode::Hybrid
+        ) {
+            return;
+        }
+        if self.memory_has_effective_embedder() {
+            return;
+        }
+
+        let search_mode = match &self.memory.search_mode {
+            SearchMode::Bm25 => "bm25",
+            SearchMode::Embedding => "embedding",
+            SearchMode::Hybrid => "hybrid",
+        };
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "memory_semantic_search_without_embedder",
+            format!(
+                "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
+                 embedding provider is configured; vector search is skipped and \
+                 recall falls back to keyword-only behavior. Configure \
+                 memory.embedding_provider or a valid memory.embedding_model \
+                 hint route, or set memory.search_mode = \"bm25\"."
+            ),
+            "memory.search_mode",
+        ));
+    }
+
+    fn memory_backend_is_sqlite(backend: &str) -> bool {
+        let trimmed = backend.trim();
+        let family = trimmed
+            .split_once('.')
+            .map_or(trimmed, |(family, _)| family)
+            .trim();
+        family.eq_ignore_ascii_case("sqlite")
+    }
+
+    fn memory_has_effective_embedder(&self) -> bool {
+        let fallback = || Self::memory_embedding_settings_have_effective_embedder(&self.memory);
+        let Some(hint) = self
+            .memory
+            .embedding_model
+            .strip_prefix("hint:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return fallback();
+        };
+
+        let Some(route) = self
+            .embedding_routes
+            .iter()
+            .find(|route| route.hint.trim() == hint)
+        else {
+            return fallback();
+        };
+
+        if Self::embedding_route_has_effective_embedder(route, self.memory.embedding_dimensions) {
+            return true;
+        }
+        fallback()
+    }
+
+    fn memory_embedding_settings_have_effective_embedder(memory: &MemoryConfig) -> bool {
+        let provider = memory.embedding_provider.trim();
+        !provider.is_empty()
+            && !provider.eq_ignore_ascii_case("none")
+            && memory.embedding_dimensions > 0
+    }
+
+    fn embedding_route_has_effective_embedder(
+        route: &EmbeddingRouteConfig,
+        fallback_dimensions: usize,
+    ) -> bool {
+        let provider = route.model_provider.trim();
+        let model = route.model.trim();
+        let dimensions = route.dimensions.unwrap_or(fallback_dimensions);
+        !provider.is_empty()
+            && !provider.eq_ignore_ascii_case("none")
+            && !model.is_empty()
+            && dimensions > 0
     }
 
     /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
@@ -20700,6 +20829,11 @@ mod tests {
             ..base
         };
         assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    async fn amqp_dispatch_defaults_to_agent_loop() {
+        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
     }
 
     #[test]
@@ -27267,6 +27401,7 @@ group_policy = "disabled"
     #[test]
     async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         // mistral has a fixed wire protocol and ignores wire_api.
         config
             .providers
@@ -31522,6 +31657,127 @@ allowed_users = []
         );
     }
 
+    const SEMANTIC_MEMORY_WARNING: &str = "memory_semantic_search_without_embedder";
+
+    fn warnings_with_code(
+        config: &Config,
+        code: &str,
+    ) -> Vec<crate::validation_warnings::ValidationWarning> {
+        config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == code)
+            .collect()
+    }
+
+    fn suppress_semantic_memory_warning(config: &mut Config) {
+        config.memory.search_mode = SearchMode::Bm25;
+    }
+
+    #[test]
+    async fn collect_warnings_flags_sqlite_hybrid_without_embedder() {
+        let config = Config::default();
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert_eq!(warning.path, "memory.search_mode");
+        assert!(
+            warning.message.contains("sqlite"),
+            "warning should name sqlite memory: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("keyword-only"),
+            "warning should describe the runtime degradation: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_sqlite_embedding_without_embedder() {
+        let mut config = Config::default();
+        config.memory.search_mode = SearchMode::Embedding;
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].message.contains("\"embedding\""),
+            "warning should name embedding search mode: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_valid_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("k".to_string()),
+                    model: Some("gpt-4o".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            model_provider: "openai.default".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: Some(1536),
+            api_key: None,
+        });
+        config.validate().expect("hint route should validate");
+
+        assert!(
+            warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty(),
+            "valid hint route must count as an effective embedder"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_missing_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_invalid_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            model_provider: "none".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: Some(1536),
+            api_key: None,
+        });
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_bm25_without_embedder() {
+        let mut config = Config::default();
+        config.memory.search_mode = SearchMode::Bm25;
+
+        assert!(warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty());
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_non_sqlite_without_embedder() {
+        let mut config = Config::default();
+        config.memory.backend = "markdown.default".to_string();
+
+        assert!(warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty());
+    }
+
     #[test]
     async fn config_validate_accepts_classifier_provider_pointing_at_existing_alias() {
         let toml = r#"
@@ -31606,6 +31862,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_on_dangling_ref() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "primary".to_string(),
             provider_entry_with_fallback(&["openai.ghost"]),
@@ -31623,6 +31880,7 @@ allowed_users = []
     #[test]
     async fn fallback_no_warning_when_ref_resolves() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "primary".to_string(),
             provider_entry_with_fallback(&["openai.backup"]),
@@ -31639,6 +31897,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_on_two_node_cycle() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config
             .providers
             .models
@@ -31664,6 +31923,7 @@ allowed_users = []
     #[test]
     async fn fallback_self_reference_is_a_cycle() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "loop".to_string(),
             provider_entry_with_fallback(&["openai.loop"]),
@@ -31677,6 +31937,7 @@ allowed_users = []
     #[test]
     async fn fallback_empty_ref_is_skipped() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config
             .providers
             .models
@@ -31689,6 +31950,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_when_chain_exceeds_max_depth() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
         for i in 0..n {
             let next = if i + 1 < n {
@@ -31718,6 +31980,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_warns_on_empty_entry() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["".to_string()];
         config
@@ -31734,6 +31997,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_warns_on_duplicate_of_primary() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["gpt-4o".to_string()];
         config
@@ -31750,6 +32014,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_distinct_entries_do_not_warn() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
         config
