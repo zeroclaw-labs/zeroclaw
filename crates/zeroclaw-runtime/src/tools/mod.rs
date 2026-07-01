@@ -762,7 +762,7 @@ pub fn all_tools_with_runtime(
     }
 
     if matches!(
-        root_config.skills_prompt_mode_for_agent(agent_alias),
+        root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
         // ReadSkillTool now holds full config to support all skill sources:
@@ -2649,14 +2649,22 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
-        // Global stays Full; the per-agent override flips this agent to Compact.
+        // Global stays Full; a runtime profile flips this agent to Compact and
+        // the agent selects it via `runtime_profile`.
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
-        cfg.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
+        cfg.runtime_profiles.insert(
+            "compact_profile".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
                 prompt_injection_mode: Some(
                     zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
                 ),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "compact_profile".into(),
                 ..Default::default()
             },
         );
@@ -2684,7 +2692,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
             names.contains(&"read_skill"),
-            "compact per-agent override should register read_skill even when global is full"
+            "compact runtime-profile override should register read_skill even when global is full"
         );
     }
 
@@ -2702,15 +2710,23 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
-        // Global is Compact; the per-agent override pins this agent to Full.
+        // Global is Compact; a runtime profile pins this agent to Full and the
+        // agent selects it via `runtime_profile`.
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
-        cfg.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
+        cfg.runtime_profiles.insert(
+            "full_profile".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
                 prompt_injection_mode: Some(
                     zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
                 ),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
                 ..Default::default()
             },
         );
@@ -2738,7 +2754,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
             !names.contains(&"read_skill"),
-            "full per-agent override should omit read_skill even when global is compact"
+            "full runtime-profile override should omit read_skill even when global is compact"
         );
     }
 }

@@ -2085,7 +2085,7 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
         ),
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config
-            .skills_prompt_mode_for_agent(ctx.agent_alias.as_str()),
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
@@ -9933,7 +9933,7 @@ pub async fn start_channels(
         ];
 
         if matches!(
-            config.skills_prompt_mode_for_agent(agent_alias),
+            config.effective_skills_prompt_mode(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -10016,7 +10016,7 @@ pub async fn start_channels(
             bootstrap_max_chars,
             Some(&risk_profile),
             native_tools,
-            config.skills_prompt_mode_for_agent(agent_alias),
+            config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
