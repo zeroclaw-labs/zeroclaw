@@ -46,6 +46,8 @@ stays correct as channels gain or lose streaming support:
 
 When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by that channel's `draft_update_interval_ms` setting to avoid rate-limiting; defaults vary by channel.
 
+**Multi-message mode differs by channel:** Matrix and Discord split on `\n\n` paragraph boundaries. Telegram `multi_message` sends one message per completed agent text turn (text between tool calls), flushed via `Channel::flush_draft_turn` when the LLM turn ends.
+
 ## Reasoning blocks
 
 `StreamEvent` has no separate `ReasoningDelta` variant. When a provider exposes reasoning during streaming, it uses the `reasoning` field on the `StreamChunk` carried by `TextDelta`; provider and runtime configuration determine whether that content is requested or surfaced. Consumers should follow the `StreamChunk` contract rather than matching a nonexistent event variant.
