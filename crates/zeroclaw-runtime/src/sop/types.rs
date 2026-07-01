@@ -10,6 +10,7 @@ use super::step_contract::{StepFailure, StepRouting};
 
 /// SOP priority level, used for execution mode resolution and scheduling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SopPriority {
     Low,
@@ -68,6 +69,7 @@ impl fmt::Display for SopExecutionMode {
 
 /// A normalized filesystem change kind reported by the watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FilesystemEventKind {
     Created,
@@ -99,6 +101,7 @@ impl std::str::FromStr for FilesystemEventKind {
 
 /// What event can activate an SOP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SopTrigger {
     Mqtt {
@@ -153,6 +156,7 @@ impl fmt::Display for SopTrigger {
 
 /// The kind of a workflow step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopStepKind {
     /// Normal step — executed by the agent (or deterministic handler).
@@ -178,6 +182,7 @@ impl fmt::Display for SopStepKind {
 /// Stored as a raw `serde_json::Value` so callers can validate without
 /// pulling in a full JSON Schema library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepSchema {
     /// JSON Schema object describing expected input shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +196,7 @@ pub struct StepSchema {
 
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStep {
     pub number: u32,
     pub title: String,
@@ -254,6 +260,7 @@ impl SopStep {
 
 /// A complete Standard Operating Procedure definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Sop {
     pub name: String,
     pub description: String,
@@ -267,6 +274,7 @@ pub struct Sop {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
     #[serde(skip)]
+    #[cfg_attr(feature = "schema-export", schemars(skip))]
     pub location: Option<PathBuf>,
     /// When true, sets execution_mode to Deterministic.
     /// Steps execute sequentially without LLM round-trips.
@@ -384,6 +392,7 @@ pub struct SopEvent {
 
 /// Status of an SOP execution run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatus {
     Pending,
@@ -556,10 +565,88 @@ pub enum SopRunAction {
 mod tests {
     use super::*;
 
+    /// The zerocode TUI carries a **mirror** of `Sop`/`SopStep`/`StepRouting`/
+    /// `StepFailure` (it is off the runtime dependency tree). This parses the
+    /// exact wire shape that mirror emits into the canonical `Sop`, asserting
+    /// the authoring fields survive. Paired with the zerocode-side
+    /// `draft_serializes_to_canonical_wire` test, any field-name or tagging
+    /// drift between the mirror and this struct fails one side loudly.
+    #[test]
+    fn mirror_wire_shape_is_canonical() {
+        let wire = serde_json::json!({
+            "name": "demo",
+            "description": "d",
+            "version": "1.0.0",
+            "priority": "high",
+            "execution_mode": "supervised",
+            "triggers": [{ "type": "manual" }],
+            "steps": [
+                {
+                    "number": 1,
+                    "title": "gate",
+                    "body": "b",
+                    "suggested_tools": ["shell"],
+                    "requires_confirmation": true,
+                    "kind": "checkpoint",
+                    "routing": { "when": "$.ok", "next": 2 },
+                    "on_failure": { "retry": { "max": 3 } }
+                },
+                {
+                    "number": 2,
+                    "title": "act",
+                    "body": "b2",
+                    "routing": { "depends_on": [1] },
+                    "on_failure": { "goto": { "step": 1 } }
+                }
+            ],
+            "cooldown_secs": 0,
+            "max_concurrent": 1,
+            "deterministic": false
+        });
+        let sop: Sop = serde_json::from_value(wire).expect("mirror wire parses into canonical Sop");
+        assert_eq!(sop.steps.len(), 2);
+        let s0 = &sop.steps[0];
+        assert_eq!(s0.kind, SopStepKind::Checkpoint);
+        assert!(s0.requires_confirmation);
+        assert_eq!(s0.routing.when.as_deref(), Some("$.ok"));
+        assert_eq!(s0.routing.next, Some(2));
+        assert_eq!(
+            s0.on_failure,
+            super::super::step_contract::StepFailure::Retry { max: 3 }
+        );
+        let s1 = &sop.steps[1];
+        assert_eq!(s1.routing.depends_on, vec![1]);
+        assert_eq!(
+            s1.on_failure,
+            super::super::step_contract::StepFailure::Goto { step: 1 }
+        );
+        // Bare "fail" string parses to the unit variant.
+        let f: super::super::step_contract::StepFailure =
+            serde_json::from_value(serde_json::json!("fail")).unwrap();
+        assert_eq!(f, super::super::step_contract::StepFailure::Fail);
+    }
+
     #[test]
     fn priority_display() {
         assert_eq!(SopPriority::Critical.to_string(), "critical");
         assert_eq!(SopPriority::Low.to_string(), "low");
+    }
+
+    /// Overlay node-state wire tokens the zerocode `NodeRunState` mirror also
+    /// parses. Guards the snake_case names against drift.
+    #[test]
+    fn node_run_state_wire_tokens_are_canonical() {
+        use crate::sop::graph::NodeRunState;
+        for (token, want) in [
+            ("pending", NodeRunState::Pending),
+            ("active", NodeRunState::Active),
+            ("completed", NodeRunState::Completed),
+            ("failed", NodeRunState::Failed),
+            ("skipped", NodeRunState::Skipped),
+        ] {
+            let got: NodeRunState = serde_json::from_value(serde_json::json!(token)).unwrap();
+            assert_eq!(got, want, "token {token}");
+        }
     }
 
     #[test]

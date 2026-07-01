@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, XCircle, Loader2, ArrowDown } from 'lucide-react';
+import { AlertTriangle, XCircle, Loader2, ArrowDown, Plus, Save, Trash2, X } from 'lucide-react';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import {
   listSops,
   getSopGraph,
   getRunOverlay,
+  getSop,
+  createSop,
+  saveSop,
+  deleteSop,
   type SopSummary,
   type SopGraph,
   type GraphNode,
@@ -13,12 +17,41 @@ import {
   type GraphWire,
   type RunOverlay,
   type NodeRunState,
+  type Sop,
+  type SopStep,
+  type StepFailure,
 } from '@/lib/sops';
+
+function blankStep(number: number): SopStep {
+  return {
+    number,
+    title: '',
+    body: '',
+    kind: 'execute',
+    requires_confirmation: false,
+    suggested_tools: [],
+  };
+}
+
+function blankSop(name: string): Sop {
+  return {
+    name,
+    description: '',
+    version: '1.0.0',
+    priority: 'normal',
+    execution_mode: 'supervised',
+    triggers: [{ type: 'manual' }],
+    steps: [blankStep(1)],
+    cooldown_secs: 0,
+    max_concurrent: 1,
+    deterministic: false,
+  };
+}
 
 function nodeStateTone(state: NodeRunState | undefined): string {
   switch (state) {
     case 'active':
-      return 'border-pc-accent ring-2 ring-pc-accent';
+      return 'border-pc-accent ring-2 ring-pc-accent animate-pulse';
     case 'completed':
       return 'border-emerald-500';
     case 'failed':
@@ -164,12 +197,19 @@ function GraphCanvas({ graph, overlay }: { graph: SopGraph; overlay?: RunOverlay
     <div className="flex flex-col items-center gap-1">
       {ordered.map((node, idx) => {
         const outbound = wiresByFrom.get(node.step) ?? [];
+        const nextStep = ordered[idx + 1]?.step;
+        const flowsToActive =
+          outbound.some((w) => stateByStep.get(w.to_step) === 'active') ||
+          (nextStep !== undefined && stateByStep.get(nextStep) === 'active');
         return (
           <div key={node.step} className="flex w-full flex-col items-center">
             <NodeCard node={node} state={stateByStep.get(node.step)} />
             {idx < ordered.length - 1 || outbound.length > 0 ? (
               <div className="flex flex-col items-center py-1">
-                <ArrowDown className="h-4 w-4 text-pc-text-muted" aria-hidden />
+                <ArrowDown
+                  className={`h-4 w-4 ${flowsToActive ? 'animate-bounce text-pc-accent' : 'text-pc-text-muted'}`}
+                  aria-hidden
+                />
                 {outbound.map((w, i) => (
                   <span key={`w-${node.step}-${i}`} className={`text-[10px] ${wireRoleTone(w)}`}>
                     {node.step} → {w.to_step} [{wireLabel(w)}]
@@ -210,6 +250,335 @@ function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
   );
 }
 
+function failureKind(f: StepFailure | undefined): 'fail' | 'retry' | 'goto' {
+  if (f === undefined || f === 'fail') return 'fail';
+  if ('retry' in f) return 'retry';
+  return 'goto';
+}
+
+function StepEditor({
+  step,
+  index,
+  count,
+  onChange,
+  onRemove,
+  onMove,
+}: {
+  step: SopStep;
+  index: number;
+  count: number;
+  onChange: (patch: Partial<SopStep>) => void;
+  onRemove: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const routing = step.routing ?? {};
+  const fkind = failureKind(step.on_failure);
+  const setFailure = (kind: 'fail' | 'retry' | 'goto') => {
+    if (kind === 'fail') onChange({ on_failure: 'fail' });
+    else if (kind === 'retry') onChange({ on_failure: { retry: { max: 1 } } });
+    else onChange({ on_failure: { goto: { step: 1 } } });
+  };
+  const setRouting = (patch: Partial<typeof routing>) =>
+    onChange({ routing: { ...routing, ...patch } });
+  return (
+    <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
+          {step.number}
+        </span>
+        <input
+          type="text"
+          value={step.title}
+          onChange={(e) => onChange({ title: e.target.value })}
+          placeholder={t('sops.step_title_placeholder')}
+          className="flex-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+        />
+        <select
+          value={step.kind ?? 'execute'}
+          onChange={(e) => onChange({ kind: e.target.value as SopStep['kind'] })}
+          className="rounded border border-pc-border bg-pc-surface px-1.5 py-1 text-xs text-pc-text"
+          aria-label={t('sops.step_kind')}
+        >
+          <option value="execute">{t('sops.kind_execute')}</option>
+          <option value="checkpoint">{t('sops.kind_checkpoint')}</option>
+        </select>
+        <button
+          type="button"
+          onClick={() => onMove(-1)}
+          disabled={index === 0}
+          className="rounded px-1.5 py-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+          aria-label={t('sops.move_up')}
+        >
+          ↑
+        </button>
+        <button
+          type="button"
+          onClick={() => onMove(1)}
+          disabled={index === count - 1}
+          className="rounded px-1.5 py-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+          aria-label={t('sops.move_down')}
+        >
+          ↓
+        </button>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="rounded px-1.5 py-1 text-rose-500 hover:bg-pc-elevated"
+          aria-label={t('sops.remove_step')}
+        >
+          <Trash2 className="h-4 w-4" aria-hidden />
+        </button>
+      </div>
+      <textarea
+        value={step.body}
+        onChange={(e) => onChange({ body: e.target.value })}
+        placeholder={t('sops.step_body_placeholder')}
+        rows={2}
+        className="mb-2 w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+      />
+      <div className="mb-2 flex items-center gap-3 text-xs">
+        <input
+          type="text"
+          value={(step.suggested_tools ?? []).join(', ')}
+          onChange={(e) =>
+            onChange({
+              suggested_tools: e.target.value
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            })
+          }
+          placeholder={t('sops.step_tools_placeholder')}
+          className="flex-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+        />
+        <label className="flex items-center gap-1 text-pc-text-muted">
+          <input
+            type="checkbox"
+            checked={step.requires_confirmation ?? false}
+            onChange={(e) => onChange({ requires_confirmation: e.target.checked })}
+          />
+          {t('sops.requires_confirmation')}
+        </label>
+      </div>
+      <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
+        <label className="block">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_depends_on')}</span>
+          <input
+            type="text"
+            value={(routing.depends_on ?? []).join(', ')}
+            onChange={(e) =>
+              setRouting({
+                depends_on: e.target.value
+                  .split(',')
+                  .map((s) => parseInt(s.trim(), 10))
+                  .filter((n) => Number.isFinite(n)),
+              })
+            }
+            placeholder="2, 3"
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_next')}</span>
+          <input
+            type="number"
+            value={routing.next ?? ''}
+            onChange={(e) =>
+              setRouting({ next: e.target.value ? parseInt(e.target.value, 10) : undefined })
+            }
+            placeholder="→"
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_when')}</span>
+          <input
+            type="text"
+            value={routing.when ?? ''}
+            onChange={(e) => setRouting({ when: e.target.value || undefined })}
+            placeholder="$.value > 85"
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.on_failure')}</span>
+          <select
+            value={fkind}
+            onChange={(e) => setFailure(e.target.value as 'fail' | 'retry' | 'goto')}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          >
+            <option value="fail">{t('sops.failure_fail')}</option>
+            <option value="retry">{t('sops.failure_retry')}</option>
+            <option value="goto">{t('sops.failure_goto')}</option>
+          </select>
+        </label>
+        {fkind === 'retry' && step.on_failure && typeof step.on_failure === 'object' && 'retry' in step.on_failure ? (
+          <label className="block">
+            <span className="mb-1 block text-pc-text-muted">{t('sops.failure_max')}</span>
+            <input
+              type="number"
+              value={step.on_failure.retry.max}
+              onChange={(e) =>
+                onChange({ on_failure: { retry: { max: parseInt(e.target.value, 10) || 1 } } })
+              }
+              className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+            />
+          </label>
+        ) : null}
+        {fkind === 'goto' && step.on_failure && typeof step.on_failure === 'object' && 'goto' in step.on_failure ? (
+          <label className="block">
+            <span className="mb-1 block text-pc-text-muted">{t('sops.failure_goto_step')}</span>
+            <input
+              type="number"
+              value={step.on_failure.goto.step}
+              onChange={(e) =>
+                onChange({ on_failure: { goto: { step: parseInt(e.target.value, 10) || 1 } } })
+              }
+              className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+            />
+          </label>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function SopEditor({
+  draft,
+  saving,
+  saveError,
+  onField,
+  onStep,
+  onAddStep,
+  onRemoveStep,
+  onMoveStep,
+  onSave,
+  onCancel,
+}: {
+  draft: Sop;
+  saving: boolean;
+  saveError: string | null;
+  onField: (patch: Partial<Sop>) => void;
+  onStep: (i: number, patch: Partial<SopStep>) => void;
+  onAddStep: () => void;
+  onRemoveStep: (i: number) => void;
+  onMoveStep: (i: number, dir: -1 | 1) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Card className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="font-medium text-pc-text">{t('sops.editor_title')}</div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated"
+          >
+            <X className="h-4 w-4" aria-hidden /> {t('sops.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={saving}
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-sm text-white disabled:opacity-50"
+          >
+            {saving ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : (
+              <Save className="h-4 w-4" aria-hidden />
+            )}
+            {t('sops.save')}
+          </button>
+        </div>
+      </div>
+      {saveError ? <div className="text-sm text-rose-500">{saveError}</div> : null}
+      <div className="grid grid-cols-2 gap-3">
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.field_name')}</span>
+          <input
+            type="text"
+            value={draft.name}
+            onChange={(e) => onField({ name: e.target.value })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          />
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.field_version')}</span>
+          <input
+            type="text"
+            value={draft.version}
+            onChange={(e) => onField({ version: e.target.value })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          />
+        </label>
+      </div>
+      <label className="block text-sm">
+        <span className="mb-1 block text-pc-text-muted">{t('sops.field_description')}</span>
+        <input
+          type="text"
+          value={draft.description}
+          onChange={(e) => onField({ description: e.target.value })}
+          className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+        />
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.field_priority')}</span>
+          <select
+            value={draft.priority}
+            onChange={(e) => onField({ priority: e.target.value as Sop['priority'] })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          >
+            <option value="critical">critical</option>
+            <option value="high">high</option>
+            <option value="normal">normal</option>
+            <option value="low">low</option>
+          </select>
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.field_execution_mode')}</span>
+          <select
+            value={draft.execution_mode}
+            onChange={(e) => onField({ execution_mode: e.target.value as Sop['execution_mode'] })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          >
+            <option value="auto">auto</option>
+            <option value="supervised">supervised</option>
+            <option value="step_by_step">step_by_step</option>
+            <option value="priority_based">priority_based</option>
+            <option value="deterministic">deterministic</option>
+          </select>
+        </label>
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-pc-text">{t('sops.steps')}</span>
+          <button
+            type="button"
+            onClick={onAddStep}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
+          </button>
+        </div>
+        {draft.steps.map((s, i) => (
+          <StepEditor
+            key={i}
+            step={s}
+            index={i}
+            count={draft.steps.length}
+            onChange={(patch) => onStep(i, patch)}
+            onRemove={() => onRemoveStep(i)}
+            onMove={(dir) => onMoveStep(i, dir)}
+          />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 export default function Sops() {
   const [sops, setSops] = useState<SopSummary[]>([]);
   const [selected, setSelected] = useState<string>('');
@@ -220,6 +589,65 @@ export default function Sops() {
   const [runId, setRunId] = useState('');
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Sop | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const refreshList = useCallback((selectName?: string) => {
+    return listSops()
+      .then((list) => {
+        setSops(list);
+        if (selectName) setSelected(selectName);
+        else if (list.length > 0 && !list.some((s) => s.name === selectName)) {
+          setSelected(list[0]?.name ?? '');
+        }
+        return list;
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof Error ? e.message : String(e));
+        return [];
+      });
+  }, []);
+
+  const renumber = (steps: SopStep[]): SopStep[] =>
+    steps.map((s, i) => ({ ...s, number: i + 1 }));
+
+  const startNew = useCallback(() => {
+    setSaveError(null);
+    setDraft(blankSop(''));
+  }, []);
+
+  const startEdit = useCallback(() => {
+    if (!selected) return;
+    setSaveError(null);
+    getSop(selected)
+      .then((full) => setDraft(full))
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+  }, [selected]);
+
+  const onSaveDraft = useCallback(() => {
+    if (!draft) return;
+    setSaving(true);
+    setSaveError(null);
+    const isNew = !sops.some((s) => s.name === draft.name);
+    const body = { ...draft, steps: renumber(draft.steps) };
+    const op = isNew ? createSop(body) : saveSop(body);
+    op.then(() => {
+      setSaving(false);
+      setDraft(null);
+      return refreshList(body.name);
+    }).catch((e: unknown) => {
+      setSaving(false);
+      setSaveError(e instanceof Error ? e.message : String(e));
+    });
+  }, [draft, sops, refreshList]);
+
+  const onDeleteSelected = useCallback(() => {
+    if (!selected) return;
+    deleteSop(selected)
+      .then(() => refreshList())
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+  }, [selected, refreshList]);
 
   useEffect(() => {
     let active = true;
@@ -293,15 +721,67 @@ export default function Sops() {
     };
   }, [selected, runId]);
 
+  const editorHandlers = draft
+    ? {
+        onField: (patch: Partial<Sop>) => setDraft((d) => (d ? { ...d, ...patch } : d)),
+        onStep: (i: number, patch: Partial<SopStep>) =>
+          setDraft((d) =>
+            d ? { ...d, steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)) } : d,
+          ),
+        onAddStep: () =>
+          setDraft((d) =>
+            d ? { ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] } : d,
+          ),
+        onRemoveStep: (i: number) =>
+          setDraft((d) => (d ? { ...d, steps: d.steps.filter((_, j) => j !== i) } : d)),
+        onMoveStep: (i: number, dir: -1 | 1) =>
+          setDraft((d) => {
+            if (!d) return d;
+            const j = i + dir;
+            if (j < 0 || j >= d.steps.length) return d;
+            const steps = [...d.steps];
+            [steps[i], steps[j]] = [steps[j]!, steps[i]!];
+            return { ...d, steps };
+          }),
+      }
+    : null;
+
   return (
     <div className="space-y-4">
-      <PageHeader title={t('sops.title')} description={t('sops.subtitle')} />
+      <PageHeader
+        title={t('sops.title')}
+        description={t('sops.subtitle')}
+        actions={
+          !draft ? (
+            <button
+              type="button"
+              onClick={startNew}
+              className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-white"
+            >
+              <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
+            </button>
+          ) : null
+        }
+      />
       {error ? (
         <Card>
           <div className="text-rose-500">{error}</div>
         </Card>
       ) : null}
-      {loading ? (
+      {draft && editorHandlers ? (
+        <SopEditor
+          draft={draft}
+          saving={saving}
+          saveError={saveError}
+          onField={editorHandlers.onField}
+          onStep={editorHandlers.onStep}
+          onAddStep={editorHandlers.onAddStep}
+          onRemoveStep={editorHandlers.onRemoveStep}
+          onMoveStep={editorHandlers.onMoveStep}
+          onSave={onSaveDraft}
+          onCancel={() => setDraft(null)}
+        />
+      ) : loading ? (
         <Card>
           <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
         </Card>
@@ -341,6 +821,23 @@ export default function Sops() {
                   {graph.nodes.length} {t('sops.steps')}
                 </Badge>
               ) : null}
+              <div className="ml-auto flex gap-2">
+                <button
+                  type="button"
+                  onClick={startEdit}
+                  disabled={!graph}
+                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
+                >
+                  {t('sops.edit')}
+                </button>
+                <button
+                  type="button"
+                  onClick={onDeleteSelected}
+                  className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-rose-500 hover:bg-pc-elevated"
+                >
+                  <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
+                </button>
+              </div>
             </div>
             <div className="mb-3 flex items-center gap-2">
               <input

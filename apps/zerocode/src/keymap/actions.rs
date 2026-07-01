@@ -280,10 +280,13 @@ keyactions! {
 
 keyactions! {
     pub enum SopTabAction ("sop") {
-        Up    [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
-        Down  [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
-        Enter [Chord::key(KeyCode::Enter)] => "load graph",
-        Watch [Chord::char('w'), Chord::char('W')] => "watch run",
+        Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        Enter  [Chord::key(KeyCode::Enter)] => "load graph",
+        Watch  [Chord::char('w'), Chord::char('W')] => "watch run",
+        New    [Chord::char('n')] => "new sop",
+        Edit   [Chord::char('e')] => "edit sop",
+        Delete [Chord::char('d')] => "delete sop",
     }
 }
 

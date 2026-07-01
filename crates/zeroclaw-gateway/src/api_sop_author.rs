@@ -1,10 +1,12 @@
-//! Read-only SOP authoring surface for the web node editor.
+//! SOP authoring surface for the web node editor.
 //!
 //! `GET /api/sops` lists the on-disk SOPs; `GET /api/sops/:name/graph` returns
-//! the inferred blueprint projection for one SOP. Both resolve the sops dir and
-//! default execution mode from live config exactly as the local RPC dispatch
-//! does, so the web surface and the TUI render the same projection. Reads are
-//! gated by the standard `/api/*` bearer-token check, never the admin gate.
+//! the inferred blueprint projection for one SOP. `POST /api/sops` creates,
+//! `PUT /api/sops/:name` saves, `DELETE /api/sops/:name` removes. Every handler
+//! resolves the sops dir from live config and calls the same
+//! `zeroclaw_runtime::sop` functions the local RPC dispatch calls, so no
+//! authoring logic is duplicated: both surfaces are thin skins over one
+//! strict-validated runtime path. Gated by the standard `/api/*` bearer check.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -108,11 +110,103 @@ pub async fn handle_sop_run_overlay(
     }
 }
 
+/// GET /api/sops/:name/full - the complete SOP definition for editing. The
+/// graph projection omits step bodies and tools; the editor needs the full
+/// `Sop`. Same load path as the graph route, serializing the SOP itself.
+pub async fn handle_sop_full(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, mode) = sops_dir_and_mode(&state);
+    match zeroclaw_runtime::sop::load_sop_by_name(&dir, &name, mode) {
+        Ok(sop) => Json(sop).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("SOP '{name}': {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/sops - create a new SOP. Rejects an overwrite: the target name
+/// must not already exist on disk. Body is the canonical `Sop` JSON.
+pub async fn handle_sop_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(sop): Json<zeroclaw_runtime::sop::Sop>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, _mode) = sops_dir_and_mode(&state);
+    if dir.join(&sop.name).exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("SOP '{}' already exists", sop.name) })),
+        )
+            .into_response();
+    }
+    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+        Ok(()) => Json(serde_json::json!({ "created": sop.name })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/sops/:name - save (create or overwrite) a SOP. The body name is the
+/// authority; the path name is advisory. Strict-validated by `save_sop`.
+pub async fn handle_sop_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(_name): Path<String>,
+    Json(sop): Json<zeroclaw_runtime::sop::Sop>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, _mode) = sops_dir_and_mode(&state);
+    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+        Ok(()) => Json(serde_json::json!({ "saved": sop.name })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/sops/:name - remove a SOP directory. 404 when absent.
+pub async fn handle_sop_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, _mode) = sops_dir_and_mode(&state);
+    match zeroclaw_runtime::sop::delete_sop(&dir, &name) {
+        Ok(()) => Json(serde_json::json!({ "deleted": name })).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
-    use axum::routing::get;
+    use axum::routing::{delete, get, post, put};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -201,6 +295,49 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/sops/missing/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn full_route_returns_complete_sop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "beta");
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/{name}/full", get(super::handle_sop_full))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sops/beta/full")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let sop: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sop["name"], "beta");
+        assert!(sop["steps"].as_array().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn full_route_unknown_name_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/{name}/full", get(super::handle_sop_full))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sops/missing/full")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -310,5 +447,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn sop_json(name: &str) -> String {
+        let sop = zeroclaw_runtime::sop::Sop {
+            name: name.to_string(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: zeroclaw_runtime::sop::SopPriority::High,
+            execution_mode: zeroclaw_runtime::sop::SopExecutionMode::Auto,
+            triggers: vec![zeroclaw_runtime::sop::SopTrigger::Manual],
+            steps: vec![zeroclaw_runtime::sop::SopStep {
+                number: 1,
+                title: "One".to_string(),
+                body: "do".to_string(),
+                ..Default::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        serde_json::to_string(&sop).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_route_writes_new_sop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops", post(super::handle_sop_create))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(sop_json("delta")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(tmp.path().join("delta").join("SOP.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn create_route_rejects_overwrite_with_409() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "dup");
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops", post(super::handle_sop_create))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(sop_json("dup")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn save_route_overwrites_existing_sop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "eps");
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/{name}", put(super::handle_sop_save))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/sops/eps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(sop_json("eps")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_route_removes_sop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(tmp.path(), "zeta");
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/{name}", delete(super::handle_sop_delete))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sops/zeta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(!tmp.path().join("zeta").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_route_missing_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route("/api/sops/{name}", delete(super::handle_sop_delete))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sops/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

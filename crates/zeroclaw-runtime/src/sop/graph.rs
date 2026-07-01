@@ -11,6 +11,7 @@ use super::types::{Sop, SopStep};
 /// A pin's data class. Flow pins carry execution order; Data pins carry
 /// typed values between step schemas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PinClass {
     Flow,
@@ -19,6 +20,7 @@ pub enum PinClass {
 
 /// The role a flow wire plays, so surfaces can style edges distinctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FlowRole {
     /// Normal successor edge (explicit `next` or implicit linear order).
@@ -32,6 +34,7 @@ pub enum FlowRole {
 /// A typed pin on a node. `data_type` is `None` for flow pins and for data
 /// pins whose schema omits a `type` (treated as `Any`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphPin {
     pub class: PinClass,
     pub name: String,
@@ -44,6 +47,7 @@ pub struct GraphPin {
 
 /// A single node in the projected graph, one per SOP step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphNode {
     pub step: u32,
     pub title: String,
@@ -54,6 +58,7 @@ pub struct GraphNode {
 /// An inferred connection. Flow wires carry a `FlowRole`; data wires carry
 /// the pin names they connect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphWire {
     pub class: PinClass,
     pub from_step: u32,
@@ -68,6 +73,7 @@ pub struct GraphWire {
 
 /// Severity of a graph diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GraphSeverity {
     Warning,
@@ -76,6 +82,7 @@ pub enum GraphSeverity {
 
 /// A structural diagnostic carried on the projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphDiagnostic {
     pub severity: GraphSeverity,
     pub step: u32,
@@ -84,6 +91,7 @@ pub struct GraphDiagnostic {
 
 /// The full projected graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopGraph {
     pub nodes: Vec<GraphNode>,
     pub wires: Vec<GraphWire>,
@@ -414,6 +422,7 @@ impl SopGraph {
 /// An immutable snapshot for watching a run progress, like a Blueprint
 /// executing. Inferred on demand; never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRunState {
     /// Not yet reached by the run.
@@ -427,6 +436,7 @@ pub enum NodeRunState {
 
 /// Run state for one graph node, keyed by the node's step number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct NodeRunOverlay {
     pub step: u32,
     pub state: NodeRunState,
@@ -436,6 +446,7 @@ pub struct NodeRunOverlay {
 /// align each entry to its `SopGraph` node by `step` and highlight it. The
 /// `waiting` / `paused` flags let a surface show why an Active node is held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct RunOverlay {
     pub run_id: String,
     pub sop_name: String,

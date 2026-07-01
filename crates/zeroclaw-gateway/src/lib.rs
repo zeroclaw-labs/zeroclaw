@@ -81,7 +81,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -1796,10 +1796,21 @@ pub async fn run_gateway(
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
-        .route("/api/sops", get(api_sop_author::handle_sops_list))
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
         .route(
             "/api/sops/{name}/graph",
             get(api_sop_author::handle_sop_graph),
+        )
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
         )
         .route(
             "/api/sops/{name}/runs/{run_id}/overlay",

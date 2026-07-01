@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Conditional routing metadata for a single SOP step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepRouting {
     /// Guard evaluated against accumulated run data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,6 +23,7 @@ impl StepRouting {
 
 /// Failure handling policy for a single SOP step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StepFailure {
     #[default]

@@ -111,8 +111,12 @@ pub mod method {
     pub const QUICKSTART_DISMISS: &str = "quickstart/dismiss";
     // SOP authoring
     pub const SOPS_LIST: &str = "sops/list";
+    pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
     pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
+    pub const SOPS_SAVE: &str = "sops/save";
+    pub const SOPS_CREATE: &str = "sops/create";
+    pub const SOPS_DELETE: &str = "sops/delete";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1192,6 +1196,11 @@ impl RpcClient {
         self.call(method::SOPS_LIST, serde_json::json!({})).await
     }
 
+    pub async fn sops_get(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_GET, serde_json::json!({ "name": name }))
+            .await
+    }
+
     pub async fn sops_graph(&self, name: &str) -> Result<Value> {
         self.call(method::SOPS_GRAPH, serde_json::json!({ "name": name }))
             .await
@@ -1203,6 +1212,21 @@ impl RpcClient {
             serde_json::json!({ "name": name, "run_id": run_id }),
         )
         .await
+    }
+
+    pub async fn sops_save(&self, sop: Value) -> Result<Value> {
+        self.call(method::SOPS_SAVE, serde_json::json!({ "sop": sop }))
+            .await
+    }
+
+    pub async fn sops_create(&self, sop: Value) -> Result<Value> {
+        self.call(method::SOPS_CREATE, serde_json::json!({ "sop": sop }))
+            .await
+    }
+
+    pub async fn sops_delete(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_DELETE, serde_json::json!({ "name": name }))
+            .await
     }
 
     // ── Session methods ──────────────────────────────────────────
@@ -1898,6 +1922,152 @@ pub struct QuickstartDismissResult {
     pub recorded: bool,
 }
 
+// ── SOP authoring types ──────────────────────────────────────────
+//
+// **Mirror** of `zeroclaw_runtime::sop::{Sop, SopStep, StepRouting,
+// StepFailure}`. Same rationale as the quickstart mirrors: the runtime
+// crate is intentionally off the TUI dependency tree, so the wire shape
+// is duplicated here and the SOP drift test enforces equality. Field
+// names and serde attributes match the canonical structs exactly so the
+// daemon's `save_sop` deserializes them without loss; strict validation
+// on the daemon side is the single authority.
+
+/// Mirror of `zeroclaw_runtime::sop::SopStepKind`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopStepKind {
+    #[default]
+    Execute,
+    Checkpoint,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::NodeRunState` (run-overlay node state).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRunState {
+    #[default]
+    Pending,
+    Active,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::StepRouting`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepRouting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<u32>,
+}
+
+impl StepRouting {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Mirror of `zeroclaw_runtime::sop::StepFailure`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepFailure {
+    #[default]
+    Fail,
+    Retry {
+        max: u32,
+    },
+    Goto {
+        step: u32,
+    },
+}
+
+impl StepFailure {
+    pub fn is_fail(&self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+/// Mirror of `zeroclaw_runtime::sop::SopStep` (authoring subset).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopStep {
+    pub number: u32,
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_confirmation: bool,
+    #[serde(default)]
+    pub kind: SopStepKind,
+    #[serde(default, skip_serializing_if = "StepRouting::is_default")]
+    pub routing: StepRouting,
+    #[serde(default, skip_serializing_if = "StepFailure::is_fail")]
+    pub on_failure: StepFailure,
+}
+
+impl Default for SopStep {
+    fn default() -> Self {
+        Self {
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            suggested_tools: Vec::new(),
+            requires_confirmation: false,
+            kind: SopStepKind::Execute,
+            routing: StepRouting::default(),
+            on_failure: StepFailure::Fail,
+        }
+    }
+}
+
+/// Mirror of `zeroclaw_runtime::sop::Sop` (authoring subset).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopDraft {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub priority: String,
+    pub execution_mode: String,
+    pub triggers: Vec<SopTriggerDraft>,
+    pub steps: Vec<SopStep>,
+    pub cooldown_secs: u64,
+    pub max_concurrent: u32,
+    pub deterministic: bool,
+}
+
+/// Minimal trigger mirror. Only the tagged `type` is edited in the TUI;
+/// the daemon fills trigger-specific fields from defaults.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopTriggerDraft {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl Default for SopDraft {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            priority: "normal".to_string(),
+            execution_mode: "supervised".to_string(),
+            triggers: vec![SopTriggerDraft {
+                kind: "manual".to_string(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            deterministic: false,
+        }
+    }
+}
+
 // ── Logs types ───────────────────────────────────────────────────
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -2569,5 +2739,113 @@ mod tls_tests {
     fn insecure_tls_config_builds_without_panic() {
         let cfg = RpcClient::insecure_tls_config();
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod sop_mirror_tests {
+    use super::*;
+
+    /// The SOP mirror must serialize to the exact wire shape the daemon's
+    /// canonical `zeroclaw_runtime::sop::Sop` deserializes. This locks field
+    /// names and the `StepFailure` tagging so the mirror cannot silently drift
+    /// from the source struct. The runtime side has the matching
+    /// `mirror_wire_shape_is_canonical` test that parses this same JSON into the
+    /// real `Sop`; together they fail loudly on any divergence.
+    #[test]
+    fn draft_serializes_to_canonical_wire() {
+        let draft = SopDraft {
+            name: "demo".to_string(),
+            description: "d".to_string(),
+            version: "1.0.0".to_string(),
+            priority: "high".to_string(),
+            execution_mode: "supervised".to_string(),
+            triggers: vec![SopTriggerDraft {
+                kind: "manual".to_string(),
+            }],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "gate".to_string(),
+                    body: "b".to_string(),
+                    suggested_tools: vec!["shell".to_string()],
+                    requires_confirmation: true,
+                    kind: SopStepKind::Checkpoint,
+                    routing: StepRouting {
+                        when: Some("$.ok".to_string()),
+                        next: Some(2),
+                        depends_on: vec![],
+                    },
+                    on_failure: StepFailure::Retry { max: 3 },
+                },
+                SopStep {
+                    number: 2,
+                    title: "act".to_string(),
+                    body: "b2".to_string(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    routing: StepRouting {
+                        when: None,
+                        next: None,
+                        depends_on: vec![1],
+                    },
+                    on_failure: StepFailure::Goto { step: 1 },
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            deterministic: false,
+        };
+        let v = serde_json::to_value(&draft).unwrap();
+        let s0 = &v["steps"][0];
+        assert_eq!(s0["kind"], "checkpoint");
+        assert_eq!(s0["on_failure"]["retry"]["max"], 3);
+        assert_eq!(s0["routing"]["when"], "$.ok");
+        assert_eq!(s0["routing"]["next"], 2);
+        let s1 = &v["steps"][1];
+        assert_eq!(s1["on_failure"]["goto"]["step"], 1);
+        assert_eq!(s1["routing"]["depends_on"][0], 1);
+        // Default-valued step: on_failure=fail routing empty => both omitted.
+        let plain = SopStep {
+            number: 3,
+            title: "t".to_string(),
+            body: "b".to_string(),
+            ..SopStep::default()
+        };
+        let pv = serde_json::to_value(&plain).unwrap();
+        assert!(
+            pv.get("routing").is_none(),
+            "default routing must be omitted"
+        );
+        assert!(
+            pv.get("on_failure").is_none(),
+            "default on_failure must be omitted"
+        );
+    }
+
+    /// Fail policy serializes as the bare `"fail"` string, matching the
+    /// canonical unit variant.
+    #[test]
+    fn fail_policy_is_bare_string() {
+        let v = serde_json::to_value(StepFailure::Fail).unwrap();
+        assert_eq!(v, serde_json::json!("fail"));
+    }
+
+    /// The zerocode overlay carries a `NodeRunState` mirror. Assert each wire
+    /// token deserializes to the mirror the same way the canonical enum does,
+    /// so overlay state names cannot drift between the two.
+    #[test]
+    fn node_run_state_wire_tokens() {
+        for (token, want) in [
+            ("pending", NodeRunState::Pending),
+            ("active", NodeRunState::Active),
+            ("completed", NodeRunState::Completed),
+            ("failed", NodeRunState::Failed),
+            ("skipped", NodeRunState::Skipped),
+        ] {
+            let got: NodeRunState = serde_json::from_value(serde_json::json!(token)).unwrap();
+            assert_eq!(got, want, "token {token}");
+        }
     }
 }
