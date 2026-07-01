@@ -5,7 +5,7 @@ use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Cursor, Read, Seek};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -2295,10 +2295,11 @@ fn validate_skill_zip_limits<R: Read + Seek>(
 }
 
 fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
+    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    if archive_len > max_bytes {
         anyhow::bail!(
             "skill zip rejected: too large ({} bytes > {})",
-            bytes.len(),
+            archive_len,
             max_bytes
         );
     }
@@ -2313,6 +2314,42 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
         let _ = std::fs::remove_dir_all(dest);
     }
     result
+}
+
+fn copy_zip_entry_bounded<R: Read, W: Write>(
+    entry: &mut R,
+    output: &mut W,
+    extracted_bytes: &mut u64,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_bytes = entry.read(&mut buffer)?;
+        if read_bytes == 0 {
+            return Ok(());
+        }
+
+        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
+        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
+        if next_extracted > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                next_extracted,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+
+        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
+        output.write_all(&buffer[..read_len])?;
+        *extracted_bytes = next_extracted;
+    }
 }
 
 fn extract_validated_skill_zip<R: Read + Seek>(
@@ -2341,21 +2378,13 @@ fn extract_validated_skill_zip<R: Read + Seek>(
                 out_path.display().to_string()
             )
         })?;
-        let copied = std::io::copy(&mut entry, &mut out_file)?;
-        extracted_bytes = checked_zip_size_add(extracted_bytes, copied, "extracted")?;
-        if extracted_bytes > max_bytes {
-            anyhow::bail!(
-                "skill zip rejected: extracted size too large ({} bytes > {})",
-                extracted_bytes,
-                max_bytes
-            );
-        }
-        if exceeds_skill_zip_ratio(extracted_bytes, compressed_bytes) {
-            anyhow::bail!(
-                "skill zip rejected: expansion ratio exceeds {}x",
-                MAX_SKILL_ZIP_EXPANSION_RATIO
-            );
-        }
+        copy_zip_entry_bounded(
+            &mut entry,
+            &mut out_file,
+            &mut extracted_bytes,
+            max_bytes,
+            compressed_bytes,
+        )?;
     }
 
     Ok(())
@@ -2813,7 +2842,39 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{self, Write};
+
+    struct CountingWriter {
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.written += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ChunkReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            let copied = chunk.len().min(buffer.len());
+            buffer[..copied].copy_from_slice(&chunk[..copied]);
+            self.index += 1;
+            Ok(copied)
+        }
+    }
 
     fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -3028,6 +3089,44 @@ mod registry_tests {
             .expect_err("zip with too many entries must be rejected");
         assert!(err.to_string().contains("too many entries"), "got: {err}");
         assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
+        let payload = vec![b'a'; 1024];
+        let mut reader = Cursor::new(payload);
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject before writing over the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 0);
+        assert_eq!(extracted_bytes, 0);
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
+        let mut reader = ChunkReader {
+            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
+            index: 0,
+        };
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject the chunk that crosses the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 400);
+        assert_eq!(extracted_bytes, 400);
     }
 
     #[test]
