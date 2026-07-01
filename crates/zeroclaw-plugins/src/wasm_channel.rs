@@ -284,6 +284,7 @@ impl Channel for WasmChannel {
                 let polled = {
                     let mut guard = state.lock().await;
                     let (ref mut store, ref mut bindings) = *guard;
+                    crate::component::refuel(store);
                     bindings
                         .zeroclaw_plugin_channel()
                         .call_poll_message(store)

@@ -45,21 +45,26 @@ pub struct HostInboundMessage {
 }
 
 impl InboundQueue {
-    /// Push a received message onto the queue for the plugin to drain.
+    /// Push a received message onto the queue for the plugin to drain. A
+    /// poisoned lock is recovered rather than swallowed, so a panic in one
+    /// producer cannot silently stop every later inbound message from landing.
     pub fn enqueue(&self, msg: HostInboundMessage) {
-        if let Ok(mut q) = self.inner.lock() {
-            q.push_back(msg);
-        }
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(msg);
     }
 
-    /// Pop the next queued message, or `None` when empty.
+    /// Pop the next queued message, or `None` when empty. Recovers a poisoned
+    /// lock so a producer panic does not strand the queued backlog.
     pub fn poll(&self) -> Option<HostInboundMessage> {
-        self.inner.lock().ok().and_then(|mut q| q.pop_front())
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.pop_front()
     }
 
-    /// Count of messages currently waiting.
+    /// Count of messages currently waiting. Recovers a poisoned lock so the
+    /// drain side keeps reporting real depth after a producer panic.
     pub fn pending(&self) -> u32 {
-        self.inner.lock().map(|q| q.len() as u32).unwrap_or(0)
+        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.len() as u32
     }
 }
 
@@ -385,6 +390,30 @@ mod tests {
             0,
             "drain on one clone empties the other"
         );
+    }
+
+    #[test]
+    fn inbound_queue_survives_a_poisoned_lock() {
+        // A producer that panics while holding the lock must not permanently
+        // silence the queue: later enqueue/poll/pending recover the poison and
+        // keep delivering, since silent inbound loss is worse than a noisy trap.
+        let q = InboundQueue::default();
+        q.enqueue(sample_inbound("before"));
+
+        let poisoned = q.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("poison the queue lock");
+        })
+        .join();
+
+        assert!(q.inner.is_poisoned(), "lock is poisoned after the panic");
+        assert_eq!(q.pending(), 1, "pending recovers the poisoned lock");
+        q.enqueue(sample_inbound("after"));
+        assert_eq!(q.pending(), 2, "enqueue recovers and appends");
+        assert_eq!(q.poll().unwrap().id, "before", "drain recovers, FIFO holds");
+        assert_eq!(q.poll().unwrap().id, "after");
+        assert_eq!(q.pending(), 0);
     }
 
     #[test]
