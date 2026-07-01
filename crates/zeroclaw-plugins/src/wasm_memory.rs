@@ -55,10 +55,14 @@ fn linker() -> Result<Linker<PluginState>> {
 
 impl WasmMemory {
     /// Compile and instantiate a memory plugin, caching its capabilities.
-    pub async fn from_wasm(alias: impl Into<String>, wasm_path: &Path) -> Result<Self> {
+    pub async fn from_wasm(
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
         let component = load_component(wasm_path)?;
         let linker = linker()?;
-        let mut store = Store::new(engine(), PluginState::default());
+        let mut store = crate::component::new_store(limits);
         let bindings = wt(
             MemoryPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate memory plugin",

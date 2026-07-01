@@ -188,3 +188,108 @@ impl TrustTracker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use zeroclaw_config::scattered_types::TrustConfig;
+
+    fn cfg() -> TrustConfig {
+        TrustConfig::default()
+    }
+
+    #[test]
+    fn new_domain_starts_at_initial_score() {
+        let mut t = TrustTracker::new(cfg());
+        let score = t.get_score("reasoning");
+        assert!((score - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correction_reduces_score() {
+        let mut t = TrustTracker::new(cfg());
+        t.record_correction("reasoning", CorrectionType::UserOverride, "desc");
+        let score = t.get_score("reasoning");
+        assert!(
+            score < 0.8,
+            "score should drop after correction, got {score}"
+        );
+    }
+
+    #[test]
+    fn success_boosts_score() {
+        let mut t = TrustTracker::new(cfg());
+        // Start below initial_score
+        t.record_correction("reasoning", CorrectionType::QualityFailure, "d");
+        let before = t.get_score("reasoning");
+        t.record_success("reasoning");
+        let after = t.get_score("reasoning");
+        assert!(after > before, "score should increase after success");
+    }
+
+    #[test]
+    fn score_clamped_to_zero_on_excess_correction() {
+        let mut t = TrustTracker::new(cfg());
+        for _ in 0..200 {
+            t.record_correction("d", CorrectionType::SopDeviation, "x");
+        }
+        assert!(t.get_score("d") >= 0.0);
+    }
+
+    #[test]
+    fn score_clamped_to_one_on_excess_success() {
+        let mut t = TrustTracker::new(cfg());
+        for _ in 0..200 {
+            t.record_success("d");
+        }
+        assert!(t.get_score("d") <= 1.0);
+    }
+
+    #[test]
+    fn apply_decay_moves_score_toward_initial() {
+        let mut t = TrustTracker::new(cfg());
+        for _ in 0..50 {
+            t.record_success("d");
+        }
+        let high = t.get_score("d");
+        assert!(high > 0.8);
+        let future = Utc::now() + Duration::days(100);
+        t.apply_decay(future);
+        let decayed = t.get_score("d");
+        assert!(decayed < high, "decay should pull score down toward 0.8");
+    }
+
+    #[test]
+    fn check_regression_below_threshold() {
+        let mut t = TrustTracker::new(cfg());
+        for _ in 0..20 {
+            t.record_correction("d", CorrectionType::UserOverride, "x");
+        }
+        let score = t.get_score("d");
+        // Precondition: if this fires, config defaults changed and the test needs updating.
+        assert!(
+            score < t.config().regression_threshold,
+            "expected score {score} to be below regression_threshold {}",
+            t.config().regression_threshold
+        );
+        assert!(t.check_regression("d").is_some());
+    }
+
+    #[test]
+    fn get_effective_autonomy_reduces_on_regression() {
+        let mut t = TrustTracker::new(cfg());
+        for _ in 0..20 {
+            t.record_correction("d", CorrectionType::SopDeviation, "x");
+        }
+        // Precondition: score must be below threshold; if not, config defaults changed.
+        assert!(
+            t.get_score("d") < t.config().regression_threshold,
+            "expected score to be below regression_threshold after 20 corrections"
+        );
+        assert!(t.check_regression("d").is_some());
+        assert_eq!(t.get_effective_autonomy("d", "full"), "supervised");
+        assert_eq!(t.get_effective_autonomy("d", "supervised"), "read_only");
+        assert_eq!(t.get_effective_autonomy("d", "read_only"), "read_only");
+    }
+}

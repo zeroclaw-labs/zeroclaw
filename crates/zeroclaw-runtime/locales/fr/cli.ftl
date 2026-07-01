@@ -26,7 +26,6 @@ cli-config-about = Gérer la configuration de ZeroClaw
 cli-update-about = Vérifier et appliquer les mises à jour de ZeroClaw
 cli-self-test-about = Exécuter les tests d'autodiagnostic
 cli-completions-about = Générer des scripts d'achèvement de shell
-cli-desktop-about = Lancer l'application de bureau companion ZeroClaw
 cli-config-schema-about = Afficher le schéma JSON complet de la configuration sur stdout
 cli-config-list-about = Lister toutes les propriétés de configuration avec leurs valeurs actuelles
 cli-config-get-about = Obtenir la valeur d'une propriété de configuration
@@ -299,16 +298,6 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
-cli-desktop-long-about =
-    Lance l'application de bureau compagnon ZeroClaw.
-
-    L'application compagnon est une application légère pour la barre de menu / zone de dénombrement du système qui se connecte au même pont que la CLI. Elle fournit un accès rapide au tableau de bord, à la supervision de l'état et à l'appairage des appareils.
-
-    Utilisez --install pour télécharger l'application compagnon pré-construite pour votre plateforme.
-
-    Exemples :
-    zeroclaw desktop              # lancer l'application compagnon
-    zeroclaw desktop --install    # télécharger et l'installer
 channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
 channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web
@@ -596,10 +585,6 @@ cli-status-service-stopped = 🔴 Service :       arrêté
 cli-status-channels = Canaux :
 cli-status-cli-always = {"  "}CLI :      ✅ toujours
 cli-status-peripherals = Périphériques :
-cli-desktop-download = Téléchargez l'application compagnon ZeroClaw :
-cli-desktop-homebrew = Ou installez via Homebrew (bientôt disponible) :
-cli-desktop-linux-pkg = {"  "}Téléchargez le fichier .deb ou .AppImage pour votre architecture.
-cli-desktop-launching = Lancement de l'application compagnon ZeroClaw...
 cli-status-version = Version :     {$v}
 cli-status-workspace = Espace de travail :   {$v}
 cli-status-config = Config :      {$v}
@@ -638,9 +623,6 @@ cli-status-word-none = (aucun)
 cli-status-word-configured = configuré
 cli-status-word-not-configured = non configuré
 cli-status-channel-not-compiled = 🚫 configuré, non compilé
-cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
-cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
-cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
 cli-config-all-configured = Toutes les sections sont déjà configurées.
 cli-config-schema-current = La configuration est déjà à la version actuelle du schéma.
 cli-config-applied-ops = {$count} opération(s) appliquée(s) :
@@ -667,7 +649,6 @@ cli-warn-crypto-provider = Avertissement : Échec de l'installation du fournisse
 cli-error-label = {"   "}Erreur : {$err}
 cli-warn-cost-usage = {"  "}⚠ Impossible de charger l'utilisation des coûts : {$err}
 cli-warn-cost-tracker = {"  "}⚠ Impossible d'initialiser le suivi des coûts : {$err}
-cli-desktop-download-at = {"  "}Téléchargez-la sur : {$url}
 cli-config-legend = Légende : 💉 remplacé par env  🔒 secret
 cli-config-secret-set = {$path} est défini (secret chiffré — valeur non affichée)
 cli-config-secret-unset = {$path} n'est pas défini (secret chiffré)
