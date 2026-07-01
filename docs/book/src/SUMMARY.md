@@ -35,6 +35,7 @@
   - [Crates](./architecture/crates.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
+  - [Config lifecycle](./architecture/config-lifecycle.md)
   - [RPC socket transport](./architecture/rpc-socket.md)
 - [Reference](./reference/index.md)
   - [CLI](./reference/cli.md)
