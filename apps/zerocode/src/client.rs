@@ -1206,6 +1206,13 @@ impl RpcClient {
             .await
     }
 
+    /// Typed `sops/graph`: the structured projection the visual node editor
+    /// renders. Deserializes into the `SopGraphView` mirror.
+    pub async fn sops_graph_view(&self, name: &str) -> Result<SopGraphView> {
+        let value = self.sops_graph(name).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     pub async fn sops_run_overlay(&self, name: &str, run_id: &str) -> Result<Value> {
         self.call(
             method::SOPS_RUN_OVERLAY,
@@ -1951,6 +1958,84 @@ pub enum NodeRunState {
     Completed,
     Failed,
     Skipped,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::PinClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinClass {
+    Flow,
+    Data,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::FlowRole`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowRole {
+    Sequence,
+    Dependency,
+    Failure,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphPin` (read-only projection pin).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphPin {
+    pub class: PinClass,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    pub required: bool,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphNode`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphNode {
+    pub step: u32,
+    pub title: String,
+    pub inputs: Vec<GraphPin>,
+    pub outputs: Vec<GraphPin>,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphWire`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphWire {
+    pub class: PinClass,
+    pub from_step: u32,
+    pub to_step: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_role: Option<FlowRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_pin: Option<String>,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphSeverity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphSeverity {
+    Warning,
+    Error,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::GraphDiagnostic`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphDiagnostic {
+    pub severity: GraphSeverity,
+    pub step: u32,
+    pub message: String,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::SopGraph`: the structured projection the
+/// visual node editor renders, deserialized straight from `sops/graph`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopGraphView {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub wires: Vec<GraphWire>,
+    #[serde(default)]
+    pub diagnostics: Vec<GraphDiagnostic>,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::StepRouting`.
@@ -2847,5 +2932,42 @@ mod sop_mirror_tests {
             let got: NodeRunState = serde_json::from_value(serde_json::json!(token)).unwrap();
             assert_eq!(got, want, "token {token}");
         }
+    }
+
+    /// The visual node editor deserializes `sops/graph` into `SopGraphView`.
+    /// Parse the exact projection wire shape the runtime emits so a field-name
+    /// or pin/wire tagging change on either side fails this guard.
+    #[test]
+    fn graph_view_parses_canonical_projection_wire() {
+        let wire = serde_json::json!({
+            "nodes": [
+                {
+                    "step": 1,
+                    "title": "collect",
+                    "inputs": [
+                        { "class": "flow", "name": "in", "required": true }
+                    ],
+                    "outputs": [
+                        { "class": "data", "name": "rows", "data_type": "array", "required": false }
+                    ]
+                }
+            ],
+            "wires": [
+                { "class": "flow", "from_step": 1, "to_step": 2, "flow_role": "sequence" },
+                { "class": "data", "from_step": 1, "to_step": 2, "from_pin": "rows", "to_pin": "src" }
+            ],
+            "diagnostics": [
+                { "severity": "warning", "step": 2, "message": "unsatisfied optional input" }
+            ]
+        });
+        let g: SopGraphView = serde_json::from_value(wire).unwrap();
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].step, 1);
+        assert_eq!(g.nodes[0].inputs[0].class, PinClass::Flow);
+        assert_eq!(g.nodes[0].outputs[0].data_type.as_deref(), Some("array"));
+        assert_eq!(g.wires[0].flow_role, Some(FlowRole::Sequence));
+        assert_eq!(g.wires[1].class, PinClass::Data);
+        assert_eq!(g.wires[1].from_pin.as_deref(), Some("rows"));
+        assert_eq!(g.diagnostics[0].severity, GraphSeverity::Warning);
     }
 }

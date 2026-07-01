@@ -224,6 +224,50 @@ function GraphCanvas({ graph, overlay }: { graph: SopGraph; overlay?: RunOverlay
   );
 }
 
+function SopFieldList({
+  graph,
+  overlay,
+}: {
+  graph: SopGraph;
+  overlay?: RunOverlay | null;
+}) {
+  const stateByStep = new Map<number, NodeRunState>();
+  for (const n of overlay?.nodes ?? []) stateByStep.set(n.step, n.state);
+  return (
+    <div className="divide-y divide-pc-border rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface text-sm">
+      {graph.nodes.map((node) => {
+        const state = stateByStep.get(node.step);
+        return (
+          <div key={node.step} className="flex items-start gap-3 px-3 py-2">
+            <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
+              {node.step}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-pc-text">{node.title}</span>
+                {state ? (
+                  <Badge tone={nodeStateBadgeTone(state)}>{t(`sops.run_state.${state}`)}</Badge>
+                ) : null}
+              </div>
+              <div className="mt-0.5 text-xs text-pc-text-muted">
+                {t('sops.inputs')}:{' '}
+                {node.inputs.length === 0
+                  ? '—'
+                  : node.inputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
+                {'  ·  '}
+                {t('sops.outputs')}:{' '}
+                {node.outputs.length === 0
+                  ? '—'
+                  : node.outputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
   if (graph.diagnostics.length === 0) return null;
   return (
@@ -592,6 +636,7 @@ export default function Sops() {
   const [draft, setDraft] = useState<Sop | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
 
   const refreshList = useCallback((selectName?: string) => {
     return listSops()
@@ -824,6 +869,14 @@ export default function Sops() {
               <div className="ml-auto flex gap-2">
                 <button
                   type="button"
+                  onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
+                  disabled={!graph}
+                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
+                >
+                  {layer === 'visual' ? t('sops.layer_fields') : t('sops.layer_visual')}
+                </button>
+                <button
+                  type="button"
                   onClick={startEdit}
                   disabled={!graph}
                   className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
@@ -859,7 +912,11 @@ export default function Sops() {
               <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
             ) : graph ? (
               <>
-                <GraphCanvas graph={graph} overlay={overlay} />
+                {layer === 'visual' ? (
+                  <GraphCanvas graph={graph} overlay={overlay} />
+                ) : (
+                  <SopFieldList graph={graph} overlay={overlay} />
+                )}
                 <DiagnosticsPanel graph={graph} />
               </>
             ) : null}

@@ -3,12 +3,15 @@ use std::sync::Arc;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::client::{NodeRunState, RpcClient, SopDraft, SopStep, SopStepKind, StepFailure};
+use crate::client::{
+    FlowRole, GraphNode, GraphPin, GraphWire, NodeRunState, PinClass, RpcClient, SopDraft,
+    SopGraphView, SopStep, SopStepKind, StepFailure,
+};
 
 /// SOP authoring pane: lists SOPs from the daemon and renders the selected
 /// SOP's projected node graph as text. The graph text is produced by the
@@ -19,12 +22,35 @@ pub(crate) struct SopPane {
     names: Vec<String>,
     list_state: ListState,
     graph_lines: Vec<String>,
+    graph: SopGraphView,
+    layer: RenderLayer,
     run_input: Option<String>,
     overlay: Option<RunOverlayView>,
     editor: Option<SopEditorState>,
     error: Option<String>,
     status: Option<String>,
     animation_origin: std::time::Instant,
+    list_row_rects: Vec<Rect>,
+    node_rects: Vec<(u32, Rect)>,
+}
+
+/// Which rendering layer the SOP surface presents. The visual node-card editor
+/// is canon; the field-list is the togglable fallback. Toggling swaps only the
+/// rendering; the `SopDraft` model and the `save_sop` write path are shared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RenderLayer {
+    #[default]
+    Visual,
+    Fields,
+}
+
+impl RenderLayer {
+    fn toggled(self) -> Self {
+        match self {
+            RenderLayer::Visual => RenderLayer::Fields,
+            RenderLayer::Fields => RenderLayer::Visual,
+        }
+    }
 }
 
 /// In-pane SOP authoring buffer. `create` distinguishes a new SOP (name still
@@ -282,12 +308,16 @@ impl SopPane {
             names: Vec::new(),
             list_state: ListState::default(),
             graph_lines: Vec::new(),
+            graph: SopGraphView::default(),
+            layer: RenderLayer::default(),
             run_input: None,
             overlay: None,
             editor: None,
             error: None,
             status: None,
             animation_origin: std::time::Instant::now(),
+            list_row_rects: Vec::new(),
+            node_rects: Vec::new(),
         }
     }
 
@@ -315,14 +345,22 @@ impl SopPane {
         let Some(name) = self.selected_name().map(String::from) else {
             return;
         };
-        match self.rpc.sops_graph(&name).await {
-            Ok(value) => {
-                self.graph_lines = graph_to_lines(&value);
+        match self.rpc.sops_graph_view(&name).await {
+            Ok(view) => {
+                self.graph_lines =
+                    graph_to_lines(&serde_json::to_value(&view).unwrap_or(serde_json::Value::Null));
+                self.graph = view;
                 self.overlay = None;
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    /// Toggle the canon visual node editor against the field-list fallback.
+    /// Rendering only; the draft model and write path are untouched.
+    pub(crate) fn toggle_layer(&mut self) {
+        self.layer = self.layer.toggled();
     }
 
     pub(crate) async fn load_run_overlay(&mut self, run_id: &str) {
@@ -389,9 +427,37 @@ impl SopPane {
             Some(SopTabAction::New) => self.editor = Some(SopEditorState::new_create()),
             Some(SopTabAction::Edit) => self.open_editor_for_selected().await,
             Some(SopTabAction::Delete) => self.delete_selected().await,
+            Some(SopTabAction::Toggle) => self.toggle_layer(),
             None => {}
         }
         false
+    }
+
+    /// Mouse support for the canon visual editor. Left-click a SOP row selects
+    /// and loads it; left-click a node card selects that SOP and opens its
+    /// editor; scroll moves the list selection. Rects are captured each render.
+    pub(crate) async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (col, row) = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = self
+                    .list_row_rects
+                    .iter()
+                    .position(|r| in_rect(col, row, *r))
+                {
+                    self.list_state.select(Some(idx));
+                    self.load_selected_graph().await;
+                    return;
+                }
+                if self.node_rects.iter().any(|(_, r)| in_rect(col, row, *r)) {
+                    self.open_editor_for_selected().await;
+                }
+            }
+            MouseEventKind::ScrollUp => self.select_prev(),
+            MouseEventKind::ScrollDown => self.select_next(),
+            _ => {}
+        }
     }
 
     async fn open_editor_for_selected(&mut self) {
@@ -658,6 +724,7 @@ impl SopPane {
             S::New,
             S::Edit,
             S::Delete,
+            S::Toggle,
         ]))
     }
 
@@ -676,41 +743,121 @@ impl SopPane {
             .block(Block::default().borders(Borders::ALL).title("SOPs"))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, cols[0], &mut self.list_state);
+        self.list_row_rects = list_row_rects(cols[0], self.names.len());
+
+        let editing = self.editor.is_some();
+        let visual = self.layer == RenderLayer::Visual;
+        let title = self.right_title();
+
+        // The visual node-card layer is canon for viewing the graph. The field
+        // editor and the fallback text layer share the paragraph path.
+        if visual && !editing && self.error.is_none() {
+            self.render_nodes(f, cols[1], &title);
+            return;
+        }
+        self.node_rects.clear();
 
         let body = if let Some(err) = &self.error {
             err.clone()
-        } else if self.editor.is_some() {
+        } else if editing {
             self.editor_lines().join("\n")
         } else {
             self.body_lines().join("\n")
-        };
-        let title = if self.editor.is_some() {
-            "Editor  [Tab field | ↑↓ step | Ctrl+n add | Ctrl+s save | Esc cancel]".to_string()
-        } else {
-            match &self.overlay {
-                Some(o) => format!(
-                    "Graph [{} {}/{}{}]",
-                    o.status,
-                    o.current_step,
-                    o.total_steps,
-                    if o.waiting {
-                        " waiting"
-                    } else if o.paused {
-                        " paused"
-                    } else {
-                        ""
-                    }
-                ),
-                None => match &self.status {
-                    Some(s) => format!("Graph  ({s})"),
-                    None => "Graph".to_string(),
-                },
-            }
         };
         let para = Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
         f.render_widget(para, cols[1]);
+    }
+
+    fn right_title(&self) -> String {
+        if self.editor.is_some() {
+            return "Editor  [Tab field | ↑↓ step | Ctrl+n add | Ctrl+s save | Esc cancel]"
+                .to_string();
+        }
+        let layer = match self.layer {
+            RenderLayer::Visual => "visual",
+            RenderLayer::Fields => "fields",
+        };
+        let toggle = crate::keymap::SopTabAction::Toggle
+            .default_chords()
+            .first()
+            .map(crate::keymap::Chord::display)
+            .unwrap_or_default();
+        match &self.overlay {
+            Some(o) => format!(
+                "Graph [{} {}/{}{}] ({layer}, {toggle} toggle)",
+                o.status,
+                o.current_step,
+                o.total_steps,
+                if o.waiting {
+                    " waiting"
+                } else if o.paused {
+                    " paused"
+                } else {
+                    ""
+                }
+            ),
+            None => match &self.status {
+                Some(s) => format!("Graph ({s}) ({layer}, {toggle} toggle)"),
+                None => format!("Graph ({layer}, {toggle} toggle)"),
+            },
+        }
+    }
+
+    /// Canon visual layer: render one node card per graph node (step chip,
+    /// title, kind/state badge, typed input/output pins) stacked vertically
+    /// with wire labels between them, at parity with the web `NodeCard`. Each
+    /// card's screen rect is recorded in `node_rects` for mouse hit-testing.
+    fn render_nodes(&mut self, f: &mut Frame, area: Rect, title: &str) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        self.node_rects.clear();
+
+        if self.graph.nodes.is_empty() {
+            let para = Paragraph::new("(no nodes; press n to author, e to edit)")
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, inner);
+            return;
+        }
+
+        let phase =
+            (self.animation_origin.elapsed().as_millis() / 200) % ACTIVE_SPINNER.len() as u128;
+        let active_frame = ACTIVE_SPINNER[phase as usize];
+
+        let mut y = inner.y;
+        let bottom = inner.y.saturating_add(inner.height);
+        for node in &self.graph.nodes {
+            let card_h: u16 = 4;
+            if y >= bottom {
+                break;
+            }
+            let h = card_h.min(bottom - y);
+            let rect = Rect::new(inner.x, y, inner.width, h);
+            let state = self
+                .overlay
+                .as_ref()
+                .and_then(|o| o.states.get(&(node.step as u64)).copied());
+            render_node_card(f, rect, node, state, active_frame);
+            self.node_rects.push((node.step, rect));
+            y = y.saturating_add(h);
+
+            for w in self.graph.wires.iter().filter(|w| w.from_step == node.step) {
+                if y >= bottom {
+                    break;
+                }
+                let label = wire_label(w);
+                let line = Line::from(Span::styled(
+                    format!("  │ {} → {} [{}]", w.from_step, w.to_step, label),
+                    Style::default().fg(wire_color(w)),
+                ));
+                f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+                y = y.saturating_add(1);
+            }
+        }
     }
 
     /// Display lines: the graph lines, prefixed with per-step state markers when
@@ -836,6 +983,137 @@ fn state_marker(state: NodeRunState, active_frame: &str) -> String {
 fn leading_step(line: &str) -> Option<u64> {
     line.split_once('.')
         .and_then(|(head, _)| head.trim().parse().ok())
+}
+
+/// Point-in-rect test for mouse hit detection.
+fn in_rect(col: u16, row: u16, r: Rect) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+/// Row rects inside a bordered list block, one per item, for mouse hit-testing.
+fn list_row_rects(area: Rect, count: usize) -> Vec<Rect> {
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    (0..count)
+        .map(|i| i as u16)
+        .take_while(|i| *i < inner_h)
+        .map(|i| Rect::new(inner_x, inner_y.saturating_add(i), inner_w, 1))
+        .collect()
+}
+
+/// Colour for a projected pin: flow pins are green, required data pins sky,
+/// optional data pins dim. Matches the web `NodeCard` pin styling.
+fn pin_color(pin: &GraphPin) -> Color {
+    match pin.class {
+        PinClass::Flow => Color::Green,
+        PinClass::Data if pin.required => Color::Cyan,
+        PinClass::Data => Color::DarkGray,
+    }
+}
+
+fn pin_type_label(pin: &GraphPin) -> String {
+    match pin.class {
+        PinClass::Flow => "flow".to_string(),
+        PinClass::Data => pin.data_type.clone().unwrap_or_else(|| "any".to_string()),
+    }
+}
+
+fn wire_label(w: &GraphWire) -> String {
+    match w.class {
+        PinClass::Data => format!(
+            "{} → {}",
+            w.from_pin.as_deref().unwrap_or("?"),
+            w.to_pin.as_deref().unwrap_or("?")
+        ),
+        PinClass::Flow => match w.flow_role {
+            Some(FlowRole::Failure) => "failure".to_string(),
+            Some(FlowRole::Dependency) => "dependency".to_string(),
+            _ => "sequence".to_string(),
+        },
+    }
+}
+
+fn wire_color(w: &GraphWire) -> Color {
+    match w.class {
+        PinClass::Data => Color::Cyan,
+        PinClass::Flow => match w.flow_role {
+            Some(FlowRole::Failure) => Color::Red,
+            Some(FlowRole::Dependency) => Color::Yellow,
+            _ => Color::Green,
+        },
+    }
+}
+
+/// State-driven border colour for a node card, at parity with the web
+/// `nodeStateTone`.
+fn node_border_color(state: Option<NodeRunState>) -> Color {
+    match state {
+        Some(NodeRunState::Active) => Color::Magenta,
+        Some(NodeRunState::Completed) => Color::Green,
+        Some(NodeRunState::Failed) => Color::Red,
+        Some(NodeRunState::Skipped) => Color::Yellow,
+        _ => Color::Gray,
+    }
+}
+
+/// Render a single node card: a bordered box with the step chip + title +
+/// state badge on the header row, then a pins row (inputs left, outputs right).
+fn render_node_card(
+    f: &mut Frame,
+    area: Rect,
+    node: &GraphNode,
+    state: Option<NodeRunState>,
+    active_frame: &str,
+) {
+    let badge = state.map(|s| format!(" [{}]", state_marker(s, active_frame)));
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" {} ", node.step),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            node.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            badge.unwrap_or_default(),
+            Style::default().fg(node_border_color(state)),
+        ),
+    ]);
+
+    let fmt_pins = |pins: &[GraphPin]| -> Vec<Span<'static>> {
+        if pins.is_empty() {
+            return vec![Span::styled("—", Style::default().fg(Color::DarkGray))];
+        }
+        let mut spans = Vec::new();
+        for (i, p) in pins.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled("●", Style::default().fg(pin_color(p))));
+            spans.push(Span::raw(format!(" {}:{}", p.name, pin_type_label(p))));
+            if p.required && p.class == PinClass::Data {
+                spans.push(Span::styled("*", Style::default().fg(Color::Red)));
+            }
+        }
+        spans
+    };
+
+    let mut in_line = vec![Span::styled("in ", Style::default().fg(Color::DarkGray))];
+    in_line.extend(fmt_pins(&node.inputs));
+    let mut out_line = vec![Span::styled("out ", Style::default().fg(Color::DarkGray))];
+    out_line.extend(fmt_pins(&node.outputs));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(node_border_color(state)));
+    let para = Paragraph::new(vec![header, Line::from(in_line), Line::from(out_line)])
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
 }
 
 /// Parse the `sops/run-overlay` projection into the pane's overlay view.
@@ -1022,6 +1300,89 @@ mod tests {
         assert_eq!(pane.list_state.selected(), Some(1));
         pane.select_next();
         assert_eq!(pane.list_state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn toggle_layer_swaps_render_layer_only() {
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        assert_eq!(pane.layer, RenderLayer::Visual);
+        pane.toggle_layer();
+        assert_eq!(pane.layer, RenderLayer::Fields);
+        pane.toggle_layer();
+        assert_eq!(pane.layer, RenderLayer::Visual);
+    }
+
+    #[test]
+    fn list_row_rects_map_rows_inside_border() {
+        let area = Rect::new(0, 0, 20, 6);
+        let rects = list_row_rects(area, 3);
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0], Rect::new(1, 1, 18, 1));
+        assert_eq!(rects[2], Rect::new(1, 3, 18, 1));
+        assert!(in_rect(2, 1, rects[0]));
+        assert!(!in_rect(0, 1, rects[0]));
+        assert!(!in_rect(2, 4, rects[0]));
+    }
+
+    #[tokio::test]
+    async fn left_click_on_list_row_selects_and_loads_graph() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (client, mut rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.names = vec!["alpha".into(), "beta".into()];
+        pane.list_row_rects = vec![Rect::new(1, 1, 18, 1), Rect::new(1, 2, 18, 1)];
+        let task = tokio::spawn(async move {
+            pane.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .await;
+            pane
+        });
+        let req = next_request(&mut rx).await;
+        assert_eq!(req["method"], method::SOPS_GRAPH);
+        assert_eq!(req["params"]["name"], "beta");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn scroll_moves_list_selection() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.names = vec!["a".into(), "b".into()];
+        pane.list_state.select(Some(0));
+        pane.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+        .await;
+        assert_eq!(pane.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn wire_label_and_color_track_flow_role() {
+        let seq = GraphWire {
+            class: PinClass::Flow,
+            from_step: 1,
+            to_step: 2,
+            flow_role: Some(FlowRole::Sequence),
+            from_pin: None,
+            to_pin: None,
+        };
+        let fail = GraphWire {
+            flow_role: Some(FlowRole::Failure),
+            ..seq.clone()
+        };
+        assert_eq!(wire_label(&seq), "sequence");
+        assert_eq!(wire_color(&seq), Color::Green);
+        assert_eq!(wire_label(&fail), "failure");
+        assert_eq!(wire_color(&fail), Color::Red);
     }
 
     #[tokio::test]

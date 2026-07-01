@@ -779,7 +779,9 @@ pub async fn run(
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
-                        Mode::Sop => {}
+                        Mode::Sop => {
+                            sop_pane.handle_mouse(mouse).await;
+                        }
                     }
                     consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
                 }

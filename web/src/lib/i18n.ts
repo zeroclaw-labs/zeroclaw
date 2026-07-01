@@ -1009,6 +1009,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.new': 'New SOP',
     'sops.edit': 'Edit',
     'sops.delete': 'Delete',
+    'sops.layer_visual': 'Visual',
+    'sops.layer_fields': 'Fields',
     'sops.save': 'Save',
     'sops.cancel': 'Cancel',
     'sops.editor_title': 'Edit SOP',

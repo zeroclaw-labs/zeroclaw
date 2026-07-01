@@ -287,6 +287,7 @@ keyactions! {
         New    [Chord::char('n')] => "new sop",
         Edit   [Chord::char('e')] => "edit sop",
         Delete [Chord::char('d')] => "delete sop",
+        Toggle [Chord::char('v')] => "toggle layer",
     }
 }
 
