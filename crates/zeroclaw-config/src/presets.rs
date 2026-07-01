@@ -107,6 +107,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         always_ask: vec![],
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy::default(),
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -138,6 +139,7 @@ fn balanced_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,
         },
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -167,6 +169,7 @@ fn yolo_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,
         },
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(false),

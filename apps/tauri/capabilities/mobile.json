@@ -1,8 +1,0 @@
-{
-  "identifier": "mobile",
-  "description": "Mobile-specific permissions for ZeroClaw",
-  "windows": ["main"],
-  "permissions": [
-    "core:default"
-  ]
-}

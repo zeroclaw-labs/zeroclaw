@@ -144,3 +144,56 @@ tool_attribution!(ToolSearchTool, ToolKind::Search);
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
 tool_attribution!(WebSearchTool, ToolKind::Search);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::calculator::CalculatorTool;
+    use zeroclaw_api::attribution::{Attributable, Role};
+
+    /// `tool_attribution!` must produce an `Attributable` impl that maps
+    /// `role()` to `Role::Tool(kind)` and `alias()` to `Tool::name()`.
+    /// CalculatorTool is the only unit-struct Tool in this crate so it
+    /// stands in as a smoke test for the macro expansion itself.
+    #[test]
+    fn macro_sets_role_to_tool_kind() {
+        let tool = CalculatorTool;
+        assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.alias(), "calculator");
+    }
+
+    /// `Attributable` is implemented for `Arc<T>` / `Box<T>` / `&T` in
+    /// `zeroclaw-api`. Dispatch sites commonly hand the runtime an
+    /// `Arc<dyn Tool>`, so the alias via `Arc` must agree with the inner.
+    #[test]
+    fn attributable_via_arc_matches_inner() {
+        let inner = CalculatorTool;
+        let arc: Arc<CalculatorTool> = Arc::new(inner);
+        assert_eq!(arc.alias(), "calculator");
+        assert_eq!(arc.role(), Role::Tool(ToolKind::Plugin));
+    }
+
+    /// The log pipeline joins `ToolKind` and `Tool::name()` with a `.`
+    /// to form the `<kind>.<alias>` composite. A `.` inside `name()`
+    /// would silently split the composite and break attribution lookup.
+    /// Pin the invariant: no Tool name contains a `.`.
+    #[test]
+    fn tool_name_has_no_dot_separator() {
+        let tool = CalculatorTool;
+        assert!(
+            !tool.alias().contains('.'),
+            "alias `{}` must not contain `.` — would break `<kind>.<alias>` composite parsing",
+            tool.alias()
+        );
+    }
+
+    /// An empty `name()` would yield `tool.<empty>` in logs, which is
+    /// useless for triage. Pin non-empty.
+    #[test]
+    fn tool_name_is_nonempty() {
+        let tool = CalculatorTool;
+        assert!(!tool.alias().is_empty());
+    }
+}

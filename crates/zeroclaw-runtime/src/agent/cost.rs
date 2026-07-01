@@ -311,7 +311,33 @@ pub fn record_tool_loop_cost_usage(
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    let (input_rate, output_rate, cached_rate) = merge_config_and_live_rates(config_rates, live);
+    // `mut` so the global-catalog fallback below can still fill rates config and
+    // the live snapshot both left unset.
+    let (mut input_rate, mut output_rate, mut cached_rate) =
+        merge_config_and_live_rates(config_rates, live);
+
+    // Global catalog fallback: when the operator never hand-priced this model
+    // in config, consult the daemon-wide pricing catalog
+    // (`<data_dir>/pricing.json`, fed by the public LiteLLM/OpenRouter feed).
+    // Exact id matching keeps provider-qualified self-hosted ids — absent from
+    // the public catalog — at $0, so only billed cloud models get a non-zero
+    // rate here.
+    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
+        if let Some((cat_in, cat_out, cat_cached)) =
+            crate::agent::pricing_catalog::global_pricing_rates(model)
+        {
+            input_rate = cat_in;
+            output_rate = cat_out;
+            if cached_rate == 0.0 {
+                cached_rate = cat_cached;
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     let cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -326,15 +352,19 @@ pub fn record_tool_loop_cost_usage(
     // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to
     // grep DEBUG logs. Subsequent sightings stay at DEBUG so the warn
-    // stream doesn't get spammy. Combines HEAD's tracker guard (only warn when
-    // a cost tracker is active) with the live-pricing branch's rate-zero check:
-    // fires when BOTH config and the live fallback left input and output at
-    // zero. A model the live snapshot just filled won't warn; a model
-    // deliberately priced at 0.0 still trips the one-shot warn (indistinguishable
-    // from unpriced here). The post-fallback rate check supersedes HEAD's
-    // `pricing.is_none()` clause, which would have warned even for live-filled
-    // models whose config pricing map was absent.
-    if ctx.tracker.is_some() && input_rate == 0.0 && output_rate == 0.0 {
+    // stream doesn't get spammy. Fires when a cost tracker is active, the global
+    // catalog fallback did not price the model, and both config and the live
+    // fallback left input and output at zero. A model the live snapshot or the
+    // catalog just filled won't warn; a model deliberately priced at 0.0 still
+    // trips the one-shot warn (indistinguishable from unpriced here). The
+    // post-fallback rate check supersedes HEAD's `pricing.is_none()` clause,
+    // which would have warned even for live-filled models whose config pricing
+    // map was absent.
+    if ctx.tracker.is_some()
+        && !priced_from_catalog
+        && input_rate == 0.0
+        && output_rate == 0.0
+    {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
