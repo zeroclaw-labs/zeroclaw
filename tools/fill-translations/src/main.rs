@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use xtask::cmd::mdbook::check::introduced_local_absolute_path;
 use xtask::cmd::mdbook::protected::{contains_generated_toml_block, preservation_prompt};
 
 #[derive(Parser)]
@@ -114,9 +115,10 @@ enum LeakCheck {
     Clean,
     Recovered(String),
     Unrecoverable,
+    IntroducedLocalPath(String),
 }
 
-/// Detect a prompt-leak response and attempt to recover the real translation.
+/// Detect prompt leaks and local-path leaks before writing a translation.
 ///
 /// When a model leaks its instructions it translates them into the target language and
 /// often appends the actual translation at the end. The leak is structural: the response
@@ -127,10 +129,11 @@ fn check_for_leak(source: &str, response: &str) -> LeakCheck {
     }
 
     let leak_threshold = source.len().saturating_mul(4).max(120);
-    let looks_like_bullets = response.trim_start().starts_with("- ") && response.contains("\\n- ");
+    let looks_like_bullets = response.trim_start().starts_with("- ")
+        && (response.contains("\n- ") || response.contains("\\n- "));
     let too_long = response.len() > leak_threshold;
     if !too_long && !looks_like_bullets {
-        return LeakCheck::Clean;
+        return check_for_local_path_leak(source, response, LeakCheck::Clean);
     }
     // Try to recover: prefer the last paragraph after a blank line, else everything
     // after the final terminal punctuation ('. ' or '.').
@@ -147,9 +150,20 @@ fn check_for_leak(source: &str, response: &str) -> LeakCheck {
                 .map(|s| s.trim_end_matches('.').trim().to_string())
         });
     match candidate {
-        Some(c) if !c.is_empty() && c.len() <= leak_threshold => LeakCheck::Recovered(c),
+        Some(c) if !c.is_empty() && c.len() <= leak_threshold => {
+            match introduced_local_absolute_path(source, &c) {
+                Some(path) => LeakCheck::IntroducedLocalPath(path),
+                None => LeakCheck::Recovered(c),
+            }
+        }
         _ => LeakCheck::Unrecoverable,
     }
+}
+
+fn check_for_local_path_leak(source: &str, response: &str, clean: LeakCheck) -> LeakCheck {
+    introduced_local_absolute_path(source, response)
+        .map(LeakCheck::IntroducedLocalPath)
+        .unwrap_or(clean)
 }
 
 /// Encode a plain string into a single-line po `msgstr "..."` value.
@@ -181,6 +195,58 @@ fn normalize_translated_text(msgid: &str, text: String) -> String {
     } else {
         text
     }
+}
+
+fn translation_for_write(source: &str, response: &str) -> String {
+    let text = match check_for_leak(source, response) {
+        LeakCheck::Clean => response.to_string(),
+        LeakCheck::Recovered(recovered) => recovered,
+        LeakCheck::Unrecoverable => String::new(),
+        LeakCheck::IntroducedLocalPath(_) => String::new(),
+    };
+    normalize_translated_text(source, text)
+}
+
+/// Repair entries whose `msgstr` is a prompt-leak or local-path-leak response.
+///
+/// Iterates in reverse so that removing continuation lines doesn't shift
+/// line indices for entries yet to visit. Returns
+/// `(recovered, prompt_blanked, path_blanked, first_path_blanked)`.
+fn repair_leaks(
+    lines: &mut Vec<String>,
+    entries: &[Entry],
+) -> (usize, usize, usize, Option<String>) {
+    let mut leak_recovered = 0;
+    let mut leak_blanked = 0;
+    let mut path_blanked = 0;
+    let mut first_path_blanked = None;
+    for entry in entries.iter().rev() {
+        if entry.msgstr.is_empty() {
+            continue;
+        }
+        match check_for_leak(&entry.msgid, &entry.msgstr) {
+            LeakCheck::Clean => {}
+            LeakCheck::Recovered(r) => {
+                replace_msgstr_line(lines, entry.msgstr_line, &r);
+                leak_recovered += 1;
+            }
+            LeakCheck::Unrecoverable => {
+                replace_msgstr_line(lines, entry.msgstr_line, "");
+                leak_blanked += 1;
+            }
+            LeakCheck::IntroducedLocalPath(path) => {
+                replace_msgstr_line(lines, entry.msgstr_line, "");
+                path_blanked += 1;
+                first_path_blanked.get_or_insert(path);
+            }
+        }
+    }
+    (
+        leak_recovered,
+        leak_blanked,
+        path_blanked,
+        first_path_blanked,
+    )
 }
 
 fn commit_entry(
@@ -373,6 +439,9 @@ async fn translate_batch(
            environment variables, code literals, function/type names.\n\
          - Do not add examples, configuration snippets, TOML blocks, code fences, or extra \
            explanatory text that is not present in the source.\n\
+         - Do not invent, localize, or substitute machine-local absolute paths such as \
+           /Users/..., /home/..., /private/tmp/..., /Volumes/..., or C:\\Users\\...; only \
+           preserve paths already present in the source.\n\
          - If the input is already in {locale}, a code literal, a URL, or a single identifier, \
            return it unchanged.\n\
          - Use established software-localization terminology in {locale} rather than literal \
@@ -420,30 +489,21 @@ async fn main() -> anyhow::Result<()> {
     // Repair entries where the model previously leaked its instructions instead of translating.
     // Recover the real translation from the response tail when possible, otherwise clear to ""
     // so the entry gets re-translated on this run.
-    let mut leak_recovered = 0;
-    let mut leak_blanked = 0;
-    for entry in entries.iter().rev() {
-        if entry.msgstr.is_empty() {
-            continue;
-        }
-        match check_for_leak(&entry.msgid, &entry.msgstr) {
-            LeakCheck::Clean => {}
-            LeakCheck::Recovered(r) => {
-                replace_msgstr_line(&mut lines, entry.msgstr_line, &r);
-                leak_recovered += 1;
-            }
-            LeakCheck::Unrecoverable => {
-                replace_msgstr_line(&mut lines, entry.msgstr_line, "");
-                leak_blanked += 1;
-            }
-        }
-    }
-    if leak_recovered + leak_blanked > 0 {
+    // NB: On master the trailing-\n pre-pass runs AFTER this loop, so there is no stale
+    // translations key to remove — the order-of-operations refactoring already fixes #8312
+    // at the production-code level. The regression test in the test module pins this
+    // invariant (see repair_leaks_drops_stale_translations_key).
+    let (leak_recovered, leak_blanked, path_blanked, first_path_blanked) =
+        repair_leaks(&mut lines, &entries);
+    if leak_recovered + leak_blanked + path_blanked > 0 {
         println!(
-            "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
+            "==> Translation repair: {leak_recovered} prompt leaks recovered, {leak_blanked} prompt leaks cleared, {path_blanked} path leaks cleared for re-translation"
         );
+        if let Some(path) = first_path_blanked {
+            println!("==> First path leak cleared: {path}");
+        }
     }
-    if leak_recovered + leak_blanked > 0 {
+    if leak_recovered + leak_blanked + path_blanked > 0 {
         entries = parse_po(&lines);
     }
 
@@ -510,13 +570,7 @@ async fn main() -> anyhow::Result<()> {
         match translate_batch(provider.as_ref(), &model, &args.locale, &msgids).await {
             Ok(translated) => {
                 for (entry, text) in chunk.iter().zip(translated.iter()) {
-                    // If msgid ends with \n, msgstr must too — gettext requires it.
-                    let text = match check_for_leak(&entry.msgid, text) {
-                        LeakCheck::Clean => text.clone(),
-                        LeakCheck::Recovered(recovered) => recovered,
-                        LeakCheck::Unrecoverable => String::new(),
-                    };
-                    let text = normalize_translated_text(&entry.msgid, text);
+                    let text = translation_for_write(&entry.msgid, text);
                     translations.insert(entry.msgstr_line, text);
                 }
                 write_po(
@@ -588,8 +642,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_translation_that_introduces_local_absolute_path() {
+        assert!(matches!(
+            check_for_leak(
+                "The failure log is next to the catalog.",
+                "Le journal est dans /private/tmp/zeroclaw/fr.failures.log.",
+            ),
+            LeakCheck::IntroducedLocalPath(_)
+        ));
+        assert_eq!(
+            translation_for_write(
+                "The failure log is next to the catalog.",
+                "Le journal est dans /private/tmp/zeroclaw/fr.failures.log.",
+            ),
+            ""
+        );
+    }
+
+    #[test]
     fn empty_unrecoverable_translation_stays_empty_for_newline_source() {
         assert_eq!(normalize_translated_text("source\n", String::new()), "");
+    }
+
+    #[test]
+    fn allows_translation_that_preserves_source_path() {
+        assert!(matches!(
+            check_for_leak(
+                "Write `/home/alice/zeroclaw/web/dist`.",
+                "Écrivez `/home/alice/zeroclaw/web/dist`.",
+            ),
+            LeakCheck::Clean
+        ));
+    }
+
+    #[test]
+    fn recovers_prompt_leak_before_checking_path_examples() {
+        let leaked = "- Do not invent paths such as /Users/... or /private/tmp/...\n\
+            - Preserve commands, paths, URLs, environment variables, code literals, and project names exactly as written.\n\n\
+            Traduit.";
+        assert!(matches!(
+            check_for_leak("Translate me.", leaked),
+            LeakCheck::Recovered(recovered) if recovered == "Traduit."
+        ));
     }
 
     #[test]
@@ -597,6 +691,101 @@ mod tests {
         assert_eq!(
             normalize_translated_text("source\n", "translated".to_string()),
             "translated\n"
+        );
+        assert_eq!(translation_for_write("source\n", "traduit"), "traduit\n");
+    }
+
+    /// A leaked msgstr long enough to trip `check_for_leak`'s `too_long` guard
+    /// (threshold = max(4*len(msgid), 120)), with the real translation (`保存`)
+    /// as the final paragraph after a blank line so it is Recovered.
+    /// The msgid ends with `\n` so the trailing-`\n` pre-pass in main() would
+    /// seed `translations[msgstr_line]` — the precondition that fired #8312.
+    const RECOVERABLE_LEAK_TRAILING_NEWLINE: &str = concat!(
+        "msgid \"Save\\n\"\n",
+        "msgstr \"\"\n",
+        "\"- You translate English technical documentation strings to Japanese.\\n\"\n",
+        "\"- Do not translate brand names, command names, CLI flags, or file paths.\\n\"\n",
+        "\"\\n\"\n",
+        "\"保存\"\n",
+    );
+
+    /// Regression for #8312: after leak repair + trailing-`\n` pre-pass,
+    /// `write_po` must emit the recovered translation, not the leaked text.
+    ///
+    /// Uses the shared `repair_leaks` helper (so it tests the real production
+    /// code path) and drives `write_po` end-to-end. Mutation check: reverting
+    /// `repair_leaks` to a no-op (bypassing the loop) makes the test fail
+    /// because the pre-pass seeds the unrecovered leaked text.
+    #[test]
+    fn repair_leaks_drops_stale_translations_key() {
+        let raw = RECOVERABLE_LEAK_TRAILING_NEWLINE;
+        let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+        let mut entries = parse_po(&lines);
+        assert_eq!(entries.len(), 1);
+        let msgstr_line = entries[0].msgstr_line;
+
+        // Blank continuation lines belonging to the leaked msgstr block so that
+        // re-parse after repair doesn't re-append them (orthogonal to #8312).
+        let mut ci = msgstr_line + 1;
+        while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+            lines[ci].clear();
+            ci += 1;
+        }
+
+        // Step 1: Run the production leak-repair path via the shared helper.
+        let (recovered, blanked, path_blanked, first_path_blanked) =
+            repair_leaks(&mut lines, &entries);
+        assert_eq!(
+            (recovered, blanked, path_blanked, first_path_blanked),
+            (1, 0, 0, None),
+            "entry must be Recovered by leak repair"
+        );
+
+        // Re-parse lines after repair (same as main() does).
+        if recovered + blanked > 0 {
+            entries = parse_po(&lines);
+        }
+        assert!(
+            !entries[0].msgstr.is_empty(),
+            "msgstr must not be empty after recovery"
+        );
+
+        // Step 2: Simulate the trailing-`\n` pre-pass (same logic as main()).
+        let mut translations: HashMap<usize, String> = HashMap::new();
+        for entry in &entries {
+            if !entry.msgstr.is_empty()
+                && entry.msgid.ends_with('\n')
+                && !entry.msgstr.ends_with('\n')
+            {
+                translations.insert(entry.msgstr_line, format!("{}\n", entry.msgstr));
+            }
+        }
+        assert!(
+            !translations.contains_key(&msgstr_line)
+                || translations
+                    .get(&msgstr_line)
+                    .is_some_and(|v| v.contains("保存")),
+            "if pre-pass seeded, it must contain the recovered translation, not leaked text"
+        );
+
+        // Step 3: write_po end-to-end — the final output must contain the
+        // recovered translation and must NOT contain the leaked prompt text.
+        let path = std::env::temp_dir().join(format!(
+            "fill_tr_stale_key_{}_{}.po",
+            std::process::id(),
+            msgstr_line
+        ));
+        write_po(&lines, raw, &translations, &[], &[], &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            out.contains("msgstr \"保存"),
+            "write_po must emit the recovered translation, got: {out}"
+        );
+        assert!(
+            !out.contains("You translate English"),
+            "stale leaked text must not be re-shipped, got: {out}"
         );
     }
 }

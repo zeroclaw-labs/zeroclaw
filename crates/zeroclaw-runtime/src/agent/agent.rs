@@ -1484,7 +1484,11 @@ impl Agent {
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
+        // `mcp_bundles` (omission is not a grant). Regression-covered by
+        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
+        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
+        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
+        // If you change the call below, update those tests.
         let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
@@ -1735,16 +1739,9 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
+                Some(Arc::new(crate::hooks::HookRunner::from_config(
+                    &config.hooks,
+                )))
             } else {
                 None
             })
