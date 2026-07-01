@@ -746,9 +746,13 @@ impl DelegateTool {
         {
             return (
                 type_key.to_string(),
-                cfg.api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone()),
+                if cfg.requires_openai_auth {
+                    None
+                } else {
+                    cfg.api_key
+                        .clone()
+                        .or_else(|| self.global_credential.clone())
+                },
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
