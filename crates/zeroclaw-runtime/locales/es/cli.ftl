@@ -286,6 +286,13 @@ cli-skills-install-suggestion =
 
     Capacidad coincidente: {$matched}
     Siguiente: Ejecuta `{$install_command}` para instalarla.
+
+cli-plugin-install-suggestion =
+    Parece que esta solicitud necesita el plugin `{$name}`, pero no está instalado.
+
+    Capacidad coincidente: {$matched}
+    Siguiente: Ejecuta `{$install_command}` para instalarlo.
+
 cli-completions-long-about =
     Genera scripts de autocompletado de shell para `zeroclaw`.
 
