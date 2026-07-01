@@ -116,6 +116,11 @@ pub struct CronAddBody {
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+    /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
+    /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
+    /// shell when no prompt is given). Ignored for agent jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +140,10 @@ pub struct CronPatchBody {
     /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
     /// the current state unchanged.
     pub enabled: Option<bool>,
+    /// Shell output format override. `"wrapped"` (default) or `"raw"`.
+    /// Only applied to shell-type jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 enum CronTimezonePatch {
@@ -392,6 +401,7 @@ pub async fn handle_api_cron_add(
         model,
         allowed_tools,
         delete_after_run,
+        shell_output_format,
     } = body;
 
     let config = state.config.read().clone();
@@ -468,7 +478,8 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let fmt = shell_output_format.unwrap_or_default();
+        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -476,6 +487,7 @@ pub async fn handle_api_cron_add(
             command,
             delivery,
             false,
+            fmt,
         )
     };
 
@@ -604,6 +616,7 @@ pub async fn handle_api_cron_patch(
         command,
         prompt,
         enabled,
+        shell_output_format,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -686,6 +699,7 @@ pub async fn handle_api_cron_patch(
         command: patch_command,
         prompt: patch_prompt,
         enabled,
+        shell_output_format,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -4188,6 +4202,86 @@ mod tests {
             codes_issued, 1,
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
+        );
+    }
+
+    /// Regression: a shell cron job created via the gateway API with
+    /// `shell_output_format = raw` must persist the format, return raw
+    /// stdout when triggered, and not wrap output in the status envelope.
+    #[tokio::test]
+    async fn cron_api_shell_raw_output_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        // 1. Create a shell job with shell_output_format = raw via the API.
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "raw-echo",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello-raw",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let add_json = response_json(add_response).await;
+        assert_eq!(add_json["status"], "ok");
+        let job_id = add_json["job"]["id"].as_str().expect("job id").to_string();
+
+        // 2. Read the job back via list and verify shell_output_format persisted.
+        let list_response = handle_api_cron_list(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let list_json = response_json(list_response).await;
+        let jobs = list_json["jobs"].as_array().expect("jobs array");
+        let listed = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some(&job_id))
+            .expect("job in list");
+        assert_eq!(
+            listed["shell_output_format"].as_str(),
+            Some("raw"),
+            "shell_output_format must persist through the API store path"
+        );
+
+        // 3. Link to test-agent so the scheduler can resolve the owner.
+        link_job_to_test_agent(&state, &job_id);
+
+        // 4. Trigger the job manually and verify raw output.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job_id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["status"], "ok", "job should succeed: {run_json}");
+        assert_eq!(run_json["success"], true);
+
+        let output = run_json["output"].as_str().expect("output string");
+        assert_eq!(
+            output, "hello-raw",
+            "raw mode must return trimmed stdout, not the wrapped envelope: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "raw output must not contain the status envelope: {output}"
+        );
+        assert!(
+            !output.contains("stdout:"),
+            "raw output must not contain the stdout header: {output}"
         );
     }
 
