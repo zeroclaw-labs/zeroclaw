@@ -1,3 +1,4 @@
+use super::protected::{contains_generated_toml_block, missing_protected_literal};
 use crate::util::*;
 use std::collections::HashMap;
 use std::process::Command;
@@ -42,10 +43,10 @@ pub fn run() -> anyhow::Result<()> {
             );
             failed = true;
         }
-        for (entry, reason) in audit_protected_literals(&po_entries) {
+        for (entry, literal) in audit_protected_literals(&po_entries) {
             eprintln!(
-                "FAIL: {locale}:{}: protected-literal translation ({reason}) at {}",
-                entry.msgstr_line, entry.reference
+                "FAIL: {locale}:{}: protected-literal translation ({}) missing {:?} at {}",
+                entry.msgstr_line, literal.reason, literal.text, entry.reference
             );
             failed = true;
         }
@@ -67,10 +68,14 @@ fn audit_generated_responses(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str
         .collect()
 }
 
-fn audit_protected_literals(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str)> {
+fn audit_protected_literals(
+    entries: &[PoEntry],
+) -> Vec<(&PoEntry, super::protected::ProtectedLiteral)> {
     entries
         .iter()
-        .filter_map(|entry| protected_literal_reason(entry).map(|reason| (entry, reason)))
+        .filter_map(|entry| {
+            missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| (entry, literal))
+        })
         .collect()
 }
 
@@ -234,6 +239,9 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
     {
         return Some("assistant-response phrase");
     }
+    if contains_generated_toml_block(&entry.msgid, &entry.msgstr) {
+        return Some("generated TOML block");
+    }
     if translation_len > (source_len * 4).max(300)
         && has_markdown_heading_outside_code(&entry.msgstr)
         && !has_markdown_heading_outside_code(&entry.msgid)
@@ -255,167 +263,9 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
     None
 }
 
+#[cfg(test)]
 fn protected_literal_reason(entry: &PoEntry) -> Option<&'static str> {
-    if entry.msgstr.trim().is_empty() {
-        return None;
-    }
-
-    for phrase in PROTECTED_PHRASES {
-        if entry.msgid.contains(phrase) && !entry.msgstr.contains(phrase) {
-            return Some("protected product/protocol name changed");
-        }
-    }
-
-    for literal in protected_code_literals(&entry.msgid) {
-        if !entry.msgstr.contains(&literal) {
-            return Some("machine-facing code literal changed");
-        }
-    }
-
-    None
-}
-
-const PROTECTED_PHRASES: &[&str] = &["ZeroClaw Maturity Framework"];
-
-fn protected_code_literals(text: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    collect_inline_code_literals(text, &mut literals);
-    collect_fenced_code_literals(text, &mut literals);
-    literals.sort();
-    literals.dedup();
-    literals
-}
-
-fn collect_inline_code_literals(text: &str, literals: &mut Vec<String>) {
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        if rest.starts_with("``") {
-            continue;
-        }
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        let literal = &rest[..end];
-        rest = &rest[end + 1..];
-        if is_protected_command_literal(literal) {
-            literals.push(literal.to_string());
-        }
-    }
-}
-
-fn collect_fenced_code_literals(text: &str, literals: &mut Vec<String>) {
-    let mut fence_language: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if fence_language.is_some() {
-                fence_language = None;
-            } else {
-                fence_language = Some(
-                    trimmed
-                        .trim_start_matches('`')
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
-                );
-            }
-            continue;
-        }
-        let Some(language) = fence_language.as_deref() else {
-            continue;
-        };
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if is_protected_command_literal(trimmed) {
-            literals.push(trimmed.to_string());
-        }
-        if language != "toml" {
-            continue;
-        }
-
-        if is_toml_section(trimmed) {
-            literals.push(trimmed.to_string());
-        } else if let Some((key, _)) = trimmed.split_once('=') {
-            let key = key.trim();
-            if is_config_key(key) {
-                literals.push(key.to_string());
-            }
-        }
-    }
-}
-
-fn is_protected_command_literal(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed == "zeroclaw daemon" || trimmed.starts_with("zeroclaw daemon ")
-}
-
-fn is_config_key(text: &str) -> bool {
-    is_toml_key_path(text)
-}
-
-fn is_toml_section(text: &str) -> bool {
-    let text = text.trim();
-    let section = if text.starts_with("[[") && text.ends_with("]]") {
-        &text[2..text.len() - 2]
-    } else if text.starts_with('[') && text.ends_with(']') {
-        &text[1..text.len() - 1]
-    } else {
-        return false;
-    };
-    is_toml_key_path(section.trim())
-}
-
-fn is_toml_key_path(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
-    }
-
-    let mut start = 0;
-    let mut quote = None;
-    for (idx, c) in text.char_indices() {
-        if let Some(active_quote) = quote {
-            if c == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '.' => {
-                if !is_toml_key_segment(&text[start..idx]) {
-                    return false;
-                }
-                start = idx + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    quote.is_none() && is_toml_key_segment(&text[start..])
-}
-
-fn is_toml_key_segment(text: &str) -> bool {
-    let text = text.trim();
-    is_bare_toml_key(text) || is_quoted_toml_key(text)
-}
-
-fn is_bare_toml_key(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn is_quoted_toml_key(text: &str) -> bool {
-    text.len() >= 2
-        && ((text.starts_with('"') && text.ends_with('"'))
-            || (text.starts_with('\'') && text.ends_with('\'')))
+    missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| literal.reason)
 }
 
 fn contains_assistant_response_phrase(text: &str) -> bool {
@@ -565,6 +415,39 @@ mod tests {
         let clean = entry(
             "```toml\n# Correct\nweb_dist_dir = \"/absolute/path\"\n```",
             "```toml\n# Correct\nweb_dist_dir = \"/absolute/path\"\n```",
+        );
+        assert_eq!(generated_response_reason(&clean), None);
+    }
+
+    #[test]
+    fn flags_generated_toml_fence_in_translation() {
+        let issue = entry(
+            "Configure the gateway before exposing it.",
+            "在公开之前配置网关。\n\n```toml\n[gateway]\nhost = \"0.0.0.0\"\nport = 42617\n```",
+        );
+        assert_eq!(
+            generated_response_reason(&issue),
+            Some("generated TOML block")
+        );
+    }
+
+    #[test]
+    fn flags_generated_toml_like_block_in_translation() {
+        let issue = entry(
+            "Set the model provider in config.",
+            "[providers.models.openai.default]\napi_key = \"...\"\nmodel = \"gpt-5\"",
+        );
+        assert_eq!(
+            generated_response_reason(&issue),
+            Some("generated TOML block")
+        );
+    }
+
+    #[test]
+    fn allows_source_toml_blocks() {
+        let clean = entry(
+            "```toml\n[gateway]\nhost = \"127.0.0.1\"\nport = 42617\n```",
+            "```toml\n[gateway]\nhost = \"127.0.0.1\"\nport = 42617\n```",
         );
         assert_eq!(generated_response_reason(&clean), None);
     }

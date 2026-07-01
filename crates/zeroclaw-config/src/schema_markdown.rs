@@ -791,4 +791,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn html_escape_replaces_all_markup_characters() {
+        assert_eq!(html_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(html_escape("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(html_escape("plain text"), "plain text");
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_encodes_ampersand_first_to_avoid_double_escaping() {
+        // The `&` replacement must run before the others, otherwise the `&`
+        // introduced by `&lt;` / `&gt;` / `&quot;` would itself be re-escaped.
+        assert_eq!(html_escape("<&>"), "&lt;&amp;&gt;");
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn markdown_prose_collapses_whitespace_to_single_spaces() {
+        assert_eq!(markdown_prose("  a\n  b\t c  "), "a b c");
+        assert_eq!(markdown_prose("single"), "single");
+        assert_eq!(markdown_prose("   "), "");
+        assert_eq!(markdown_prose(""), "");
+        // Inline code spans are just whitespace-delimited tokens here.
+        assert_eq!(markdown_prose("use `foo`  now"), "use `foo` now");
+    }
+
+    #[test]
+    fn inline_code_html_wraps_backticked_values_and_escapes_inner_text() {
+        assert_eq!(inline_code_html("`true`"), "<code>true</code>");
+        assert_eq!(inline_code_html("  `42`  "), "<code>42</code>");
+        // Inner markup is HTML-escaped inside the <code> wrapper.
+        assert_eq!(inline_code_html("`<x>`"), "<code>&lt;x&gt;</code>");
+    }
+
+    #[test]
+    fn inline_code_html_escapes_unwrapped_or_unbalanced_input() {
+        assert_eq!(inline_code_html("plain"), "plain");
+        assert_eq!(inline_code_html("a<b>"), "a&lt;b&gt;");
+        // A single leading backtick is not a balanced wrap, so it is escaped as-is.
+        assert_eq!(inline_code_html("`open"), "`open");
+        assert_eq!(inline_code_html("`"), "`");
+    }
+
+    #[test]
+    fn first_line_returns_first_line_or_empty() {
+        assert_eq!(first_line(Some("first\nsecond")), "first");
+        assert_eq!(first_line(Some("only")), "only");
+        assert_eq!(first_line(Some("first\r\nsecond")), "first");
+        assert_eq!(first_line(Some("")), "");
+        assert_eq!(first_line(None), "");
+    }
 }

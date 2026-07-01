@@ -327,6 +327,8 @@ impl VoiceCallChannel {
             interruption_scope_id: Some(call_id.to_string()),
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         tx.send(msg).await.map_err(|e| {
             ::zeroclaw_log::record!(
@@ -526,11 +528,12 @@ impl Channel for VoiceCallChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
-        Ok(()) // Not applicable for voice calls
+        // Typing indicator not applicable to voice channels.
+        Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        Ok(()) // Not applicable for voice calls
+        Ok(())
     }
 
     fn supports_draft_updates(&self) -> bool {
