@@ -262,6 +262,15 @@ impl SopEngine {
             .collect()
     }
 
+    /// Whether any loaded SOP has a trigger fanning in from `source`. A cheap
+    /// gate so a live source (e.g. the channel orchestrator) can skip building
+    /// and screening a `SopEvent` when no SOP would ever match it.
+    pub fn wants_source(&self, source: SopTriggerSource) -> bool {
+        self.sops
+            .iter()
+            .any(|sop| sop.triggers.iter().any(|t| t.source() == source))
+    }
+
     // ── Run lifecycle ───────────────────────────────────────────
 
     /// Check whether a new run can be started for the given SOP
@@ -2830,6 +2839,30 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert!(engine.match_trigger(&unmet).is_empty());
+    }
+
+    #[test]
+    fn wants_source_gates_channel_fan_in() {
+        let chan = Sop {
+            triggers: vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: None,
+                condition: None,
+            }],
+            ..test_sop("chan-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![chan]);
+        assert!(engine.wants_source(SopTriggerSource::Channel));
+        assert!(!engine.wants_source(SopTriggerSource::Mqtt));
+
+        let cron = Sop {
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            ..test_sop("cron-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![cron]);
+        assert!(!engine.wants_source(SopTriggerSource::Channel));
     }
 
     #[test]

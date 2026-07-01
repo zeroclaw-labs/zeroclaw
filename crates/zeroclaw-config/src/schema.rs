@@ -14233,21 +14233,22 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
-/// Where an AMQP delivery is routed once consumed.
+/// Where a fan-in delivery is routed once consumed. Shared by every channel
+/// that can feed the SOP engine (AMQP, and agent-loop channels via their
+/// `dispatch` field); the mode is source-agnostic.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum AmqpDispatch {
-    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
-    /// shaped by `content_template`/`thread_id_field`. This is the default and
-    /// preserves the original AMQP consumer behavior.
+pub enum SopDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`.
+    /// This is the default and preserves each channel's original behavior.
     #[default]
     AgentLoop,
-    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
-    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
-    /// `amqp` trigger routing key matches. No agent turn is started.
+    /// Dispatch the delivery to the SOP engine as a `SopEvent` (`topic` =
+    /// source identifier, `payload` = body), matching SOPs whose trigger for
+    /// this source matches. No agent turn is started.
     Sop,
     /// Do both: dispatch to the SOP engine and drive an agent turn from the
     /// same delivery.
@@ -14331,7 +14332,7 @@ pub struct AmqpConfig {
     /// the delivery against SOP `amqp` triggers by routing key.
     #[tab(Behavior)]
     #[serde(default)]
-    pub dispatch: AmqpDispatch,
+    pub dispatch: SopDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -20833,7 +20834,7 @@ mod tests {
 
     #[test]
     async fn amqp_dispatch_defaults_to_agent_loop() {
-        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
+        assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
     #[test]

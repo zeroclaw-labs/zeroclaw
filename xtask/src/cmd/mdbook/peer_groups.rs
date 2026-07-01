@@ -1149,6 +1149,17 @@ mod generated_prose_gate {
     }
 
     #[test]
+    fn sop_trigger_channel_renders_live_and_appears_in_index() {
+        let single = super::render_sop_trigger("channel").expect("channel trigger renders");
+        assert!(single.contains("Live: delivered by the channel orchestrator"));
+        assert!(single.contains("channel"));
+
+        let index = super::render_sop_trigger_index().expect("trigger index renders");
+        assert!(index.contains("| `channel` |"));
+        assert!(index.contains("| `amqp` |"));
+    }
+
+    #[test]
     fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
         let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
 

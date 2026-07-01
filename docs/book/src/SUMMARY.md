@@ -112,6 +112,7 @@
     - [MQTT](./sop/fan-in/mqtt.md)
     - [Filesystem](./sop/fan-in/filesystem.md)
     - [AMQP](./sop/fan-in/amqp.md)
+    - [Channel](./sop/fan-in/channel.md)
     - [Manual](./sop/fan-in/manual.md)
     - [Webhook](./sop/fan-in/webhook.md)
     - [Cron](./sop/fan-in/cron.md)

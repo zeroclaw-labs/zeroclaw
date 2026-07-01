@@ -197,6 +197,25 @@ impl fmt::Display for SopTrigger {
     }
 }
 
+impl SopTrigger {
+    /// The `SopTriggerSource` this trigger fans in from. Single source of truth
+    /// for the trigger-to-source mapping; surfaces and the dispatcher read it
+    /// rather than re-deriving from the variant.
+    pub fn source(&self) -> SopTriggerSource {
+        match self {
+            Self::Mqtt { .. } => SopTriggerSource::Mqtt,
+            Self::Webhook { .. } => SopTriggerSource::Webhook,
+            Self::Cron { .. } => SopTriggerSource::Cron,
+            Self::Peripheral { .. } => SopTriggerSource::Peripheral,
+            Self::Filesystem { .. } => SopTriggerSource::Filesystem,
+            Self::Calendar { .. } => SopTriggerSource::Calendar,
+            Self::Channel { .. } => SopTriggerSource::Channel,
+            Self::Manual => SopTriggerSource::Manual,
+            Self::Amqp { .. } => SopTriggerSource::Amqp,
+        }
+    }
+}
+
 // ── Step kind ────────────────────────────────────────────────────
 
 /// The kind of a workflow step.
