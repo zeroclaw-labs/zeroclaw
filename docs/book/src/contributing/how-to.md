@@ -44,7 +44,7 @@ The key checkpoints:
 ## Testing
 
 - Unit tests co-located with the code (`mod tests`)
-- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`
+- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace`
 - Feature-gated code needs feature-gated tests
 - Don't mock the database for tests that exercise schema or SQL: integration tests must hit a real SQLite
 
