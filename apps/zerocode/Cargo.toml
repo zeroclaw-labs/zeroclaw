@@ -30,6 +30,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = { version = "0.30", default-features = true, features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+zeroclaw-api = { path = "../../crates/zeroclaw-api" }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 toml = "1.0"

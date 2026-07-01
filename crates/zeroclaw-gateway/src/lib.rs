@@ -1821,6 +1821,10 @@ pub async fn run_gateway(
             post(api_sop_author::handle_sop_graph_draft),
         )
         .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
             "/api/sops/{name}/runs/{run_id}/overlay",
             get(api_sop_author::handle_sop_run_overlay),
         )

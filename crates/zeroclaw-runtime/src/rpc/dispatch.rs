@@ -156,6 +156,7 @@ pub enum Method {
     SopsDelete,
     SopsWireDraft,
     SopsGraphDraft,
+    SopsTriggerSources,
 }
 
 impl Method {
@@ -260,6 +261,7 @@ impl Method {
         (Method::SopsDelete, "sops/delete"),
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
+        (Method::SopsTriggerSources, "sops/trigger-sources"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -718,6 +720,7 @@ impl RpcDispatcher {
             Method::SopsDelete => self.handle_sops_delete(&req.params),
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
+            Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
         };
 
         if is_notification {
@@ -4012,6 +4015,27 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
         let sop = Self::parse_sop(sop_val)?;
         to_result(crate::sop::SopGraph::from_sop(&sop))
+    }
+
+    /// Return the trigger-source registry the authoring surfaces render. Walks
+    /// the backend channel registry (never a hardcoded list) and pairs each
+    /// inbound-capable channel kind with its configured aliases from live
+    /// config, plus a setup deep-link for unconfigured kinds.
+    fn handle_sops_trigger_sources(&self) -> RpcResult {
+        let configured: Vec<crate::sop::ConfiguredChannel> = {
+            let config = self.ctx.config.read();
+            config
+                .channels_by_alias()
+                .into_iter()
+                .map(|info| crate::sop::ConfiguredChannel {
+                    channel_type: info.channel_type.replace('-', "_"),
+                    alias: info.alias,
+                    enabled: info.enabled,
+                    owning_agent: info.owning_agent,
+                })
+                .collect()
+        };
+        to_result(crate::sop::build_registry(&configured))
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {

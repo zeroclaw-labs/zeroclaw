@@ -27,6 +27,10 @@ pub(crate) struct SopPane {
     run_input: Option<String>,
     overlay: Option<RunOverlayView>,
     editor: Option<SopEditorState>,
+    /// Trigger-source registry fetched from `sops/trigger-sources` on editor
+    /// open. Single source for the trigger picker; the pane never hardcodes a
+    /// channel or source list.
+    trigger_registry: crate::client::TriggerSourceRegistryView,
     error: Option<String>,
     status: Option<String>,
     animation_origin: std::time::Instant,
@@ -83,12 +87,14 @@ struct SopEditorState {
     draft: SopDraft,
     focus: EditorFocus,
     step_cursor: usize,
+    trigger_cursor: usize,
     field: StepField,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum EditorFocus {
     Name,
+    Triggers,
     Steps,
 }
 
@@ -133,6 +139,7 @@ impl SopEditorState {
             draft: SopDraft::default(),
             focus: EditorFocus::Name,
             step_cursor: 0,
+            trigger_cursor: 0,
             field: StepField::Title,
         }
     }
@@ -154,6 +161,7 @@ impl SopEditorState {
             draft,
             focus: EditorFocus::Steps,
             step_cursor: 0,
+            trigger_cursor: 0,
             field: StepField::Title,
         }
     }
@@ -420,6 +428,7 @@ impl SopPane {
             run_input: None,
             overlay: None,
             editor: None,
+            trigger_registry: crate::client::TriggerSourceRegistryView::default(),
             error: None,
             status: None,
             animation_origin: std::time::Instant::now(),
@@ -538,7 +547,10 @@ impl SopPane {
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
             Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
-            Some(SopTabAction::New) => self.editor = Some(SopEditorState::new_create()),
+            Some(SopTabAction::New) => {
+                self.editor = Some(SopEditorState::new_create());
+                self.refresh_trigger_registry().await;
+            }
             Some(SopTabAction::Edit) => self.open_editor_for_selected().await,
             Some(SopTabAction::Delete) => self.delete_selected().await,
             Some(SopTabAction::Toggle) => self.toggle_layer(),
@@ -649,6 +661,7 @@ impl SopPane {
                     self.editor = Some(SopEditorState::from_draft(false, draft));
                     self.error = None;
                     self.refresh_editor_graph().await;
+                    self.refresh_trigger_registry().await;
                 }
                 Err(e) => self.error = Some(format!("parse SOP '{name}': {e}")),
             },
@@ -683,6 +696,15 @@ impl SopPane {
         let sop = editor.to_sop_json();
         if let Ok(view) = self.rpc.sops_graph_draft(sop).await {
             self.editor_graph = view;
+        }
+    }
+
+    /// Fetch the trigger-source registry from the daemon so the trigger picker
+    /// renders the walked channel + bound-source list. On failure the previous
+    /// registry is retained; the picker degrades to whatever was last known.
+    async fn refresh_trigger_registry(&mut self) {
+        if let Ok(reg) = self.rpc.sops_trigger_sources().await {
+            self.trigger_registry = reg;
         }
     }
 
@@ -793,11 +815,33 @@ impl SopPane {
     /// Route a key to the active editor. `Tab` advances focus: from the Name
     /// field into the step field cursor, then cycles through each step field
     /// (title/body/tools/kind/depends_on/next/when/on_failure/failure_arg) and
-    /// wraps back to Name. `Up`/`Down` move between steps. `Ctrl+n` inserts a
-    /// step, `Ctrl+s` saves, `Esc` cancels. Text fields take char/backspace;
-    /// `kind` and `on_failure` toggle their enum with any char key.
+    /// wraps back to Name. `Up`/`Down` move between steps/triggers. `Ctrl+n`
+    /// inserts a step, `Ctrl+s` saves, `Esc` cancels. Text fields take
+    /// char/backspace; `kind`/`on_failure` toggle with any char key. Trigger
+    /// commands (source/channel/alias cycling, add/remove) resolve through
+    /// `SopEditorAction` so they are rebindable and never collide with text
+    /// entry (they are alt-chorded, outside the typed-char set).
     async fn handle_editor_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::keymap::SopEditorAction;
         use crossterm::event::{KeyCode, KeyModifiers};
+        let in_triggers = self
+            .editor
+            .as_ref()
+            .is_some_and(|ed| ed.focus == EditorFocus::Triggers);
+        if in_triggers && let Some(action) = SopEditorAction::from_chord(&key) {
+            match action {
+                SopEditorAction::SourcePrev => self.editor_cycle_trigger_source(false),
+                SopEditorAction::SourceNext => self.editor_cycle_trigger_source(true),
+                SopEditorAction::ChannelNext => self.editor_cycle_trigger_channel(true),
+                SopEditorAction::AliasNext => self.editor_cycle_trigger_alias(true),
+                SopEditorAction::Add => self.editor_add_trigger(),
+                SopEditorAction::Remove => self.editor_remove_trigger(),
+            }
+            if self.editor.is_some() {
+                self.refresh_editor_graph().await;
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.editor = None, // keyguard: text-entry cancel
@@ -807,8 +851,8 @@ impl SopPane {
             KeyCode::Up => self.editor_step_up(), // keyguard: text-entry step cursor
             KeyCode::Down => self.editor_step_down(), // keyguard: text-entry step cursor
             KeyCode::Enter => self.editor_enter(), // keyguard: text-entry newline/advance
-            KeyCode::Backspace => self.editor_backspace(), // keyguard: text-entry edit
-            KeyCode::Char(c) if !ctrl => self.editor_push_char(c), // keyguard: text-entry char input
+            KeyCode::Backspace if !in_triggers => self.editor_backspace(), // keyguard: text-entry edit
+            KeyCode::Char(c) if !ctrl && !in_triggers => self.editor_push_char(c), // keyguard: text-entry char input
             _ => {}
         }
         // Refresh the visual canvas projection after any edit that may have
@@ -823,6 +867,12 @@ impl SopPane {
         if let Some(ed) = self.editor.as_mut() {
             match ed.focus {
                 EditorFocus::Name => {
+                    ed.focus = EditorFocus::Triggers;
+                    ed.trigger_cursor = ed
+                        .trigger_cursor
+                        .min(ed.draft.triggers.len().saturating_sub(1));
+                }
+                EditorFocus::Triggers => {
                     ed.focus = EditorFocus::Steps;
                     ed.field = StepField::Title;
                 }
@@ -885,20 +935,26 @@ impl SopPane {
     }
 
     fn editor_step_up(&mut self) {
-        if let Some(ed) = self.editor.as_mut()
-            && ed.focus == EditorFocus::Steps
-            && ed.step_cursor > 0
-        {
-            ed.step_cursor -= 1;
+        if let Some(ed) = self.editor.as_mut() {
+            match ed.focus {
+                EditorFocus::Steps if ed.step_cursor > 0 => ed.step_cursor -= 1,
+                EditorFocus::Triggers if ed.trigger_cursor > 0 => ed.trigger_cursor -= 1,
+                _ => {}
+            }
         }
     }
 
     fn editor_step_down(&mut self) {
-        if let Some(ed) = self.editor.as_mut()
-            && ed.focus == EditorFocus::Steps
-            && ed.step_cursor + 1 < ed.draft.steps.len()
-        {
-            ed.step_cursor += 1;
+        if let Some(ed) = self.editor.as_mut() {
+            match ed.focus {
+                EditorFocus::Steps if ed.step_cursor + 1 < ed.draft.steps.len() => {
+                    ed.step_cursor += 1;
+                }
+                EditorFocus::Triggers if ed.trigger_cursor + 1 < ed.draft.triggers.len() => {
+                    ed.trigger_cursor += 1;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -906,11 +962,154 @@ impl SopPane {
         if let Some(ed) = self.editor.as_mut() {
             match ed.focus {
                 EditorFocus::Name => {
-                    ed.focus = EditorFocus::Steps;
-                    ed.field = StepField::Title;
+                    ed.focus = EditorFocus::Triggers;
                 }
+                EditorFocus::Triggers => self.editor_add_trigger(),
                 EditorFocus::Steps => self.editor_add_step(),
             }
+        }
+    }
+
+    /// Append a trigger (defaults to `manual`) and select it. Source and
+    /// binding are then cycled with the trigger key controls.
+    fn editor_add_trigger(&mut self) {
+        if let Some(ed) = self.editor.as_mut() {
+            ed.draft
+                .triggers
+                .push(crate::client::SopTriggerDraft::default());
+            ed.trigger_cursor = ed.draft.triggers.len() - 1;
+        }
+    }
+
+    /// Remove the focused trigger. A SOP retains at least one trigger, so the
+    /// last one is not deletable (it falls back to `manual` semantics).
+    fn editor_remove_trigger(&mut self) {
+        if let Some(ed) = self.editor.as_mut()
+            && ed.draft.triggers.len() > 1
+            && ed.trigger_cursor < ed.draft.triggers.len()
+        {
+            ed.draft.triggers.remove(ed.trigger_cursor);
+            ed.trigger_cursor = ed.trigger_cursor.min(ed.draft.triggers.len() - 1);
+        }
+    }
+
+    /// Cycle the focused trigger's source type across the registry's bound
+    /// sources plus a single `channel` source (the channel kind is then picked
+    /// separately). Walks the fetched registry; no hardcoded source list.
+    fn editor_cycle_trigger_source(&mut self, forward: bool) {
+        let mut sources: Vec<String> = self
+            .trigger_registry
+            .bound
+            .iter()
+            .map(|b| b.source.clone())
+            .collect();
+        sources.push("channel".to_string());
+        if sources.is_empty() {
+            return;
+        }
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        let Some(trigger) = ed.draft.triggers.get_mut(ed.trigger_cursor) else {
+            return;
+        };
+        let cur = if trigger.channel.is_some() {
+            "channel".to_string()
+        } else {
+            trigger.kind.clone()
+        };
+        let idx = sources.iter().position(|s| *s == cur).unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % sources.len()
+        } else {
+            (idx + sources.len() - 1) % sources.len()
+        };
+        let picked = sources[next].clone();
+        *trigger = crate::client::SopTriggerDraft::default();
+        if picked == "channel" {
+            trigger.kind = "channel".to_string();
+            trigger.channel = self.trigger_registry.channels.first().and_then(|c| {
+                <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(&c.channel)
+                    .ok()
+            });
+        } else {
+            trigger.kind = picked;
+        }
+    }
+
+    /// Cycle the focused channel trigger's channel kind across the walked
+    /// inbound-capable channel list. No-op unless the trigger is a channel
+    /// source. Resets the alias since it is kind-specific.
+    fn editor_cycle_trigger_channel(&mut self, forward: bool) {
+        let kinds: Vec<String> = self
+            .trigger_registry
+            .channels
+            .iter()
+            .map(|c| c.channel.clone())
+            .collect();
+        if kinds.is_empty() {
+            return;
+        }
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        let Some(trigger) = ed.draft.triggers.get_mut(ed.trigger_cursor) else {
+            return;
+        };
+        if trigger.channel.is_none() {
+            return;
+        }
+        let cur = trigger
+            .channel
+            .map(|k| k.as_wire().to_string())
+            .unwrap_or_default();
+        let idx = kinds.iter().position(|s| *s == cur).unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % kinds.len()
+        } else {
+            (idx + kinds.len() - 1) % kinds.len()
+        };
+        trigger.channel =
+            <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(&kinds[next])
+                .ok();
+        trigger.alias = None;
+    }
+
+    /// Cycle the focused channel trigger's alias across the configured aliases
+    /// for its channel kind, including an "any" (None) slot. No-op for
+    /// non-channel triggers.
+    fn editor_cycle_trigger_alias(&mut self, forward: bool) {
+        let Some(ed) = self.editor.as_ref() else {
+            return;
+        };
+        let Some(trigger) = ed.draft.triggers.get(ed.trigger_cursor) else {
+            return;
+        };
+        let Some(kind) = trigger.channel else {
+            return;
+        };
+        let kind_wire = kind.as_wire().to_string();
+        let mut aliases: Vec<Option<String>> = vec![None];
+        if let Some(entry) = self
+            .trigger_registry
+            .channels
+            .iter()
+            .find(|c| c.channel == kind_wire)
+        {
+            aliases.extend(entry.aliases.iter().map(|a| Some(a.alias.clone())));
+        }
+        let cur = trigger.alias.clone();
+        let idx = aliases.iter().position(|a| *a == cur).unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % aliases.len()
+        } else {
+            (idx + aliases.len() - 1) % aliases.len()
+        };
+        let picked = aliases[next].clone();
+        if let Some(ed) = self.editor.as_mut()
+            && let Some(trigger) = ed.draft.triggers.get_mut(ed.trigger_cursor)
+        {
+            trigger.alias = picked;
         }
     }
 
@@ -1424,6 +1623,58 @@ impl SopPane {
             ed.draft.name,
             if name_focus { "_" } else { "" }
         ));
+        lines.push(String::new());
+        let triggers_focus = ed.focus == EditorFocus::Triggers;
+        lines.push(format!(
+            "{} triggers  [alt+←/→ source · alt+c channel · alt+a alias · alt+n add · alt+x remove]",
+            if triggers_focus { ">" } else { " " }
+        ));
+        for (i, trigger) in ed.draft.triggers.iter().enumerate() {
+            let on = triggers_focus && i == ed.trigger_cursor;
+            let mark = if on { ">" } else { " " };
+            let source = if trigger.channel.is_some() {
+                "channel".to_string()
+            } else {
+                trigger.kind.clone()
+            };
+            let detail = match &trigger.channel {
+                Some(kind) => {
+                    let alias = trigger.alias.clone().unwrap_or_else(|| "any".to_string());
+                    let kind_wire = kind.as_wire();
+                    let unconfigured = self
+                        .trigger_registry
+                        .channels
+                        .iter()
+                        .find(|c| c.channel == kind_wire)
+                        .is_some_and(|c| !c.configured);
+                    let hint = if unconfigured {
+                        "  (no alias configured; set up this channel first)"
+                    } else {
+                        ""
+                    };
+                    format!(" {kind_wire}/{alias}{hint}")
+                }
+                None => match source.as_str() {
+                    "filesystem" => trigger
+                        .path
+                        .clone()
+                        .map(|p| format!(" {p}"))
+                        .unwrap_or_default(),
+                    "cron" => trigger
+                        .expression
+                        .clone()
+                        .map(|e| format!(" {e}"))
+                        .unwrap_or_default(),
+                    "mqtt" => trigger
+                        .topic
+                        .clone()
+                        .map(|t| format!(" {t}"))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                },
+            };
+            lines.push(format!("{mark}  {source}{detail}"));
+        }
         lines.push(String::new());
         let steps_focus = ed.focus == EditorFocus::Steps;
         for (i, step) in ed.draft.steps.iter().enumerate() {
@@ -2465,5 +2716,97 @@ mod tests {
         pane.submit_editor().await;
         assert!(pane.editor.is_some());
         assert!(pane.error.is_some());
+    }
+
+    fn registry_with(channels: &[&str]) -> crate::client::TriggerSourceRegistryView {
+        crate::client::TriggerSourceRegistryView {
+            bound: vec![
+                crate::client::BoundTriggerSourceView {
+                    source: "webhook".to_string(),
+                    fields: vec!["path".to_string()],
+                },
+                crate::client::BoundTriggerSourceView {
+                    source: "cron".to_string(),
+                    fields: vec!["expression".to_string()],
+                },
+            ],
+            channels: channels
+                .iter()
+                .map(|c| crate::client::ChannelTriggerKindView {
+                    channel: (*c).to_string(),
+                    aliases: Vec::new(),
+                    configured: false,
+                    setup_path: format!("/config/channels/{c}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cycle_trigger_source_selects_channel_from_registry() {
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.trigger_registry = registry_with(&["telegram", "discord"]);
+        pane.editor = Some(SopEditorState::new_create());
+        // Default trigger is manual. Cycle backward once lands on `channel`
+        // (the last synthetic source), binding the first registry channel.
+        pane.editor_cycle_trigger_source(false);
+        let ed = pane.editor.as_ref().unwrap();
+        let tr = &ed.draft.triggers[0];
+        assert_eq!(tr.kind, "channel");
+        assert_eq!(
+            tr.channel.map(|k| k.as_wire().to_string()),
+            Some("telegram".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cycle_trigger_channel_walks_registry_kinds() {
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.trigger_registry = registry_with(&["telegram", "discord"]);
+        pane.editor = Some(SopEditorState::new_create());
+        pane.editor_cycle_trigger_source(false); // -> channel/telegram
+        pane.editor_cycle_trigger_channel(true); // telegram -> discord
+        let tr = &pane.editor.as_ref().unwrap().draft.triggers[0];
+        assert_eq!(
+            tr.channel.map(|k| k.as_wire().to_string()),
+            Some("discord".to_string())
+        );
+        // Channel change clears the alias.
+        assert!(tr.alias.is_none());
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_trigger_keeps_at_least_one() {
+        let (client, _rx) = test_client_with_rpc();
+        let mut pane = SopPane::new(client);
+        pane.editor = Some(SopEditorState::new_create());
+        pane.editor_add_trigger();
+        assert_eq!(pane.editor.as_ref().unwrap().draft.triggers.len(), 2);
+        pane.editor_remove_trigger();
+        assert_eq!(pane.editor.as_ref().unwrap().draft.triggers.len(), 1);
+        // The final trigger is not removable.
+        pane.editor_remove_trigger();
+        assert_eq!(pane.editor.as_ref().unwrap().draft.triggers.len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_serializes_wire_string() {
+        let mut ed = SopEditorState::new_create();
+        ed.draft.name = "demo".to_string();
+        ed.draft.triggers[0] = crate::client::SopTriggerDraft {
+            kind: "channel".to_string(),
+            channel: <zeroclaw_api::attribution::ChannelKind as core::str::FromStr>::from_str(
+                "telegram",
+            )
+            .ok(),
+            alias: Some("main".to_string()),
+            ..Default::default()
+        };
+        let json = ed.to_sop_json();
+        assert_eq!(json["triggers"][0]["type"], "channel");
+        assert_eq!(json["triggers"][0]["channel"], "telegram");
+        assert_eq!(json["triggers"][0]["alias"], "main");
     }
 }

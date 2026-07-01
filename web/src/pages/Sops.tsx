@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, XCircle, Loader2, ArrowDown, Plus, Save, Trash2, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import SopCanvas from './SopCanvas';
 import { t } from '@/lib/i18n';
@@ -13,6 +14,7 @@ import {
   deleteSop,
   wireDraft,
   graphDraft,
+  triggerSources,
   type WireRole,
   type SopSummary,
   type SopGraph,
@@ -23,7 +25,10 @@ import {
   type NodeRunState,
   type Sop,
   type SopStep,
+  type SopTrigger,
   type StepFailure,
+  type TriggerSourceRegistry,
+  type BoundTriggerSource,
 } from '@/lib/sops';
 
 function blankStep(number: number): SopStep {
@@ -35,6 +40,26 @@ function blankStep(number: number): SopStep {
     requires_confirmation: false,
     suggested_tools: [],
   };
+}
+
+const DRAFT_STORAGE_KEY = 'zeroclaw_sop_draft';
+
+function loadStoredDraft(): Sop | null {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Sop) : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeDraft(draft: Sop | null): void {
+  try {
+    if (draft) sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+    else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Storage is best-effort; a failure only loses cross-navigation recovery.
+  }
 }
 
 function blankSop(name: string): Sop {
@@ -567,13 +592,269 @@ function StepEditor({
   );
 }
 
+const CHANNEL_SOURCE = 'channel';
+const MANUAL_SOURCE = 'manual';
+
+function triggerSource(trigger: SopTrigger): string {
+  return trigger.type === CHANNEL_SOURCE ? CHANNEL_SOURCE : trigger.type;
+}
+
+/// Build a fresh trigger for a chosen source. The registry supplies the field
+/// set; each bound field starts empty and the channel source starts unbound so
+/// the author picks a channel from the walked list. No per-source field logic is
+/// hardcoded beyond the generated union shape.
+function blankTrigger(
+  source: string,
+  registry: TriggerSourceRegistry | null,
+): SopTrigger {
+  if (source === CHANNEL_SOURCE) {
+    const firstChannel = registry?.channels[0]?.channel ?? '';
+    return { type: 'channel', channel: firstChannel, alias: null, condition: null };
+  }
+  if (source === MANUAL_SOURCE) return { type: 'manual' };
+  const bound = registry?.bound.find((b) => b.source === source);
+  const fields = bound?.fields ?? [];
+  const base: Record<string, unknown> = { type: source };
+  for (const field of fields) {
+    base[field] = field === 'events' || field === 'calendar_ids' ? [] : field === 'condition' ? null : '';
+  }
+  return base as unknown as SopTrigger;
+}
+
+function triggerFieldLabel(field: string): string {
+  switch (field) {
+    case 'path':
+      return t('sops.trigger_path');
+    case 'expression':
+      return t('sops.trigger_expression');
+    case 'topic':
+      return t('sops.trigger_topic');
+    case 'condition':
+      return t('sops.trigger_condition');
+    case 'board':
+      return t('sops.trigger_board');
+    case 'signal':
+      return t('sops.trigger_signal');
+    case 'events':
+      return t('sops.trigger_events');
+    case 'calendar_source':
+      return t('sops.trigger_calendar_source');
+    case 'calendar_ids':
+      return t('sops.trigger_calendar_ids');
+    default:
+      return field;
+  }
+}
+
+function TriggerFieldInput({
+  field,
+  value,
+  onChange,
+}: {
+  field: string;
+  value: unknown;
+  onChange: (next: unknown) => void;
+}) {
+  const isList = field === 'events' || field === 'calendar_ids';
+  const text = isList
+    ? Array.isArray(value)
+      ? value.join(', ')
+      : ''
+    : typeof value === 'string'
+      ? value
+      : '';
+  return (
+    <label className="block text-sm">
+      <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(field)}</span>
+      <input
+        type="text"
+        value={text}
+        onChange={(e) => {
+          const raw = e.target.value;
+          if (isList) {
+            onChange(
+              raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter((s) => s.length > 0),
+            );
+          } else if (field === 'condition') {
+            onChange(raw.length > 0 ? raw : null);
+          } else {
+            onChange(raw);
+          }
+        }}
+        className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+      />
+    </label>
+  );
+}
+
+function ChannelTriggerFields({
+  trigger,
+  registry,
+  onChange,
+}: {
+  trigger: Extract<SopTrigger, { type: 'channel' }>;
+  registry: TriggerSourceRegistry | null;
+  onChange: (patch: Partial<Extract<SopTrigger, { type: 'channel' }>>) => void;
+}) {
+  const channels = registry?.channels ?? [];
+  const selected = channels.find((c) => c.channel === trigger.channel);
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-3">
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_channel')}</span>
+          <select
+            value={trigger.channel}
+            onChange={(e) => onChange({ channel: e.target.value, alias: null })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          >
+            {channels.map((c) => (
+              <option key={c.channel} value={c.channel}>
+                {c.channel}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_alias')}</span>
+          <select
+            value={trigger.alias ?? ''}
+            onChange={(e) => onChange({ alias: e.target.value.length > 0 ? e.target.value : null })}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+            disabled={!selected?.configured}
+          >
+            <option value="">{t('sops.trigger_alias_any')}</option>
+            {selected?.aliases.map((a) => (
+              <option key={a.alias} value={a.alias}>
+                {a.alias}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {selected && !selected.configured ? (
+        <div className="flex items-center gap-2 text-xs text-amber-500">
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
+          <span>{t('sops.trigger_unconfigured')}</span>
+          <Link
+            to={selected.setup_path}
+            className="underline hover:text-pc-accent"
+          >
+            {t('sops.trigger_setup_link')}
+          </Link>
+        </div>
+      ) : null}
+      <TriggerFieldInput
+        field="condition"
+        value={trigger.condition}
+        onChange={(next) => onChange({ condition: (next as string | null) ?? null })}
+      />
+    </div>
+  );
+}
+
+function TriggerEditor({
+  trigger,
+  index,
+  selected,
+  registry,
+  onChange,
+  onRemove,
+}: {
+  trigger: SopTrigger;
+  index: number;
+  selected: boolean;
+  registry: TriggerSourceRegistry | null;
+  onChange: (next: SopTrigger) => void;
+  onRemove: () => void;
+}) {
+  const source = triggerSource(trigger);
+  const bound = registry?.bound ?? [];
+  const boundFields: string[] =
+    source === CHANNEL_SOURCE || source === MANUAL_SOURCE
+      ? []
+      : (bound.find((b) => b.source === source)?.fields ?? []);
+
+  const sources: string[] = [
+    ...bound.map((b: BoundTriggerSource) => b.source),
+    CHANNEL_SOURCE,
+  ];
+
+  return (
+    <div
+      className={`space-y-2 rounded border bg-pc-surface p-2 ${
+        selected ? 'border-pc-accent' : 'border-pc-border'
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <label className="flex-1 text-sm">
+          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_source')}</span>
+          <select
+            value={source}
+            onChange={(e) => onChange(blankTrigger(e.target.value, registry))}
+            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+          >
+            {sources.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="mt-5 inline-flex items-center rounded border border-pc-border p-1 text-pc-text-muted hover:bg-pc-elevated"
+          aria-label={t('sops.remove_trigger')}
+        >
+          <Trash2 className="h-3.5 w-3.5" aria-hidden />
+        </button>
+      </div>
+      {trigger.type === CHANNEL_SOURCE ? (
+        <ChannelTriggerFields
+          trigger={trigger}
+          registry={registry}
+          onChange={(patch) => onChange({ ...trigger, ...patch })}
+        />
+      ) : source === MANUAL_SOURCE ? (
+        <p className="text-xs text-pc-text-muted">{t('sops.trigger_manual_hint')}</p>
+      ) : (
+        <div className="space-y-2">
+          {boundFields.map((field) => (
+            <TriggerFieldInput
+              key={field}
+              field={field}
+              value={(trigger as unknown as Record<string, unknown>)[field]}
+              onChange={(next) =>
+                onChange({
+                  ...(trigger as unknown as Record<string, unknown>),
+                  [field]: next,
+                } as unknown as SopTrigger)
+              }
+            />
+          ))}
+        </div>
+      )}
+      <span className="sr-only">{`trigger ${index + 1}`}</span>
+    </div>
+  );
+}
+
 function SopEditor({
   draft,
   saving,
   saveError,
   selectedStep,
+  selectedTrigger,
+  triggerRegistry,
   onSelectStep,
   onField,
+  onTrigger,
+  onAddTrigger,
+  onRemoveTrigger,
   onStep,
   onAddStep,
   onRemoveStep,
@@ -585,8 +866,13 @@ function SopEditor({
   saving: boolean;
   saveError: string | null;
   selectedStep: number | null;
+  selectedTrigger: number | null;
+  triggerRegistry: TriggerSourceRegistry | null;
   onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
+  onTrigger: (i: number, next: SopTrigger) => void;
+  onAddTrigger: () => void;
+  onRemoveTrigger: (i: number) => void;
   onStep: (i: number, patch: Partial<SopStep>) => void;
   onAddStep: () => void;
   onRemoveStep: (i: number) => void;
@@ -682,6 +968,33 @@ function SopEditor({
       </div>
       <div className="space-y-2">
         <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-pc-text">{t('sops.triggers')}</span>
+          <button
+            type="button"
+            onClick={onAddTrigger}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_trigger')}
+          </button>
+        </div>
+        {draft.triggers.length === 0 ? (
+          <p className="text-xs text-pc-text-muted">{t('sops.trigger_none')}</p>
+        ) : (
+          draft.triggers.map((trigger, i) => (
+            <TriggerEditor
+              key={i}
+              trigger={trigger}
+              index={i}
+              selected={selectedTrigger === i}
+              registry={triggerRegistry}
+              onChange={(next) => onTrigger(i, next)}
+              onRemove={() => onRemoveTrigger(i)}
+            />
+          ))
+        )}
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-pc-text">{t('sops.steps')}</span>
           <button
             type="button"
@@ -719,12 +1032,43 @@ export default function Sops() {
   const [runId, setRunId] = useState('');
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Sop | null>(null);
+  const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
+  const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
+  const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
+
+  // Mirror the in-progress draft to session storage so navigating away (e.g. to
+  // channel setup for an unconfigured trigger) and back does not lose it, and
+  // warn on a full tab close/reload while a draft is open.
+  useEffect(() => {
+    storeDraft(draft);
+    if (!draft) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [draft]);
+
+  useEffect(() => {
+    let active = true;
+    triggerSources()
+      .then((reg) => {
+        if (active) setTriggerRegistry(reg);
+      })
+      .catch(() => {
+        // Registry is best-effort: the editor still renders bound sources it
+        // knows about and simply omits channel aliases if the fetch failed.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const onConnect = useCallback(
     (from: number, to: number, kind: WireRole, portIndex?: number) => {
@@ -916,6 +1260,16 @@ export default function Sops() {
   const editorHandlers = draft
     ? {
         onField: (patch: Partial<Sop>) => setDraft((d) => (d ? { ...d, ...patch } : d)),
+        onTrigger: (i: number, next: SopTrigger) =>
+          setDraft((d) =>
+            d ? { ...d, triggers: d.triggers.map((tr, j) => (j === i ? next : tr)) } : d,
+          ),
+        onAddTrigger: () =>
+          setDraft((d) =>
+            d ? { ...d, triggers: [...d.triggers, blankTrigger(MANUAL_SOURCE, triggerRegistry)] } : d,
+          ),
+        onRemoveTrigger: (i: number) =>
+          setDraft((d) => (d ? { ...d, triggers: d.triggers.filter((_, j) => j !== i) } : d)),
         onStep: (i: number, patch: Partial<SopStep>) =>
           setDraft((d) =>
             d ? { ...d, steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)) } : d,
@@ -969,6 +1323,7 @@ export default function Sops() {
               selectedStep={selectedStep}
               runStateByStep={runStateByStep}
               onSelectStep={setSelectedStep}
+              onSelectTrigger={setSelectedTrigger}
               onAddStep={editorHandlers.onAddStep}
               onConnect={onConnect}
               onDisconnect={onDisconnect}
@@ -979,8 +1334,13 @@ export default function Sops() {
             saving={saving}
             saveError={saveError}
             selectedStep={selectedStep}
+            selectedTrigger={selectedTrigger}
+            triggerRegistry={triggerRegistry}
             onSelectStep={setSelectedStep}
             onField={editorHandlers.onField}
+            onTrigger={editorHandlers.onTrigger}
+            onAddTrigger={editorHandlers.onAddTrigger}
+            onRemoveTrigger={editorHandlers.onRemoveTrigger}
             onStep={editorHandlers.onStep}
             onAddStep={editorHandlers.onAddStep}
             onRemoveStep={editorHandlers.onRemoveStep}

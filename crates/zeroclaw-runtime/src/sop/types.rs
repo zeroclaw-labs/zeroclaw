@@ -133,6 +133,16 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// An inbound message on a configured channel (telegram, discord, slack,
+    /// email, filesystem, ...). `channel` is a `ChannelKind` snake_case value;
+    /// `alias` optionally scopes to one configured instance of that channel.
+    Channel {
+        channel: String,
+        #[serde(default)]
+        alias: Option<String>,
+        #[serde(default)]
+        condition: Option<String>,
+    },
     Manual,
 }
 
@@ -147,6 +157,10 @@ impl fmt::Display for SopTrigger {
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { channel, alias, .. } => match alias {
+                Some(a) => write!(f, "channel:{channel}/{a}"),
+                None => write!(f, "channel:{channel}"),
+            },
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -357,6 +371,7 @@ pub enum SopTriggerSource {
     Peripheral,
     Filesystem,
     Calendar,
+    Channel,
     Manual,
 }
 
@@ -369,6 +384,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Peripheral => write!(f, "peripheral"),
             Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
+            Self::Channel => write!(f, "channel"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -807,6 +823,48 @@ path = "/var/inbox"
     #[test]
     fn trigger_source_filesystem_display() {
         assert_eq!(SopTriggerSource::Filesystem.to_string(), "filesystem");
+    }
+
+    #[test]
+    fn trigger_channel_toml_roundtrip_and_display() {
+        let toml_str = r#"
+type = "channel"
+channel = "telegram"
+alias = "main"
+condition = "$.text == \"go\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(matches!(
+            &trigger,
+            SopTrigger::Channel { channel, alias, condition }
+                if channel == "telegram"
+                    && alias.as_deref() == Some("main")
+                    && condition.is_some()
+        ));
+        assert_eq!(trigger.to_string(), "channel:telegram/main");
+        let round = toml::to_string(&trigger).unwrap();
+        let reparsed: SopTrigger = toml::from_str(&round).unwrap();
+        assert_eq!(reparsed, trigger);
+    }
+
+    #[test]
+    fn trigger_channel_without_alias_matches_kind_only() {
+        let toml_str = r#"
+type = "channel"
+channel = "discord"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert_eq!(trigger.to_string(), "channel:discord");
+        assert!(matches!(
+            &trigger,
+            SopTrigger::Channel { alias, condition, .. }
+                if alias.is_none() && condition.is_none()
+        ));
+    }
+
+    #[test]
+    fn trigger_source_channel_display() {
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
     }
 
     #[test]

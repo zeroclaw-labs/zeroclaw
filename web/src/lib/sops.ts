@@ -28,6 +28,10 @@ export type FlowRole = NonNullable<GraphWire['flow_role']>;
 export type GraphSeverity = GraphDiagnostic['severity'];
 
 export type RunOverlay = Schemas['RunOverlay'];
+export type TriggerSourceRegistry = Schemas['TriggerSourceRegistry'];
+export type BoundTriggerSource = Schemas['BoundTriggerSource'];
+export type ChannelTriggerKind = Schemas['ChannelTriggerKind'];
+export type ChannelAlias = Schemas['ChannelAlias'];
 export type NodeRunOverlay = Schemas['NodeRunOverlay'];
 export type NodeRunState = Schemas['NodeRunState'];
 export type SopRunStatus = Schemas['SopRunStatus'];
@@ -105,6 +109,13 @@ export function graphDraft(sop: Sop): Promise<SopGraph> {
     method: 'POST',
     body: JSON.stringify({ sop }),
   });
+}
+
+/// The trigger-source registry: bound sources plus every inbound-capable
+/// channel kind with its configured aliases. Walked from the backend registry;
+/// the surface renders whatever it returns and never hardcodes a channel list.
+export function triggerSources(): Promise<TriggerSourceRegistry> {
+  return apiFetch<TriggerSourceRegistry>('/api/sops/trigger-sources');
 }
 
 export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> {

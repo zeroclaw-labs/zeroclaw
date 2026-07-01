@@ -10,18 +10,22 @@ const NODE_H = 84;
 const COL_GAP = 130;
 const ROW_GAP = 46;
 
+// Wire and node colors read from the gateway theme's semantic status tokens and
+// accent, so the canvas follows light/dark and the active palette instead of
+// fixed hex. `--color-status-*` are the design system's success/error/warning
+// roles; accent variants carry switch and trigger.
 function wireStroke(kind: FlowRole): string {
   switch (kind) {
     case 'failure':
-      return 'var(--pc-danger, #f43f5e)';
+      return 'var(--color-status-error)';
     case 'dependency':
-      return '#f59e0b';
+      return 'var(--color-status-warning)';
     case 'switch':
-      return '#a78bfa';
+      return 'var(--pc-accent-light)';
     case 'trigger':
-      return '#38bdf8';
+      return 'var(--pc-accent)';
     default:
-      return '#10b981';
+      return 'var(--color-status-success)';
   }
 }
 
@@ -30,11 +34,11 @@ function nodeStateStroke(state: NodeRunState | undefined): string {
     case 'active':
       return 'var(--pc-accent)';
     case 'completed':
-      return '#10b981';
+      return 'var(--color-status-success)';
     case 'failed':
-      return '#f43f5e';
+      return 'var(--color-status-error)';
     case 'skipped':
-      return '#f59e0b';
+      return 'var(--color-status-warning)';
     default:
       return 'var(--pc-border-strong)';
   }
@@ -76,6 +80,7 @@ interface Props {
   selectedStep: number | null;
   runStateByStep: Map<number, NodeRunState>;
   onSelectStep: (n: number) => void;
+  onSelectTrigger: (index: number) => void;
   onAddStep: () => void;
   onConnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
   onDisconnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
@@ -87,6 +92,7 @@ export default function SopCanvas({
   selectedStep,
   runStateByStep,
   onSelectStep,
+  onSelectTrigger,
   onAddStep,
   onConnect,
   onDisconnect,
@@ -259,7 +265,7 @@ export default function SopCanvas({
                 <path
                   d={d}
                   fill="none"
-                  stroke={hovered && kind !== 'trigger' ? 'var(--pc-danger, #f43f5e)' : wireStroke(kind)}
+                  stroke={hovered && kind !== 'trigger' ? 'var(--color-status-error)' : wireStroke(kind)}
                   strokeWidth={active ? 3 : hovered ? 2.5 : 1.75}
                   strokeDasharray={
                     hovered && kind !== 'trigger'
@@ -286,7 +292,7 @@ export default function SopCanvas({
                 </path>
                 {hovered && kind !== 'trigger' ? (
                   <g pointerEvents="none">
-                    <circle cx={(a.x + NODE_W + b.x) / 2} cy={(a.y + b.y) / 2 + NODE_H / 2} r={8} fill="var(--pc-danger, #f43f5e)" />
+                    <circle cx={(a.x + NODE_W + b.x) / 2} cy={(a.y + b.y) / 2 + NODE_H / 2} r={8} fill="var(--color-status-error)" />
                     <text
                       x={(a.x + NODE_W + b.x) / 2}
                       y={(a.y + b.y) / 2 + NODE_H / 2 + 3}
@@ -333,8 +339,17 @@ export default function SopCanvas({
   );
 
   function renderTrigger(node: GraphNode, p: XY) {
+    const idx = node.trigger_index;
     return (
-      <g key={`trigger-${node.step}`} transform={`translate(${p.x}, ${p.y})`}>
+      <g
+        key={`trigger-${node.step}`}
+        transform={`translate(${p.x}, ${p.y})`}
+        onClick={() => {
+          if (idx != null) onSelectTrigger(idx);
+        }}
+        className={idx != null ? 'cursor-pointer' : undefined}
+      >
+        <title>{t('sops.trigger_edit_hint')}</title>
         <rect
           width={NODE_W}
           height={NODE_H}
@@ -402,11 +417,11 @@ export default function SopCanvas({
           {(node.title || t('sops.untitled')).slice(0, 22)}
         </text>
         {isCheckpoint ? (
-          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="#f59e0b">
+          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--color-status-warning)">
             ⏸ {t('sops.checkpoint')}
           </text>
         ) : switchRules.length > 0 ? (
-          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="#a78bfa">
+          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--pc-accent-light)">
             ⋔ {t('sops.switch')}
           </text>
         ) : null}
@@ -429,7 +444,7 @@ export default function SopCanvas({
                   y={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP + 3}
                   fontSize="9"
                   textAnchor="end"
-                  fill="#a78bfa"
+                  fill="var(--pc-accent-light)"
                 >
                   {(rule.name || `port ${ri + 1}`).slice(0, 16)}
                 </text>

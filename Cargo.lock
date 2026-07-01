@@ -13616,6 +13616,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "strum 0.28.0",
  "sys-locale",
  "tar",
  "tempfile",
@@ -13844,6 +13845,7 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "zeroclaw-api",
 ]
 
 [[package]]

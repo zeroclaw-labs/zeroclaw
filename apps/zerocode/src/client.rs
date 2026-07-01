@@ -119,6 +119,7 @@ pub mod method {
     pub const SOPS_DELETE: &str = "sops/delete";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
+    pub const SOPS_TRIGGER_SOURCES: &str = "sops/trigger-sources";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1258,6 +1259,16 @@ impl RpcClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
+    /// Fetch the trigger-source registry: bound sources plus inbound-capable
+    /// channel kinds with configured aliases. Walked from the backend registry;
+    /// the TUI renders whatever it returns and never hardcodes a channel list.
+    pub async fn sops_trigger_sources(&self) -> Result<TriggerSourceRegistryView> {
+        let value = self
+            .call(method::SOPS_TRIGGER_SOURCES, serde_json::json!({}))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     // ── Session methods ──────────────────────────────────────────
 
     pub async fn session_new(
@@ -2029,6 +2040,8 @@ pub struct GraphNode {
     pub kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_index: Option<u32>,
     pub inputs: Vec<GraphPin>,
     pub outputs: Vec<GraphPin>,
 }
@@ -2095,6 +2108,44 @@ pub struct SopGraphView {
     pub diagnostics: Vec<GraphDiagnostic>,
     #[serde(default)]
     pub layout: GraphLayout,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::ChannelAlias`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelAliasView {
+    pub alias: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_agent: Option<String>,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::ChannelTriggerKind`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelTriggerKindView {
+    pub channel: String,
+    #[serde(default)]
+    pub aliases: Vec<ChannelAliasView>,
+    pub configured: bool,
+    pub setup_path: String,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::BoundTriggerSource`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoundTriggerSourceView {
+    pub source: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+/// Mirror of `zeroclaw_runtime::sop::TriggerSourceRegistry`: the trigger-source
+/// registry the authoring surfaces render, deserialized from
+/// `sops/trigger-sources`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TriggerSourceRegistryView {
+    #[serde(default)]
+    pub bound: Vec<BoundTriggerSourceView>,
+    #[serde(default)]
+    pub channels: Vec<ChannelTriggerKindView>,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::StepRouting`.
@@ -2196,12 +2247,47 @@ pub struct SopDraft {
     pub deterministic: bool,
 }
 
-/// Minimal trigger mirror. Only the tagged `type` is edited in the TUI;
-/// the daemon fills trigger-specific fields from defaults.
+/// Trigger mirror. The tagged `type` selects the source; the optional bound
+/// fields carry the source-specific binding (channel/alias for a channel
+/// trigger, path/expression/topic for the fixed sources). `channel` is the
+/// canonical `ChannelKind` enum, round-tripped through its strum string form
+/// at the wire boundary so no parallel channel list is hand-maintained here.
+/// Empty fields are omitted so the daemon fills defaults and TOML stays
+/// lossless.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopTriggerDraft {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(
+        default,
+        with = "zeroclaw_api::attribution::channel_kind_opt_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel: Option<zeroclaw_api::attribution::ChannelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+}
+
+impl Default for SopTriggerDraft {
+    fn default() -> Self {
+        Self {
+            kind: "manual".to_string(),
+            channel: None,
+            alias: None,
+            path: None,
+            expression: None,
+            topic: None,
+            condition: None,
+        }
+    }
 }
 
 impl Default for SopDraft {
@@ -2214,6 +2300,7 @@ impl Default for SopDraft {
             execution_mode: "supervised".to_string(),
             triggers: vec![SopTriggerDraft {
                 kind: "manual".to_string(),
+                ..SopTriggerDraft::default()
             }],
             steps: vec![SopStep {
                 number: 1,
@@ -2920,6 +3007,7 @@ mod sop_mirror_tests {
             execution_mode: "supervised".to_string(),
             triggers: vec![SopTriggerDraft {
                 kind: "manual".to_string(),
+                ..SopTriggerDraft::default()
             }],
             steps: vec![
                 SopStep {

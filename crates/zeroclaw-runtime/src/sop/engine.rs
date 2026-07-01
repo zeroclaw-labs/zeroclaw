@@ -1936,9 +1936,47 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             SopTriggerSource::Calendar,
         ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
 
+        (
+            SopTrigger::Channel {
+                channel,
+                alias,
+                condition,
+            },
+            SopTriggerSource::Channel,
+        ) => {
+            if !channel_trigger_topic_matches(channel, alias.as_deref(), event.topic.as_deref()) {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
 
         _ => false,
+    }
+}
+
+/// Match a channel trigger's `channel`/`alias` against the event topic. The
+/// dispatcher tags channel events with a topic of `<channel_kind>` or
+/// `<channel_kind>/<alias>`. A trigger without an alias matches any instance of
+/// that channel kind; a trigger with an alias must match that exact instance.
+fn channel_trigger_topic_matches(channel: &str, alias: Option<&str>, topic: Option<&str>) -> bool {
+    let Some(topic) = topic else {
+        return false;
+    };
+    let (topic_channel, topic_alias) = match topic.split_once('/') {
+        Some((c, a)) => (c, Some(a)),
+        None => (topic, None),
+    };
+    if !topic_channel.eq_ignore_ascii_case(channel) {
+        return false;
+    }
+    match alias {
+        Some(a) => topic_alias.is_some_and(|ta| ta == a),
+        None => true,
     }
 }
 
@@ -2641,6 +2679,75 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_no_alias_matches_any_instance() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: None,
+                condition: None,
+            }],
+            ..test_sop("chan-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("telegram/main".into()),
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+        // Different channel kind must not match.
+        let other = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("discord/x".into()),
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&other).is_empty());
+    }
+
+    #[test]
+    fn channel_trigger_alias_scopes_to_instance_and_condition_gates() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: Some("ops".into()),
+                condition: Some("$.text == \"deploy\"".into()),
+            }],
+            ..test_sop(
+                "chan-alias-sop",
+                SopExecutionMode::Auto,
+                SopPriority::Normal,
+            )
+        };
+        let engine = engine_with_sops(vec![sop]);
+        // Wrong alias: no match.
+        let wrong_alias = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("telegram/main".into()),
+            payload: Some(r#"{"text":"deploy"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_alias).is_empty());
+        // Right alias, condition met: match.
+        let ok = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("telegram/ops".into()),
+            payload: Some(r#"{"text":"deploy"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&ok).len(), 1);
+        // Right alias, condition unmet: no match.
+        let unmet = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("telegram/ops".into()),
+            payload: Some(r#"{"text":"nope"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&unmet).is_empty());
     }
 
     #[test]

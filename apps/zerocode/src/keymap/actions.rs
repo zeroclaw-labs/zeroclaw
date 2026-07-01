@@ -296,6 +296,17 @@ keyactions! {
 }
 
 keyactions! {
+    pub enum SopEditorAction ("sop_editor") {
+        SourcePrev  [Chord::with(KeyCode::Left, KeyModifiers::ALT)]  => "prev trigger source",
+        SourceNext  [Chord::with(KeyCode::Right, KeyModifiers::ALT)] => "next trigger source",
+        ChannelNext [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "cycle channel",
+        AliasNext   [Chord::with(KeyCode::Char('a'), KeyModifiers::ALT)] => "cycle alias",
+        Add         [Chord::with(KeyCode::Char('n'), KeyModifiers::ALT)] => "add trigger",
+        Remove      [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "remove trigger",
+    }
+}
+
+keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
         Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",

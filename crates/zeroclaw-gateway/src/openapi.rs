@@ -90,6 +90,7 @@ pub fn build_spec() -> serde_json::Value {
             "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
             "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
             "RunOverlay":       schema_value::<zeroclaw_runtime::sop::RunOverlay>(),
+            "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
         },
         "securitySchemes": {
             "bearerAuth": {

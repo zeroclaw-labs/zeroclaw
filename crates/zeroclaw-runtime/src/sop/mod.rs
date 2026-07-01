@@ -13,6 +13,7 @@ pub mod schema;
 pub mod scope;
 pub mod step_contract;
 pub mod store;
+pub mod trigger_registry;
 pub mod types;
 pub mod wire;
 
@@ -29,6 +30,10 @@ pub use step_contract::{StepFailure, StepRouting, SwitchRule};
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
     SqliteRunStore, StoreError, build_run_store,
+};
+pub use trigger_registry::{
+    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerSourceRegistry,
+    build_registry,
 };
 #[allow(unused_imports)]
 pub use types::{

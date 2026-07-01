@@ -36,6 +36,35 @@ pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap)
     Json(serde_json::json!({ "sops": sops })).into_response()
 }
 
+/// GET /api/sops/trigger-sources - the trigger-source registry the authoring
+/// surfaces render. Walks the backend channel registry (never a hardcoded UI
+/// list) and pairs each inbound-capable channel kind with its configured
+/// aliases from live config, plus a setup deep-link for unconfigured kinds.
+pub async fn handle_sop_trigger_sources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let configured: Vec<zeroclaw_runtime::sop::ConfiguredChannel> = {
+        let config = state.config.read();
+        config
+            .channels_by_alias()
+            .into_iter()
+            .map(|info| zeroclaw_runtime::sop::ConfiguredChannel {
+                // Schema emits kebab channel types; ChannelKind is snake_case.
+                channel_type: info.channel_type.replace('-', "_"),
+                alias: info.alias,
+                enabled: info.enabled,
+                owning_agent: info.owning_agent,
+            })
+            .collect()
+    };
+    let registry = zeroclaw_runtime::sop::build_registry(&configured);
+    Json(registry).into_response()
+}
+
 /// GET /api/sops/:name/graph - inferred blueprint projection for one SOP.
 pub async fn handle_sop_graph(
     State(state): State<AppState>,
@@ -342,6 +371,47 @@ mod tests {
         assert!(graph["wires"].is_array());
         assert!(graph["diagnostics"].is_array());
         assert!(graph["layout"]["positions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn trigger_sources_route_enumerates_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state_with_sops(tmp.path());
+        let router = axum::Router::new()
+            .route(
+                "/api/sops/trigger-sources",
+                get(super::handle_sop_trigger_sources),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sops/trigger-sources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let reg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Bound sources include cron; channels are walked from the backend
+        // registry and include a known inbound channel but never `cli`.
+        let bound: Vec<&str> = reg["bound"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["source"].as_str().unwrap())
+            .collect();
+        assert!(bound.contains(&"cron"));
+        let channels: Vec<&str> = reg["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["channel"].as_str().unwrap())
+            .collect();
+        assert!(channels.contains(&"telegram"));
+        assert!(!channels.contains(&"cli"));
     }
 
     #[tokio::test]

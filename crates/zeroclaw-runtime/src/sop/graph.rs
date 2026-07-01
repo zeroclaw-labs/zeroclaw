@@ -73,6 +73,11 @@ pub struct GraphNode {
     pub kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    /// For `Trigger` nodes, the index of this trigger in `sop.triggers`, so a
+    /// surface can bind a canvas click straight to the matching trigger editor
+    /// without recomputing the synthetic id offset. `None` for step nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_index: Option<u32>,
     pub inputs: Vec<GraphPin>,
     pub outputs: Vec<GraphPin>,
 }
@@ -316,6 +321,7 @@ fn node_for(step: &SopStep) -> GraphNode {
         title: step.title.clone(),
         kind: NodeKind::Step,
         subtitle: None,
+        trigger_index: None,
         inputs,
         outputs,
     }
@@ -332,6 +338,7 @@ fn trigger_node(index: usize, trigger: &super::types::SopTrigger) -> GraphNode {
         title,
         kind: NodeKind::Trigger,
         subtitle: Some(subtitle),
+        trigger_index: Some(index as u32),
         inputs: Vec::new(),
         outputs: vec![GraphPin {
             class: PinClass::Flow,
@@ -347,15 +354,16 @@ fn trigger_node(index: usize, trigger: &super::types::SopTrigger) -> GraphNode {
 fn trigger_labels(trigger: &super::types::SopTrigger) -> (String, String) {
     use super::types::SopTrigger;
     let kind = match trigger {
-        SopTrigger::Mqtt { .. } => "mqtt",
-        SopTrigger::Webhook { .. } => "webhook",
-        SopTrigger::Cron { .. } => "cron",
-        SopTrigger::Peripheral { .. } => "peripheral",
-        SopTrigger::Filesystem { .. } => "filesystem",
-        SopTrigger::Calendar { .. } => "calendar",
-        SopTrigger::Manual => "manual",
+        SopTrigger::Mqtt { .. } => "mqtt".to_string(),
+        SopTrigger::Webhook { .. } => "webhook".to_string(),
+        SopTrigger::Cron { .. } => "cron".to_string(),
+        SopTrigger::Peripheral { .. } => "peripheral".to_string(),
+        SopTrigger::Filesystem { .. } => "filesystem".to_string(),
+        SopTrigger::Calendar { .. } => "calendar".to_string(),
+        SopTrigger::Channel { channel, .. } => channel.clone(),
+        SopTrigger::Manual => "manual".to_string(),
     };
-    (kind.to_string(), trigger.to_string())
+    (kind, trigger.to_string())
 }
 
 /// Strict pin type check: identical, or Any on either side. No widening.
@@ -1211,6 +1219,28 @@ mod tests {
             assert!(tnode.inputs.is_empty());
             assert_eq!(tnode.outputs.len(), 1);
         }
+    }
+
+    #[test]
+    fn channel_trigger_projects_as_node_titled_by_channel_kind() {
+        use super::super::types::SopTrigger;
+        let mut sop = sop_with(vec![step(1, "a"), step(2, "b")]);
+        sop.triggers = vec![SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: Some("ops".into()),
+            condition: None,
+        }];
+        let graph = SopGraph::from_sop(&sop);
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Trigger)
+            .expect("channel trigger node");
+        assert_eq!(node.title, "telegram");
+        assert_eq!(node.subtitle.as_deref(), Some("channel:telegram/ops"));
+        assert!(graph.wires.iter().any(|w| {
+            w.flow_role == Some(FlowRole::Trigger) && w.from_step == node.step && w.to_step == 1
+        }));
     }
 
     #[test]
