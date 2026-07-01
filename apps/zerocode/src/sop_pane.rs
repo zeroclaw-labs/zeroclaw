@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::client::{
     FlowRole, GraphNode, GraphPin, GraphWire, NodeRunState, PinClass, RpcClient, SopDraft,
-    SopGraphView, SopStep, SopStepKind, StepFailure,
+    SopGraphView, SopStep, SopStepKind, StepFailure, SwitchRule,
 };
 
 /// SOP authoring pane: lists SOPs from the daemon and renders the selected
@@ -86,6 +86,7 @@ enum StepField {
     When,
     OnFailure,
     FailureArg,
+    Switch,
 }
 
 impl StepField {
@@ -99,7 +100,8 @@ impl StepField {
             Self::Next => Self::When,
             Self::When => Self::OnFailure,
             Self::OnFailure => Self::FailureArg,
-            Self::FailureArg => Self::Title,
+            Self::FailureArg => Self::Switch,
+            Self::Switch => Self::Title,
         }
     }
 }
@@ -169,6 +171,16 @@ impl SopEditorState {
                     .filter_map(|d| remap.get(d).copied())
                     .collect();
                 out.routing.next = out.routing.next.and_then(|n| remap.get(&n).copied());
+                out.routing.switch = out
+                    .routing
+                    .switch
+                    .iter()
+                    .map(|rule| {
+                        let mut r = rule.clone();
+                        r.goto = r.goto.and_then(|g| remap.get(&g).copied());
+                        r
+                    })
+                    .collect();
                 if let StepFailure::Goto { step } = out.on_failure {
                     out.on_failure = remap
                         .get(&step)
@@ -214,6 +226,81 @@ fn num_csv(list: &[u32]) -> String {
         .map(|n| n.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Serialize switch rules to an editable line: `name>when>goto` per rule,
+/// `;`-separated. Empty `when`/`goto` render as blanks between separators.
+fn switch_to_text(rules: &[SwitchRule]) -> String {
+    rules
+        .iter()
+        .map(|r| {
+            let goto = r.goto_buf.clone().or_else(|| r.goto.map(|g| g.to_string()));
+            match (&r.when, goto) {
+                (_, Some(g)) => {
+                    let when = r.when.as_deref().unwrap_or("");
+                    format!("{}>{}>{}", r.name, when, g)
+                }
+                (Some(w), None) => format!("{}>{}", r.name, w),
+                (None, None) => r.name.clone(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn push_switch_char(rules: &mut Vec<SwitchRule>, c: char) {
+    if c == ';' {
+        rules.push(SwitchRule::default());
+        return;
+    }
+    if rules.is_empty() {
+        rules.push(SwitchRule::default());
+    }
+    let rule = rules.last_mut().expect("just pushed");
+    if c == '>' {
+        if rule.when.is_none() {
+            rule.when = Some(String::new());
+        } else if rule.goto_buf.is_none() {
+            rule.goto_buf = Some(String::new());
+        }
+        return;
+    }
+    match (&mut rule.when, &mut rule.goto_buf) {
+        (_, Some(g)) => {
+            if c.is_ascii_digit() {
+                g.push(c);
+                rule.goto = g.parse::<u32>().ok();
+            }
+        }
+        (Some(w), None) => w.push(c),
+        (None, None) => rule.name.push(c),
+    }
+}
+
+fn pop_switch_char(rules: &mut Vec<SwitchRule>) {
+    let Some(rule) = rules.last_mut() else {
+        return;
+    };
+    match (&mut rule.when, &mut rule.goto_buf) {
+        (_, Some(g)) => {
+            if g.pop().is_none() {
+                rule.goto_buf = None;
+                rule.goto = None;
+            } else {
+                rule.goto = g.parse::<u32>().ok();
+            }
+        }
+        (Some(w), None) => {
+            if w.pop().is_none() {
+                rule.when = None;
+            }
+        }
+        (None, None) => {
+            if rule.name.pop().is_none() {
+                rules.pop();
+            }
+        }
+    }
 }
 
 /// Edit a `Vec<u32>` as digits and commas. Non-digit, non-comma chars are
@@ -643,6 +730,7 @@ impl SopPane {
                 };
             }
             StepField::FailureArg => push_failure_arg_char(&mut step.on_failure, c),
+            StepField::Switch => push_switch_char(&mut step.routing.switch, c),
         }
     }
 
@@ -689,6 +777,7 @@ impl SopPane {
             }
             StepField::OnFailure => {}
             StepField::FailureArg => pop_failure_arg_char(&mut step.on_failure),
+            StepField::Switch => pop_switch_char(&mut step.routing.switch),
         }
     }
 
@@ -983,6 +1072,16 @@ impl SopPane {
                 };
                 lines.push(format!("{m}   arg: {arg}{cur}"));
             }
+            let (m, cur) = marker(StepField::Switch);
+            lines.push(format!(
+                "{m} switch: {}{cur}",
+                switch_to_text(&step.routing.switch)
+            ));
+            if on_step && ed.field == StepField::Switch {
+                lines.push(
+                    "      (name>when>goto; ... — makes this an if-this-then-that node)".into(),
+                );
+            }
             lines.push(String::new());
         }
         lines
@@ -1056,6 +1155,10 @@ fn wire_label(w: &GraphWire) -> String {
         PinClass::Flow => match w.flow_role {
             Some(FlowRole::Failure) => "failure".to_string(),
             Some(FlowRole::Dependency) => "dependency".to_string(),
+            Some(FlowRole::Switch) => match &w.from_pin {
+                Some(port) => format!("switch:{port}"),
+                None => "switch".to_string(),
+            },
             _ => "sequence".to_string(),
         },
     }
@@ -1067,6 +1170,7 @@ fn wire_color(w: &GraphWire) -> Color {
         PinClass::Flow => match w.flow_role {
             Some(FlowRole::Failure) => Color::Red,
             Some(FlowRole::Dependency) => Color::Yellow,
+            Some(FlowRole::Switch) => Color::Magenta,
             _ => Color::Green,
         },
     }
@@ -1396,25 +1500,27 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (client, _rx) = test_client_with_rpc();
         let mut pane = SopPane::new(client);
-        let mut draft = SopDraft::default();
-        draft.name = "demo".into();
-        draft.steps = vec![
-            SopStep {
-                number: 1,
-                title: "one".into(),
-                ..Default::default()
-            },
-            SopStep {
-                number: 2,
-                title: "two".into(),
-                ..Default::default()
-            },
-            SopStep {
-                number: 3,
-                title: "three".into(),
-                ..Default::default()
-            },
-        ];
+        let draft = SopDraft {
+            name: "demo".into(),
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "one".into(),
+                    ..Default::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "two".into(),
+                    ..Default::default()
+                },
+                SopStep {
+                    number: 3,
+                    title: "three".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         pane.editor = Some(SopEditorState::from_draft(false, draft));
         pane.node_rects = vec![
             (1, Rect::new(1, 1, 20, 4)),
@@ -1431,6 +1537,40 @@ mod tests {
         let ed = pane.editor.as_ref().expect("editor open");
         assert_eq!(ed.focus, EditorFocus::Steps);
         assert_eq!(ed.step_cursor, 1);
+    }
+
+    #[test]
+    fn switch_to_text_renders_rules() {
+        let rules = vec![
+            SwitchRule {
+                name: "pull_request".into(),
+                when: Some("$.event".into()),
+                goto: Some(3),
+                goto_buf: None,
+            },
+            SwitchRule {
+                name: "catch-all".into(),
+                when: None,
+                goto: Some(7),
+                goto_buf: None,
+            },
+        ];
+        assert_eq!(
+            switch_to_text(&rules),
+            "pull_request>$.event>3;catch-all>>7"
+        );
+    }
+
+    #[test]
+    fn switch_char_edit_builds_rule() {
+        let mut rules: Vec<SwitchRule> = Vec::new();
+        for c in "pr>$.x>2".chars() {
+            push_switch_char(&mut rules, c);
+        }
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "pr");
+        assert_eq!(rules[0].when.as_deref(), Some("$.x"));
+        assert_eq!(rules[0].goto, Some(2));
     }
 
     #[test]

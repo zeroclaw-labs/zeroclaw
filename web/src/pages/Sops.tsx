@@ -499,6 +499,67 @@ function StepEditor({
           </label>
         ) : null}
       </div>
+      <div className="mt-2 rounded border border-pc-border p-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-xs font-medium text-pc-text">{t('sops.switch_ports')}</span>
+          <button
+            type="button"
+            onClick={() =>
+              setRouting({
+                switch: [...(routing.switch ?? []), { name: `port ${(routing.switch?.length ?? 0) + 1}`, when: undefined, goto: undefined }],
+              })
+            }
+            className="rounded border border-pc-border px-2 py-0.5 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="mr-1 inline h-3 w-3" aria-hidden />
+            {t('sops.add_port')}
+          </button>
+        </div>
+        {(routing.switch ?? []).length === 0 ? (
+          <div className="text-xs text-pc-text-faint">{t('sops.no_ports')}</div>
+        ) : (
+          (routing.switch ?? []).map((rule, ri) => {
+            const setRule = (patch: Partial<typeof rule>) => {
+              const rules = [...(routing.switch ?? [])];
+              rules[ri] = { ...rules[ri]!, ...patch };
+              setRouting({ switch: rules });
+            };
+            return (
+              <div key={ri} className="mb-1 grid grid-cols-[1fr_1.4fr_4rem_1.5rem] items-center gap-1">
+                <input
+                  type="text"
+                  value={rule.name}
+                  onChange={(e) => setRule({ name: e.target.value })}
+                  placeholder={t('sops.port_name')}
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <input
+                  type="text"
+                  value={rule.when ?? ''}
+                  onChange={(e) => setRule({ when: e.target.value || undefined })}
+                  placeholder={t('sops.port_when')}
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <input
+                  type="number"
+                  value={rule.goto ?? ''}
+                  onChange={(e) => setRule({ goto: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                  placeholder="→"
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <button
+                  type="button"
+                  onClick={() => setRouting({ switch: (routing.switch ?? []).filter((_, j) => j !== ri) })}
+                  className="text-rose-500"
+                  aria-label={t('sops.remove_port')}
+                >
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
     </div>
   );
 }
@@ -661,7 +722,7 @@ export default function Sops() {
   const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
 
-  const onConnect = useCallback((from: number, to: number, kind: 'sequence' | 'dependency' | 'failure') => {
+  const onConnect = useCallback((from: number, to: number, kind: 'sequence' | 'dependency' | 'failure' | 'switch', portIndex?: number) => {
     setDraft((d) => {
       if (!d) return d;
       const steps = d.steps.map((s) => {
@@ -674,6 +735,11 @@ export default function Sops() {
         }
         if (kind === 'failure' && s.number === from) {
           return { ...s, on_failure: { goto: { step: to } } };
+        }
+        if (kind === 'switch' && s.number === from && portIndex !== undefined) {
+          const rules = [...(s.routing?.switch ?? [])];
+          if (rules[portIndex]) rules[portIndex] = { ...rules[portIndex], goto: to };
+          return { ...s, routing: { ...(s.routing ?? {}), switch: rules } };
         }
         return s;
       });

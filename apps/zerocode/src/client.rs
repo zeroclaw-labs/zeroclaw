@@ -1975,6 +1975,7 @@ pub enum FlowRole {
     Sequence,
     Dependency,
     Failure,
+    Switch,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::GraphPin` (read-only projection pin).
@@ -2039,6 +2040,18 @@ pub struct SopGraphView {
 }
 
 /// Mirror of `zeroclaw_runtime::sop::StepRouting`.
+/// Mirror of `zeroclaw_runtime::sop::step_contract::SwitchRule`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchRule {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goto: Option<u32>,
+    #[serde(skip)]
+    pub goto_buf: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepRouting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2047,6 +2060,8 @@ pub struct StepRouting {
     pub next: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub switch: Vec<SwitchRule>,
 }
 
 impl StepRouting {
@@ -2860,6 +2875,12 @@ mod sop_mirror_tests {
                         when: Some("$.ok".to_string()),
                         next: Some(2),
                         depends_on: vec![],
+                        switch: vec![SwitchRule {
+                            name: "pr".to_string(),
+                            when: Some("$.event".to_string()),
+                            goto: Some(2),
+                            goto_buf: None,
+                        }],
                     },
                     on_failure: StepFailure::Retry { max: 3 },
                 },
@@ -2874,6 +2895,7 @@ mod sop_mirror_tests {
                         when: None,
                         next: None,
                         depends_on: vec![1],
+                        switch: vec![],
                     },
                     on_failure: StepFailure::Goto { step: 1 },
                 },
@@ -2891,6 +2913,8 @@ mod sop_mirror_tests {
         let s1 = &v["steps"][1];
         assert_eq!(s1["on_failure"]["goto"]["step"], 1);
         assert_eq!(s1["routing"]["depends_on"][0], 1);
+        assert_eq!(s0["routing"]["switch"][0]["name"], "pr");
+        assert_eq!(s0["routing"]["switch"][0]["goto"], 2);
         // Default-valued step: on_failure=fail routing empty => both omitted.
         let plain = SopStep {
             number: 3,

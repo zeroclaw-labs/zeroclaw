@@ -43,6 +43,36 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     }
 
+    // ── Switch: evaluate ports top to bottom; first passing rule routes. A
+    // rule with no `when` is the catch-all. No rule matches → Complete.
+    if !current.routing.switch.is_empty() {
+        let payload = ctx.run_data.to_payload().to_string();
+        for rule in &current.routing.switch {
+            let matched = match rule.when.as_deref() {
+                Some(when) => evaluate_condition(when, Some(&payload)),
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+            let Some(target) = rule.goto else {
+                return NextStep::Fail(format!("switch port '{}' has no target", rule.name));
+            };
+            let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
+                return NextStep::Fail(format!("step {target} does not exist"));
+            };
+            if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
+                return NextStep::Fail(format!("step {target} visit limit reached"));
+            }
+            return if eligible(step, ctx.run_data) {
+                NextStep::Step(target)
+            } else {
+                NextStep::Wait(target)
+            };
+        }
+        return NextStep::Complete;
+    }
+
     let explicit_next = current.routing.next;
     let next_step = explicit_next.unwrap_or_else(|| ctx.run.current_step.saturating_add(1));
     let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
@@ -131,6 +161,56 @@ mod tests {
             waiting_since: None,
             llm_calls_saved: 0,
         }
+    }
+
+    #[test]
+    fn switch_routes_to_first_matching_port() {
+        use super::super::step_contract::SwitchRule;
+        let mut sop = sop();
+        sop.steps.push(step(3));
+        sop.steps[0].routing.switch = vec![
+            SwitchRule {
+                name: "never".into(),
+                when: Some("$.value > 999".into()),
+                goto: Some(2),
+            },
+            SwitchRule {
+                name: "catch_all".into(),
+                when: None,
+                goto: Some(3),
+            },
+        ];
+        let run = run();
+        let run_data = RunData::default();
+        let ctx = RouteCtx {
+            sop: &sop,
+            run: &run,
+            run_data: &run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
+        };
+        assert_eq!(resolve_next(&ctx), NextStep::Step(3));
+    }
+
+    #[test]
+    fn switch_with_no_match_completes() {
+        use super::super::step_contract::SwitchRule;
+        let mut sop = sop();
+        sop.steps[0].routing.switch = vec![SwitchRule {
+            name: "never".into(),
+            when: Some("$.value > 999".into()),
+            goto: Some(2),
+        }];
+        let run = run();
+        let run_data = RunData::default();
+        let ctx = RouteCtx {
+            sop: &sop,
+            run: &run,
+            run_data: &run_data,
+            last_status: SopStepStatus::Completed,
+            max_step_visits: 256,
+        };
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
     #[test]

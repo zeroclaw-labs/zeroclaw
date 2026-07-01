@@ -10,6 +10,7 @@ export type SopPriority = Schemas['SopPriority'];
 export type SopExecutionMode = Schemas['SopExecutionMode'];
 export type SopStepKind = Schemas['SopStepKind'];
 export type StepRouting = Schemas['StepRouting'];
+export type SwitchRule = Schemas['SwitchRule'];
 export type StepFailure = Schemas['StepFailure'];
 export type StepSchema = Schemas['StepSchema'];
 export type StepToolScope = Schemas['StepToolScope'];

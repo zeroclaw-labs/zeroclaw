@@ -4,13 +4,15 @@ import { t } from '@/lib/i18n';
 import type { Sop, SopStep, NodeRunState } from '@/lib/sops';
 
 type XY = { x: number; y: number };
-type WireKind = 'sequence' | 'dependency' | 'failure';
+type WireKind = 'sequence' | 'dependency' | 'failure' | 'switch';
 
 interface CanvasWire {
   from: number;
   to: number;
   kind: WireKind;
   label?: string;
+  port?: string;
+  portIndex?: number;
 }
 
 const NODE_W = 210;
@@ -24,6 +26,8 @@ function wireStroke(kind: WireKind): string {
       return 'var(--pc-danger, #f43f5e)';
     case 'dependency':
       return '#f59e0b';
+    case 'switch':
+      return '#a78bfa';
     default:
       return '#10b981';
   }
@@ -95,13 +99,29 @@ function deriveWires(steps: SopStep[]): CanvasWire[] {
     const s = ordered[i];
     if (!s) continue;
     const routing = s.routing ?? {};
-    const next = routing.next ?? undefined;
-    const hasExplicit = next !== undefined && nums.has(next);
-    if (hasExplicit) {
-      wires.push({ from: s.number, to: next as number, kind: 'sequence', label: routing.when ?? undefined });
-    } else if (!routing.when) {
-      const nx = ordered[i + 1];
-      if (nx) wires.push({ from: s.number, to: nx.number, kind: 'sequence' });
+    const rules = routing.switch ?? [];
+    if (rules.length > 0) {
+      rules.forEach((rule, ri) => {
+        if (rule.goto !== undefined && rule.goto !== null && nums.has(rule.goto)) {
+          wires.push({
+            from: s.number,
+            to: rule.goto,
+            kind: 'switch',
+            port: rule.name,
+            portIndex: ri,
+            label: rule.when ?? rule.name,
+          });
+        }
+      });
+    } else {
+      const next = routing.next ?? undefined;
+      const hasExplicit = next !== undefined && nums.has(next);
+      if (hasExplicit) {
+        wires.push({ from: s.number, to: next as number, kind: 'sequence', label: routing.when ?? undefined });
+      } else if (!routing.when) {
+        const nx = ordered[i + 1];
+        if (nx) wires.push({ from: s.number, to: nx.number, kind: 'sequence' });
+      }
     }
     for (const dep of routing.depends_on ?? []) {
       if (nums.has(dep)) wires.push({ from: dep, to: s.number, kind: 'dependency' });
@@ -115,13 +135,19 @@ function deriveWires(steps: SopStep[]): CanvasWire[] {
   return wires;
 }
 
-function edgePath(a: XY, b: XY): string {
+function edgePath(a: XY, b: XY, sourceY?: number): string {
   const x1 = a.x + NODE_W;
-  const y1 = a.y + NODE_H / 2;
+  const y1 = sourceY ?? a.y + NODE_H / 2;
   const x2 = b.x;
   const y2 = b.y + NODE_H / 2;
   const dx = Math.max(40, Math.abs(x2 - x1) / 2);
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+}
+
+const SWITCH_PORT_TOP = 34;
+const SWITCH_PORT_GAP = 14;
+function switchPortY(nodeY: number, index: number): number {
+  return nodeY + SWITCH_PORT_TOP + index * SWITCH_PORT_GAP;
 }
 
 interface Props {
@@ -130,7 +156,7 @@ interface Props {
   runStateByStep: Map<number, NodeRunState>;
   onSelectStep: (n: number) => void;
   onAddStep: () => void;
-  onConnect: (from: number, to: number, kind: WireKind) => void;
+  onConnect: (from: number, to: number, kind: WireKind, portIndex?: number) => void;
 }
 
 export default function SopCanvas({
@@ -145,6 +171,7 @@ export default function SopCanvas({
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
   const [linkFrom, setLinkFrom] = useState<number | null>(null);
   const [linkKind, setLinkKind] = useState<WireKind>('sequence');
+  const [linkPort, setLinkPort] = useState<number | undefined>(undefined);
   const [cursor, setCursor] = useState<XY | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
@@ -181,18 +208,19 @@ export default function SopCanvas({
 
   const endDrag = useCallback(() => setDrag(null), []);
 
-  const startLink = useCallback((step: number, kind: WireKind) => {
+  const startLink = useCallback((step: number, kind: WireKind, port?: number) => {
     setLinkKind(kind);
+    setLinkPort(port);
     setLinkFrom(step);
   }, []);
 
   const completeLink = useCallback(
     (target: number) => {
-      if (linkFrom !== null && linkFrom !== target) onConnect(linkFrom, target, linkKind);
+      if (linkFrom !== null && linkFrom !== target) onConnect(linkFrom, target, linkKind, linkPort);
       setLinkFrom(null);
       setCursor(null);
     },
-    [linkFrom, linkKind, onConnect],
+    [linkFrom, linkKind, linkPort, onConnect],
   );
 
   const extent = useMemo(() => {
@@ -260,10 +288,14 @@ export default function SopCanvas({
           const b = pos.get(w.to);
           if (!a || !b) return null;
           const active = runStateByStep.get(w.to) === 'active';
+          const srcY =
+            w.kind === 'switch' && w.portIndex !== undefined
+              ? switchPortY(a.y, w.portIndex)
+              : undefined;
           return (
             <g key={`wire-${i}`}>
               <path
-                d={edgePath(a, b)}
+                d={edgePath(a, b, srcY)}
                 fill="none"
                 stroke={wireStroke(w.kind)}
                 strokeWidth={active ? 3 : 1.75}
@@ -346,6 +378,10 @@ export default function SopCanvas({
                 <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="#f59e0b">
                   ⏸ {t('sops.checkpoint')}
                 </text>
+              ) : (step.routing?.switch?.length ?? 0) > 0 ? (
+                <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="#a78bfa">
+                  ⋔ {t('sops.switch')}
+                </text>
               ) : null}
               <text x={12} y={46} fontSize="10" fill="var(--pc-text-muted)">
                 {step.suggested_tools && step.suggested_tools.length > 0
@@ -357,48 +393,80 @@ export default function SopCanvas({
                   {t(`sops.run_state.${state}`)}
                 </text>
               ) : null}
-              {/* output handles: sequence / dependency / failure */}
-              <g>
-                <circle
-                  cx={NODE_W}
-                  cy={NODE_H / 2}
-                  r={6}
-                  fill={wireStroke('sequence')}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    startLink(step.number, 'sequence');
-                  }}
-                  className="cursor-crosshair"
-                >
-                  <title>{t('sops.handle_sequence')}</title>
-                </circle>
-                <circle
-                  cx={NODE_W}
-                  cy={NODE_H / 2 + 18}
-                  r={5}
-                  fill={wireStroke('dependency')}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    startLink(step.number, 'dependency');
-                  }}
-                  className="cursor-crosshair"
-                >
-                  <title>{t('sops.handle_dependency')}</title>
-                </circle>
-                <circle
-                  cx={NODE_W}
-                  cy={NODE_H / 2 - 18}
-                  r={5}
-                  fill={wireStroke('failure')}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    startLink(step.number, 'failure');
-                  }}
-                  className="cursor-crosshair"
-                >
-                  <title>{t('sops.handle_failure')}</title>
-                </circle>
-              </g>
+              {(step.routing?.switch?.length ?? 0) > 0 ? (
+                <g>
+                  {(step.routing?.switch ?? []).map((rule, ri) => (
+                    <g key={`port-${ri}`}>
+                      <text
+                        x={NODE_W - 16}
+                        y={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP + 3}
+                        fontSize="9"
+                        textAnchor="end"
+                        fill="#a78bfa"
+                      >
+                        {(rule.name || `port ${ri + 1}`).slice(0, 16)}
+                      </text>
+                      <circle
+                        cx={NODE_W}
+                        cy={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP}
+                        r={5}
+                        fill={wireStroke('switch')}
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          startLink(step.number, 'switch', ri);
+                        }}
+                        className="cursor-crosshair"
+                      >
+                        <title>
+                          {t('sops.handle_switch')}: {rule.name}
+                        </title>
+                      </circle>
+                    </g>
+                  ))}
+                </g>
+              ) : (
+                <g>
+                  <circle
+                    cx={NODE_W}
+                    cy={NODE_H / 2}
+                    r={6}
+                    fill={wireStroke('sequence')}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      startLink(step.number, 'sequence');
+                    }}
+                    className="cursor-crosshair"
+                  >
+                    <title>{t('sops.handle_sequence')}</title>
+                  </circle>
+                  <circle
+                    cx={NODE_W}
+                    cy={NODE_H / 2 + 18}
+                    r={5}
+                    fill={wireStroke('dependency')}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      startLink(step.number, 'dependency');
+                    }}
+                    className="cursor-crosshair"
+                  >
+                    <title>{t('sops.handle_dependency')}</title>
+                  </circle>
+                  <circle
+                    cx={NODE_W}
+                    cy={NODE_H / 2 - 18}
+                    r={5}
+                    fill={wireStroke('failure')}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      startLink(step.number, 'failure');
+                    }}
+                    className="cursor-crosshair"
+                  >
+                    <title>{t('sops.handle_failure')}</title>
+                  </circle>
+                </g>
+              )}
               <circle cx={0} cy={NODE_H / 2} r={5} fill="var(--pc-border-strong)" />
             </g>
           );

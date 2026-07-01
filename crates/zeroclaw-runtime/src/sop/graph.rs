@@ -29,6 +29,8 @@ pub enum FlowRole {
     Dependency,
     /// An `on_failure: goto` edge.
     Failure,
+    /// A named switch-port edge. The port label rides in the wire's `from_pin`.
+    Switch,
 }
 
 /// A typed pin on a node. `data_type` is `None` for flow pins and for data
@@ -128,6 +130,10 @@ pub fn render_graph_text(graph: &SopGraph, format: &TextGraphFormat) -> String {
             let mut out = String::new();
             for wire in &graph.wires {
                 let label = match (wire.class, wire.flow_role) {
+                    (PinClass::Flow, Some(FlowRole::Switch)) => match &wire.from_pin {
+                        Some(port) => format!("switch:{port}"),
+                        None => "switch".to_string(),
+                    },
                     (PinClass::Flow, Some(role)) => format!("{role:?}").to_lowercase(),
                     (PinClass::Data, _) => "data".to_string(),
                     (PinClass::Flow, None) => "flow".to_string(),
@@ -227,12 +233,25 @@ fn node_for(step: &SopStep) -> GraphNode {
         data_type: None,
         required: false,
     }];
-    let mut outputs = vec![GraphPin {
-        class: PinClass::Flow,
-        name: "out".to_string(),
-        data_type: None,
-        required: false,
-    }];
+    let mut outputs = if step.routing.switch.is_empty() {
+        vec![GraphPin {
+            class: PinClass::Flow,
+            name: "out".to_string(),
+            data_type: None,
+            required: false,
+        }]
+    } else {
+        step.routing
+            .switch
+            .iter()
+            .map(|rule| GraphPin {
+                class: PinClass::Flow,
+                name: rule.name.clone(),
+                data_type: None,
+                required: false,
+            })
+            .collect()
+    };
 
     if let Some(schema) = &step.schema {
         inputs.extend(data_pins(schema.input.as_ref(), "input"));
@@ -337,6 +356,39 @@ impl SopGraph {
                         step: step.number,
                         message: format!("on_failure goto target step {target} does not exist"),
                     });
+                }
+            }
+
+            // ── Flow: switch ports ──
+            for rule in &step.routing.switch {
+                match rule.goto {
+                    Some(target) if valid_steps.contains(&target) => {
+                        wires.push(GraphWire {
+                            class: PinClass::Flow,
+                            from_step: step.number,
+                            to_step: target,
+                            flow_role: Some(FlowRole::Switch),
+                            from_pin: Some(rule.name.clone()),
+                            to_pin: None,
+                        });
+                    }
+                    Some(target) => {
+                        diagnostics.push(GraphDiagnostic {
+                            severity: GraphSeverity::Error,
+                            step: step.number,
+                            message: format!(
+                                "switch port '{}' target step {target} does not exist",
+                                rule.name
+                            ),
+                        });
+                    }
+                    None => {
+                        diagnostics.push(GraphDiagnostic {
+                            severity: GraphSeverity::Warning,
+                            step: step.number,
+                            message: format!("switch port '{}' has no target", rule.name),
+                        });
+                    }
                 }
             }
         }
@@ -592,6 +644,61 @@ mod tests {
                 .any(|w| w.flow_role == Some(FlowRole::Sequence)
                     && w.from_step == 1
                     && w.to_step == 3)
+        );
+    }
+
+    #[test]
+    fn switch_ports_project_named_edges_and_output_pins() {
+        use super::super::step_contract::SwitchRule;
+        let mut s1 = step(1, "router");
+        s1.routing = StepRouting {
+            switch: vec![
+                SwitchRule {
+                    name: "pull_request".into(),
+                    when: Some("$.event == \"pr\"".into()),
+                    goto: Some(2),
+                },
+                SwitchRule {
+                    name: "catch-all".into(),
+                    when: None,
+                    goto: Some(3),
+                },
+            ],
+            ..StepRouting::default()
+        };
+        let graph = SopGraph::from_sop(&sop_with(vec![s1, step(2, "b"), step(3, "c")]));
+        let pr = graph.wires.iter().find(|w| {
+            w.flow_role == Some(FlowRole::Switch) && w.from_pin.as_deref() == Some("pull_request")
+        });
+        assert!(pr.is_some(), "pull_request switch edge projected");
+        assert_eq!(pr.unwrap().to_step, 2);
+        let catch = graph.wires.iter().find(|w| {
+            w.flow_role == Some(FlowRole::Switch) && w.from_pin.as_deref() == Some("catch-all")
+        });
+        assert_eq!(catch.unwrap().to_step, 3);
+        let router = graph.nodes.iter().find(|n| n.step == 1).unwrap();
+        let ports: Vec<&str> = router.outputs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(ports, vec!["pull_request", "catch-all"]);
+    }
+
+    #[test]
+    fn switch_port_dangling_target_is_error() {
+        use super::super::step_contract::SwitchRule;
+        let mut s1 = step(1, "router");
+        s1.routing = StepRouting {
+            switch: vec![SwitchRule {
+                name: "gone".into(),
+                when: None,
+                goto: Some(99),
+            }],
+            ..StepRouting::default()
+        };
+        let graph = SopGraph::from_sop(&sop_with(vec![s1]));
+        assert!(
+            graph
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == GraphSeverity::Error && d.message.contains("gone"))
         );
     }
 
