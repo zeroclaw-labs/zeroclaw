@@ -6643,7 +6643,9 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
-                .with_proxy_url(dt.proxy_url.clone()),
+                .with_proxy_url(dt.proxy_url.clone())
+                .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms)
+                .with_ai_card_template_opt(dt.ai_card_template_id.clone()),
             ))
         }
         #[cfg(not(feature = "channel-dingtalk"))]
@@ -8404,7 +8406,9 @@ fn collect_configured_channels(
                     alias.clone(),
                     peer_resolver,
                 )
-                .with_proxy_url(dt.proxy_url.clone()),
+                .with_proxy_url(dt.proxy_url.clone())
+                .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms)
+                .with_ai_card_template_opt(dt.ai_card_template_id.clone()),
             ),
         });
     }
@@ -21776,7 +21780,8 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-                ..Default::default()
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::default(),
             },
             CancellationToken::new(),
         )

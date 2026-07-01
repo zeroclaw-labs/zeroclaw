@@ -15252,6 +15252,33 @@ pub struct DingTalkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Streaming mode for AI card responses: `off` (default) sends
+    /// complete response as single message; `partial` creates an AI
+    /// card and updates it incrementally via streamingUpdate API.
+    /// DingTalk does not support `multi_message` mode (falls back to `off`).
+    ///
+    /// Note: Requires `ai_card_template_id` to be configured.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive streamingUpdate calls
+    /// in milliseconds. Default: 500 ms (tuned to DingTalk's rate limits).
+    #[tab(Behavior)]
+    #[serde(default = "default_dingtalk_streaming_interval_ms")]
+    pub streaming_update_interval_ms: u64,
+
+    /// AI Card Template ID for streaming responses.
+    /// Must be created in DingTalk developer console first.
+    /// Format: "card_template_xxx"
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub ai_card_template_id: Option<String>,
+}
+
+pub fn default_dingtalk_streaming_interval_ms() -> u64 {
+    1000
 }
 
 impl ChannelConfig for DingTalkConfig {
