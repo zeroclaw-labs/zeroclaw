@@ -798,6 +798,8 @@ impl EmailChannel {
             interruption_scope_id: None,
             attachments: email.attachments,
             subject: Some(email.subject),
+
+            ..Default::default()
         };
         Ok(tx.send(msg).await.is_ok())
     }
@@ -896,6 +898,16 @@ fn is_synthetic_email_message_id(value: &str) -> bool {
 #[async_trait]
 
 impl Channel for EmailChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Email has no typing-indicator concept.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Email has no typing-indicator concept.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "email"
     }

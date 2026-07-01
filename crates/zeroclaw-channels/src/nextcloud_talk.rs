@@ -332,6 +332,8 @@ impl NextcloudTalkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -476,6 +478,8 @@ impl NextcloudTalkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -815,6 +819,15 @@ impl Channel for NextcloudTalkChannel {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Typing endpoint not wired; no-op stub keeps the trait surface uniform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

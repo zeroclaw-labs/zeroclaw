@@ -170,6 +170,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .attributes
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_u64),
+            messages: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
