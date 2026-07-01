@@ -44,7 +44,7 @@ The key checkpoints:
 ## Testing
 
 - Unit tests co-located with the code (`mod tests`)
-- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`
+- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace`
 - Feature-gated code needs feature-gated tests
 - Don't mock the database for tests that exercise schema or SQL: integration tests must hit a real SQLite
 
@@ -97,9 +97,9 @@ Body uses the PR template. **The validation-evidence section is required**: past
 
 Risk labels:
 
-- `risk: low`: rollback is a revert; no user action needed
-- `risk: medium`: users may need to update config / env / CLI usage; rollback plan required
-- `risk: high`: security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
+- `risk:low`: rollback is a revert; no user action needed
+- `risk:medium`: users may need to update config / env / CLI usage; rollback plan required
+- `risk:high`: security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
 
 ## After the PR
 

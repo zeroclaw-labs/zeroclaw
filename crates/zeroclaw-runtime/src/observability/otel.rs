@@ -1,4 +1,4 @@
-use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use super::traits::{LlmMessageSnapshot, Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
 use opentelemetry::{Context, KeyValue, global};
@@ -510,6 +510,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                messages,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -543,6 +544,7 @@ impl Observer for OtelObserver {
                 if let Some(output) = output_tokens {
                     span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
                 }
+                span_attrs.extend(message_attrs(messages));
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("llm.response")
@@ -563,8 +565,8 @@ impl Observer for OtelObserver {
                 duration,
                 tokens_used,
                 cost_usd,
-                channel: _,
-                agent_alias: _,
+                channel,
+                agent_alias,
                 turn_id,
             } => {
                 if let Some(tid) = turn_id {
@@ -576,6 +578,14 @@ impl Observer for OtelObserver {
                     if let Some((mut span, _)) = entry {
                         let secs = duration.as_secs_f64();
                         span.set_attribute(KeyValue::new("duration_s", secs));
+                        span.set_attribute(KeyValue::new(
+                            "zeroclaw.channel",
+                            channel.clone().unwrap_or_default(),
+                        ));
+                        span.set_attribute(KeyValue::new(
+                            "gen_ai.agent.name",
+                            agent_alias.clone().unwrap_or_default(),
+                        ));
                         if let Some(usage) = tokens_used {
                             span.set_attribute(KeyValue::new(
                                 "gen_ai.usage.input_tokens",
@@ -599,6 +609,7 @@ impl Observer for OtelObserver {
                     &[
                         KeyValue::new("gen_ai.provider.name", model_provider.clone()),
                         KeyValue::new("gen_ai.request.model", model.clone()),
+                        KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     ],
                 );
             }
@@ -761,10 +772,152 @@ impl Observer for OtelObserver {
     }
 }
 
+/// Build the OTel GenAI message-content attributes from a captured snapshot.
+/// Returns an empty vec when there is nothing to emit. Encoding matches the
+/// Langfuse-validated shape: system carried separately, system filtered out of
+/// `input.messages`, output as a single assistant message (text + tool calls).
+fn message_attrs(messages: &Option<LlmMessageSnapshot>) -> Vec<KeyValue> {
+    let Some(snap) = messages else {
+        return Vec::new();
+    };
+    let mut attrs = Vec::new();
+
+    if let Some(sys) = snap.system_instructions.as_ref() {
+        attrs.push(KeyValue::new("gen_ai.system_instructions", sys.clone()));
+    }
+
+    if !snap.input.is_empty() {
+        // `content` stays a plain string (free-form prose); only tool-call `arguments`
+        // (below) are re-parsed into a nested tree — the bce8da324 / Langfuse-validated shape.
+        let input_json = serde_json::to_string(
+            &snap
+                .input
+                .iter()
+                .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+        attrs.push(KeyValue::new("gen_ai.input.messages", input_json));
+    }
+
+    // Output is a single assistant message: text (if any) plus tool calls (if any).
+    let mut output_msg = serde_json::Map::new();
+    output_msg.insert("role".into(), serde_json::Value::String("assistant".into()));
+    if let Some(text) = snap.output_text.as_ref() {
+        output_msg.insert("content".into(), serde_json::Value::String(text.clone()));
+    }
+    if !snap.output_tool_calls.is_empty() {
+        let calls: Vec<serde_json::Value> = snap
+            .output_tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "name": tc.name,
+                    // arguments_json is already JSON text — re-parse so the attribute
+                    // is a nested tree, not a double-encoded string. On malformed JSON,
+                    // fall back to the (scrubbed) raw string rather than silently dropping it.
+                    "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments_json)
+                        .unwrap_or_else(|_| serde_json::Value::String(tc.arguments_json.clone())),
+                })
+            })
+            .collect();
+        output_msg.insert("tool_calls".into(), serde_json::Value::Array(calls));
+    }
+    if output_msg.contains_key("content") || output_msg.contains_key("tool_calls") {
+        let output_json = serde_json::to_string(&vec![serde_json::Value::Object(output_msg)])
+            .unwrap_or_else(|_| "[]".to_string());
+        attrs.push(KeyValue::new("gen_ai.output.messages", output_json));
+    }
+
+    attrs
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::traits::{LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot};
     use super::*;
     use std::time::Duration;
+
+    fn attr_value(attrs: &[opentelemetry::KeyValue], key: &str) -> Option<String> {
+        attrs
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.as_str().to_string())
+    }
+
+    #[test]
+    fn message_attrs_emits_genai_semconv() {
+        let snap = LlmMessageSnapshot {
+            input: vec![MessageSnapshot {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            output_text: Some("hello".into()),
+            output_tool_calls: vec![ToolCallSnapshot {
+                id: "c1".into(),
+                name: "shell".into(),
+                arguments_json: r#"{"cmd":"ls"}"#.into(),
+            }],
+            system_instructions: Some("You are helpful.".into()),
+        };
+        let attrs = message_attrs(&Some(snap));
+
+        assert_eq!(
+            attr_value(&attrs, "gen_ai.system_instructions").as_deref(),
+            Some("You are helpful.")
+        );
+
+        let input: serde_json::Value =
+            serde_json::from_str(&attr_value(&attrs, "gen_ai.input.messages").unwrap()).unwrap();
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hi");
+
+        let output: serde_json::Value =
+            serde_json::from_str(&attr_value(&attrs, "gen_ai.output.messages").unwrap()).unwrap();
+        assert_eq!(output[0]["role"], "assistant");
+        assert_eq!(output[0]["content"], "hello");
+        assert_eq!(output[0]["tool_calls"][0]["name"], "shell");
+        assert_eq!(output[0]["tool_calls"][0]["arguments"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn message_attrs_omits_empty_and_handles_none() {
+        // Only system set: input/output omitted.
+        let snap = LlmMessageSnapshot {
+            input: vec![],
+            output_text: None,
+            output_tool_calls: vec![],
+            system_instructions: Some("sys".into()),
+        };
+        let attrs = message_attrs(&Some(snap));
+        let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
+        assert!(keys.contains(&"gen_ai.system_instructions"));
+        assert!(!keys.contains(&"gen_ai.input.messages"));
+        assert!(!keys.contains(&"gen_ai.output.messages"));
+
+        // None → no attrs.
+        assert!(message_attrs(&None).is_empty());
+    }
+
+    #[test]
+    fn message_attrs_malformed_tool_arguments_falls_back_to_string() {
+        let snap = LlmMessageSnapshot {
+            input: vec![],
+            output_text: None,
+            output_tool_calls: vec![ToolCallSnapshot {
+                id: "c1".into(),
+                name: "shell".into(),
+                arguments_json: "not valid json".into(),
+            }],
+            system_instructions: None,
+        };
+        let attrs = message_attrs(&Some(snap));
+        let output: serde_json::Value =
+            serde_json::from_str(&attr_value(&attrs, "gen_ai.output.messages").unwrap()).unwrap();
+        // Malformed arguments fall back to the raw string, not null / dropped.
+        assert_eq!(output[0]["tool_calls"][0]["arguments"], "not valid json");
+    }
 
     // Note: OtelObserver::new() requires an OTLP endpoint.
     // In tests we verify the struct creation fails gracefully
@@ -811,6 +964,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -1020,6 +1174,7 @@ mod tests {
             error_message: Some("404 Not Found".into()),
             input_tokens: None,
             output_tokens: None,
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -1082,6 +1237,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            messages: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
@@ -1161,6 +1317,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(10),
             output_tokens: Some(5),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,

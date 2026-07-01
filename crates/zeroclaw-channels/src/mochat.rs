@@ -244,6 +244,8 @@ impl Channel for MochatChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -297,6 +299,15 @@ impl Channel for MochatChannel {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the MoChat REST API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

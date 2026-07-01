@@ -43,21 +43,25 @@
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
         # Default feature set: canonical Dist (all channels, no heavyweight).
         # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "schema-export" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-filesystem" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "schema-export" ];
         buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.1";
+            version = "0.8.2";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = builtins.fromJSON (builtins.readFile ./nix/hashes.json);
+            };
             cargoBuildFlags =
               [ "-p" cargoPkg "--no-default-features" ]
               ++ pkgs.lib.optionals (features != [])
                 [ "--features" (pkgs.lib.concatStringsSep "," features) ];
             doCheck = false;
+            buildInputs = [ pkgs.stdenv.cc.cc ];
           };
         # >>> end generated:flake-packages <<<
       in {
@@ -73,6 +77,8 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.nix-prefetch-git
+            pkgs.jq
           ];
         };
       }) // {

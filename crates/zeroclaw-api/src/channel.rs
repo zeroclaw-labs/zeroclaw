@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
@@ -33,6 +34,16 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// Conversation history scope for an inbound channel message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelConversationScope {
+    /// Isolate history by channel, room/reply target, thread, and sender.
+    #[default]
+    Sender,
+    /// Share history for everyone in the room/reply target.
+    ReplyTarget,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
@@ -62,6 +73,11 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// When true, the orchestrator records this as context only and must not
+    /// start an agent turn or emit visible channel side effects.
+    pub passive_context: bool,
+    /// Controls whether conversation history is sender-scoped or room-scoped.
+    pub conversation_scope: ChannelConversationScope,
 }
 
 /// Message to send through a channel
@@ -79,6 +95,60 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// When `true`, channels that support TTS must not synthesise this
+    /// message as a voice note. Use for error notices, system alerts, and
+    /// other non-conversational content that should never be voiced.
+    pub suppress_voice: bool,
+}
+
+/// Cross-channel room visibility used by room-management APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomVisibility {
+    Private,
+    Public,
+}
+
+impl RoomVisibility {
+    pub const SCHEMA_VALUES: &'static [&'static str] = &["private", "public"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+}
+
+impl fmt::Display for RoomVisibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RoomVisibility {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "private" => Ok(Self::Private),
+            "public" => Ok(Self::Public),
+            other => {
+                anyhow::bail!("unsupported room visibility '{other}': expected private or public")
+            }
+        }
+    }
+}
+
+/// Room creation options shared by channel implementations that support
+/// creating group conversations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomCreationOptions {
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub invites: Vec<String>,
+    pub visibility: Option<RoomVisibility>,
+    pub encryption: Option<bool>,
 }
 
 impl SendMessage {
@@ -92,7 +162,14 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
+    }
+
+    /// Prevent TTS channels from voicing this message.
+    pub fn suppress_voice(mut self) -> Self {
+        self.suppress_voice = true;
+        self
     }
 
     /// Create a new message with content, recipient, and subject
@@ -109,6 +186,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            suppress_voice: false,
         }
     }
 
@@ -391,6 +469,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Create a new platform room/conversation when the channel supports it.
+    async fn create_room(&self, _options: &RoomCreationOptions) -> anyhow::Result<String> {
+        anyhow::bail!("channel does not support room creation")
+    }
+
+    /// Invite a user to an existing platform room/conversation.
+    async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support room invites")
+    }
+
     /// Request interactive tool-call approval from the channel operator.
     ///
     /// Returns `Ok(Some(response))` when the operator answers within the
@@ -429,12 +517,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Ask the user a multiple-choice question and return the chosen option's text.
     ///
     /// Returns `Ok(Some(answer))` if the channel handled the question natively
-    /// (e.g. ACP `session/request_permission`, Telegram inline keyboard).
-    /// Returns `Ok(None)` to signal the caller should fall back to the
-    /// generic `send` + `listen` flow. Default impl returns `None`.
+    /// (e.g. ACP `elicitation/create` with a single-select enum schema, or
+    /// the legacy `session/request_permission` fallback for older ACP clients;
+    /// Telegram inline keyboard; etc.). Returns `Ok(None)` to signal the
+    /// caller should fall back to the generic `send` + `listen` flow.
+    /// Default impl returns `None`.
     ///
-    /// Free-form questions (no choices) are not modeled here yet — they
-    /// require the ACP elicitation RFD to land for a clean cross-channel API.
+    /// Free-form (no-choices) questions are not modeled by this method.
+    /// Multiple-choice support landed via ACP `elicitation/create` (see
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation);
+    /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
         _question: &str,
@@ -444,12 +536,36 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Ask the user a multi-select multiple-choice question and return the
+    /// chosen options' text.
+    ///
+    /// Returns `Ok(Some(answers))` if the channel handled it natively (e.g.
+    /// ACP `elicitation/create` with a `type: array` schema). Returns
+    /// `Ok(None)` to signal the caller should fall back to a non-native
+    /// path (formatted text + reactions, etc.). Default impl returns `None`.
+    ///
+    /// `min_items` and `max_items` map to JSON Schema's `minItems` /
+    /// `maxItems` — clients enforce the bound before submitting.
+    async fn request_multi_choice(
+        &self,
+        _question: &str,
+        _choices: &[String],
+        _min_items: usize,
+        _max_items: usize,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow.
     ///
-    /// Channels that can only handle structured choices (e.g. ACP today, until
-    /// the elicitation RFD lands) should return `false` so callers can fail
-    /// fast with a useful error instead of timing out on `listen`.
+    /// Channels that can only handle structured choices (e.g. ACP in Phase 1
+    /// of the elicitation rollout — see
+    /// the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
+    /// should return `false` so callers can fail fast with a useful error
+    /// instead of timing out on `listen`. Free-form text support flips this
+    /// to `true` in Phase 2.
     fn supports_free_form_ask(&self) -> bool {
         true
     }
@@ -511,6 +627,8 @@ mod tests {
         assert!(msg.interruption_scope_id.is_none());
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
+        assert!(!msg.passive_context);
+        assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 
     #[test]
@@ -546,6 +664,48 @@ mod tests {
         let reply = SendMessage::reply_to(&inbound, "pong");
         assert!(reply.subject.is_none());
         assert_eq!(reply.in_reply_to.as_deref(), Some("msg-003"));
+    }
+
+    #[test]
+    fn room_visibility_parses_supported_values() {
+        assert_eq!(
+            "private".parse::<RoomVisibility>().unwrap(),
+            RoomVisibility::Private
+        );
+        assert_eq!(
+            "PUBLIC".parse::<RoomVisibility>().unwrap(),
+            RoomVisibility::Public
+        );
+    }
+
+    #[test]
+    fn room_visibility_rejects_unknown_values() {
+        let err = "shared".parse::<RoomVisibility>().unwrap_err();
+        assert!(err.to_string().contains("expected private or public"));
+    }
+
+    #[tokio::test]
+    async fn room_management_defaults_report_unsupported() {
+        let channel = StubChannel { handle: None };
+
+        let create = channel
+            .create_room(&RoomCreationOptions {
+                name: Some("ops".into()),
+                ..RoomCreationOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            create
+                .to_string()
+                .contains("does not support room creation")
+        );
+
+        let invite = channel
+            .invite_user("!room:example.org", "@alice:example.org")
+            .await
+            .unwrap_err();
+        assert!(invite.to_string().contains("does not support room invites"));
     }
 
     #[test]

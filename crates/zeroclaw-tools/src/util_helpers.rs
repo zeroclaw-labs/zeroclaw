@@ -32,14 +32,33 @@ pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         let path_str = path.to_string_lossy();
-        if path_str.starts_with(r"\\?\") {
+        if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
             // Check if it's a local drive path (e.g. \\?\C:\...) by checking if the 6th char is ':'
             if path_str.chars().nth(5) == Some(':') {
-                return std::path::PathBuf::from(&path_str[4..]);
+                return std::path::PathBuf::from(stripped);
             }
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_prefixed_relative_path_for_test(
+    workspace: &std::path::Path,
+) -> std::path::PathBuf {
+    let mut relative = std::path::PathBuf::new();
+    for component in workspace.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                panic!("test workspace path must not contain parent components")
+            }
+            std::path::Component::Normal(part) => relative.push(part),
+        }
+    }
+    relative
 }
 
 #[cfg(test)]
@@ -87,5 +106,30 @@ mod tests {
         let cleaned = clean_verbatim_path(unc_server_path);
         // Should remain unchanged since there's no drive letter at position 5
         assert_eq!(cleaned.to_string_lossy(), r"\\?\UNC\server\share");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_or_exact_strings() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+        // Exactly at the char budget is not truncated.
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+        assert_eq!(truncate_with_ellipsis("", 3), "");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_truncates_and_appends() {
+        assert_eq!(truncate_with_ellipsis("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_trims_trailing_space_before_ellipsis() {
+        // The kept slice "ab " is trimmed before the ellipsis is appended.
+        assert_eq!(truncate_with_ellipsis("ab cd", 3), "ab...");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_counts_unicode_chars_not_bytes() {
+        // "héllo" cut after 2 chars keeps "hé" (3 bytes), not 2 bytes.
+        assert_eq!(truncate_with_ellipsis("héllo", 2), "hé...");
     }
 }

@@ -247,11 +247,13 @@ fn audit_markdown_link_target(
 
     if let Some(scheme) = url_scheme(normalized) {
         if matches!(scheme, "http" | "https" | "mailto") {
-            if has_markdown_suffix(normalized) {
-                report.findings.push(format!(
-                    "{rel}: remote markdown links are blocked by skill security audit ({normalized})."
-                ));
-            }
+            // Remote documentation links are passed through as prompt text; the
+            // loader never fetches them at audit/load time, and any later fetch
+            // stays governed by normal tool/network policy. A `.md` suffix does
+            // not reliably indicate Markdown content (many docs sites serve HTML
+            // at `.md` routes), so flagging these was a false positive that
+            // silently degraded legitimate skills. Structural checks below still
+            // reject other schemes (e.g. `javascript:`/`file:`). See #6714.
             return;
         }
 
@@ -843,6 +845,57 @@ EOF\"\"\"
         assert!(
             is_cross_skill_reference("../../escape.md"),
             "double parent should still be cross-skill"
+        );
+    }
+
+    #[test]
+    fn audit_allows_remote_markdown_documentation_links() {
+        // Regression for #6714: remote http/https/mailto links that happen to
+        // end in `.md`/`.markdown` are documentation references, not fetched at
+        // load time, so they must not be flagged. Real skills (e.g. Cloudinary,
+        // Sanity) cite many such URLs.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("remote-docs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\
+             See [transforms](https://cloudinary.com/documentation/transformation_reference.md)\n\
+             and [schema guide](http://example.com/docs/schema.markdown)\n\
+             or email [support](mailto:support@example.com).\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(report.is_clean(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn audit_still_rejects_unsupported_url_schemes() {
+        // The structural scheme check must survive the #6714 cleanup: only
+        // http/https/mailto pass through; other schemes (javascript:, file:)
+        // are still rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("bad-scheme");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\
+             Click [here](javascript:alert(1))\n\
+             or open [local](file:///etc/passwd.md)\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.contains("unsupported URL scheme in markdown link"))
+                .count(),
+            2,
+            "{:#?}",
+            report.findings
         );
     }
 }

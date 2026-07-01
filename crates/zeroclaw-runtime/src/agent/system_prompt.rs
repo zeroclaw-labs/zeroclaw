@@ -9,6 +9,8 @@ use crate::skills::Skill;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+pub(crate) const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
+pub(crate) const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -112,7 +114,7 @@ pub fn build_system_prompt_with_mode(
     skills: &[Skill],
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
-    native_tools: bool,
+    native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
@@ -128,7 +130,7 @@ pub fn build_system_prompt_with_mode(
         identity_config,
         bootstrap_max_chars,
         Some(&autonomy_cfg),
-        native_tools,
+        native_tool_specs_present,
         skills_prompt_mode,
         false,
         0,
@@ -146,7 +148,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
-    native_tools: bool,
+    native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
@@ -160,7 +162,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
-    let has_tools = !tools.is_empty();
+    let has_tools = !tools.is_empty() || native_tool_specs_present;
 
     // ── 0. Anti-narration (top priority) ───────────────────────
     // When show_tool_calls is true, the model is allowed to describe
@@ -188,7 +190,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() && !native_tools {
+    if !tools.is_empty() && !native_tool_specs_present {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
@@ -231,13 +233,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally and answer directly from conversation context.\n\
-             No tools are available for this turn, so do not emit tool calls or describe unavailable actions.\n\
+             ",
+        );
+        prompt.push_str(NO_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            ", so do not emit tool calls or describe unavailable actions.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
-    } else if native_tools {
+    } else if native_tool_specs_present {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+             When the user sends a message, respond naturally. ",
+        );
+        prompt.push_str(NATIVE_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            " (running commands, reading files, etc.).\n\
              For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
