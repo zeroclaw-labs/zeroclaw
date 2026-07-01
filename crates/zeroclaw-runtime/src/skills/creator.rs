@@ -22,10 +22,11 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
+use zeroclaw_providers::ProviderDispatch;
 
 use super::document::SkillDocument;
 
@@ -101,6 +102,7 @@ impl SkillCreator {
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
         embedding_provider: Option<&dyn EmbeddingProvider>,
+        provider_name: &str,
         model_provider: &dyn ModelProvider,
         model: &str,
     ) -> Result<Option<String>> {
@@ -117,6 +119,7 @@ impl SkillCreator {
                 task_description,
                 tool_calls,
                 final_answer,
+                provider_name,
                 model_provider,
                 model,
             )
@@ -217,14 +220,40 @@ impl SkillCreator {
         task_description: &str,
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
+        provider_name: &str,
         model_provider: &dyn ModelProvider,
         model: &str,
     ) -> Result<String> {
         let prompt = self.build_reflection_prompt(slug, task_description, tool_calls, final_answer);
-        let raw = model_provider
-            .chat_with_system(Some(REFLECTION_SYSTEM_PROMPT), &prompt, model, None)
+        // Fail closed before spending a provider call when the parent turn's
+        // cost budget is already exhausted. No-op when unscoped (e.g. tests that
+        // drive reflection without a `TOOL_LOOP_COST_TRACKING_CONTEXT` scope).
+        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        // Route through the structured dispatch path (rather than the bare
+        // `chat_with_system`) so the returned token usage can be recorded
+        // against the same cost tracker as the main tool loop.
+        let messages = [
+            ChatMessage::system(REFLECTION_SYSTEM_PROMPT),
+            ChatMessage::user(prompt),
+        ];
+        let resp = ProviderDispatch::from_ref(model_provider)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                model,
+                None,
+            )
             .await
             .context("reflection provider call failed")?;
+        // Record spend before output validation, so a malformed reflected body
+        // that falls back to SKILL.toml still counts the provider usage.
+        if let Some(usage) = resp.usage.as_ref() {
+            crate::agent::cost::record_tool_loop_cost_usage(provider_name, model, usage);
+        }
+        let raw = resp.text.unwrap_or_default();
         Self::normalize_reflected_md(slug, &raw)
     }
 
@@ -1359,6 +1388,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "All tests passed.",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1394,6 +1424,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Deployed.",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1408,6 +1439,78 @@ tags = ["auto-generated"]
     }
 
     #[tokio::test]
+    async fn reflected_over_budget_skips_provider_call() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A provider that WOULD succeed if reached; the already-exceeded budget
+        // must block the reflection call before it happens.
+        let provider = MockModelProvider::replying(
+            "---\nname: model-picked\ndescription: Build and test the project.\n---\n\n# X\n\nBody.\n",
+        );
+        let creator = SkillCreator::new(dir.path().to_path_buf(), reflect_config());
+
+        let cost_dir = tempfile::tempdir().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, cost_dir.path()).unwrap());
+        // Pre-record usage that already exceeds the daily limit.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
+            .unwrap();
+        let before = tracker.get_summary().unwrap().request_count;
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(std::collections::HashMap::new()),
+        );
+
+        // Drive the reflected path under the exceeded budget scope. It returns
+        // Ok because reflection fails closed to the deterministic SKILL.toml.
+        let slug = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                creator.create_from_execution_reflected(
+                    "Build and test the project",
+                    &two_calls(),
+                    "All tests passed.",
+                    None,
+                    "mock-provider",
+                    &provider,
+                    "mock-model",
+                ),
+            )
+            .await
+            .expect("reflection returns Ok even over budget (TOML fallback)")
+            .expect("skill is still created via the deterministic TOML fallback");
+
+        // The over-budget guard blocked the provider call entirely ...
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "over-budget reflection must not reach the provider"
+        );
+        // ... recorded no new usage ...
+        assert_eq!(tracker.get_summary().unwrap().request_count, before);
+        // ... and still produced a skill deterministically via SKILL.toml.
+        let skill_dir = dir.path().join("skills").join(&slug);
+        assert!(skill_dir.join("SKILL.toml").exists());
+        assert!(!skill_dir.join("SKILL.md").exists());
+    }
+
+    #[tokio::test]
     async fn reflected_falls_back_to_toml_on_invalid_output() {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockModelProvider::replying("I could not produce a skill, sorry.");
@@ -1419,6 +1522,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Done.",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1445,6 +1549,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Done.",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1475,6 +1580,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "answer",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1502,6 +1608,7 @@ tags = ["auto-generated"]
                 &one_call,
                 "answer",
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1656,6 +1763,7 @@ tags = ["auto-generated"]
                 &calls,
                 &format!("Done. Authenticated with {aws_key}."),
                 None,
+                "mock-provider",
                 &provider,
                 "test-model",
             )
@@ -1897,6 +2005,7 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "answer",
                 Some(&embed),
+                "mock-provider",
                 &provider,
                 "test-model",
             )
