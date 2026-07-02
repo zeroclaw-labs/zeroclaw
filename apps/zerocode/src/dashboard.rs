@@ -2971,6 +2971,86 @@ mod tests {
     }
 
     #[test]
+    fn mouse_tab_change_runs_tab_cleanup() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (sender, _receiver) = tokio::sync::mpsc::channel::<String>(16);
+            let rpc = Arc::new(crate::jsonrpc::RpcOutbound::new(sender));
+            let client = Arc::new(RpcClient::with_rpc(rpc));
+            let mut dashboard = Dashboard::new(client, "local", false);
+            dashboard.tab = Tab::Sessions;
+            dashboard.detail_open = true;
+            dashboard.last_poll = Some(Instant::now());
+            dashboard.tab_area = Rect::new(0, 0, 80, 1);
+
+            let overview_width = crate::i18n::t(Tab::Overview.fluent_key()).chars().count() as u16;
+            let sessions_width = crate::i18n::t(Tab::Sessions.fluent_key()).chars().count() as u16;
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: overview_width + 3 + sessions_width + 3,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            dashboard.handle_mouse(event, Rect::new(0, 0, 80, 24)).await;
+
+            assert_eq!(dashboard.tab, Tab::Agents);
+            assert!(!dashboard.detail_open);
+            assert!(dashboard.last_poll.is_none());
+        });
+    }
+
+    #[test]
+    fn mouse_click_opened_detail_requests_lazy_load() {
+        let mut double_click = mouse::DoubleClickTracker::new();
+        let list_area = Rect::new(0, 0, 20, 5);
+
+        let first =
+            handle_detail_list_click(1, 1, list_area, 3, 0, false, 7, 30, &mut double_click)
+                .expect("click inside list");
+        assert_eq!(first.index, 0);
+        assert!(!first.should_load_detail);
+
+        let second = handle_detail_list_click(
+            1,
+            1,
+            list_area,
+            3,
+            0,
+            first.detail_open,
+            first.detail_scroll,
+            first.detail_pct,
+            &mut double_click,
+        )
+        .expect("double-click inside list");
+        assert!(second.should_load_detail);
+        assert!(second.detail_open);
+        assert_eq!(second.detail_scroll, 0);
+        assert_eq!(second.detail_pct, 50);
+    }
+
+    #[test]
+    fn mouse_selection_change_with_open_detail_requests_lazy_load() {
+        let mut double_click = mouse::DoubleClickTracker::new();
+        let result = handle_detail_list_click(
+            1,
+            2,
+            Rect::new(0, 0, 20, 5),
+            3,
+            0,
+            true,
+            7,
+            50,
+            &mut double_click,
+        )
+        .expect("click inside list");
+
+        assert_eq!(result.index, 1);
+        assert!(result.should_load_detail);
+        assert_eq!(result.detail_scroll, 0);
+    }
+
+    #[test]
     fn truncate_does_not_panic_on_multibyte_boundary() {
         // Regression: byte-index slicing panicked when the byte length exceeded
         // `max` but `max` landed inside a multi-byte char. This 35-char CJK
