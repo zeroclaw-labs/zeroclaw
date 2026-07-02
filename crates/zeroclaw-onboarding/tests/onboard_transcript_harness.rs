@@ -66,10 +66,12 @@ fn accessible_config_dir() -> Option<PathBuf> {
         .filter(|p| p.join("config.toml").exists())
 }
 
-/// Resolve the first enabled agent alias and its dotted model-provider ref from
-/// the accessible config. Never hardcoded; absent config yields None and the
-/// GUIDED cells are skipped. Parsed generically (not through the strict `Config`
-/// view) so an operator config with crate-unknown fields still resolves.
+/// Resolve the agent alias and its dotted model-provider ref for GUIDED runs.
+/// `ZEROCLAW_ONBOARD_AGENT` picks the alias explicitly; otherwise the first
+/// enabled agent (sorted) is used. Never hardcoded; absent config yields None
+/// and the GUIDED cells are skipped. Parsed generically (not through the strict
+/// `Config` view) so an operator config with crate-unknown fields still
+/// resolves.
 fn resolve_agent_provider() -> Option<(String, String)> {
     let dir = accessible_config_dir()?;
     let raw = std::fs::read_to_string(dir.join("config.toml")).ok()?;
@@ -77,7 +79,12 @@ fn resolve_agent_provider() -> Option<(String, String)> {
     let agents = value.get("agents")?.as_table()?;
     let mut aliases: Vec<&String> = agents.keys().collect();
     aliases.sort();
-    for alias in aliases {
+    let preferred = std::env::var("ZEROCLAW_ONBOARD_AGENT").ok();
+    let candidates: Vec<&String> = match &preferred {
+        Some(wanted) => aliases.into_iter().filter(|a| *a == wanted).collect(),
+        None => aliases,
+    };
+    for alias in candidates {
         let Some(agent) = agents.get(alias).and_then(|a| a.as_table()) else {
             continue;
         };
@@ -492,6 +499,68 @@ impl<S: SecretReader> SecretReader for RecordingSecretReader<S> {
     }
 }
 
+/// Transcribes both directions of the guide/operator conversation that happens
+/// inside a field: what the guide says to the human and what the human replies.
+struct RecordingOperatorIo<O: zeroclaw_onboarding::OperatorIo> {
+    inner: O,
+    log: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait]
+impl<O: zeroclaw_onboarding::OperatorIo> zeroclaw_onboarding::OperatorIo
+    for RecordingOperatorIo<O>
+{
+    async fn say(&mut self, text: &str) -> TransportResult<()> {
+        {
+            let mut log = self.log.lock().unwrap();
+            let _ = writeln!(log, "  GUIDE-SAY: {text}");
+        }
+        self.inner.say(text).await
+    }
+
+    async fn hear(&mut self) -> TransportResult<String> {
+        let reply = self.inner.hear().await;
+        let mut log = self.log.lock().unwrap();
+        match &reply {
+            Ok(text) => {
+                let _ = writeln!(log, "  USER: {text}");
+            }
+            Err(error) => {
+                let _ = writeln!(log, "  USER error: {error}");
+            }
+        }
+        reply
+    }
+}
+
+/// A scripted non-technical human. Replies to whatever the guide asks with a
+/// vague plain-language answer; the guide has to do the interpreting. The
+/// queue carries any field-specific replies first, then the generic shrug.
+struct VagueScriptedOperator {
+    replies: std::collections::VecDeque<String>,
+}
+
+impl VagueScriptedOperator {
+    fn new(replies: Vec<&str>) -> Self {
+        Self {
+            replies: replies.into_iter().map(String::from).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl zeroclaw_onboarding::OperatorIo for VagueScriptedOperator {
+    async fn say(&mut self, _text: &str) -> TransportResult<()> {
+        Ok(())
+    }
+
+    async fn hear(&mut self) -> TransportResult<String> {
+        Ok(self.replies.pop_front().unwrap_or_else(|| {
+            "hmm i don't really get that, just pick whatever is normal please".to_string()
+        }))
+    }
+}
+
 /// A scripted stand-in for the live agent that implements the real `AgentTurn`
 /// seam, so the offline guided cell runs the exact
 /// `AgentResponder -> LlmTransport -> spec.walk` stack the live agent drives,
@@ -501,9 +570,11 @@ impl<S: SecretReader> SecretReader for RecordingSecretReader<S> {
 /// each is a realistic value chosen by the field's `prop` so the transcript
 /// reads like a real operator being guided (a homeserver URL for `homeserver`,
 /// `@bot:matrix.org` for `user_id`, an in-range number for a pacing field),
-/// while still parsing for its field's type. The first field gets a mid-field
-/// clarification turn before its real answer so the recorded transcript captures
-/// genuine back-and-forth. It can never loop forever because each served answer
+/// while still parsing for its field's type. For the first field the guide
+/// opens a conversation with the operator (a plain-language question, no
+/// `ANSWER:` marker) and only resolves after hearing the operator's vague
+/// reply, so the recorded transcript captures genuine guide/user
+/// back-and-forth. It can never loop forever because each served answer
 /// parses.
 struct MemoryScriptedTurn {
     answers: std::collections::VecDeque<String>,
@@ -606,7 +677,7 @@ impl zeroclaw_onboarding::AgentTurn for MemoryScriptedTurn {
     async fn run_single(&mut self, message: &str) -> TransportResult<String> {
         self.history.push(message.to_string());
         if let Some(queued) = self.pending.pop_front() {
-            return Ok(queued);
+            return Ok(format!("ANSWER: {queued}"));
         }
         let Some(answer) = self.answers.pop_front() else {
             return Err(TransportError::Agent {
@@ -618,9 +689,11 @@ impl zeroclaw_onboarding::AgentTurn for MemoryScriptedTurn {
         if !self.injected_clarification {
             self.injected_clarification = true;
             self.pending.push_back(answer);
-            return Ok("Let me make sure I understand the field first.".to_string());
+            return Ok("This first one controls a small behavior of your bot. \
+                 Do you want the usual setup, or something specific?"
+                .to_string());
         }
-        Ok(answer)
+        Ok(format!("ANSWER: {answer}"))
     }
 }
 
@@ -640,7 +713,15 @@ async fn run_guided_offline_cell(base: &Path) {
 
     let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let responder = RecordingResponder {
-        inner: zeroclaw_onboarding::AgentResponder::new(MemoryScriptedTurn::new(&config)),
+        inner: zeroclaw_onboarding::AgentResponder::new(
+            MemoryScriptedTurn::new(&config),
+            RecordingOperatorIo {
+                inner: VagueScriptedOperator::new(vec![
+                    "oh um, whatever the normal thing is? i just want it to work",
+                ]),
+                log: std::sync::Arc::clone(&log),
+            },
+        ),
         log: std::sync::Arc::clone(&log),
         turn: 0,
     };
@@ -719,28 +800,17 @@ async fn run_guided_offline_cell(base: &Path) {
         "the guided walk must complete even with conversational back-and-forth"
     );
     assert!(
-        transcript.contains("make sure I understand"),
-        "the recorded transcript must include the guide's mid-field clarification turn"
+        transcript.contains("GUIDE-SAY:"),
+        "the recorded transcript must show the guide speaking to the operator"
     );
     assert!(
-        transcript.matches("LLM-ASK").count() > spec_field_prompts(&config),
-        "a conversational walk must record more turns than there are fields"
+        transcript.contains("USER:"),
+        "the recorded transcript must show the operator replying to the guide"
     );
-}
-
-fn spec_field_prompts(config: &Config) -> usize {
-    build_spec(
-        config.prop_fields(),
-        SECTION,
-        LAYER,
-        INSTANCE,
-        Outcome::Cancelled,
-    )
-    .expect("spec")
-    .nodes
-    .values()
-    .filter(|node| !matches!(node.prompt.response_type, ResponseType::Secret))
-    .count()
+    assert!(
+        transcript.contains("i just want it to work"),
+        "the operator's vague plain-language reply must appear in the transcript"
+    );
 }
 
 /// Live GUIDED cell (opt-in). Resolves a genuine agent + provider from the
@@ -772,6 +842,23 @@ async fn run_guided_live_cell(base: &Path) {
             return;
         }
     };
+    // Decrypt enc2 secrets with the co-located .secret_key so the built agent
+    // authenticates live instead of sending raw ciphertext upstream.
+    let accessible = {
+        let store = zeroclaw_config::secrets::SecretStore::new(&dir, accessible.secrets.encrypt);
+        let mut config = accessible;
+        if let Err(error) = config.decrypt_secrets(&store) {
+            let cell = base.join("inproc").join("guided-live").join("happy");
+            std::fs::create_dir_all(&cell).expect("create live guided cell");
+            std::fs::write(
+                cell.join("transcript.txt"),
+                format!("skipped: accessible config secrets did not decrypt: {error}\n"),
+            )
+            .expect("write skip note");
+            return;
+        }
+        config
+    };
 
     let agent = match Box::pin(zeroclaw_runtime::agent::Agent::from_config(
         &accessible,
@@ -800,6 +887,15 @@ async fn run_guided_live_cell(base: &Path) {
     let responder = RecordingResponder {
         inner: zeroclaw_onboarding::AgentResponder::new(
             zeroclaw_onboarding::InProcessAgentTurn::new(agent),
+            RecordingOperatorIo {
+                inner: VagueScriptedOperator::new(vec![
+                    "honestly no clue what that means, whatever you think is best",
+                    "i just want my bot to answer me on matrix",
+                    "the normal one? we use matrix.org i think",
+                    "sure",
+                ]),
+                log: std::sync::Arc::clone(&log),
+            },
         ),
         log: std::sync::Arc::clone(&log),
         turn: 0,
