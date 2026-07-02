@@ -711,6 +711,20 @@ impl SqliteMemory {
     /// the handle (#8359).
     pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
         *self.embedder.write() = embedder;
+        // `embedding_cache` is keyed by content hash only, so every cached
+        // vector belongs to the *previous* provider/model/dimensions. Drop the
+        // cache on swap so the next embed goes through the new embedder instead
+        // of returning a stale vector (#8359). Best-effort — a cache-clear
+        // failure must not block the swap.
+        if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory embedder refresh: failed to clear stale embedding cache"
+            );
+        }
     }
 
     /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
@@ -2516,10 +2530,23 @@ mod tests {
 
     // ── Embedder hot-swap (#8359) ────────────────────────────────
 
-    /// A working embedder double that returns a fixed-length vector so a swap
-    /// is observable on the real read path without any network I/O.
+    /// A working embedder double that returns a fixed-length vector (each
+    /// element = `fill`, so the source embedder is identifiable) and counts its
+    /// embed calls — makes a swap observable on the real read path, network-free.
     struct StubEmbedding {
         dims: usize,
+        fill: f32,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StubEmbedding {
+        fn new(dims: usize, fill: f32) -> Self {
+            Self {
+                dims,
+                fill,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2531,7 +2558,9 @@ mod tests {
             self.dims
         }
         async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| vec![0.1; self.dims]).collect())
+            self.calls
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![self.fill; self.dims]).collect())
         }
     }
 
@@ -2550,7 +2579,7 @@ mod tests {
             "Noop embedder must short-circuit to no vector"
         );
 
-        mem.swap_embedder(Arc::new(StubEmbedding { dims: 4 }));
+        mem.swap_embedder(Arc::new(StubEmbedding::new(4, 0.1)));
 
         let embedding = mem
             .get_or_compute_embedding("hello")
@@ -2558,6 +2587,57 @@ mod tests {
             .unwrap()
             .expect("swapped-in embedder must now produce a vector");
         assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
+    }
+
+    /// After an embedder swap, the same content must re-embed through the NEW
+    /// provider rather than return the previous provider's cached vector — the
+    /// `embedding_cache` (keyed by content hash only) must be invalidated.
+    #[tokio::test]
+    async fn swap_embedder_invalidates_stale_embedding_cache() {
+        let tmp = TempDir::new().unwrap();
+        let first = Arc::new(StubEmbedding::new(4, 0.1));
+        let first_calls = Arc::clone(&first.calls);
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            first,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // Prime the cache with the first provider's vector.
+        let v1 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(v1.unwrap(), vec![0.1_f32; 4]);
+        // Second call for identical content is served from cache (no new embed).
+        let _ = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "identical content must hit the cache, not re-embed"
+        );
+
+        // Swap to a different provider (distinct fill so its output is unique).
+        let second = Arc::new(StubEmbedding::new(4, 0.9));
+        let second_calls = Arc::clone(&second.calls);
+        mem.swap_embedder(second);
+
+        // Same content again: must re-embed through the NEW provider, not return
+        // the stale cached 0.1 vector.
+        let v2 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            v2.unwrap(),
+            vec![0.9_f32; 4],
+            "post-swap embed must use the new provider, not the stale cache"
+        );
+        assert_eq!(
+            second_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cache must have been invalidated so the new provider is called"
+        );
     }
 
     /// The `Memory::refresh_embedder` hook rebuilds the embedder from freshly
