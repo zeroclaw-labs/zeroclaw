@@ -1076,6 +1076,7 @@ mod tests {
             }],
             prompts: vec![],
             location: None,
+            always: false,
         };
         crate::tools::register_skill_tools_with_context(
             &mut registry,
