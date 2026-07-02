@@ -300,6 +300,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             has_session,
             turn_memory.suppress,
         ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+            // Idempotence: a model-switch retry re-enters the engine with the
+            // same history; the preamble must not stack.
+            && !history[last_user_idx]
+                .content
+                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
