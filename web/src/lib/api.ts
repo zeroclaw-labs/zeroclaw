@@ -1025,6 +1025,43 @@ export function objectArrayElementProps(
   return out;
 }
 
+/** Read the backend-stamped `x-required-by-transport` metadata off the
+ *  `McpServerConfig` schema (a `mcp.servers.<name>` map value). The backend
+ *  derives this map from `McpTransport::required_leaf`, the same relationship
+ *  `validate_mcp_config` enforces, so the form classifies a transport's
+ *  required leaf by reading the registry rather than re-encoding the enum.
+ *  Returns `null` when the path doesn't resolve or the backend predates the
+ *  extension, in which case callers leave required-ness unclassified. */
+export function mcpRequiredByTransport(
+  schema: JsonSchema,
+): Record<string, string> | null {
+  if (!schema) return null;
+  // Walk root -> mcp -> servers (a map whose value type is McpServerConfig).
+  let cur: unknown = schema;
+  for (const seg of ["mcp", "servers"]) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== "object") return null;
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    if (!props || !Object.prototype.hasOwnProperty.call(props, seg)) return null;
+    cur = props[seg];
+  }
+  // `cur` is the servers map; its value type (McpServerConfig) carries the
+  // extension, reachable through `additionalProperties`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== "object") return null;
+  const additional = (cur as { additionalProperties?: unknown })
+    .additionalProperties;
+  const serverDef = unwrapOptional(resolveRef(additional, schema));
+  if (!serverDef || typeof serverDef !== "object") return null;
+  const raw = (serverDef as Record<string, unknown>)["x-required-by-transport"];
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k.toLowerCase()] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 export function descriptionForPath(
   schema: JsonSchema,
   kebabPath: string,
