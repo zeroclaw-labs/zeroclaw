@@ -150,7 +150,7 @@ pub fn tool_dispatcher_for_provider(
 /// Either the decision is settled here (the named approver answered, or the gate
 /// fails closed), or the caller should fall through to the originating fan-out
 /// (explicit `InheritOriginator`).
-enum RoutedApproval {
+pub(crate) enum RoutedApproval {
     /// Use this response. `decider` names the channel that answered, for audit
     /// attribution; `None` for a bridge-synthesized fail-closed deny.
     Decided {
@@ -168,7 +168,7 @@ enum RoutedApproval {
 ///
 /// Extracted from `AskUserApprovalBridge::request_approval` so the routing
 /// decision is unit-testable against stub channels without a full Agent.
-async fn resolve_routed_approval(
+pub(crate) async fn resolve_routed_approval(
     handles: &tools::PerToolChannelHandle,
     route: &zeroclaw_config::autonomy::ApprovalRoute,
     recipient: &str,
@@ -251,7 +251,6 @@ async fn resolve_routed_approval(
 pub(crate) struct RoutedApprovalChannel {
     handles: tools::PerToolChannelHandle,
     route: zeroclaw_config::autonomy::ApprovalRoute,
-    last_decision: parking_lot::Mutex<Option<String>>,
 }
 
 impl RoutedApprovalChannel {
@@ -259,11 +258,7 @@ impl RoutedApprovalChannel {
         handles: tools::PerToolChannelHandle,
         route: zeroclaw_config::autonomy::ApprovalRoute,
     ) -> Self {
-        Self {
-            handles,
-            route,
-            last_decision: parking_lot::Mutex::new(None),
-        }
+        Self { handles, route }
     }
 }
 
@@ -282,10 +277,6 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         "approval-route"
     }
 
-    fn last_decision_channel(&self) -> Option<String> {
-        self.last_decision.lock().clone()
-    }
-
     async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
         Ok(())
     }
@@ -297,16 +288,33 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         Ok(())
     }
 
+    /// Non-attributed entry point: delegates to
+    /// [`Self::request_approval_attributed`] and drops the attribution so the
+    /// routing decision lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
-        *self.last_decision.lock() = None;
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+            // The deciding approver's name travels on the response itself (issue
+            // #7737); `None` for a bridge-synthesized fail-closed deny.
             RoutedApproval::Decided { response, decider } => {
-                *self.last_decision.lock() = decider;
-                Ok(Some(response))
+                Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
+                    response,
+                    decided_by: decider,
+                }))
             }
             // No originating channel to inherit on this path; let the gate apply
             // the non-interactive default (auto-deny).
@@ -2455,128 +2463,6 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
-        /// Routes the loop's single-channel approval callback through every
-        /// registered ask_user back-channel — the first decisive answer wins —
-        /// preserving the multi-channel iteration of the old direct execution
-        /// path (ACP and WS sessions register their approval back-channels
-        /// here at session start; hard-coding one name would break the other).
-        struct AskUserApprovalBridge {
-            handles: tools::PerToolChannelHandle,
-            // The back-channel that answered the most recent request, so the
-            // approval audit records the deciding surface (WS, ACP, …) rather
-            // than the loop's static "cli" channel name. See
-            // `last_decision_channel` below and `gate_tool_approval`.
-            last_decision: parking_lot::Mutex<Option<String>>,
-            // Cross-channel HITL: when the active risk profile names a DISTINCT
-            // approver channel, this gate asks only that channel (bounded by a
-            // timeout, fail-closed) instead of fanning out to the originating
-            // back-channels. `None` ⇒ today's fan-out behavior. See EPIC B.
-            route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
-        }
-
-        impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Channel(
-                    ::zeroclaw_api::attribution::ChannelKind::Cli,
-                )
-            }
-            fn alias(&self) -> &str {
-                "agent-approval-bridge"
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl zeroclaw_api::channel::Channel for AskUserApprovalBridge {
-            fn name(&self) -> &str {
-                "agent-approval-bridge"
-            }
-
-            fn last_decision_channel(&self) -> Option<String> {
-                self.last_decision.lock().clone()
-            }
-
-            async fn send(
-                &self,
-                _message: &zeroclaw_api::channel::SendMessage,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            async fn listen(
-                &self,
-                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            async fn request_approval(
-                &self,
-                recipient: &str,
-                request: &zeroclaw_api::channel::ChannelApprovalRequest,
-            ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>>
-            {
-                // Clear the previous decision's attribution; only a decisive
-                // answer below sets it, so an all-`None` fan-out leaves it unset
-                // and the gate falls back to the loop's channel name.
-                *self.last_decision.lock() = None;
-
-                // ── Cross-channel HITL route (EPIC B) ──────────────────────
-                // A configured `ApprovalRoute` redirects this gate to a DISTINCT
-                // approver channel rather than the originating fan-out. The
-                // approver is asked alone, bounded by `timeout_secs`; any
-                // non-decisive outcome (declined-without-answer, unreachable,
-                // unregistered, or timed out) is resolved by `on_no_approver` —
-                // fail-closed `Deny` by default, or fall through to the
-                // originating fan-out on explicit `InheritOriginator`. The
-                // decision logic lives in `resolve_routed_approval` so it is
-                // unit-testable without standing up a full Agent.
-                if let Some(route) = &self.route {
-                    match resolve_routed_approval(&self.handles, route, recipient, request).await {
-                        RoutedApproval::Decided { response, decider } => {
-                            *self.last_decision.lock() = decider;
-                            return Ok(Some(response));
-                        }
-                        RoutedApproval::Fallthrough => {
-                            // explicit InheritOriginator → originating fan-out below
-                        }
-                    }
-                }
-
-                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
-                    .handles
-                    .read()
-                    .iter()
-                    .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
-                    .collect();
-                for (channel_name, channel) in &channels {
-                    match channel.request_approval(recipient, request).await {
-                        Ok(Some(response)) => {
-                            *self.last_decision.lock() = Some(channel_name.clone());
-                            return Ok(Some(response));
-                        }
-                        Ok(None) => continue,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({
-                                    "tool": request.tool_name,
-                                    "channel": channel_name,
-                                    "error": format!("{}", e),
-                                })),
-                                "channel approval request failed"
-                            );
-                        }
-                    }
-                }
-                Ok(None)
-            }
-        }
-
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -2679,11 +2565,10 @@ impl Agent {
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
-                Box::new(AskUserApprovalBridge {
-                    handles: Arc::clone(handles),
-                    last_decision: parking_lot::Mutex::new(None),
-                    route: self.approval_route.clone(),
-                }) as Box<dyn zeroclaw_api::channel::Channel>
+                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                    Arc::clone(handles),
+                    self.approval_route.clone(),
+                )) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
         let knobs = crate::agent::loop_::LoopKnobs {
@@ -7865,10 +7750,14 @@ mod approval_route_tests {
             behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
         }]);
         let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
-        let out = bridge.request_approval("r", &req()).await.unwrap();
-        assert_eq!(out, Some(ChannelApprovalResponse::Approve));
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("the approver decided");
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
         assert_eq!(
-            bridge.last_decision_channel().as_deref(),
+            out.decided_by.as_deref(),
             Some("ops"),
             "the gate attributes the approval to the deciding channel"
         );
@@ -7877,13 +7766,20 @@ mod approval_route_tests {
     #[tokio::test]
     async fn routed_channel_fails_closed_when_approver_unregistered() {
         let bridge = RoutedApprovalChannel::new(registry(vec![]), route("ops", OnNoApprover::Deny));
-        let out = bridge.request_approval("r", &req()).await.unwrap();
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("the fail-closed deny is a decision");
         assert_eq!(
-            out,
-            Some(ChannelApprovalResponse::Deny),
+            out.response,
+            ChannelApprovalResponse::Deny,
             "unreachable approver denies, not auto-approves"
         );
-        assert!(bridge.last_decision_channel().is_none());
+        assert!(
+            out.decided_by.is_none(),
+            "a bridge-synthesized fail-closed deny has no deciding channel"
+        );
     }
 
     #[tokio::test]
