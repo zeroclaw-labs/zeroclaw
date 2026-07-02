@@ -333,6 +333,21 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     }
 }
 
+/// Whether memory embeddings resolve from the given `<type>.<alias>` provider
+/// profile — either the base `[memory].embedding_provider` reference or any
+/// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
+/// `config/set` provider-profile change (#8359).
+fn memory_embeddings_use_provider(
+    config: &zeroclaw_config::schema::Config,
+    model_provider_ref: &str,
+) -> bool {
+    config.memory.embedding_provider.trim() == model_provider_ref
+        || config
+            .embedding_routes
+            .iter()
+            .any(|route| route.model_provider.trim() == model_provider_ref)
+}
+
 fn rename_error_to_rpc(
     path: &str,
     from: &str,
@@ -2623,12 +2638,44 @@ impl RpcDispatcher {
         }
         self.flush_config().await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
         }
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
         })
+    }
+
+    /// Hot-swap the long-lived RPC memory handle's embedder when a `config/set`
+    /// provider-profile change touches the profile memory embeddings resolve
+    /// from. Without this, the install-wide memory handle keeps its
+    /// construction-time endpoint/key until a daemon restart (#8359). Mirrors
+    /// the live-session refresh's "only when the changed provider is in use"
+    /// gate; a no-op for backends that don't hot-swap their embedder.
+    fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
+        let Some(memory) = self.ctx.memory.as_ref() else {
+            return;
+        };
+        let config = self.ctx.config.read();
+        if !memory_embeddings_use_provider(&config, model_provider_ref) {
+            return;
+        }
+        // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
+        // is called with `api_key = None`): keys come from the per-route /
+        // `[memory]` override or the referenced profile, never an inherited seed.
+        let resolved = zeroclaw_memory::resolve_embedding_settings(
+            &config.memory,
+            &config.embedding_routes,
+            None,
+            Some(&config.providers.models),
+        );
+        memory.refresh_embedder(
+            &resolved.model_provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        );
     }
 
     fn schedule_live_sessions_refresh_for_model_provider(&self, model_provider_ref: String) {
@@ -4013,6 +4060,31 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn memory_embeddings_use_provider_matches_base_ref_and_routes() {
+        use zeroclaw_config::schema::{Config, EmbeddingRouteConfig};
+
+        let mut config = Config::default();
+        config.memory.embedding_provider = "openai.default".into();
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openrouter.alt".into(),
+            model: "embed".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+
+        // Base `[memory].embedding_provider` reference.
+        assert!(memory_embeddings_use_provider(&config, "openai.default"));
+        // Any `[[embedding_routes]]` reference.
+        assert!(memory_embeddings_use_provider(&config, "openrouter.alt"));
+        // An unrelated provider must not trigger a memory-embedder refresh.
+        assert!(!memory_embeddings_use_provider(
+            &config,
+            "anthropic.default"
+        ));
     }
 
     #[test]
@@ -5990,6 +6062,59 @@ mod tests {
             stored.as_deref(),
             Some("sk-real-test-key"),
             "real secret must land in memory as plaintext"
+        );
+    }
+
+    /// End-to-end (#8359): a `config/set` on the provider profile memory
+    /// embeddings resolve from must refresh the long-lived RPC memory handle's
+    /// embedder in place — no daemon restart, no rebuilt handle. Drives the real
+    /// `handle_config_set` path and observes the live handle flip from the Noop
+    /// embedder (dims 0) to the resolved provider's embedder (dims 1536).
+    #[tokio::test]
+    async fn config_set_refreshes_memory_embedder_on_provider_change() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        // Memory embeddings resolve from openai.default.
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
+        // Long-lived handle constructed with the Noop embedder (dims 0), exactly
+        // the stale state the bug leaves behind.
+        let mem = Arc::new(zeroclaw_memory::SqliteMemory::new("default", tmp.path()).unwrap());
+        assert_eq!(mem.embedder_dimensions(), 0, "starts on the Noop embedder");
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_memory(
+            cfg,
+            Arc::clone(&sessions),
+            Arc::clone(&mem) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        let params = json!({
+            "prop": "providers.models.openai.default.api_key",
+            "value": "sk-rotated-key"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "config/set on the memory embedding provider must hot-swap the live \
+             handle's embedder to the resolved provider (#8359)"
         );
     }
 

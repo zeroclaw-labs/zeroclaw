@@ -4,7 +4,7 @@ use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -39,7 +39,11 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
-    embedder: Arc<dyn EmbeddingProvider>,
+    // Behind an `RwLock` so `config/set` can hot-swap the embedder on a
+    // long-lived handle after a provider-profile change, without a daemon
+    // restart (#8359). Reads snapshot the `Arc` and drop the guard before any
+    // `.await`, so the lock is never held across async work.
+    embedder: RwLock<Arc<dyn EmbeddingProvider>>,
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
@@ -85,7 +89,7 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            embedder: Arc::new(super::embeddings::NoopEmbedding),
+            embedder: RwLock::new(Arc::new(super::embeddings::NoopEmbedding)),
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
@@ -141,7 +145,7 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            embedder,
+            embedder: RwLock::new(embedder),
             vector_weight,
             keyword_weight,
             cache_max,
@@ -420,7 +424,11 @@ impl SqliteMemory {
 
     /// Get embedding from cache, or compute + cache it
     pub async fn get_or_compute_embedding(&self, text: &str) -> anyhow::Result<Option<Vec<f32>>> {
-        if self.embedder.dimensions() == 0 {
+        // Snapshot the embedder once so a concurrent `refresh_embedder` swap
+        // can't split this call across two providers; the guard is dropped
+        // immediately, never held across the `.await` below.
+        let embedder = self.embedder.read().clone();
+        if embedder.dimensions() == 0 {
             return Ok(None); // Noop embedder
         }
 
@@ -452,7 +460,7 @@ impl SqliteMemory {
         }
 
         // Compute embedding (async I/O)
-        let embedding = self.embedder.embed_one(text).await?;
+        let embedding = embedder.embed_one(text).await?;
         let bytes = vector::vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
@@ -695,12 +703,48 @@ impl SqliteMemory {
         })
         .await?
     }
+
+    /// Replace the live embedder in place. Shared by the runtime
+    /// `refresh_embedder` hook (after a `config/set` provider-profile change)
+    /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without rebuilding
+    /// the handle (#8359).
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
+    }
 }
 
 #[async_trait]
 impl Memory for SqliteMemory {
     fn name(&self) -> &str {
         "sqlite"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. No
+        // provider state is duplicated into a separate cache — the endpoint/key
+        // come from the canonical config via the runtime resolver.
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
     }
 
     async fn store(
@@ -1349,7 +1393,7 @@ impl Memory for SqliteMemory {
         }
 
         // Step 2: Re-embed memories with NULL vectors, if embedder is configured
-        if self.embedder.dimensions() == 0 {
+        if self.embedder.read().dimensions() == 0 {
             return Ok(0);
         }
 
@@ -2468,6 +2512,75 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 1, "row must be persisted");
         let entry = mem.get("survives").await.unwrap().unwrap();
         assert_eq!(entry.content, "this content must be retained");
+    }
+
+    // ── Embedder hot-swap (#8359) ────────────────────────────────
+
+    /// A working embedder double that returns a fixed-length vector so a swap
+    /// is observable on the real read path without any network I/O.
+    struct StubEmbedding {
+        dims: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for StubEmbedding {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1; self.dims]).collect())
+        }
+    }
+
+    /// Swapping the embedder on a live handle is observed by the real embed
+    /// path: a Noop handle yields no vector, and after the swap the same handle
+    /// produces one from the new embedder — no rebuild of the `SqliteMemory`.
+    #[tokio::test]
+    async fn refresh_embedder_takes_effect_on_live_handle() {
+        let (_tmp, mem) = temp_sqlite(); // constructed with NoopEmbedding (dims 0)
+
+        assert!(
+            mem.get_or_compute_embedding("hello")
+                .await
+                .unwrap()
+                .is_none(),
+            "Noop embedder must short-circuit to no vector"
+        );
+
+        mem.swap_embedder(Arc::new(StubEmbedding { dims: 4 }));
+
+        let embedding = mem
+            .get_or_compute_embedding("hello")
+            .await
+            .unwrap()
+            .expect("swapped-in embedder must now produce a vector");
+        assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
+    }
+
+    /// The `Memory::refresh_embedder` hook rebuilds the embedder from freshly
+    /// resolved provider settings and installs it on the live handle (the shape
+    /// `config/set` uses after a provider-profile change).
+    #[test]
+    fn refresh_embedder_rebuilds_from_resolved_settings() {
+        let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
+        assert_eq!(mem.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &mem,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "refresh_embedder must install the resolved provider's embedder"
+        );
     }
 
     // ── With-embedder constructor test ───────────────────────────
