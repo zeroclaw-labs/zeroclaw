@@ -112,4 +112,9 @@ mod tests {
         assert_eq!(TransportKind::Serial, TransportKind::Serial);
         assert_ne!(TransportKind::Serial, TransportKind::Swd);
     }
+
+    #[test]
+    fn aardvark_transport_kind_display() {
+        assert_eq!(TransportKind::Aardvark.to_string(), "aardvark");
+    }
 }
