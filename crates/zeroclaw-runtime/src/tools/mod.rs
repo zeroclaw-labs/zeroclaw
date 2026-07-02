@@ -452,6 +452,37 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Deferred pipeline construction data.
+///
+/// Collects the pieces needed to build a `PipelineTool` after the per-agent
+/// `ToolAccessPolicy` has been derived. Call [`build_pipeline_tool`] to
+/// produce the final `PipelineTool` with the policy gate baked in.
+pub struct PipelineRaw {
+    pub config: zeroclaw_config::schema::PipelineConfig,
+    /// Unfiltered tool Arcs (before policy filtering). The pipeline tool
+    /// gets a clone of this snapshot so it can resolve tools by name
+    /// regardless of top-level allowlist filtering.
+    pub tool_arcs: Vec<Arc<dyn Tool>>,
+}
+
+/// Build a `PipelineTool` from the raw deferred data and an optional
+/// per-agent `ToolAccessPolicy`.
+///
+/// Returns `None` when `raw.tool_arcs` is empty (nothing to pipeline).
+pub fn build_pipeline_tool(
+    raw: &PipelineRaw,
+    access_policy: Option<zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> Option<Box<dyn Tool>> {
+    if raw.tool_arcs.is_empty() {
+        return None;
+    }
+    Some(Box::new(zeroclaw_tools::pipeline::PipelineTool::new(
+        raw.config.clone(),
+        raw.tool_arcs.clone(),
+        access_policy,
+    )))
+}
+
 /// Bundled return values from tool registry construction.
 ///
 /// Named struct to avoid an ever-growing positional tuple that's painful
@@ -465,9 +496,14 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
-    /// Pre-boxed Arcs of every tool (before policy filter). Used by
-    /// skill-scoped builtin elevation to resolve targets at registration.
+    /// Pre-boxed Arcs of every tool (before policy filter and before
+    /// PipelineTool is added). PipelineTool construction is deferred to
+    /// the caller so the per-agent policy can be baked in immutably.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// Raw data for deferred PipelineTool construction. The caller derives
+    /// a `ToolAccessPolicy` from the agent's `SecurityPolicy` and then
+    /// calls `build_pipeline_tool()` to get a policy-gated pipeline tool.
+    pub pipeline_raw: Option<PipelineRaw>,
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -1336,6 +1372,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    pipeline_raw: None,
                 };
             }
 
@@ -1557,14 +1594,18 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
-    if root_config.pipeline.enabled {
-        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
-        tool_arcs.push(Arc::new(PipelineTool::new(
-            root_config.pipeline.clone(),
-            pipeline_tools,
-        )));
-    }
+    // Pipeline tool (execute_pipeline) — construction is deferred.
+    // The caller derives a ToolAccessPolicy from the agent's SecurityPolicy
+    // and calls build_pipeline_tool() to produce an immutable, policy-gated
+    // PipelineTool. No mutable slot; no stale/missing policy.
+    let pipeline_raw: Option<PipelineRaw> = if root_config.pipeline.enabled {
+        Some(PipelineRaw {
+            config: root_config.pipeline.clone(),
+            tool_arcs: tool_arcs.clone(),
+        })
+    } else {
+        None
+    };
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
@@ -1575,6 +1616,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        pipeline_raw,
     }
 }
 
