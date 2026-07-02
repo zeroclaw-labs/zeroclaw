@@ -21,6 +21,8 @@ pub struct OpenRouterModelProvider {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    /// Fallback models for automatic failover (OpenRouter feature).
+    fallback_models: Vec<String>,
 }
 
 /// OpenRouter's public aggregator endpoint.
@@ -29,7 +31,12 @@ const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
+    /// Primary model string.
     model: String,
+    /// Fallback models array for automatic failover (OpenRouter feature).
+    /// When set, OpenRouter tries models in order: [model] + models array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<String>>,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -96,7 +103,11 @@ struct ResponseMessage {
 
 #[derive(Debug, Serialize)]
 struct NativeChatRequest {
+    /// Primary model string.
     model: String,
+    /// Fallback models array for automatic failover (OpenRouter feature).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<String>>,
     messages: Vec<NativeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -206,8 +217,16 @@ impl OpenRouterModelProvider {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             max_tokens: None,
             extra_body: None,
+            fallback_models: Vec::new(),
         }
     }
+
+    /// Set fallback models for automatic failover.
+    pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {
+        self.fallback_models = models;
+        self
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
@@ -319,6 +338,7 @@ impl OpenRouterModelProvider {
     }
 
     fn build_chat_with_system_request(
+        &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
@@ -339,8 +359,17 @@ impl OpenRouterModelProvider {
             content: Self::to_message_content("user", message),
         });
 
+        // Build models array for failover if fallback_models is configured.
+        // OpenRouter tries models in order: [model] + fallback_models array.
+        let models = if self.fallback_models.is_empty() {
+            None
+        } else {
+            Some(self.fallback_models.clone())
+        };
+
         ChatRequest {
             model: model.to_string(),
+            models,
             messages,
             temperature,
             max_tokens,
@@ -586,7 +615,7 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let request = Self::build_chat_with_system_request(
+        let request = self.build_chat_with_system_request(
             system_prompt,
             message,
             model,
@@ -659,8 +688,16 @@ impl ModelProvider for OpenRouterModelProvider {
             })
             .collect();
 
+        // Build models array for failover if fallback_models is configured.
+        let models = if self.fallback_models.is_empty() {
+            None
+        } else {
+            Some(self.fallback_models.clone())
+        };
+
         let request = ChatRequest {
             model: model.to_string(),
+            models,
             messages: api_messages,
             temperature,
             max_tokens: self.max_tokens,
@@ -724,8 +761,16 @@ impl ModelProvider for OpenRouterModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        // Build models array for failover if fallback_models is configured.
+        let models = if self.fallback_models.is_empty() {
+            None
+        } else {
+            Some(self.fallback_models.clone())
+        };
+
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models,
             messages: Self::convert_messages(request.messages),
             temperature,
             tool_choice: tools
@@ -821,8 +866,16 @@ impl ModelProvider for OpenRouterModelProvider {
         };
 
         let tools = Self::convert_tools(request.tools);
+        // Build models array for failover if fallback_models is configured.
+        let models = if self.fallback_models.is_empty() {
+            None
+        } else {
+            Some(self.fallback_models.clone())
+        };
+
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models,
             messages: Self::convert_messages(request.messages),
             temperature,
             tool_choice: tools
@@ -954,8 +1007,16 @@ impl ModelProvider for OpenRouterModelProvider {
         // when history contains native tool-call metadata.
         let native_messages = Self::convert_messages(messages);
 
+        // Build models array for failover if fallback_models is configured.
+        let models = if self.fallback_models.is_empty() {
+            None
+        } else {
+            Some(self.fallback_models.clone())
+        };
+
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models,
             messages: native_messages,
             temperature,
             tool_choice: native_tools
@@ -1143,6 +1204,7 @@ mod tests {
     fn native_chat_request_serializes_stream_true() {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.0),
             tools: None,
@@ -1158,6 +1220,7 @@ mod tests {
     fn native_chat_request_omits_stream_when_none() {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.0),
             tools: None,
@@ -1244,7 +1307,8 @@ mod tests {
 
     #[test]
     fn chat_request_serializes_with_system_and_user() {
-        let request = OpenRouterModelProvider::build_chat_with_system_request(
+        let provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let request = provider.build_chat_with_system_request(
             Some("You are helpful"),
             "Summarize this",
             "anthropic/claude-sonnet-4",
@@ -1285,6 +1349,7 @@ mod tests {
 
         let request = ChatRequest {
             model: "google/gemini-2.5-pro".into(),
+            models: None,
             messages: messages
                 .iter()
                 .map(|msg| Message {
@@ -1981,6 +2046,7 @@ mod tests {
         let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -1997,6 +2063,7 @@ mod tests {
             .with_extra_body(serde_json::json!({}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2013,6 +2080,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2034,6 +2102,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"temperature": 0.9}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2050,6 +2119,7 @@ mod tests {
             .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
         let request = ChatRequest {
             model: "test-model".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
@@ -2071,6 +2141,7 @@ mod tests {
         );
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.7),
             tools: None,

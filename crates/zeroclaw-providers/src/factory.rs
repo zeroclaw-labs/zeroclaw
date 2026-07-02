@@ -950,6 +950,10 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         let mut p =
             crate::openrouter::OpenRouterModelProvider::new(alias, key, opts.provider_timeout_secs)
                 .with_max_tokens(opts.provider_max_tokens);
+        // Pass fallback_models from config to the provider.
+        if !self.base.fallback_models.is_empty() {
+            p = p.with_fallback_models(self.base.fallback_models.clone());
+        }
         if let Some(extra) = opts.provider_extra.clone() {
             p = p.with_extra_body(extra);
         }
