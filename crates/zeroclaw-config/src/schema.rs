@@ -5772,6 +5772,45 @@ pub struct SkillCreationConfig {
     /// Embedding similarity threshold for deduplication.
     /// Skills with descriptions more similar than this value are skipped.
     pub similarity_threshold: f64,
+    /// Synthesize a canonical `SKILL.md` from the execution trace via a
+    /// bounded model-provider reflection call instead of the deterministic
+    /// `SKILL.toml` generator. Requires `enabled = true`. Falls back to
+    /// `SKILL.toml` whenever the reflection call or its output is invalid, so
+    /// turning this on never leaves a skill un-created. This is distinct from
+    /// the `[skills.skill_improvement]` background review fork, which patches
+    /// existing skills after use rather than creating new ones from a trace.
+    /// Default: `false`.
+    #[serde(default = "default_reflection_enabled")]
+    pub reflection_enabled: bool,
+    /// Maximum characters of the final assistant answer fed into the
+    /// reflection prompt. Bounds prompt size so a long answer cannot blow up
+    /// the reflection request. Default: `2000`.
+    #[serde(default = "default_max_final_answer_chars")]
+    pub max_final_answer_chars: usize,
+    /// Maximum characters of the rendered tool-call trace fed into the
+    /// reflection prompt. Default: `4000`.
+    #[serde(default = "default_max_tool_trace_chars")]
+    pub max_tool_trace_chars: usize,
+    /// Maximum characters of the task description fed into the reflection
+    /// prompt. Default: `1000`.
+    #[serde(default = "default_max_task_chars")]
+    pub max_task_chars: usize,
+}
+
+fn default_reflection_enabled() -> bool {
+    false
+}
+
+fn default_max_final_answer_chars() -> usize {
+    2000
+}
+
+fn default_max_tool_trace_chars() -> usize {
+    4000
+}
+
+fn default_max_task_chars() -> usize {
+    1000
 }
 
 impl Default for SkillCreationConfig {
@@ -5780,6 +5819,10 @@ impl Default for SkillCreationConfig {
             enabled: false,
             max_skills: 500,
             similarity_threshold: 0.85,
+            reflection_enabled: default_reflection_enabled(),
+            max_final_answer_chars: default_max_final_answer_chars(),
+            max_tool_trace_chars: default_max_tool_trace_chars(),
+            max_task_chars: default_max_task_chars(),
         }
     }
 }
