@@ -144,6 +144,10 @@ section APIs. A PR that adds or changes such a surface must be precise about
 whether it only stores configuration, wires the runtime behavior, or completes
 both.
 
+When reviewing a PR that touches a schema-visible but not yet runtime-consumed
+field, require the PR description to say whether runtime wiring is deferred, out
+of scope, or completed by the same change.
+
 ## Reviewer checklist
 
 For config-schema, env-var, default, or reload changes, ask:
@@ -170,4 +174,5 @@ For config-schema, env-var, default, or reload changes, ask:
 - Web Quickstart reload signaling: `crates/zeroclaw-gateway/src/api_quickstart.rs`
 - Gateway config API and reload banner: `crates/zeroclaw-gateway/src/api_config.rs`
 - Reload endpoint and access gate: `crates/zeroclaw-gateway/src/lib.rs`
+- Gateway bearer auth helper: `crates/zeroclaw-gateway/src/api.rs`
 - Generated reference pipeline: `xtask/src/cmd/mdbook/refs.rs`
