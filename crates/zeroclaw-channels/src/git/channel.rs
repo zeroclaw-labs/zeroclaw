@@ -1120,7 +1120,7 @@ mod tests {
             ch.update_draft("octo/repo#5", "42", "partial")
                 .await
                 .unwrap();
-            ch.finalize_draft("octo/repo#5", "42", "done")
+            ch.finalize_draft("octo/repo#5", "42", "done", false)
                 .await
                 .unwrap();
         }
