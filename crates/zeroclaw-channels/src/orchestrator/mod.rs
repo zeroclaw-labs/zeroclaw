@@ -20257,6 +20257,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
@@ -20265,8 +20267,6 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-
-                ..Default::default()
             },
             CancellationToken::new(),
         )
@@ -21856,6 +21856,8 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
@@ -21864,7 +21866,6 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
-                ..Default::default()
             },
             CancellationToken::new(),
         )

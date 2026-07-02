@@ -42,6 +42,14 @@
           - "src/channels/**"
           - "crates/zeroclaw-channels/src/**"
 
+"channel:core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/mod.rs"
+          - "crates/zeroclaw-api/src/channel.rs"
+          - "crates/zeroclaw-channels/src/lib.rs"
+          - "crates/zeroclaw-channels/src/orchestrator/**"
+
 "channel:acp":
   - changed-files:
       - any-glob-to-any-file:
