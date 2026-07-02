@@ -14,9 +14,9 @@ use lapin::{
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::SopDispatch;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
-use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
-use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::engine::SopEngine;
+use zeroclaw_runtime::sop::types::SopTriggerSource;
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -184,14 +184,14 @@ impl AmqpChannel {
         }
 
         if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
-            let event = SopEvent {
-                source: SopTriggerSource::Amqp,
-                topic: Some(routing_key.to_string()),
-                payload: Some(String::from_utf8_lossy(data).to_string()),
-                timestamp: now_iso8601(),
-            };
-            let results = dispatch_sop_event(engine, audit, event).await;
-            process_headless_results(&results);
+            dispatch_untrusted_fan_in(
+                engine,
+                audit,
+                SopTriggerSource::Amqp,
+                Some(routing_key),
+                Some(&String::from_utf8_lossy(data)),
+            )
+            .await;
         }
 
         DeliveryOutcome::Processed

@@ -4392,11 +4392,12 @@ async fn process_channel_message_body(
     }
 
     // ── SOP channel fan-in ───────────────────────────────────────
-    // Project this inbound message into a `SopEvent { source: Channel }` and
-    // dispatch it so channel-sourced SOP triggers fire. Gated on
-    // `wants_source(Channel)` so the untrusted-input screen and dispatch only
-    // run when at least one loaded SOP actually watches a channel. `topic` is
-    // `<kind>[/<alias>]`, matching `channel_trigger_topic_matches`.
+    // Fan this inbound message into the SOP engine so channel-sourced
+    // triggers fire. Gated on `wants_source(Channel)` so the untrusted-input
+    // screen and dispatch only run when at least one loaded SOP actually
+    // watches a channel. `topic` is `<kind>[/<alias>]`, matching
+    // `channel_trigger_topic_matches`. Capping, event construction, and
+    // headless result processing live in `dispatch_untrusted_fan_in`.
     if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
         let wants = engine
             .lock()
@@ -4407,15 +4408,14 @@ async fn process_channel_message_body(
                 Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
                 _ => msg.channel.clone(),
             };
-            let event = zeroclaw_runtime::sop::types::SopEvent {
-                source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-                topic: Some(topic),
-                payload: Some(msg.content.clone()),
-                timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
-            };
-            let results =
-                zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await;
-            zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
+                engine,
+                audit,
+                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+                Some(&topic),
+                Some(&msg.content),
+            )
+            .await;
         }
     }
 

@@ -392,6 +392,77 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
+// ── Untrusted fan-in helper ─────────────────────────────────────
+
+/// Dispatch one untrusted external event through the standard path with the
+/// engine's `untrusted_payload_max_bytes` cap applied to topic and payload.
+/// The single fan-in entry for every external source (channel, MQTT, AMQP,
+/// filesystem, ...): callers hand over raw strings and this owns capping,
+/// truncation logging, event construction, dispatch, and headless result
+/// processing, so no source can forget the cap.
+pub async fn dispatch_untrusted_fan_in(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+) -> Vec<DispatchResult> {
+    let max_bytes = match engine.lock() {
+        Ok(eng) => eng.config().untrusted_payload_max_bytes,
+        Err(e) => {
+            crate::health::mark_component_error(
+                "sop_dispatch",
+                format!("SOP engine lock poisoned: {e}"),
+            );
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e), "source": source.to_string()})),
+                "SOP fan-in: engine lock poisoned while reading SOP safety config"
+            );
+            return vec![];
+        }
+    };
+    let (topic, topic_truncated) = match topic {
+        Some(t) => {
+            let (capped, truncated) = crate::security::cap_untrusted(t, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    let (payload, payload_truncated) = match payload {
+        Some(p) => {
+            let (capped, truncated) = crate::security::cap_untrusted(p, max_bytes);
+            (Some(capped), truncated)
+        }
+        None => (None, false),
+    };
+    if topic_truncated || payload_truncated {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": source.to_string(),
+                    "topic_truncated": topic_truncated,
+                    "payload_truncated": payload_truncated,
+                    "max_bytes": max_bytes,
+                })),
+            "SOP fan-in: capped oversized untrusted event"
+        );
+    }
+    let event = SopEvent {
+        source,
+        topic,
+        payload,
+        timestamp: now_iso8601(),
+    };
+    let results = dispatch_sop_event(engine, audit, event).await;
+    process_headless_results(&results);
+    results
+}
+
 // ── Peripheral signal helper ────────────────────────────────────
 
 /// Convenience wrapper for peripheral hardware callbacks.
