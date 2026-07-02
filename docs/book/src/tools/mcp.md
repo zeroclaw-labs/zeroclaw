@@ -125,3 +125,42 @@ The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_t
 `auto_approve` alone does not hide a tool from the model; it only answers the approval question after the model selects that tool. Use `tool_filter_groups` to reduce prompt noise and `allowed_tools` / `excluded_tools` to enforce a capability boundary.
 
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
+
+## MCP Resources and Prompts
+
+In addition to MCP **tools**, ZeroClaw exposes MCP **resources** and **prompts**
+from connected servers.
+
+### Tools
+
+Two built-in tools are available (subject to your agent's tool access policy):
+
+- `mcp_resources`: `action: "list"` (optional `server`, `cursor`) lists
+  resources; `action: "read"` with `uri` (prefixed `<server>__<uri>`) returns
+  contents.
+- `mcp_prompts`: `action: "list"` lists prompts; `action: "get"` with `name`
+  (prefixed `<server>__<name>`) and optional `arguments` returns the rendered
+  prompt messages.
+
+Servers that do not advertise resource/prompt capabilities are skipped, and calls
+against them return a clear "does not support" error.
+
+### Pinning resources into context
+
+Each MCP server entry accepts an optional `pinned_resources` field: a list of
+resource URIs to read once at startup and inject into the system prompt. Set it
+through the same config surfaces used to define the server (the gateway, zerocode,
+or `zeroclaw config set`, as shown under [Configure MCP](#configure-mcp)), naming
+the resources you want the agent to always have on hand. The field defaults to
+empty, so servers without it are unaffected.
+
+Pinned content is read once per run (no live refresh) and is labeled
+`trust="untrusted-external"` so the model treats it as data, not instructions.
+
+### Security
+
+Resource and prompt content originates from the configured MCP server and is
+treated as **untrusted**: it is provenance-wrapped, secret-scrubbed, and
+length-bounded before entering context. Access to `mcp_resources` / `mcp_prompts`
+and to specific servers is governed by your agent's tool access policy (risk
+profile), and narrows correctly when delegating to subagents.
