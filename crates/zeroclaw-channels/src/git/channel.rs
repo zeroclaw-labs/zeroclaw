@@ -521,6 +521,7 @@ impl Channel for GitChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let result = self.edit_comment(recipient, message_id, text, false).await;
         self.draft_edits.lock().remove(message_id);
@@ -1132,7 +1133,7 @@ mod tests {
             ch.update_draft("octo/repo#5", "42", "partial")
                 .await
                 .unwrap();
-            ch.finalize_draft("octo/repo#5", "42", "done")
+            ch.finalize_draft("octo/repo#5", "42", "done", false)
                 .await
                 .unwrap();
         }
