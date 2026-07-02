@@ -1,22 +1,37 @@
 //! `ScopedToolRegistry` - the one gated seam that mints the per-agent tool set.
 //!
-//! Epic A of the agent-policy enforcement-unification program. The per-agent tool
-//! registry was assembled by hand at five construction sites (channels orchestrator,
-//! runtime `run` / `process_message`, `Agent::from_config`, the gateway), and each
-//! site re-applied the policy itself. That is why the built-in allow/deny filter and
-//! the MCP scoping had to be patched repeatedly (#7064, #6960, #8120) and why the
-//! gateway still leaked: a path that forgets a step silently widens the agent's
-//! authority. `ScopedToolRegistry` makes that unrepresentable - its field is private
-//! and the only constructor that mints one is [`ScopedToolRegistry::assemble`], which
-//! always applies, in order: built-in `allowed_tools`/`excluded_tools` filtering,
-//! per-agent MCP server scoping (`mcp_bundles`, omission is not a grant), MCP tool
-//! gating, and skill registration under the same `SecurityPolicy`.
+//! Epic A of the agent-policy enforcement-unification program (see the contributing
+//! page `agent-policy-parity-harness.md`). The per-agent tool registry has
+//! historically been assembled by hand at six construction sites (channels
+//! orchestrator, runtime `run` / `process_message`, `Agent::from_config`, the
+//! gateway, and the delegate independent-target builder), each re-applying the
+//! policy itself. That is why the built-in filter and the MCP scoping had to be
+//! patched per-site (#7064, #6960, #8120) and why the gateway's `/api/tools`
+//! listings misreported the tool set a real turn receives (its live chat resolves
+//! through `process_message`, which filters; its listing registries never did).
 //!
-//! Per-site variation is expressed as DATA, never as "skip a security step": the only
-//! knobs are three documented divergences - a per-run caller allowlist that only
-//! narrows, the ACP fast-boot that does not connect MCP, and the ACP memory-tool strip.
-//! Peripherals, the policy filter, and skills run on every path (the gateway and
-//! `from_config` omissions were latent bugs, now fixed by construction).
+//! [`ScopedToolRegistry::assemble`] is the seam that ends the copying: it applies,
+//! in order, peripherals, the built-in `allowed_tools`/`excluded_tools` filter, the
+//! ACP memory strip, per-agent MCP server scoping (`mcp_bundles`, omission is not a
+//! grant) with per-tool gating plus the MCP capability tools and pinned-resources
+//! section, and skill registration under the same `SecurityPolicy`.
+//!
+//! Cut-over status: the gateway's two registry builders are the first consumers;
+//! the remaining sites migrate one PR at a time, after which the engine's tools
+//! field seals to this newtype and handing it an unfiltered registry becomes a
+//! compile error instead of a review-checklist item. Until that seal lands, the
+//! guarantee is that every path routed through `assemble` shares one
+//! implementation; paths not yet routed remain hand-rolled by convention.
+//!
+//! Per-site variation is expressed as DATA, never as "skip a security step": the
+//! knobs are documented divergences - a per-run caller allowlist that only narrows,
+//! `connect_mcp` (ACP fast-boot), `connect_peripherals` (listing-only surfaces must
+//! not open hardware), and the ACP memory-tool strip. One known cross-path
+//! divergence remains OUTSIDE the seam: `process_message` filters built-ins via
+//! `filter_channel_builtin_tools`, which admits the canonical read-only defaults
+//! past `allowed_tools` at non-Full autonomy; `assemble` applies the plain policy
+//! filter (as `run` and the orchestrator do). Unifying that semantic into the seam
+//! is a tracked follow-up of the parity program.
 
 use std::sync::Arc;
 
@@ -25,8 +40,8 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 use crate::agent::loop_::{
-    apply_policy_tool_filter, eager_mcp_tool_allowed, load_peripheral_tools, mcp_allowed_tool_count,
-    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+    apply_policy_tool_filter, eager_mcp_tool_allowed, load_peripheral_tools,
+    mcp_allowed_tool_count, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
 };
 use crate::skills::Skill;
 use crate::tools::{
@@ -35,9 +50,12 @@ use crate::tools::{
 };
 
 /// A per-agent tool registry that has been scoped and gated. The inner field is
-/// private; the engine accepts only a `ScopedToolRegistry`, so a construction path
-/// physically cannot hand it an unfiltered registry - that is a compile error, not a
-/// review checklist item.
+/// private and production code can only mint one through
+/// [`ScopedToolRegistry::assemble`]. Today (the unsealed P1 phase) the engine still
+/// takes `&[Box<dyn Tool>]`, so callers dissolve the type via [`Deref`] or
+/// [`Self::into_inner`] at the boundary; once every construction site is cut over,
+/// the engine's tools field seals to this type and handing it an unfiltered
+/// registry becomes a compile error instead of a review-checklist item.
 pub struct ScopedToolRegistry(Vec<Box<dyn Tool>>);
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -76,9 +94,15 @@ pub struct ScopedAssembly<'a> {
     /// threaded into BOTH the built-in filter and the MCP tool-access policy. `None`
     /// on every path except `run`.
     pub caller_allowed: Option<&'a [String]>,
-    /// Documented divergence: ACP `session/new` must return promptly, so it skips
-    /// connecting MCP servers (scoping is still computed; nothing is granted).
+    /// Documented divergence: ACP `session/new` must return promptly, so it does not
+    /// connect MCP servers - they are neither resolved nor connected; nothing is
+    /// granted.
     pub connect_mcp: bool,
+    /// Documented divergence: loading peripherals physically connects hardware (the
+    /// daemon's loader opens serial ports, exclusively for real devices). Listing-only
+    /// surfaces (the gateway's `/api/tools` registries) MUST pass `false` so they never
+    /// hold devices the live turn paths need; execution surfaces pass `true`.
+    pub connect_peripherals: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
 }
@@ -114,6 +138,7 @@ impl ScopedToolRegistry {
             runtime,
             caller_allowed,
             connect_mcp,
+            connect_peripherals,
             exclude_memory,
         } = spec;
 
@@ -128,10 +153,14 @@ impl ScopedToolRegistry {
             unfiltered_tool_arcs,
         } = built;
 
-        // 1. Peripherals (uniform: every path wires the agent's `config.peripherals`;
-        //    the gateway + from_config used to skip this).
-        let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
-        tools_registry.extend(peripheral_tools);
+        // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
+        //    real devices), so this is gated: execution surfaces pass
+        //    `connect_peripherals: true`; listing-only surfaces pass `false` and
+        //    enumerate without holding devices.
+        if connect_peripherals {
+            let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
+            tools_registry.extend(peripheral_tools);
+        }
 
         // 2. Built-in allow/deny filter (uniform: the gateway used to skip it entirely).
         //    `caller_allowed` narrows on top of the policy, for the `run` path only.
@@ -158,13 +187,37 @@ impl ScopedToolRegistry {
             match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = Arc::new(registry);
-                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
+                    // Elevation arcs exist only to resolve skill-declared MCP
+                    // elevation in step 5; skip the collection when no skills are
+                    // registered through this assembly.
+                    if !skills.is_empty() {
+                        mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
+                    }
                     let mcp_policy = mcp_tool_access_policy(security.as_ref(), caller_allowed);
+                    // Generic MCP resource/prompt capability tools (policy-gated in
+                    // deferred-loading and eager modes) - parity with run/process_message.
+                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
+                        register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools_registry,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
+                    let pinned_section = tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         let deferred_set =
                             tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
                         let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set.stubs.iter().map(|stub| stub.prefixed_name.as_str()),
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
                             mcp_policy.as_ref(),
                         );
                         deferred_section = tools::build_deferred_tools_section_filtered(
@@ -218,13 +271,27 @@ impl ScopedToolRegistry {
                             }
                         }
                     }
+                    // Pinned MCP resources ride the same prompt section in both
+                    // modes - parity with run/process_message.
+                    crate::agent::loop_::append_pinned_mcp_section(
+                        &mut deferred_section,
+                        &pinned_section,
+                    );
                 }
                 Err(err) => {
+                    // Non-fatal (the assembly proceeds without MCP), but an ERROR
+                    // with structured attrs - parity with the run/process_message
+                    // connect-failure logging.
                     ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                        &format!("MCP connect failed (non-fatal): {err}")
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "agent_alias": agent_alias,
+                                "error": format!("{err}"),
+                            })),
+                        "MCP registry failed to initialize (assembly proceeds without MCP)"
                     );
                 }
             }
@@ -304,6 +371,7 @@ mod tests {
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             poll_handle: None,
             escalate_handle: None,
+            channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
         }
     }
@@ -323,6 +391,7 @@ mod tests {
             runtime: Arc::new(crate::platform::NativeRuntime::new()),
             caller_allowed,
             connect_mcp: false, // exercise the filter path without MCP fixtures
+            connect_peripherals: false,
             exclude_memory: false,
         })
         .await;
@@ -340,14 +409,97 @@ mod tests {
         });
         let names = assemble_names(
             security,
-            vec![Box::new(MockTool("shell")), Box::new(MockTool("spawn_subagent"))],
+            vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("spawn_subagent")),
+            ],
             None,
         )
         .await;
-        assert!(names.iter().any(|n| n == "shell"), "unlisted tool kept: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "shell"),
+            "unlisted tool kept: {names:?}"
+        );
         assert!(
             !names.iter().any(|n| n == "spawn_subagent"),
             "excluded tool dropped: {names:?}"
+        );
+    }
+
+    /// Regression pin for #7733 at the seam (ported from the gateway's
+    /// `append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles` when the
+    /// gateway cut over to `assemble`): an agent with NO `mcp_bundles` grant
+    /// must get no MCP tools even when `[[mcp.servers]]` is non-empty and MCP
+    /// is enabled - omission is not a grant. Bounded by a timeout so a
+    /// regression that tries to spawn the phantom stdio server fails fast
+    /// instead of hanging CI.
+    ///
+    /// Note (carried from the original): this is a behavior-pinning test, not a
+    /// mutation-discriminating one - the phantom stdio server would also yield
+    /// zero tools if the scoping regressed to `&config.mcp.servers` (the connect
+    /// fails non-fatally). The stronger guards are
+    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` and the
+    /// resolver-level pins in `zeroclaw-config`.
+    #[tokio::test]
+    async fn assemble_grants_no_mcp_to_agent_without_bundles() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        // Critically: NO mcp_bundles configured and NO agent grants.
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "unscoped".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: Vec::new(),
+                ..Default::default()
+            },
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ScopedToolRegistry::assemble(ScopedAssembly {
+                config: &config,
+                agent_alias: "unscoped",
+                security: &security,
+                built: built_with(Vec::new()),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: true,
+                connect_peripherals: false,
+                exclude_memory: false,
+            }),
+        )
+        .await
+        .expect("assemble must not hang for an unscoped agent");
+
+        assert!(
+            out.registry.is_empty(),
+            "assemble must not mint any MCP tool when the agent has no \
+             mcp_bundles grant; got {:?}",
+            out.registry.iter().map(|t| t.name()).collect::<Vec<_>>()
+        );
+        assert!(
+            out.activated_handle.is_none() && out.deferred_section.is_empty(),
+            "no deferred-MCP artifacts may exist for an unscoped agent"
         );
     }
 
@@ -362,6 +514,10 @@ mod tests {
             Some(&allow),
         )
         .await;
-        assert_eq!(names, vec!["shell".to_string()], "caller_allowed narrows: {names:?}");
+        assert_eq!(
+            names,
+            vec!["shell".to_string()],
+            "caller_allowed narrows: {names:?}"
+        );
     }
 }
