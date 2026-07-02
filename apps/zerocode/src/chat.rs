@@ -3654,6 +3654,27 @@ fn render_entry_into(
     }
 }
 
+fn copy_action_rects(body_x: u16, row: u16) -> [(CopyFormat, Rect); 2] {
+    use unicode_width::UnicodeWidthStr;
+
+    let copy_label = crate::i18n::t("zc-chat-action-copy");
+    let markdown_label = crate::i18n::t("zc-chat-action-copy-md");
+    let copy_width = UnicodeWidthStr::width(copy_label.as_str()) as u16;
+    let markdown_x = body_x + 2 + copy_width + 2;
+    [
+        (CopyFormat::Raw, Rect::new(body_x + 2, row, copy_width, 1)),
+        (
+            CopyFormat::Markdown,
+            Rect::new(
+                markdown_x,
+                row,
+                UnicodeWidthStr::width(markdown_label.as_str()) as u16,
+                1,
+            ),
+        ),
+    ]
+}
+
 fn action_header_line(label: &str, label_style: Style, selection: Modifier) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action = theme::accent_style().add_modifier(selection | Modifier::BOLD);
@@ -3847,6 +3868,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
+    state.copy_action_hit_regions.clear();
     for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
@@ -3865,16 +3887,13 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.entry_rects.push((entry_idx, rect));
         if screen_lo >= scroll && screen_lo < scroll + body_h {
             let y = body_y + (screen_lo - scroll);
-            state.copy_action_hit_regions.push(CopyActionHitRegion {
-                entry_index: entry_idx,
-                format: CopyFormat::Raw,
-                rect: Rect::new(body_x + 2, y, 4, 1),
-            });
-            state.copy_action_hit_regions.push(CopyActionHitRegion {
-                entry_index: entry_idx,
-                format: CopyFormat::Markdown,
-                rect: Rect::new(body_x + 8, y, 4, 1),
-            });
+            for (format, rect) in copy_action_rects(body_x, y) {
+                state.copy_action_hit_regions.push(CopyActionHitRegion {
+                    entry_index: entry_idx,
+                    format,
+                    rect,
+                });
+            }
         }
     }
 
@@ -3889,16 +3908,20 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         body_area,
         &mut scrollbar_state,
     );
-    if body_area.height > 0 {
-        state.scrollbar_track_rect = Some(Rect::new(
-            body_area.x + body_area.width.saturating_sub(1),
-            body_area.y,
-            1,
-            body_area.height,
-        ));
-    } else {
-        state.scrollbar_track_rect = None;
+    state.scrollbar_track_rect = scrollbar_hit_rect(body_area);
+}
+
+fn scrollbar_hit_rect(body_area: Rect) -> Option<Rect> {
+    if body_area.width == 0 || body_area.height == 0 {
+        return None;
     }
+    let width = body_area.width.min(3);
+    Some(Rect::new(
+        body_area.x + body_area.width - width,
+        body_area.y,
+        width,
+        body_area.height,
+    ))
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -6213,16 +6236,40 @@ fn markdown_clipboard_text(entry: &ChatEntry) -> String {
             result,
             ..
         } => {
-            let mut text = format!("**Tool: {name}**\n\n```json\n{input_json}\n```");
+            let mut text = format!(
+                "**Tool: {name}**\n\n{}",
+                fenced_markdown_block(Some("json"), input_json)
+            );
             if let Some(result) = result {
-                text.push_str("\n\n```\n");
-                text.push_str(result);
-                text.push_str("\n```");
+                text.push_str("\n\n");
+                text.push_str(&fenced_markdown_block(None, result));
             }
             text
         }
         _ => clipboard_text(entry),
     }
+}
+
+fn fenced_markdown_block(info: Option<&str>, content: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(content).saturating_add(1).max(3));
+    match info {
+        Some(info) => format!("{fence}{info}\n{content}\n{fence}"),
+        None => format!("{fence}\n{content}\n{fence}"),
+    }
+}
+
+fn longest_backtick_run(content: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for character in content.chars() {
+        if character == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 fn markdown_plain_text(markdown: &str) -> String {
@@ -6420,11 +6467,8 @@ mod tests {
         };
         let agent = ChatEntry::AgentMessage(Arc::<str>::from("world"));
 
-        assert_eq!(rendered_entry(&user, 80), "  copy  cpmd  You:\n  hello\n");
-        assert_eq!(
-            rendered_entry(&agent, 80),
-            "  copy  cpmd  Agent:\n  world\n"
-        );
+        assert_eq!(rendered_entry(&user, 80), "  copy  md  You:\n  hello\n");
+        assert_eq!(rendered_entry(&agent, 80), "  copy  md  Agent:\n  world\n");
     }
 
     #[test]
@@ -6466,6 +6510,49 @@ mod tests {
     }
 
     #[test]
+    fn copy_action_rects_track_label_widths() {
+        let rects = copy_action_rects(10, 3);
+        assert_eq!(rects[0], (CopyFormat::Raw, Rect::new(12, 3, 4, 1)));
+        assert_eq!(rects[1], (CopyFormat::Markdown, Rect::new(18, 3, 2, 1)));
+    }
+
+    #[test]
+    fn render_conversation_clears_stale_copy_actions() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state.copy_action_hit_regions.push(CopyActionHitRegion {
+            entry_index: 99,
+            format: CopyFormat::Raw,
+            rect: Rect::new(1, 1, 4, 1),
+        });
+
+        let area = Rect::new(0, 0, 80, 12);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
+            .expect("draw conversation");
+
+        assert!(state.copy_action_hit_regions.is_empty());
+    }
+
+    #[test]
+    fn scrollbar_hit_rect_is_wider_than_rendered_thumb() {
+        assert_eq!(
+            scrollbar_hit_rect(Rect::new(10, 2, 80, 20)),
+            Some(Rect::new(87, 2, 3, 20))
+        );
+        assert_eq!(
+            scrollbar_hit_rect(Rect::new(10, 2, 1, 20)),
+            Some(Rect::new(10, 2, 1, 20))
+        );
+        assert_eq!(scrollbar_hit_rect(Rect::new(10, 2, 0, 20)), None);
+    }
+
+    #[test]
     fn conversation_scrollbar_renders_only_thumb() {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -6496,6 +6583,21 @@ mod tests {
             !rendered.contains('║'),
             "scrollbar track must stay hidden: {rendered}"
         );
+    }
+
+    #[test]
+    fn markdown_tool_copy_uses_longer_fences() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("shell"),
+            input_json: Arc::<str>::from(r#"{"command":"echo ```"}"#),
+            result: Some(Arc::<str>::from("before\n```\nafter")),
+        };
+
+        let text = markdown_clipboard_text(&entry);
+
+        assert!(text.contains("````json\n"), "input fence too short: {text}");
+        assert!(text.contains("````\nbefore\n```\nafter\n````"));
     }
 
     #[test]

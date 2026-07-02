@@ -369,7 +369,7 @@ zc-chat-approval-action-edit = Editar
 zc-chat-clipboard-you = Tú: { $text }
 zc-chat-clipboard-agent = Agente: { $text }
 zc-chat-action-copy = copy
-zc-chat-action-copy-md = cpmd
+zc-chat-action-copy-md = md
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = Copiado al portapapeles
 zc-chat-copied-markdown = Markdown copiado al portapapeles

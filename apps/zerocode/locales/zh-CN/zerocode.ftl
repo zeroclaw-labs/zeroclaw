@@ -369,7 +369,7 @@ zc-chat-approval-action-edit = 编辑
 zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-action-copy = copy
-zc-chat-action-copy-md = cpmd
+zc-chat-action-copy-md = md
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = 已复制到剪贴板
 zc-chat-copied-markdown = 已复制 Markdown 到剪贴板

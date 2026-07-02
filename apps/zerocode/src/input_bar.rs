@@ -1173,12 +1173,18 @@ impl InputBarState {
         }
 
         // Input bar interactions.
-        if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
+        let input_content_area = Rect::new(
+            self.last_input_area.x,
+            self.last_input_area.y.saturating_add(1),
+            self.last_input_area.width,
+            self.last_input_area.height.saturating_sub(1),
+        );
+        if !mouse::in_rect(mouse.column, mouse.row, input_content_area) {
             return false;
         }
 
-        let inner_x = mouse.column.saturating_sub(self.last_input_area.x);
-        let inner_y = mouse.row.saturating_sub(self.last_input_area.y + 1);
+        let inner_x = mouse.column.saturating_sub(input_content_area.x);
+        let inner_y = mouse.row.saturating_sub(input_content_area.y);
         let width = self.last_inner_width;
 
         match mouse.kind {
@@ -1883,6 +1889,42 @@ mod tests {
             !rendered.contains("?=help"),
             "bottom title overlaps compact input: {rendered}"
         );
+    }
+
+    #[test]
+    fn mouse_click_ignores_input_top_border() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        bar.last_input_area = Rect::new(10, 5, 20, 2);
+        bar.last_inner_width = 20;
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(!bar.handle_mouse(click));
+        assert_eq!(bar.cursor(), 5);
+    }
+
+    #[test]
+    fn mouse_click_content_maps_to_text_cell() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        bar.last_input_area = Rect::new(10, 5, 20, 2);
+        bar.last_inner_width = 20;
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(bar.handle_mouse(click));
+        assert_eq!(bar.cursor(), 2);
     }
 
     #[test]

@@ -369,7 +369,7 @@ zc-chat-approval-action-edit = 編集
 zc-chat-clipboard-you = あなた: { $text }
 zc-chat-clipboard-agent = エージェント: { $text }
 zc-chat-action-copy = copy
-zc-chat-action-copy-md = cpmd
+zc-chat-action-copy-md = md
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = クリップボードにコピーしました
 zc-chat-copied-markdown = Markdown をクリップボードにコピーしました

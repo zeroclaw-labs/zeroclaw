@@ -40,7 +40,7 @@ struct CronTriggerUpdate {
 
 // ── Tab enum ─────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Overview,
     Sessions,
@@ -2242,7 +2242,7 @@ impl Dashboard {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(
+    pub(crate) async fn handle_mouse(
         &mut self,
         evt: MouseEvent,
         _content_area: Rect,
@@ -2275,6 +2275,7 @@ impl Dashboard {
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
                     self.tab = TABS[idx];
+                    self.on_tab_change();
                     return None;
                 }
 
@@ -2282,18 +2283,25 @@ impl Dashboard {
                 if mouse::in_rect(col, row, self.list_area) && self.has_detail_pane() {
                     let count = self.active_list_count();
                     let list_area = self.list_area;
-                    let state = self.active_list_state_mut();
-                    if let Some(idx) =
-                        mouse::list_click_index(row, list_area, state.offset(), count)
-                    {
-                        state.select(Some(idx));
-                        if self.detail_open {
-                            self.detail_scroll = 0;
-                        }
-                        if self.double_click.click(col, row) {
-                            self.detail_open = true;
-                            self.detail_scroll = 0;
-                            self.detail_pct = 50;
+                    let offset = self.active_list_state().offset();
+                    let click_result = handle_detail_list_click(
+                        col,
+                        row,
+                        list_area,
+                        count,
+                        offset,
+                        self.detail_open,
+                        self.detail_scroll,
+                        self.detail_pct,
+                        &mut self.double_click,
+                    );
+                    if let Some(result) = click_result {
+                        self.active_list_state_mut().select(Some(result.index));
+                        self.detail_open = result.detail_open;
+                        self.detail_scroll = result.detail_scroll;
+                        self.detail_pct = result.detail_pct;
+                        if result.should_load_detail {
+                            self.on_selection_change().await;
                         }
                     }
                 }
@@ -2303,9 +2311,13 @@ impl Dashboard {
                 if mouse::in_rect(col, row, self.list_area) {
                     let count = self.active_list_count();
                     let state = self.active_list_state_mut();
-                    let i = state.selected().unwrap_or(0);
-                    let new_i = mouse::list_scroll(i, count, up, 3);
-                    state.select(Some(new_i));
+                    let index = state.selected().unwrap_or(0);
+                    let new_index = mouse::list_scroll(index, count, up, 3);
+                    state.select(Some(new_index));
+                    if self.detail_open {
+                        self.detail_scroll = 0;
+                        self.on_selection_change().await;
+                    }
                 } else if let Some(detail) = self.detail_area
                     && mouse::in_rect(col, row, detail)
                 {
@@ -2367,13 +2379,23 @@ impl Dashboard {
         )
     }
 
+    fn active_list_state(&self) -> &ListState {
+        match self.tab {
+            Tab::Sessions => &self.session_state,
+            Tab::Agents => &self.agent_state,
+            Tab::Memories => &self.memory_state,
+            Tab::Cron => &self.cron_state,
+            _ => &self.session_state,
+        }
+    }
+
     fn active_list_state_mut(&mut self) -> &mut ListState {
         match self.tab {
             Tab::Sessions => &mut self.session_state,
             Tab::Agents => &mut self.agent_state,
             Tab::Memories => &mut self.memory_state,
             Tab::Cron => &mut self.cron_state,
-            _ => &mut self.session_state, // fallback
+            _ => &mut self.session_state,
         }
     }
 
@@ -2510,6 +2532,45 @@ impl crate::widgets::HelpContext for Dashboard {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailListClickResult {
+    index: usize,
+    detail_open: bool,
+    detail_scroll: u16,
+    detail_pct: u16,
+    should_load_detail: bool,
+}
+
+fn handle_detail_list_click(
+    col: u16,
+    row: u16,
+    list_area: Rect,
+    count: usize,
+    offset: usize,
+    mut detail_open: bool,
+    mut detail_scroll: u16,
+    mut detail_pct: u16,
+    double_click: &mut mouse::DoubleClickTracker,
+) -> Option<DetailListClickResult> {
+    let index = mouse::list_click_index(row, list_area, offset, count)?;
+    let was_detail_open = detail_open;
+    if was_detail_open {
+        detail_scroll = 0;
+    }
+    if double_click.click(col, row) {
+        detail_open = true;
+        detail_scroll = 0;
+        detail_pct = 50;
+    }
+    Some(DetailListClickResult {
+        index,
+        detail_open,
+        detail_scroll,
+        detail_pct,
+        should_load_detail: was_detail_open || detail_open,
+    })
+}
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
     let pad = 12usize.saturating_sub(label.len());
@@ -2827,6 +2888,86 @@ mod tests {
         let text = lines_text(&org_section_lines(Some(&org), None, 0.5));
         assert!(text.contains("Acme"), "org label: {text}");
         assert!(text.contains("1234"), "YTD cost: {text}");
+    }
+
+    #[test]
+    fn mouse_tab_change_runs_tab_cleanup() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (sender, _receiver) = tokio::sync::mpsc::channel::<String>(16);
+            let rpc = Arc::new(crate::jsonrpc::RpcOutbound::new(sender));
+            let client = Arc::new(RpcClient::with_rpc(rpc));
+            let mut dashboard = Dashboard::new(client, "local", false);
+            dashboard.tab = Tab::Sessions;
+            dashboard.detail_open = true;
+            dashboard.last_poll = Some(Instant::now());
+            dashboard.tab_area = Rect::new(0, 0, 80, 1);
+
+            let overview_width = crate::i18n::t(Tab::Overview.fluent_key()).chars().count() as u16;
+            let sessions_width = crate::i18n::t(Tab::Sessions.fluent_key()).chars().count() as u16;
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: overview_width + 3 + sessions_width + 3,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            dashboard.handle_mouse(event, Rect::new(0, 0, 80, 24)).await;
+
+            assert_eq!(dashboard.tab, Tab::Agents);
+            assert!(!dashboard.detail_open);
+            assert!(dashboard.last_poll.is_none());
+        });
+    }
+
+    #[test]
+    fn mouse_click_opened_detail_requests_lazy_load() {
+        let mut double_click = mouse::DoubleClickTracker::new();
+        let list_area = Rect::new(0, 0, 20, 5);
+
+        let first =
+            handle_detail_list_click(1, 1, list_area, 3, 0, false, 7, 30, &mut double_click)
+                .expect("click inside list");
+        assert_eq!(first.index, 0);
+        assert!(!first.should_load_detail);
+
+        let second = handle_detail_list_click(
+            1,
+            1,
+            list_area,
+            3,
+            0,
+            first.detail_open,
+            first.detail_scroll,
+            first.detail_pct,
+            &mut double_click,
+        )
+        .expect("double-click inside list");
+        assert!(second.should_load_detail);
+        assert!(second.detail_open);
+        assert_eq!(second.detail_scroll, 0);
+        assert_eq!(second.detail_pct, 50);
+    }
+
+    #[test]
+    fn mouse_selection_change_with_open_detail_requests_lazy_load() {
+        let mut double_click = mouse::DoubleClickTracker::new();
+        let result = handle_detail_list_click(
+            1,
+            2,
+            Rect::new(0, 0, 20, 5),
+            3,
+            0,
+            true,
+            7,
+            50,
+            &mut double_click,
+        )
+        .expect("click inside list");
+
+        assert_eq!(result.index, 1);
+        assert!(result.should_load_detail);
+        assert_eq!(result.detail_scroll, 0);
     }
 
     #[test]
