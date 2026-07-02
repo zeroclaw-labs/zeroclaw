@@ -216,6 +216,10 @@ impl HasPropKind for Vec<crate::schema::ClassificationRule> {
 }
 impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::EmbeddingRouteConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -229,8 +233,18 @@ impl HasPropKind for Vec<crate::schema::McpServerConfig> {
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::ModelRouteConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for crate::schema::DelegateExecutionMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for Vec<crate::schema::DelegateTargetConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
@@ -592,6 +606,89 @@ impl SecretField for Option<String> {
 
     fn is_set(&self) -> bool {
         self.as_ref().is_some_and(|v| !v.is_empty())
+    }
+}
+
+impl SecretField for std::path::PathBuf {
+    fn mask(&mut self) {
+        let mut s = self.to_string_lossy().into_owned();
+        if !s.is_empty() {
+            s.mask();
+            *self = std::path::PathBuf::from(s);
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        let mut s = self.to_string_lossy().into_owned();
+        let cur = current.to_string_lossy().into_owned();
+        s.restore_from(&cur);
+        *self = std::path::PathBuf::from(s);
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.to_string_lossy().into_owned();
+        s.encrypt_in_place(store, field)?;
+        *self = std::path::PathBuf::from(s);
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.to_string_lossy().into_owned();
+        s.decrypt_in_place(store, field)?;
+        *self = std::path::PathBuf::from(s);
+        Ok(())
+    }
+
+    fn is_set(&self) -> bool {
+        !self.as_os_str().is_empty()
+    }
+}
+
+impl SecretField for Option<std::path::PathBuf> {
+    fn mask(&mut self) {
+        if let Some(inner) = self {
+            inner.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        if let (Some(inner), Some(cur)) = (self.as_mut(), current.as_ref()) {
+            inner.restore_from(cur);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.encrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.decrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.as_ref().is_some_and(|v| !v.as_os_str().is_empty())
     }
 }
 

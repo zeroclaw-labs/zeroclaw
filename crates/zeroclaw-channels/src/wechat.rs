@@ -1292,9 +1292,13 @@ impl WeChatChannel {
             .upload_to_cdn(&upload_param, &filekey, &ciphertext)
             .await?;
 
+        // CDNMedia `aes_key` must be base64(hex(key)).
+        // WeChat client base64-decodes then hex-decodes to recover the 16 bytes.
+        let aes_key_base64 = base64::engine::general_purpose::STANDARD.encode(hex::encode(aes_key));
+
         Ok(UploadedWeChatMedia {
             encrypted_query_param,
-            aes_key_base64: base64::engine::general_purpose::STANDARD.encode(aes_key),
+            aes_key_base64,
             raw_size: payload.bytes.len(),
             encrypted_size: ciphertext.len(),
         })
@@ -1990,6 +1994,10 @@ impl Channel for WeChatChannel {
         "wechat"
     }
 
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let recipient = &message.recipient;
         let content = crate::util::strip_tool_call_tags(&message.content);
@@ -2281,6 +2289,8 @@ impl Channel for WeChatChannel {
                     interruption_scope_id: None,
                     attachments: Vec::new(),
                     subject: None,
+
+                    ..Default::default()
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2369,6 +2379,59 @@ impl Channel for WeChatChannel {
         if let Some(handle) = guard.take() {
             handle.abort();
         }
+        Ok(())
+    }
+
+    async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
+        // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
+        //
+        // Current behavior: Return draft_id without sending placeholder.
+        // The final response will be sent in finalize_draft().
+        let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
+        Ok(Some(draft_id))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        _draft_id: &str,
+        _content: &str,
+    ) -> anyhow::Result<()> {
+        // WeChat iLink doesn't support message editing.
+        // We accumulate deltas in the draft_updater task and only send the final
+        // message in finalize_draft(). This method is a no-op.
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        _draft_id: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        // Send the final accumulated response
+        let result = self
+            .send(&SendMessage::new(
+                content.to_string(),
+                recipient.to_string(),
+            ))
+            .await;
+        let _ = self.stop_typing(recipient).await; // Always stop the typing indicator
+        result
+    }
+
+    async fn cancel_draft(&self, recipient: &str, _draft_id: &str) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        _draft_id: &str,
+        _progress: &str,
+    ) -> anyhow::Result<()> {
+        // Use the typing indicator instead of message updates
+        let _ = self.start_typing(recipient).await;
         Ok(())
     }
 }
@@ -2587,12 +2650,22 @@ mod tests {
 
     #[test]
     fn parse_aes_key_accepts_hex_and_base64() {
-        let raw = *b"0123456789abcdef";
+        let raw: [u8; 16] = *b"0123456789abcdef";
         let hex_key = hex::encode(raw);
         let base64_key = base64::engine::general_purpose::STANDARD.encode(raw);
 
+        // Inbound accepts plain hex and base64(raw bytes).
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
+
+        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
+        // official @tencent-weixin/openclaw-weixin client (base64-decode then
+        // hex-decode back to 16 bytes). Encoding raw bytes directly is
+        // undecryptable by the client ("image expired"), so it must NOT equal
+        // base64(raw) and must round-trip through the same parser.
+        let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
+        assert_ne!(outbound, base64_key);
+        assert_eq!(parse_aes_key(&outbound).unwrap(), raw);
     }
 
     #[test]

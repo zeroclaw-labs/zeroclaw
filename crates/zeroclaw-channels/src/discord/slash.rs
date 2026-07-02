@@ -994,7 +994,7 @@ Write it.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), md).unwrap();
 
-        let skills = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
+        let (skills, _) = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
         let specs = discord_slash_specs_from_skills(&skills);
         assert_eq!(
             specs.len(),

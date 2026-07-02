@@ -1,6 +1,5 @@
 import { getToken } from './auth';
-import { apiOrigin, basePath } from './basePath';
-import { isTauri } from './tauri';
+import { basePath } from './basePath';
 
 export type JsonRpcId = number | string;
 
@@ -87,9 +86,6 @@ const ACP_PROTOCOL = 'zeroclaw.acp.v1';
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 
 function acpWebSocketBaseUrl(): string {
-  if (isTauri() && apiOrigin) {
-    return apiOrigin.replace(/^http/, 'ws');
-  }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}`;
 }
