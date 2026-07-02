@@ -48,7 +48,8 @@ Do not include any text outside the JSON object."#;
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .expect("media-tag regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }

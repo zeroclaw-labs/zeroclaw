@@ -270,6 +270,22 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+    if pinned_section.is_empty() {
+        return;
+    }
+    deferred_section.push_str("\n\n");
+    deferred_section.push_str(pinned_section);
+}
+
 /// Register an eager MCP tool wrapper into `tools` (and the delegate handle,
 /// when present) only if `policy` admits it. Returns `true` when the tool was
 /// registered, `false` when the policy dropped it.
@@ -1309,6 +1325,7 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
+            None,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1431,6 +1448,12 @@ pub async fn run(
                             mcp_policy.as_ref(),
                         );
                     }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -1530,6 +1553,10 @@ pub async fn run(
                             )
                         );
                     }
+                    // Append pinned MCP resources unconditionally, after both the
+                    // deferred and eager branches, so the deferred-path reassignment
+                    // of `deferred_section` does not clobber them.
+                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -1927,9 +1954,12 @@ pub async fn run(
                 thinking_params.system_prompt_prefix.as_deref(),
             )?;
 
+            let excluded_tool_names: HashSet<&str> =
+                excluded_tools.iter().map(String::as_str).collect();
             let runtime_capability_names = tools_registry
                 .iter()
                 .map(|tool| tool.name())
+                .filter(|name| !excluded_tool_names.contains(*name))
                 .collect::<Vec<_>>();
             if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                 &effective_msg,
@@ -2398,9 +2428,12 @@ pub async fn run(
                     &effective_input,
                 );
 
+                let excluded_tool_names: HashSet<&str> =
+                    excluded_tools.iter().map(String::as_str).collect();
                 let runtime_capability_names = tools_registry
                     .iter()
                     .map(|tool| tool.name())
+                    .filter(|name| !excluded_tool_names.contains(*name))
                     .collect::<Vec<_>>();
                 if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                     &effective_input,
@@ -3006,6 +3039,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
+            None,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
@@ -3090,6 +3124,12 @@ pub async fn process_message(
                             mcp_policy_pm.as_ref(),
                         );
                     }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy_pm.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -3186,6 +3226,10 @@ pub async fn process_message(
                             )
                         );
                     }
+                    // Append pinned MCP resources unconditionally, after both the
+                    // deferred and eager branches, so the deferred-path reassignment
+                    // of `deferred_section` does not clobber them.
+                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -3578,7 +3622,7 @@ mod tests {
         seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
-    use crate::agent::tool_execution::execute_one_tool;
+    use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3588,6 +3632,33 @@ mod tests {
     };
     use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
+
+    fn extract_sop_started_run_id(content: &str) -> Option<String> {
+        content
+            .split("SOP run started: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(str::to_string)
+    }
+
+    fn sop_started_run_id_from_history(history: &[ChatMessage]) -> Option<String> {
+        history.iter().find_map(|msg| {
+            if let Some(content) = msg.content.strip_prefix("[Tool results]\n")
+                && let Some(run_id) = extract_sop_started_run_id(content)
+            {
+                return Some(run_id);
+            }
+
+            if msg.role == "tool"
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(content) = value.get("content").and_then(|content| content.as_str())
+            {
+                return extract_sop_started_run_id(content);
+            }
+
+            extract_sop_started_run_id(&msg.content)
+        })
+    }
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -4071,8 +4142,11 @@ mod tests {
             "unknown_tool",
             call_arguments,
             None,
-            &[],
-            None,
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4110,8 +4184,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4155,8 +4232,11 @@ mod tests {
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
-            &[],
-            Some(&activated),
+            ToolDispatchContext {
+                tools_registry: &[],
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4185,8 +4265,11 @@ mod tests {
             "empty_success",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -4236,8 +4319,11 @@ mod tests {
             "credential_output",
             serde_json::json!({}),
             None,
-            &tools,
-            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
             &meta,
             &observer,
             None,
@@ -6358,13 +6444,8 @@ mod tests {
         .expect("live SOP execution should complete");
 
         assert_eq!(result, "outer done");
-        let started = history
-            .iter()
-            .find_map(|msg| msg.content.strip_prefix("[Tool results]\n"))
-            .and_then(|content| content.split("SOP run started: ").nth(1))
-            .and_then(|rest| rest.lines().next())
-            .expect("sop_execute tool result should include a run id")
-            .to_string();
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
         let engine = engine.lock().unwrap();
         let run = engine
             .get_run(&started)
@@ -6373,6 +6454,168 @@ mod tests {
         assert_eq!(run.step_results.len(), 2);
         assert_eq!(run.step_results[0].output, "step one done");
         assert_eq!(run.step_results[1].output, "step two done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "outer-sop".to_string(),
+                        name: "sop_execute".to_string(),
+                        arguments: r#"{"name":"scoped-sop"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-denied".to_string(),
+                        name: "denied_tool".to_string(),
+                        arguments: r#"{"value":"blocked"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("step recovered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("outer done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let sop = crate::sop::Sop {
+            name: "scoped-sop".to_string(),
+            description: "scoped sop".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![crate::sop::SopStep {
+                number: 1,
+                title: "Scoped".to_string(),
+                body: "Use only allowed tools".to_string(),
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["allowed_tool".to_string()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+            step_scope_enforce: true,
+            ..zeroclaw_config::schema::SopConfig::default()
+        });
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let allowed_invocations = Arc::new(AtomicUsize::new(0));
+        let denied_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+            Box::new(CountingTool::new(
+                "allowed_tool",
+                Arc::clone(&allowed_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "denied_tool",
+                Arc::clone(&denied_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the scoped sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("scoped SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+        assert!(
+            history.iter().any(|msg| msg
+                .content
+                .contains("Tool not available in this turn: denied_tool")),
+            "denied tool call should be recorded as unavailable in history: {history:?}"
+        );
+
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable after completion");
+        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+        assert_eq!(run.step_results.len(), 1);
+        assert_eq!(run.step_results[0].output, "step recovered");
     }
 
     /// Regression: a native provider emitting multiple parallel tool calls
@@ -9697,6 +9940,90 @@ This is an example, not an invocation."#;
         assert!(
             !visible_deltas.contains("<tool_call"),
             "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    // Gemini 2.5 Flash emits text alongside its XML tool calls: a ``tool_code``
+    // Python block + hallucinated result + premature prose in the same response
+    // turn. None of that text should reach the user — only the final clean reply
+    // (iteration with no tool calls) should be accumulated.
+    #[tokio::test]
+    async fn parsed_tool_call_iteration_text_is_suppressed() {
+        let gemini_turn1 = concat!(
+            "<tool_call>\n",
+            "{\"name\":\"count_tool\",\"arguments\":{\"value\":\"A\"}}\n",
+            "</tool_call>\n",
+            "```tool_code\nprint(count_tool(value='A'))\n```\n",
+            "```\n{\"result\": \"counted:ok\"}\n```\n",
+            "I already have the answer, it is counted:ok.",
+        );
+        let provider = ScriptedModelProvider::from_text_responses(vec![gemini_turn1, "done"]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("should complete");
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "tool should run once"
+        );
+        assert_eq!(
+            result, "done",
+            "hallucinated text from tool-call iteration must be suppressed; got: {result:?}"
         );
     }
 
@@ -14225,6 +14552,50 @@ Let me check the result."#;
             ),
             0,
             "deferred MCP must not register tool_search when policy admits no MCP stubs"
+        );
+    }
+
+    #[test]
+    fn pinned_section_survives_deferred_loading_reassignment() {
+        // Regression for the loop_.rs clobber bug (PR #8508 review): the
+        // pinned-resources block must reach the prompt even under
+        // `deferred_loading = true`, where the deferred branch reassigns
+        // `deferred_section` with `=`. The fix appends pins AFTER that branch
+        // via `append_pinned_mcp_section`; this test pins that ordering.
+        let pinned = "## Pinned MCP Resources\n\n\
+            <mcp-resource server=\"docs\" uri=\"docs__file:///handbook.md\" \
+            mime=\"text/plain\" trust=\"untrusted-external\">\nhandbook body\n</mcp-resource>\n";
+
+        // Emulate the production statement order for the deferred path.
+        // (build_pinned_resources_section result is captured first in `run()`)
+        let pinned_section = pinned.to_string();
+        // deferred_loading == true branch reassigns the section (as
+        // build_deferred_tools_section_filtered does), dropping prior content.
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+        // The fix: append pins AFTER the branch.
+        super::append_pinned_mcp_section(&mut deferred_section, &pinned_section);
+
+        assert!(
+            deferred_section.contains("## Pinned MCP Resources"),
+            "pinned section must survive the deferred-loading reassignment, got: {deferred_section}"
+        );
+        assert!(
+            deferred_section.contains("trust=\"untrusted-external\""),
+            "provenance-wrapped pinned content must reach the prompt under deferred_loading"
+        );
+        assert!(
+            deferred_section.contains("## Deferred MCP Tools"),
+            "the deferred tools section must also remain present"
+        );
+    }
+
+    #[test]
+    fn append_pinned_mcp_section_is_noop_for_empty() {
+        let mut section = "## Deferred MCP Tools".to_string();
+        super::append_pinned_mcp_section(&mut section, "");
+        assert_eq!(
+            section, "## Deferred MCP Tools",
+            "empty pinned section must not alter the accumulator"
         );
     }
 

@@ -108,8 +108,10 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
+    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -509,6 +511,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ..
         } = iteration_tool_specs;
 
+        // ── Per-turn system prompt anchor refresh (#8054 Surface 3) ──
+        // The system prompt in `history[0]` was built by
+        // `Agent::build_system_prompt()` against the base provider, and
+        // may not reflect this iteration's `active_model_provider` after
+        // vision routing.  Swap the TASK_FRAMING anchor so the prompt's
+        // tool-availability claim matches the actual `request_tools`.
+        refresh_prompt_anchor(history, use_native_tools);
+
         let prepared_messages = prepare_messages_for_iteration(
             history,
             multimodal_config,
@@ -843,10 +853,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
-                    execute_tools_parallel(
-                        &executable_calls,
+                    let dispatch = ToolDispatchContext {
                         tools_registry,
                         activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_parallel(
+                        &executable_calls,
+                        dispatch,
                         &meta,
                         observer,
                         cancellation_token.as_ref(),
@@ -856,10 +870,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     .await
                 } else {
                     let meta = ctx.meta();
-                    execute_tools_sequential(
-                        &executable_calls,
+                    let dispatch = ToolDispatchContext {
                         tools_registry,
                         activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_sequential(
+                        &executable_calls,
+                        dispatch,
                         &meta,
                         observer,
                         cancellation_token.as_ref(),
@@ -1056,6 +1074,91 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     .await
 }
 
+fn collect_callable_tool_names(
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Vec<String> {
+    let mut names = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    if let Some(activated) = activated_tools {
+        let activated = match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "activated-tool lock poisoned while resolving SOP step scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        names.extend(activated.tool_names().into_iter().map(String::from));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn push_excluded_tool(excluded_tools: &mut Vec<String>, tool: impl Into<String>) {
+    let tool = tool.into();
+    if !excluded_tools
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&tool))
+    {
+        excluded_tools.push(tool);
+    }
+}
+
+fn sop_step_excluded_tools(
+    queued: &crate::sop::executor::QueuedSopAction,
+    run_id: &str,
+    step: &crate::sop::SopStep,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
+) -> Vec<String> {
+    let mut scoped = excluded_tools.to_vec();
+    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+        push_excluded_tool(&mut scoped, tool);
+    }
+
+    let registry_names = collect_callable_tool_names(tools_registry, activated_tools);
+    let active_scope = {
+        let engine = match queued.engine.lock() {
+            Ok(engine) => engine,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+                    "SOP engine lock poisoned while resolving step tool scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        crate::sop::active_scope::resolve_active_step_scope(
+            run_id,
+            step,
+            engine.config(),
+            &registry_names,
+        )
+    };
+
+    if let Some(active_scope) = active_scope {
+        for tool in active_scope.excluded {
+            push_excluded_tool(&mut scoped, tool);
+        }
+    }
+    scoped.sort();
+    scoped
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
@@ -1096,7 +1199,7 @@ async fn drive_live_sop_actions(
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
-        let mut action = queued.action;
+        let mut action = queued.action.clone();
         loop {
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
@@ -1111,12 +1214,14 @@ async fn drive_live_sop_actions(
                         out.push(user_message);
                     }
 
-                    let mut sop_excluded_tools = excluded_tools.to_vec();
-                    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
-                        if !sop_excluded_tools.iter().any(|existing| existing == tool) {
-                            sop_excluded_tools.push(tool.to_string());
-                        }
-                    }
+                    let sop_excluded_tools = sop_step_excluded_tools(
+                        &queued,
+                        &run_id,
+                        &step,
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    );
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_output = Box::pin(run_tool_call_loop(ToolLoop {
@@ -1288,4 +1393,112 @@ async fn drive_live_sop_actions(
         }
     }
     Ok(())
+}
+
+/// Per-turn system prompt TASK_FRAMING anchor refresh (#8054 Surface 3).
+///
+/// The system prompt in `history[0]` was built by
+/// `Agent::build_system_prompt()` against the base provider, and may not
+/// reflect the iteration's `active_model_provider` after vision routing.
+/// This function surgically swaps the `NATIVE_TOOLS_TASK_FRAMING` /
+/// `NO_TOOLS_TASK_FRAMING` anchor so the prompt's tool-availability claim
+/// matches the actual `request_tools` for this iteration.
+///
+/// When neither anchor is present (custom `system_prompt_prefix`), the
+/// function is a no-op — same as the pre-existing behavior.
+fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
+    if let Some(first) = history.first_mut()
+        && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
+            || first.content.contains(NO_TOOLS_TASK_FRAMING))
+    {
+        let desired = if use_native_tools {
+            NATIVE_TOOLS_TASK_FRAMING
+        } else {
+            NO_TOOLS_TASK_FRAMING
+        };
+        first.content = first
+            .content
+            .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
+            .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+    }
+}
+
+#[cfg(test)]
+mod surface3_tests {
+    use super::*;
+    use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    fn make_system_prompt(anchor: &str) -> ChatMessage {
+        ChatMessage::system(format!(
+            "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
+        ))
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_native_to_no_tools_when_signal_drops() {
+        // When the per-turn signal is `use_native_tools = false` but the
+        // system prompt has NATIVE_TOOLS_TASK_FRAMING (the prompt was built
+        // against the base provider, but the active provider is non-native),
+        // the anchor must be replaced with NO_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NATIVE_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, false);
+        assert!(
+            history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must contain NO_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must not retain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_no_tools_to_native_when_signal_rises() {
+        // Reverse direction: when the per-turn signal flips to true,
+        // NO_TOOLS_TASK_FRAMING must be replaced with NATIVE_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NO_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, true);
+        assert!(
+            history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must contain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must not retain NO_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_anchor_already_matches() {
+        // Byte-stability: when the per-turn signal already matches the
+        // anchor in the prompt, the function must not mutate the content.
+        let original = make_system_prompt(NATIVE_TOOLS_TASK_FRAMING);
+        let mut history = vec![original.clone()];
+        refresh_prompt_anchor(&mut history, true);
+        assert_eq!(
+            history[0].content, original.content,
+            "content must be identical when anchor already matches signal"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_no_anchor_present() {
+        // Custom system_prompt_prefix: when neither anchor is present,
+        // the function must not touch the prompt at all.
+        let custom_prompt = "You are a custom agent. Answer concisely.".to_string();
+        let mut history = vec![ChatMessage::system(custom_prompt.clone())];
+        refresh_prompt_anchor(&mut history, false);
+        assert_eq!(
+            history[0].content, custom_prompt,
+            "custom prompt without either anchor must be unchanged"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_noop_on_empty_history() {
+        // Edge case: empty history shouldn't panic.
+        let mut history: Vec<ChatMessage> = Vec::new();
+        refresh_prompt_anchor(&mut history, false);
+        // Just verifying no panic.
+    }
 }

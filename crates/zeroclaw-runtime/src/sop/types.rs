@@ -64,30 +64,104 @@ impl fmt::Display for SopExecutionMode {
     }
 }
 
+// ── Filesystem event kind ───────────────────────────────────────
+
+/// A normalized filesystem change kind reported by the watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum FilesystemEventKind {
+    Created,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl fmt::Display for FilesystemEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
+            Self::Renamed => write!(f, "renamed"),
+        }
+    }
+}
+
+impl std::str::FromStr for FilesystemEventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| ())
+    }
+}
+
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SopTrigger {
+    /// MQTT message arrival. Live: delivered by the MQTT listener.
     Mqtt {
+        /// Topic filter. `+` matches one level, `#` matches the remaining levels.
         topic: String,
+        /// Optional expression evaluated against the message payload; the run
+        /// starts only when it holds.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
     Webhook {
+        /// Request path matched exactly against the event path.
         path: String,
     },
+    /// Time-based firing. Defined and matched, but no scheduler feeds it.
     Cron {
+        /// Cron expression evaluated over the run window.
         expression: String,
     },
+    /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
     Peripheral {
+        /// Board identifier the signal originates from.
         board: String,
+        /// Signal name on the board; matched as `board/signal`.
         signal: String,
+        /// Optional expression evaluated against the signal payload.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Filesystem change. Live: delivered by the filesystem watcher.
+    Filesystem {
+        /// Path glob (`*`, `**`, `?`); a bare directory matches anything under it.
+        path: String,
+        /// Change kinds to match; empty matches every kind.
+        #[serde(default)]
+        events: Vec<FilesystemEventKind>,
+        /// Optional expression evaluated against the change payload.
+        #[serde(default)]
+        condition: Option<String>,
+    },
+    /// Calendar event state. Defined and matched, but no poller feeds it live.
+    Calendar {
+        /// Calendar source identifier the event originates from.
+        calendar_source: String,
+        /// Calendar IDs to scope to; empty matches all of the source's calendars.
+        #[serde(default)]
+        calendar_ids: Vec<String>,
+    },
+    /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
+    /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
+    Amqp {
+        /// Routing-key filter (topic-exchange semantics): `.`-delimited words,
+        /// `*` matches one word, `#` matches zero or more words.
+        routing_key: String,
+        /// Optional expression evaluated against the delivery body.
+        #[serde(default)]
+        condition: Option<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -97,7 +171,12 @@ impl fmt::Display for SopTrigger {
             Self::Webhook { path } => write!(f, "webhook:{path}"),
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
+            Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
+            Self::Calendar {
+                calendar_source, ..
+            } => write!(f, "calendar:{calendar_source}"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
         }
     }
 }
@@ -279,7 +358,10 @@ pub enum SopTriggerSource {
     Webhook,
     Cron,
     Peripheral,
+    Filesystem,
+    Calendar,
     Manual,
+    Amqp,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -289,7 +371,10 @@ impl fmt::Display for SopTriggerSource {
             Self::Webhook => write!(f, "webhook"),
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
+            Self::Filesystem => write!(f, "filesystem"),
+            Self::Calendar => write!(f, "calendar"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp => write!(f, "amqp"),
         }
     }
 }
@@ -373,6 +458,9 @@ pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
     pub trigger_event: SopEvent,
+    /// Stable per-run boundary marker for untrusted trigger framing.
+    #[serde(default)]
+    pub frame_marker_id: String,
     pub status: SopRunStatus,
     pub current_step: u32,
     pub total_steps: u32,
@@ -504,6 +592,12 @@ mod tests {
         };
         assert_eq!(mqtt.to_string(), "mqtt:sensors/temp");
 
+        let calendar = SopTrigger::Calendar {
+            calendar_source: "microsoft365".into(),
+            calendar_ids: vec!["primary".into()],
+        };
+        assert_eq!(calendar.to_string(), "calendar:microsoft365");
+
         let manual = SopTrigger::Manual;
         assert_eq!(manual.to_string(), "manual");
     }
@@ -525,6 +619,40 @@ mod tests {
     }
 
     #[test]
+    fn calendar_trigger_serde_roundtrip() {
+        let trigger = SopTrigger::Calendar {
+            calendar_source: "microsoft365".into(),
+            calendar_ids: vec!["primary".into()],
+        };
+
+        let json = serde_json::to_string(&trigger).unwrap();
+        let parsed: SopTrigger = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, trigger);
+        assert_eq!(SopTriggerSource::Calendar.to_string(), "calendar");
+        assert_eq!(
+            serde_json::to_string(&SopTriggerSource::Calendar).unwrap(),
+            "\"calendar\""
+        );
+    }
+
+    #[test]
+    fn calendar_trigger_toml_roundtrip() {
+        let toml_str = r#"
+type = "calendar"
+calendar_source = "microsoft365"
+calendar_ids = ["primary", "team"]
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+
+        assert!(
+            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids }
+                if calendar_source == "microsoft365"
+                    && calendar_ids.as_slice() == ["primary", "team"])
+        );
+    }
+
+    #[test]
     fn trigger_toml_roundtrip() {
         let toml_str = r#"
 type = "mqtt"
@@ -542,6 +670,69 @@ condition = "$.value > 85"
         let toml_str = r#"type = "manual""#;
         let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
         assert_eq!(trigger, SopTrigger::Manual);
+    }
+
+    #[test]
+    fn trigger_filesystem_toml_roundtrip() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox/**/*.json"
+events = ["created", "modified"]
+condition = "$.extension == \"json\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        match trigger {
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            } => {
+                assert_eq!(path, "/var/inbox/**/*.json");
+                assert_eq!(
+                    events,
+                    vec![FilesystemEventKind::Created, FilesystemEventKind::Modified]
+                );
+                assert_eq!(condition.as_deref(), Some(r#"$.extension == "json""#));
+            }
+            other => panic!("expected Filesystem trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_filesystem_defaults_events_empty() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Filesystem { ref events, ref condition, .. } if events.is_empty() && condition.is_none())
+        );
+    }
+
+    #[test]
+    fn filesystem_event_kind_display_and_serde() {
+        assert_eq!(FilesystemEventKind::Created.to_string(), "created");
+        assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
+        let json = serde_json::to_string(&FilesystemEventKind::Deleted).unwrap();
+        assert_eq!(json, "\"deleted\"");
+        let parsed: FilesystemEventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, FilesystemEventKind::Deleted);
+    }
+
+    #[test]
+    fn trigger_filesystem_display() {
+        let trigger = SopTrigger::Filesystem {
+            path: "/var/inbox/*.json".into(),
+            events: vec![FilesystemEventKind::Created],
+            condition: None,
+        };
+        assert_eq!(trigger.to_string(), "filesystem:/var/inbox/*.json");
+    }
+
+    #[test]
+    fn trigger_source_filesystem_display() {
+        assert_eq!(SopTriggerSource::Filesystem.to_string(), "filesystem");
     }
 
     #[test]
@@ -692,6 +883,7 @@ path = "/sop/test"
                 payload: None,
                 timestamp: "2026-02-19T12:00:00Z".into(),
             },
+            frame_marker_id: "marker-run-001".into(),
             status: SopRunStatus::Running,
             current_step: 2,
             total_steps: 5,

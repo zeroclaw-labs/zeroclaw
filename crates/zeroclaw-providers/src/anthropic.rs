@@ -3,6 +3,7 @@ use crate::traits::{
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
@@ -843,11 +844,11 @@ impl AnthropicModelProvider {
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest) -> serde_json::Value {
-        let mut body =
-            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
+    fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(request)
+            .context("Failed to serialize NativeChatRequest to JSON")?;
         body["stream"] = serde_json::Value::Bool(true);
-        body
+        Ok(body)
     }
 
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
@@ -1609,7 +1610,13 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
         };
 
-        let body = Self::build_streaming_request(&native_request);
+        let body = match Self::build_streaming_request(&native_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
+                    .boxed();
+            }
+        };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);

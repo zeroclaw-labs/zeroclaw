@@ -325,7 +325,7 @@ async fn channel_draft_defaults() {
     );
     assert!(
         channel
-            .finalize_draft("target", "msg_1", "final")
+            .finalize_draft("target", "msg_1", "final", false)
             .await
             .is_ok()
     );

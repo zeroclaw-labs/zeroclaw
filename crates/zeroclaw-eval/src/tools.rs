@@ -60,3 +60,64 @@ impl Tool for EchoTool {
 pub fn default_tools() -> Vec<Box<dyn Tool>> {
     vec![Box::new(EchoTool)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+
+    #[test]
+    fn echo_tool_name_and_alias() {
+        let t = EchoTool;
+        assert_eq!(t.name(), "echo");
+        assert_eq!(t.alias(), "echo");
+    }
+
+    #[test]
+    fn echo_tool_role_is_plugin() {
+        let t = EchoTool;
+        assert_eq!(t.role(), Role::Tool(ToolKind::Plugin));
+    }
+
+    #[test]
+    fn echo_tool_description_is_non_empty() {
+        assert!(!EchoTool.description().is_empty());
+    }
+
+    #[test]
+    fn echo_tool_parameters_schema_has_message_property() {
+        let schema = EchoTool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["message"].is_object());
+    }
+
+    #[tokio::test]
+    async fn echo_tool_execute_returns_message() {
+        let args = serde_json::json!({ "message": "hello world" });
+        let result = EchoTool
+            .execute(args)
+            .await
+            .expect("execute should succeed");
+        assert!(result.success);
+        assert_eq!(result.output, "hello world");
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn echo_tool_execute_missing_message_uses_default() {
+        let args = serde_json::json!({});
+        let result = EchoTool
+            .execute(args)
+            .await
+            .expect("execute should succeed");
+        assert!(result.success);
+        assert_eq!(result.output, "(empty)");
+    }
+
+    #[test]
+    fn default_tools_contains_echo() {
+        let tools = default_tools();
+        assert!(!tools.is_empty());
+        assert!(tools.iter().any(|t| t.name() == "echo"));
+    }
+}
