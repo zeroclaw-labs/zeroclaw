@@ -72,7 +72,7 @@ pub async fn handle_command(
                         .map_err(anyhow::Error::msg)?;
                 rendered.push((
                     format!("bundle: {b}"),
-                    load_skills_from_directory(&dir, allow_scripts),
+                    load_skills_from_directory(&dir, allow_scripts).0,
                 ));
             } else if let Some(ref a) = agent {
                 // Exactly what this agent loads at runtime — the same loader the
@@ -98,7 +98,7 @@ pub async fn handle_command(
                     ) {
                         rendered.push((
                             format!("bundle: {alias}"),
-                            load_skills_from_directory(&dir, allow_scripts),
+                            load_skills_from_directory(&dir, allow_scripts).0,
                         ));
                     }
                 }
