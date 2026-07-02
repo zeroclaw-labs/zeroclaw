@@ -111,6 +111,8 @@ accordingly: assume everything before install is untrusted transport.
 
 ## The publisher's checklist
 
+{{#include ../_snippets/plugin-wasm-binary-warning.md}}
+
 1. Finalize the manifest: name, version, capabilities, and the narrowest
    permission set the code uses.
 2. Build the component; for skill bundles, validate frontmatter on every
