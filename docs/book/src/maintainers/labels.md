@@ -73,6 +73,7 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `type:dependencies` | Dependency or lockfile maintenance |
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
+| `type:test` | Test-only or test-primary work |
 
 ## Path labels
 
@@ -140,9 +141,12 @@ Gateway subarea labels such as `gateway: api`, `gateway: sse`, `gateway:local_br
 
 Each channel gets a `channel:<name>` label in addition to the base `channel` label when the change touches channel crate paths. Cross-surface channel labels such as `channel:acp` may instead pair with the matching base surface label, such as `gateway`, `docs`, or app/web scope labels.
 
+`channel:core` is the shared channel API and orchestrator label. Use it for work on channel trait contracts, channel orchestration, delivery hooks, routing/session behavior, runtime-command handling, and cross-channel behavior that would be misleading under a single platform label.
+
 | Label | Matches |
 |---|---|
 | `channel:acp` | `acp_channel.rs`, `acp_server.rs`, `zeroclaw-acp-bridge.rs`, `acp_session_store.rs`, `channels/acp.md`, selected ACP gateway/app/web entrypoints |
+| `channel:core` | `crates/zeroclaw-api/src/channel.rs`, `crates/zeroclaw-channels/src/lib.rs`, `crates/zeroclaw-channels/src/orchestrator/**`, `src/channels/mod.rs` |
 | `channel:bluesky` | `bluesky.rs` |
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
