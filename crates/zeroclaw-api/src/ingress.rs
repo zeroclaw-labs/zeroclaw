@@ -45,6 +45,34 @@ pub enum Transport {
     Internal,
 }
 
+/// Who initiated an inbound turn: the provenance axis, orthogonal to
+/// [`SourceClass`] (the external/internal trust split) and [`Transport`]
+/// (the arrival path). Origin exists so per-origin turn policy (first
+/// consumer: memory-context injection) can distinguish top-level turns
+/// that want their own context from nested sub-turns that must not
+/// re-inject the parent's, without overloading the trust semantics that
+/// `ingress_policy` keys on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    /// An interactive operator session (CLI chat loop or one-shot run).
+    Interactive,
+    /// A turn dispatched by the channel orchestrator for a channel peer.
+    Channel,
+    /// A scheduled cron job turn.
+    Cron,
+    /// A daemon-initiated turn (heartbeat task pipeline).
+    Daemon,
+    /// A direct embedded `Agent::turn` call (library/API consumer).
+    AgentDirect,
+    /// A nested sub-turn inside a parent turn (delegate subagent, safety
+    /// net, skills review). Fail-closed default: sub-turns never receive
+    /// origin-gated behavior such as context injection, so an unstamped
+    /// or legacy envelope behaves like a sub-turn.
+    #[default]
+    SubTurn,
+}
+
 /// Trust class resolved for the turn's sender. Minimal for phase 1; peer-group
 /// resolution (the real source) is phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,25 +106,80 @@ pub struct IngressContext {
     pub transport: Transport,
     /// The resolved trust class of the sender.
     pub trust: TrustClass,
+    /// Who initiated the turn (see [`TurnOrigin`]). Serde-defaults to
+    /// [`TurnOrigin::SubTurn`] so envelopes serialized before this field
+    /// existed deserialize fail-closed (no origin-gated behavior).
+    #[serde(default)]
+    pub origin: TurnOrigin,
 }
 
 impl IngressContext {
-    /// The envelope for an internally driven, trusted turn (cron, SOP step,
-    /// subagent, or any phase-1 caller that has not yet stamped real identity).
-    ///
-    /// `source_class = Internal`, `trust = Trusted`, `transport = Internal`,
-    /// `sender = None`, `message_id = None`. Passing the layer with this
-    /// envelope dispositions to [`IngressDecision::Loop`] under the default
-    /// policy, so behavior is identical to a turn that never had an envelope.
-    #[must_use]
-    pub fn internal() -> Self {
+    /// The shared phase-1 envelope shape: `source_class = Internal`,
+    /// `trust = Trusted`, `transport = Internal`, `sender = None`,
+    /// `message_id = None`, with only the origin varying. Real
+    /// source/transport/trust stamping at the entry edge is phase 2
+    /// (tracker #8583); every constructor below keeps the phase-1
+    /// placeholders so trust-facing behavior is unchanged. Passing the
+    /// layer with any of these envelopes dispositions to
+    /// [`IngressDecision::Loop`] under the default policy.
+    fn phase1(origin: TurnOrigin) -> Self {
         Self {
             message_id: None,
             source_class: SourceClass::Internal,
             sender: None,
             transport: Transport::Internal,
             trust: TrustClass::Trusted,
+            origin,
         }
+    }
+
+    /// Envelope for an interactive operator turn (CLI chat loop, one-shot run).
+    #[must_use]
+    pub fn interactive() -> Self {
+        Self::phase1(TurnOrigin::Interactive)
+    }
+
+    /// Envelope for a turn the channel orchestrator dispatches for a channel
+    /// peer. Phase 1 keeps the placeholder source/transport/trust; the real
+    /// channel transport identity is stamped at the edge in phase 2.
+    #[must_use]
+    pub fn channel() -> Self {
+        Self::phase1(TurnOrigin::Channel)
+    }
+
+    /// Envelope for a scheduled cron job turn.
+    #[must_use]
+    pub fn cron() -> Self {
+        Self::phase1(TurnOrigin::Cron)
+    }
+
+    /// Envelope for a daemon-initiated turn (heartbeat task pipeline).
+    #[must_use]
+    pub fn daemon() -> Self {
+        Self::phase1(TurnOrigin::Daemon)
+    }
+
+    /// Envelope for a direct embedded `Agent::turn` call.
+    #[must_use]
+    pub fn agent_direct() -> Self {
+        Self::phase1(TurnOrigin::AgentDirect)
+    }
+
+    /// Envelope for a nested sub-turn inside a parent turn (delegate
+    /// subagent, safety net, skills review). Sub-turns never receive
+    /// origin-gated behavior such as context injection.
+    #[must_use]
+    pub fn sub_turn() -> Self {
+        Self::phase1(TurnOrigin::SubTurn)
+    }
+
+    /// Envelope for a turn whose origin is threaded in from the entry
+    /// point (e.g. `agent::run` / `process_message`, whose one body serves
+    /// several distinct entries: CLI, cron, daemon, subagent spawn).
+    /// Equivalent to the per-origin constructors above.
+    #[must_use]
+    pub fn from_origin(origin: TurnOrigin) -> Self {
+        Self::phase1(origin)
     }
 }
 
@@ -123,12 +206,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn internal_envelope_is_internal_and_trusted() {
-        let ctx = IngressContext::internal();
+    fn sub_turn_envelope_is_internal_and_trusted() {
+        let ctx = IngressContext::sub_turn();
         assert_eq!(ctx.source_class, SourceClass::Internal);
         assert_eq!(ctx.trust, TrustClass::Trusted);
         assert_eq!(ctx.transport, Transport::Internal);
         assert!(ctx.sender.is_none());
         assert!(ctx.message_id.is_none());
+        assert_eq!(ctx.origin, TurnOrigin::SubTurn);
+    }
+
+    #[test]
+    fn from_origin_matches_the_named_constructor() {
+        assert_eq!(
+            IngressContext::from_origin(TurnOrigin::Cron),
+            IngressContext::cron()
+        );
+        assert_eq!(
+            IngressContext::from_origin(TurnOrigin::SubTurn),
+            IngressContext::sub_turn()
+        );
+    }
+
+    #[test]
+    fn per_origin_constructors_vary_only_the_origin() {
+        let cases = [
+            (IngressContext::interactive(), TurnOrigin::Interactive),
+            (IngressContext::channel(), TurnOrigin::Channel),
+            (IngressContext::cron(), TurnOrigin::Cron),
+            (IngressContext::daemon(), TurnOrigin::Daemon),
+            (IngressContext::agent_direct(), TurnOrigin::AgentDirect),
+            (IngressContext::sub_turn(), TurnOrigin::SubTurn),
+        ];
+        for (ctx, origin) in cases {
+            assert_eq!(ctx.origin, origin);
+            assert_eq!(ctx.source_class, SourceClass::Internal);
+            assert_eq!(ctx.trust, TrustClass::Trusted);
+            assert_eq!(ctx.transport, Transport::Internal);
+            assert!(ctx.sender.is_none());
+            assert!(ctx.message_id.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_envelope_without_origin_deserializes_fail_closed() {
+        // An envelope serialized before the origin field existed must come
+        // back as SubTurn (no origin-gated behavior), not error.
+        let legacy = serde_json::json!({
+            "message_id": null,
+            "source_class": "internal",
+            "sender": null,
+            "transport": "internal",
+            "trust": "trusted",
+        });
+        let ctx: IngressContext = serde_json::from_value(legacy).unwrap();
+        assert_eq!(ctx.origin, TurnOrigin::SubTurn);
+    }
+
+    #[test]
+    fn origin_serializes_snake_case() {
+        let ctx = IngressContext::agent_direct();
+        let v = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(v["origin"], "agent_direct");
+        let back: IngressContext = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ctx);
     }
 }

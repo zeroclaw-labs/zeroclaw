@@ -322,7 +322,10 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+    /// Stable half of the engine's memory-context injection policy
+    /// (recall limit, relevance floor, budgets). Threaded into `ToolLoop`
+    /// as `TurnMemory.cfg` on every turn.
+    memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
@@ -482,7 +485,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_strategy: Option<Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>>,
+    memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -529,7 +532,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_strategy: None,
+            memory_inject_cfg: None,
             config: None,
             multimodal_config: None,
             model_name: None,
@@ -592,11 +595,14 @@ impl AgentBuilder {
         self
     }
 
-    pub fn memory_strategy(
+    /// Stable half of the engine's memory-context injection policy. When
+    /// unset, defaults preserve the legacy loader shape (recall limit 5,
+    /// the schema-default relevance floor).
+    pub fn memory_inject_cfg(
         mut self,
-        memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+        cfg: crate::agent::memory_inject::MemoryInjectConfig,
     ) -> Self {
-        self.memory_strategy = Some(memory_strategy);
+        self.memory_inject_cfg = Some(cfg);
         self
     }
 
@@ -794,11 +800,6 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let workspace_dir = self
-            .workspace_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
         let memory: Arc<dyn Memory> = if exclude_memory {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -813,14 +814,6 @@ impl AgentBuilder {
                 anyhow::Error::msg("memory is required")
             })?
         };
-        // No-memory sessions must not retain a caller-provided strategy that
-        // still closes over persistent memory.
-        let memory_strategy = if exclude_memory {
-            None
-        } else {
-            self.memory_strategy
-        };
-
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -857,14 +850,12 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
-            memory_strategy: memory_strategy.unwrap_or_else(|| {
-                Arc::new(
-                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                        memory.clone(),
-                        zeroclaw_config::schema::MemoryConfig::default(),
-                        workspace_dir.clone(),
-                    ),
-                )
+            memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
+                crate::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
+                        .min_relevance_score,
+                    ..Default::default()
+                }
             }),
             config: self.config.unwrap_or_default(),
             multimodal_config: self.multimodal_config.unwrap_or_default(),
@@ -1065,16 +1056,8 @@ impl Agent {
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
     ) {
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -1095,11 +1078,7 @@ impl Agent {
         }
 
         let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
+        let enriched = format!("[{now}] {user_message}");
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1728,14 +1707,11 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_strategy(Arc::new(
-                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config_and_limit(
-                    memory.clone(),
-                    config.memory.clone(),
-                    security.workspace_dir.clone(),
-                    config.effective_memory_recall_limit(agent_alias),
-                ),
-            ))
+            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
+                limit: config.effective_memory_recall_limit(agent_alias),
+                min_relevance_score: config.memory.min_relevance_score,
+                ..Default::default()
+            })
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -2178,16 +2154,8 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -2214,11 +2182,7 @@ impl Agent {
         let date_str =
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
+        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -2356,9 +2320,16 @@ impl Agent {
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay phase-1 placeholders (RFC #6971 §4).
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
                         turn_id: &turn_id,
                     }),
@@ -2806,9 +2777,16 @@ impl Agent {
                             steering: None,
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
-                            // Phase 1: stamp Internal/Trusted. Real per-transport
-                            // stamping is PR C (RFC #6971 §4).
-                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay phase-1 placeholders (RFC #6971 §4).
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
                             turn_id: &turn_id,
                         }),
