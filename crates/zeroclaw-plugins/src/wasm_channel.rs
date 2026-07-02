@@ -502,7 +502,13 @@ impl Channel for WasmChannel {
         )
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         if !self
             .capabilities
             .contains(ChannelCapabilities::FINALIZE_DRAFT)

@@ -99,6 +99,10 @@ pub struct SendMessage {
     /// message as a voice note. Use for error notices, system alerts, and
     /// other non-conversational content that should never be voiced.
     pub suppress_voice: bool,
+    /// When `true`, channels that support TTS must deliver this message as
+    /// a voice note even if the peer's default modality is text.
+    /// Ignored when `suppress_voice` is also `true`.
+    pub force_voice: bool,
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -163,12 +167,19 @@ impl SendMessage {
             attachments: vec![],
             in_reply_to: None,
             suppress_voice: false,
+            force_voice: false,
         }
     }
 
     /// Prevent TTS channels from voicing this message.
     pub fn suppress_voice(mut self) -> Self {
         self.suppress_voice = true;
+        self
+    }
+
+    /// Force TTS channels to deliver this message as a voice note.
+    pub fn force_voice(mut self) -> Self {
+        self.force_voice = true;
         self
     }
 
@@ -187,6 +198,7 @@ impl SendMessage {
             attachments: vec![],
             in_reply_to: None,
             suppress_voice: false,
+            force_voice: false,
         }
     }
 
@@ -415,11 +427,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
+    /// `suppress_voice` forces text delivery even on voice-only peers.
     async fn finalize_draft(
         &self,
         _recipient: &str,
         _message_id: &str,
         _text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         Ok(())
     }

@@ -34,6 +34,24 @@ pub enum DaemonExit {
 /// Default grace period (seconds) before ephemeral shutdown after last client disconnects.
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
+/// Test-only sentinel for the scheduler cooperative-shutdown path through
+/// `daemon::run`. `spawn_component_supervisor` sets this to `true` only when
+/// the scheduler component takes the cancel-aware clean-return branch. The
+/// daemon-boundary regression test in `#[cfg(test)]` resets and asserts it.
+#[cfg(test)]
+static SCHEDULER_CLEAN_SHUTDOWN_OBSERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_scheduler_clean_shutdown_observed() {
+    SCHEDULER_CLEAN_SHUTDOWN_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn scheduler_clean_shutdown_observed() -> bool {
+    SCHEDULER_CLEAN_SHUTDOWN_OBSERVED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 async fn wait_for_exit_signal(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
     ephemeral: bool,
@@ -384,6 +402,13 @@ pub async fn run(
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+
+    // Shared shutdown signal for every supervised component. Hoisted
+    // here (before any `spawn_component_supervisor` call) so the
+    // gateway supervisor — which is the first to spawn — can also
+    // receive a clone. Firing once in the shutdown sequence cancels
+    // every component in a single atomic step.
+    let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
     // Construct the TUI registry early so both the gateway (for /api/tuis)
@@ -405,6 +430,7 @@ pub async fn run(
             "gateway",
             initial_backoff,
             max_backoff,
+            channels_cancel.clone(),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
@@ -426,8 +452,6 @@ pub async fn run(
             },
         ));
     }
-
-    let channels_cancel = tokio_util::sync::CancellationToken::new();
 
     // EPIC-A supervision: bring up (or, on reload, REUSE) the durable run/task
     // control-plane, then recover prior-boot orphan tasks and start the reaper. Inits
@@ -472,6 +496,7 @@ pub async fn run(
                 "channels",
                 initial_backoff,
                 max_backoff,
+                channels_cancel.clone(),
                 move || {
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
@@ -646,6 +671,7 @@ pub async fn run(
             "socket",
             initial_backoff,
             max_backoff,
+            socket_cancel.clone(),
             move || {
                 let ctx = rpc_ctx.clone();
                 let start = socket_start.clone();
@@ -668,6 +694,7 @@ pub async fn run(
             "wss",
             initial_backoff,
             max_backoff,
+            wss_cancel.clone(),
             move || {
                 let ctx = rpc_ctx.clone();
                 let start = wss_start.clone();
@@ -697,6 +724,7 @@ pub async fn run(
                 "mqtt",
                 initial_backoff,
                 max_backoff,
+                channels_cancel.clone(),
                 move || {
                     let cfg = mqtt_cfg.clone();
                     let start = mqtt_start.clone();
@@ -719,6 +747,7 @@ pub async fn run(
             "heartbeat",
             initial_backoff,
             max_backoff,
+            channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -729,14 +758,22 @@ pub async fn run(
     if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
+        // Reuse the daemon's `channels_cancel` token so the scheduler
+        // receives the same shutdown signal as every other supervised
+        // component. See `daemon/mod.rs:584` — the token is cancelled
+        // before the supervisor's `.abort()` fallback, so the scheduler
+        // returns `Ok(())` cleanly via its own `select!` arm.
+        let scheduler_cancel = channels_cancel.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
             max_backoff,
+            channels_cancel.clone(),
             move || {
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx))).await }
+                let cancel = scheduler_cancel.clone();
+                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
             },
         ));
     } else {
@@ -762,12 +799,45 @@ pub async fn run(
 
     // Fire channel cancellation before aborting supervisors so listener tasks
     // get a chance to drop their `Arc<dyn Channel>` (and the matrix-sdk SQLite
-    // pools the Arc transitively pins).
+    // pools the Arc transitively pins). The supervisor itself observes the
+    // same `cancel` token (see `spawn_component_supervisor`); cooperative
+    // components like the cron scheduler (#8465) return `Ok(())` cleanly on
+    // their cancellation arm and the supervisor exits the restart loop.
+    // Components that abort their async work before a forced abort will
+    // still get `handle.abort()` called, but the tokio abort on an already-
+    // completed task is a no-op, so the `handle.await` below resolves
+    // immediately rather than waiting for a yield point.
     channels_cancel.cancel();
-    for handle in &handles {
-        handle.abort();
+
+    // Grace window: cooperative components (e.g. the cron scheduler)
+    // get a bounded window to observe the cancellation token and exit
+    // cleanly before forced abort. Without this the abort wins the race
+    // against the supervisor's `cancel.is_cancelled()` check. The
+    // `select!` uses biased priority so an already-finished handle is
+    // drained immediately even before the deadline fires.
+    // Handles that complete during the grace window are dropped; only
+    // handles that must be force-aborted go into `remaining` for
+    // a final bounded await.
+    const GRACE_WINDOW: Duration = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
+    let mut remaining: Vec<JoinHandle<()>> = Vec::new();
+    for mut handle in handles {
+        tokio::select! {
+            biased;
+            _ = &mut handle => {
+                // Cooperative handle exited cleanly during grace window.
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                // Grace window expired; force-abort and re-join later.
+                handle.abort();
+                remaining.push(handle);
+            }
+        }
     }
-    for handle in handles {
+    // Await remaining (aborted) handles. Already-completed handles from
+    // the grace window are not re-await, so "JoinHandle polled after
+    // completion" is avoided.
+    for handle in remaining {
         let _ = handle.await;
     }
 
@@ -831,6 +901,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    cancel: tokio_util::sync::CancellationToken,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -845,6 +916,34 @@ where
             crate::health::mark_component_ok(name);
             match run_component().await {
                 Ok(()) => {
+                    // Distinguish cooperative shutdown (cancel signal
+                    // fired) from an unexpected `Ok(())` early return.
+                    // Without this check, every cooperative shutdown
+                    // was misclassified as "exited unexpectedly" and
+                    // looped forever, blocking the daemon's
+                    // `for handle in handles { handle.await }` wait at
+                    // shutdown.
+                    if cancel.is_cancelled() {
+                        crate::health::mark_component_ok(name);
+                        #[cfg(test)]
+                        if name == "scheduler" {
+                            SCHEDULER_CLEAN_SHUTDOWN_OBSERVED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                            &format!(
+                                "Daemon component '{name}' shut down cleanly via cancellation token"
+                            )
+                        );
+                        return;
+                    }
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     ::zeroclaw_log::record!(
                         WARN,
@@ -1835,9 +1934,11 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
-            anyhow::bail!("boom")
-        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-fail", 1, 1, cancel.clone(), || async {
+                anyhow::bail!("boom")
+            });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -1857,7 +1958,11 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-exit", 1, 1, cancel.clone(), || async {
+                Ok(())
+            });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -1872,6 +1977,66 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("component exited unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_marks_clean_shutdown_when_cancel_fires() {
+        // Regression for #8465: a component that returns `Ok(())` on
+        // its cancellation arm (e.g. the cron scheduler after the
+        // `CancellationToken` was threaded through) must be classified
+        // as a clean shutdown, not an unexpected exit. Without this
+        // distinction, the daemon's "exited unexpectedly" log path
+        // misclassifies every cooperative shutdown.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // `spawn_component_supervisor` requires `FnMut` so the closure
+        // can be re-invoked on every component restart. `CancellationToken`
+        // is not `Copy`, so the outer closure must hold it by `Arc` to
+        // share it across invocations; the inner async block takes a
+        // reference to the same `Arc<CancellationToken>` on each call.
+        let cancel_arc = std::sync::Arc::new(cancel.clone());
+        let handle = spawn_component_supervisor("daemon-test-cancel", 1, 1, cancel.clone(), {
+            let cancel_arc = std::sync::Arc::clone(&cancel_arc);
+            move || {
+                let cancel_arc = std::sync::Arc::clone(&cancel_arc);
+                async move {
+                    cancel_arc.cancelled().await;
+                    Ok(())
+                }
+            }
+        });
+
+        // Give the supervisor a tick to call the component once (so
+        // the component is parked in `cancel.cancelled().await`).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire the cancellation. The component wakes up, returns
+        // `Ok(())`, and the supervisor takes the clean-shutdown path
+        // (mark ok + return) instead of the "exited unexpectedly"
+        // path.
+        cancel.cancel();
+
+        // The supervisor's outer loop is `loop { run_component().await; ... }`
+        // so a single Ok(()) while cancelled makes it `return`.
+        let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            join.is_ok(),
+            "supervisor should exit cooperatively within 1s of cancel; got: {join:?}"
+        );
+        let _ = join.unwrap();
+
+        // Health snapshot must show the component as healthy (not error),
+        // because the supervisor took the cancel-aware return path.
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"]["daemon-test-cancel"];
+        assert_eq!(
+            component["status"], "ok",
+            "cooperative shutdown must mark the component healthy, not error; got snapshot: {component}"
+        );
+        assert_eq!(
+            component["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "cooperative shutdown must not trigger a restart; got snapshot: {component}"
         );
     }
 
@@ -2370,6 +2535,105 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    /// Daemon-boundary evidence for #8465: the cooperative scheduler
+    /// shutdown must be observable through the real `daemon::run`
+    /// shutdown loop, not only the `spawn_component_supervisor` helper
+    /// in isolation (see `supervisor_marks_clean_shutdown_when_cancel_fires`).
+    ///
+    /// The earlier two-patch series proved that the supervisor's
+    /// `cancel.is_cancelled()` branch classifies a cooperative `Ok(())`
+    /// as clean, and that the daemon's bounded 500ms grace window lets
+    /// the scheduler's `cancel.cancelled()` arm fire before the abort
+    /// fallback. This test proves the *combined* path through the real
+    /// `daemon::run` reload flow rather than a hand-rolled supervisor
+    /// call: the scheduler is enabled in config, spawned by the daemon,
+    /// observes the same `channels_cancel` token, takes its cancel arm,
+    /// returns `Ok(())`, and the supervisor takes the clean-shutdown
+    /// return path.
+    ///
+    /// The reviewer asked specifically for evidence that the supervisor's
+    /// `cancel.is_cancelled()` branch runs through the real daemon
+    /// shutdown loop. The health snapshot alone (`status == "ok"`,
+    /// `restart_count == 0`, `last_error == null`) is not sufficient,
+    /// because aborting the supervisor task before it observes the
+    /// component's `Ok(())` leaves the pre-await health state unchanged.
+    ///
+    /// To prove the clean-return branch actually ran, this test uses a
+    /// test-only sentinel that `spawn_component_supervisor` sets only
+    /// when the scheduler component reaches the cancel-aware `return`.
+    /// If the grace window is removed, or if the supervisor handle is
+    /// aborted before the scheduler returns `Ok(())`, the sentinel stays
+    /// `false` and the test fails.
+    #[tokio::test]
+    async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.enabled = true;
+        // First `tokio::time::interval` tick fires immediately; the
+        // scheduler then parks at `select! { interval.tick(), cancel.cancelled() }`
+        // waiting for the next tick (5s, the MIN_POLL_SECONDS floor).
+        // We trigger reload well within that window so the cancel arm
+        // wins deterministically.
+
+        reset_scheduler_clean_shutdown_observed();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg| {
+                Box::pin(async move {
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    // Give the scheduler a tick to enter its select!
+                    // loop and park at the next interval tick or cancel.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(3),
+            run(config, "127.0.0.1".to_string(), 0, registry, false),
+        )
+        .await
+        .expect("daemon should return after gateway-triggered reload")
+        .expect("daemon run should succeed");
+        assert_eq!(exit, DaemonExit::Reload);
+
+        // The scheduler's cooperative cancel arm must have fired
+        // through the real `daemon::run` shutdown loop, and the
+        // supervisor must have observed the resulting `Ok(())` and
+        // taken the cancel-aware clean-return branch. The sentinel is
+        // only set in that specific branch.
+        assert!(
+            scheduler_clean_shutdown_observed(),
+            "scheduler supervisor must take the cancel-aware clean-return branch; \
+             aborting the supervisor before it observes Ok(()) leaves this sentinel false"
+        );
+
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"]["scheduler"];
+        assert_eq!(
+            component["status"], "ok",
+            "scheduler health snapshot must show ok after cooperative shutdown; got: {component}"
+        );
+        assert_eq!(
+            component["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "scheduler must not have been restarted; \
+             restart_count > 0 means the supervisor took the unexpected-Ok or Err branch \
+             instead of the cancel-aware return, which is the regression this test pins"
+        );
+        assert!(
+            component["last_error"].is_null(),
+            "scheduler must have no last_error after cooperative shutdown; got: {component}"
+        );
     }
 
     #[tokio::test]
