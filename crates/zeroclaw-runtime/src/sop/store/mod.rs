@@ -51,6 +51,11 @@ pub trait SopRunStore: Send + Sync {
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Single run by id (latest revision), terminal or not.
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError>;
+    /// `completed_at` of the most recently completed terminal run for `sop_name`,
+    /// or `None` if that SOP has no terminal run with a recorded completion. Drives
+    /// the cooldown check off the shared store so every engine holder observes the
+    /// same last-finished marker (not just the engine that ran the SOP).
+    fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError>;
 
     // ── CAS claim primitive (concurrency-control) ──
     /// Atomic single-winner admission honoring BOTH concurrency limits. Returns
@@ -66,6 +71,20 @@ pub trait SopRunStore: Send + Sync {
         per_sop_cap: usize,
         global_cap: usize,
     ) -> Result<Option<ClaimToken>, StoreError>;
+    /// Re-establish the claim for an already-running run during boot rehydrate
+    /// (`restore_runs`), WITHOUT applying admission caps. These runs were admitted
+    /// before the restart, so reconstruction is not new admission: an over-cap
+    /// restored set must keep its claims (1:1 with `active_runs`) rather than be
+    /// silently dropped. Idempotent: refreshes an existing claim or inserts a fresh
+    /// one. Not for live admission - that is `try_claim_run`.
+    fn renew_claim_for_restore(
+        &self,
+        run_id: &str,
+        sop_name: &str,
+    ) -> Result<ClaimToken, StoreError>;
+    /// Live claim counts as `(for_sop, total)`, used by read-only admission
+    /// checks so status surfaces observe the same concurrency source as CAS.
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
     /// Renew a claim's lease (tick liveness). No-op if the claim is gone.
     fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError>;
     /// Release a claim (finish/cancel), freeing the slot for admission.
@@ -297,6 +316,18 @@ impl SopRunStore for InMemoryRunStore {
         Ok(self.lock()?.runs.get(run_id).cloned())
     }
 
+    fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
+        let g = self.lock()?;
+        // Max `completed_at` over terminal runs for this SOP. Timestamps are
+        // ISO-8601 UTC ("...Z"), which sort lexically in completion order.
+        Ok(g.terminal
+            .iter()
+            .filter_map(|id| g.runs.get(id))
+            .filter(|r| r.run.sop_name == sop_name)
+            .filter_map(|r| r.run.completed_at.clone())
+            .max())
+    }
+
     fn try_claim_run(
         &self,
         run_id: &str,
@@ -334,6 +365,31 @@ impl SopRunStore for InMemoryRunStore {
         };
         g.claims.insert(run_id.to_string(), token.clone());
         Ok(Some(token))
+    }
+
+    fn renew_claim_for_restore(
+        &self,
+        run_id: &str,
+        sop_name: &str,
+    ) -> Result<ClaimToken, StoreError> {
+        let mut g = self.lock()?;
+        // No cap check: a restored run was already admitted before the restart.
+        // Idempotent insert/overwrite (matches the in-memory empty-lease shape).
+        let token = ClaimToken {
+            run_id: run_id.to_string(),
+            sop_name: sop_name.to_string(),
+            claimed_at: String::new(),
+            lease_expires: String::new(),
+            holder: "in-memory".to_string(),
+        };
+        g.claims.insert(run_id.to_string(), token.clone());
+        Ok(token)
+    }
+
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+        let g = self.lock()?;
+        let per_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
+        Ok((per_sop, g.claims.len()))
     }
 
     fn heartbeat_claim(&self, _token: &ClaimToken) -> Result<(), StoreError> {

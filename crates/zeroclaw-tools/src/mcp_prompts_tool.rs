@@ -125,10 +125,14 @@ impl Tool for McpPromptsTool {
                 };
                 let arguments = map.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 match self.registry.get_prompt(&name, arguments).await {
-                    Ok(result) => match serde_json::to_string_pretty(&result) {
-                        Ok(s) => Ok(Self::ok(s)),
-                        Err(e) => Ok(Self::fail(format!("failed to serialize prompt: {e}"))),
-                    },
+                    Ok(result) => {
+                        let server = McpRegistry::split_prefixed(&name)
+                            .map(|(s, _)| s)
+                            .unwrap_or_default();
+                        let rendered =
+                            crate::mcp_context::render_prompt_messages(&server, &name, &result);
+                        Ok(Self::ok(rendered))
+                    }
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

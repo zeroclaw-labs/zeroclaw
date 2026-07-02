@@ -285,6 +285,13 @@ cli-skills-install-suggestion =
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
+
+cli-plugin-install-suggestion =
+    看起来此请求需要 `{$name}` 插件，但它尚未安装。
+
+    匹配的能力：{$matched}
+    下一步：运行 `{$install_command}` 进行安装。
+
 cli-completions-long-about =
     为 `zeroclaw` 生成 shell 补全脚本。
 
