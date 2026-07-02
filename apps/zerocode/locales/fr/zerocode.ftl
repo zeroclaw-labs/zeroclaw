@@ -368,7 +368,11 @@ zc-chat-approval-action-reject = Rejeter
 zc-chat-approval-action-edit = Modifier
 zc-chat-clipboard-you = Vous : { $text }
 zc-chat-clipboard-agent = Agent : { $text }
+zc-chat-action-copy = copy
+zc-chat-action-copy-md = cpmd
+zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = Copié dans le presse-papiers
+zc-chat-copied-markdown = Markdown copié dans le presse-papiers
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } ou { $into } pour ouvrir cette section
 zc-config-breadcrumb-new = Nouveau

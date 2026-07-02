@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
+use pulldown_cmark::{
+    Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser, Tag, TagEnd,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -2411,6 +2413,10 @@ impl Chat {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
                 MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(hit) = state.copy_action_hit_at(col, row) {
+                        state.copy_entry(hit.entry_index, hit.format);
+                        return;
+                    }
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
@@ -2426,18 +2432,6 @@ impl Chat {
                             let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
                             state.scroll_offset = new_off.min(max);
                             state.pinned_to_bottom = state.scroll_offset >= max;
-                        }
-                        return;
-                    }
-                    if let Some(text) = state
-                        .copy_hit_regions
-                        .iter()
-                        .find(|r| mouse::in_rect(col, row, r.rect))
-                        .map(|r| r.text.clone())
-                    {
-                        if !text.is_empty() {
-                            crate::mouse::copy_osc52(&text);
-                            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                         }
                         return;
                     }
@@ -2541,19 +2535,13 @@ impl Chat {
                     //   * Drag (range set) → copy the selection.
                     if let Some(idx) = state.mouse_down_entry.take() {
                         if state.browse_anchor.is_some() {
-                            // Drag → copy the range
                             let text = state.yank_selection();
                             if !text.is_empty() {
                                 crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                                state.set_info_notice(copy_notice(CopyFormat::Raw));
                             }
                         } else {
-                            // Plain click → copy the single entry
-                            let text = state.yank_single_entry(idx);
-                            if !text.is_empty() {
-                                crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                            }
+                            state.copy_entry(idx, CopyFormat::Raw);
                         }
                     }
                 }
@@ -3125,42 +3113,20 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         queue_paused_hint.as_deref(),
     );
 
-    // Optional CWD line just above the input bar (bottom of conv_area).
-    // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
-    // segments are appended only when the daemon's git poll has resolved them.
-    let actual_conv = if let Some(ref cwd) = state.cwd {
-        if conv_area.height > 1 {
-            let cwd_row = Rect::new(
-                conv_area.x,
-                conv_area.y + conv_area.height - 1,
-                conv_area.width,
-                1,
-            );
-            let mut line = format!(" {cwd}");
-            if state.git_branch.is_some() || state.git_hash.is_some() {
-                line.push_str(" -");
-                if let Some(ref branch) = state.git_branch {
-                    line.push_str(&format!(" ({branch})"));
-                }
-                if let Some(ref hash) = state.git_hash {
-                    line.push_str(&format!(" ({hash})"));
-                }
-            }
-            line.push(' ');
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(line, theme::dim_style())))
-                    .alignment(Alignment::Left),
-                cwd_row,
-            );
-            Rect::new(
-                conv_area.x,
-                conv_area.y,
-                conv_area.width,
-                conv_area.height - 1,
-            )
-        } else {
-            conv_area
-        }
+    let actual_conv = if conv_area.height > 1 {
+        let status_row = Rect::new(
+            conv_area.x,
+            conv_area.y + conv_area.height - 1,
+            conv_area.width,
+            1,
+        );
+        render_session_status_row(f, state, status_row);
+        Rect::new(
+            conv_area.x,
+            conv_area.y,
+            conv_area.width,
+            conv_area.height - 1,
+        )
     } else {
         conv_area
     };
@@ -3311,6 +3277,75 @@ fn chord_label_pair(
     Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
+fn render_session_status_row(f: &mut Frame, state: &ChatState, area: Rect) {
+    let text = session_status_text(state, area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme::dim_style())))
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+fn session_status_text(state: &ChatState, width: usize) -> String {
+    let mut parts = vec![state.agent_alias.clone()];
+    if let Some(provider) = &state.model_provider_ref {
+        let model = state.model.as_deref().unwrap_or("model");
+        parts.push(format!("{provider}/{model}"));
+    } else if let Some(model) = &state.model {
+        parts.push(model.clone());
+    }
+    if let Some(tokens) = context_status_text(state.context_input_tokens, state.context_max_tokens)
+    {
+        parts.push(tokens);
+    }
+    if let Some(cwd) = cwd_status_text(state) {
+        parts.push(cwd);
+    }
+    parts.push(crate::i18n::t("zc-chat-status-help"));
+    let line = format!(" {} ", parts.join(" · "));
+    first_line_preview(&line, width)
+}
+
+fn context_status_text(input: Option<u64>, max: Option<u64>) -> Option<String> {
+    let input = input?;
+    match max {
+        Some(max) if max > 0 => Some(format!(
+            "ctx {} / {}",
+            compact_number(input),
+            compact_number(max)
+        )),
+        _ => Some(format!("ctx {}", compact_number(input))),
+    }
+}
+
+fn cwd_status_text(state: &ChatState) -> Option<String> {
+    let cwd = state.cwd.as_ref()?;
+    let mut text = cwd.clone();
+    if let Some(branch) = &state.git_branch {
+        text.push_str(" (");
+        text.push_str(branch);
+        text.push(')');
+    }
+    if let Some(hash) = &state.git_hash {
+        text.push_str(" (");
+        text.push_str(hash);
+        text.push(')');
+    }
+    Some(text)
+}
+
+fn compact_number(value: u64) -> String {
+    let raw = value.to_string();
+    let mut output = String::new();
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            output.push(',');
+        }
+        output.push(ch);
+    }
+    output.chars().rev().collect()
+}
+
 fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let title = crate::i18n::t_args(
         "zc-queue-title",
@@ -3444,15 +3479,13 @@ fn render_tool_entry(
     } else {
         Modifier::empty()
     };
-    lines.push(Line::from(vec![Span::styled(
-        format!("[tool: {name}] "),
+    let parsed: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
+    let title = tool_title(name, parsed.as_ref());
+    lines.push(action_header_line(
+        &title,
         theme::tool_label_style().add_modifier(sel_mod),
-    )]));
-
-    let parsed: Option<serde_json::Value> = match name {
-        "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
-        _ => None,
-    };
+        sel_mod,
+    ));
 
     let body_start = lines.len();
     match name {
@@ -3541,57 +3574,52 @@ fn render_entry_into(
     };
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
-            let label_span = Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-you")),
+            lines.push(action_header_line(
+                &crate::i18n::t("zc-chat-label-you"),
                 theme::user_label_style().add_modifier(sel_mod),
-            );
+                sel_mod,
+            ));
             let body_style = theme::body_style().add_modifier(sel_mod);
-            let mut text_lines: Vec<&str> = match text {
-                Some(t) => t.split('\n').collect(),
-                None => Vec::new(),
-            };
-            if text_lines.is_empty() {
-                text_lines.push("");
-            }
-            for (idx, line_text) in text_lines.iter().enumerate() {
-                let mut spans = Vec::new();
-                if idx == 0 {
-                    spans.push(label_span.clone());
-                }
-                spans.push(Span::styled((*line_text).to_string(), body_style));
-                lines.push(Line::from(spans));
+            let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
+            for line_text in text_lines {
+                lines.push(plain_indented_line(line_text, body_style));
             }
             if !attachments.is_empty() {
                 let label = attachments
                     .iter()
-                    .map(|a| a.as_ref())
+                    .map(|attachment| attachment.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
-                lines.push(Line::from(Span::styled(
-                    format!(" [{label}]"),
+                lines.push(plain_indented_line(
+                    &format!("[{label}]"),
                     theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
-                )));
+                ));
             }
+            lines.push(Line::default());
         }
         ChatEntry::AgentMessage(text) => {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+            lines.push(action_header_line(
+                &crate::i18n::t("zc-chat-label-agent"),
                 theme::agent_label_style().add_modifier(sel_mod),
-            )]));
+                sel_mod,
+            ));
+            let body_style = theme::body_style().add_modifier(sel_mod);
             let md_lines = markdown_to_lines(text.as_ref(), width);
             for mut line in md_lines {
                 if is_selected {
                     line = Line::from(
                         line.spans
                             .into_iter()
-                            .map(|s| {
-                                s.patch_style(Style::default().add_modifier(Modifier::REVERSED))
+                            .map(|span| {
+                                span.patch_style(Style::default().add_modifier(Modifier::REVERSED))
                             })
                             .collect::<Vec<_>>(),
-                    );
+                    )
+                    .style(line.style);
                 }
-                lines.push(line);
+                lines.push(indented_line(line, body_style));
             }
+            lines.push(Line::default());
         }
         ChatEntry::AgentThought(text) => {
             if show_thoughts {
@@ -3626,69 +3654,63 @@ fn render_entry_into(
     }
 }
 
-/// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
-/// starting column (display cells from line start) and its trimmed width in
-/// cells, or `None` if the line has no copy label.
-fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
-    use unicode_width::UnicodeWidthStr;
-    let mut col = 0u16;
-    for span in &line.spans {
-        let content = span.content.as_ref();
-        if content == copy_lbl {
-            let lead = copy_lbl.len() - copy_lbl.trim_start().len();
-            let trimmed = copy_lbl.trim();
-            return Some((col + lead as u16, UnicodeWidthStr::width(trimmed) as u16));
-        }
-        col += UnicodeWidthStr::width(content) as u16;
+fn action_header_line(label: &str, label_style: Style, selection: Modifier) -> Line<'static> {
+    let muted = theme::dim_style().add_modifier(selection);
+    let action = theme::accent_style().add_modifier(selection | Modifier::BOLD);
+    Line::from(vec![
+        Span::styled("  ", muted),
+        Span::styled(crate::i18n::t("zc-chat-action-copy"), action),
+        Span::styled("  ", muted),
+        Span::styled(crate::i18n::t("zc-chat-action-copy-md"), action),
+        Span::styled("  ", muted),
+        Span::styled(label.to_string(), label_style),
+    ])
+}
+
+fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
+    let string_field = |key: &str| {
+        input
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_str())
+    };
+    match name {
+        "shell" | "bash" | "terminal" => string_field("command")
+            .map(|command| format!("$ {command}"))
+            .unwrap_or_else(|| format!("$ {name}")),
+        "file_read" | "read" => string_field("path")
+            .or_else(|| string_field("filePath"))
+            .map(|path| format!("→ Read {path}"))
+            .unwrap_or_else(|| "→ Read".to_string()),
+        "file_write" | "write" => string_field("path")
+            .or_else(|| string_field("filePath"))
+            .map(|path| format!("← Write {path}"))
+            .unwrap_or_else(|| "← Write".to_string()),
+        "file_edit" | "edit" => string_field("path")
+            .or_else(|| string_field("filePath"))
+            .map(|path| format!("← Edit {path}"))
+            .unwrap_or_else(|| "← Edit".to_string()),
+        "grep" | "search" | "file_search" => string_field("pattern")
+            .or_else(|| string_field("query"))
+            .map(|pattern| format!("✱ {pattern}"))
+            .unwrap_or_else(|| format!("✱ {name}")),
+        "glob" => string_field("pattern")
+            .map(|pattern| format!("✱ {pattern}"))
+            .unwrap_or_else(|| "✱ Glob".to_string()),
+        "task" => string_field("description")
+            .map(|description| format!("▣ {description}"))
+            .unwrap_or_else(|| "▣ Task".to_string()),
+        _ => format!("⚙ {name}"),
     }
-    None
 }
 
-/// Recover the fence language token from a code-fence header bar line. The
-/// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
-/// empty info string both yield `None` so the rebuilt fence stays unlabelled.
-fn header_fence_lang(line: &Line<'static>) -> Option<String> {
-    let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-    let token = first
-        .trim_start_matches('\u{250c}')
-        .trim_matches('\u{2500}')
-        .trim();
-    if token.is_empty() || token == "code" {
-        None
-    } else {
-        Some(token.to_string())
-    }
+fn indented_line(mut line: Line<'static>, style: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled("  ".to_string(), style)];
+    spans.append(&mut line.spans);
+    Line::from(spans)
 }
 
-/// Return the code body for clipboard copy without markdown fences.
-/// Users pasting into a terminal expect raw commands, not fenced blocks.
-fn fenced_text(_lang: Option<&str>, body: &str) -> String {
-    body.to_string()
-}
-
-/// Wrapped screen-row count for a single cached line at the given width.
-fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
-    Paragraph::new(vec![borrow_line(line)])
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
-}
-
-/// Build a `[Copy]` region if its global wrapped row is on-screen.
-fn copy_region(
-    global_row: u16,
-    col: u16,
-    cells: u16,
-    scroll: u16,
-    body: Rect,
-    text: &str,
-) -> Option<CopyHitRegion> {
-    if global_row < scroll || global_row >= scroll + body.height {
-        return None;
-    }
-    Some(CopyHitRegion {
-        rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
-        text: text.to_string(),
-    })
+fn plain_indented_line(text: &str, style: Style) -> Line<'static> {
+    Line::from(Span::styled(format!("  {text}"), style))
 }
 
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
@@ -3709,7 +3731,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Width must be computed before cache rebuild — table column budgets
     // depend on it, and a width change invalidates cached layouts.
-    let inner_width = area.width.saturating_sub(2);
+    let inner_width = area.width;
 
     // ── Rebuild cached lines only when entries changed ────────
     if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
@@ -3732,7 +3754,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .is_some_and(|m| !m.is_empty());
     let first_row_h: u16 = if show_first && area.height > 2 { 1 } else { 0 };
 
-    let inner_height = area.height.saturating_sub(2).saturating_sub(first_row_h);
+    let inner_height = area.height.saturating_sub(1).saturating_sub(first_row_h);
 
     let block = theme::panel_block(&format!(" {} ", state.title()));
     let inner = block.inner(area);
@@ -3759,11 +3781,15 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let transient_lines: Vec<Line<'static>> = if transient {
         let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
         if has_stream_text {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-chat-label-agent"),
                 theme::agent_label_style(),
-            )]));
-            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
+            )));
+            lines.extend(
+                markdown_to_lines(&state.streaming_text, inner_width)
+                    .into_iter()
+                    .map(|line| indented_line(line, theme::body_style())),
+            );
         }
         if has_stream_thought {
             lines.push(Line::from(vec![
@@ -3837,27 +3863,38 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
+        if screen_lo >= scroll && screen_lo < scroll + body_h {
+            let y = body_y + (screen_lo - scroll);
+            state.copy_action_hit_regions.push(CopyActionHitRegion {
+                entry_index: entry_idx,
+                format: CopyFormat::Raw,
+                rect: Rect::new(body_x + 2, y, 4, 1),
+            });
+            state.copy_action_hit_regions.push(CopyActionHitRegion {
+                entry_index: entry_idx,
+                format: CopyFormat::Markdown,
+                rect: Rect::new(body_x + 8, y, 4, 1),
+            });
+        }
     }
 
-    let body_rect = Rect::new(body_x, body_y, body_w, body_h);
-    state.rebuild_copy_regions(inner_width, scroll, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None),
-        area,
+            .end_symbol(None)
+            .track_symbol(None),
+        body_area,
         &mut scrollbar_state,
     );
-    // Scrollbar paints in `area.right() - 1`; mirror that.
-    if area.height > 2 {
+    if body_area.height > 0 {
         state.scrollbar_track_rect = Some(Rect::new(
-            area.x + area.width.saturating_sub(1),
-            area.y + 1,
+            body_area.x + body_area.width.saturating_sub(1),
+            body_area.y,
             1,
-            area.height - 2,
+            body_area.height,
         ));
     } else {
         state.scrollbar_track_rect = None;
@@ -4156,41 +4193,13 @@ fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option
     }
 }
 
-/// Builds one full-width code-block border bar: `corner_l`, an optional left
-/// label (the language), then dashes wrapping a centered `[Copy]`, then
-/// `corner_r`. Header and footer share this so their geometry can never drift.
-fn code_block_bar(
-    width: u16,
-    corner_l: char,
-    corner_r: char,
-    label: Option<&str>,
-) -> Line<'static> {
-    let label = label.unwrap_or("");
-    let copy_lbl = " [Copy] ";
-    let label_len = label.chars().count();
-    let copy_len = copy_lbl.chars().count();
-    let inner = (width as usize).saturating_sub(2);
-    let left_total = inner.saturating_sub(copy_len) / 2;
-    let right = inner.saturating_sub(copy_len).saturating_sub(left_total);
-    let left_dashes = left_total.saturating_sub(label_len);
-    Line::from(vec![
-        Span::styled(
-            format!("{corner_l}{label}{}", "\u{2500}".repeat(left_dashes)),
-            theme::dim_style(),
-        ),
-        Span::styled(
-            copy_lbl.to_string(),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{}{corner_r}", "\u{2500}".repeat(right)),
-            theme::dim_style(),
-        ),
-    ])
+fn code_block_header(lang: Option<&str>) -> Line<'static> {
+    let label = lang.filter(|token| !token.is_empty()).unwrap_or("code");
+    Line::from(Span::styled(format!("  {label}"), theme::dim_style()))
 }
 
 fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    use pulldown_cmark::{Alignment as MdAlign, HeadingLevel};
+    use pulldown_cmark::Alignment as MdAlign;
 
     let mut opts = MdOptions::empty();
     opts.insert(MdOptions::ENABLE_TABLES);
@@ -4309,19 +4318,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
 
-                // Header bar: ┌─ lang ──── [Copy] ────┐
-                let lang_display = code_block_lang.clone().unwrap_or_default();
-                let label = if lang_display.is_empty() {
-                    " code ".to_string()
-                } else {
-                    format!(" {} ", lang_display.as_str())
-                };
-                lines.push(code_block_bar(
-                    width,
-                    '\u{250c}',
-                    '\u{2510}',
-                    Some(&format!("\u{2500}{label}")),
-                ));
+                lines.push(code_block_header(code_block_lang.as_deref()));
             }
             MdEvent::End(TagEnd::CodeBlock) => {
                 push_line(&mut lines, &mut current_spans);
@@ -4329,11 +4326,6 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 
                 emit_code_block_body(&mut lines, &code_block_text, code_block_lang.as_deref());
 
-                // Footer bar: └──── [Copy] ────┘
-                lines.push(code_block_bar(width, '\u{2514}', '\u{2518}', None));
-
-                // Accumulated code text is ready for clipboard copy;
-                // the Copy action is handled by the chat pane.
                 code_block_text.clear();
                 code_block_lang = None;
             }
@@ -4828,12 +4820,17 @@ struct TitleHitRect {
     rect: Rect,
 }
 
-/// A clickable `[Copy]` label on a code-fence header bar. `text` is the exact
-/// fence contents; `rect` is the label's screen cells from the last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFormat {
+    Raw,
+    Markdown,
+}
+
 #[derive(Debug, Clone)]
-struct CopyHitRegion {
+struct CopyActionHitRegion {
+    entry_index: usize,
+    format: CopyFormat,
     rect: Rect,
-    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4910,8 +4907,8 @@ pub struct ChatState {
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Clickable `[Copy]` code-fence labels from the last draw.
-    copy_hit_regions: Vec<CopyHitRegion>,
+    /// Per-message copy action rects from the last draw.
+    copy_action_hit_regions: Vec<CopyActionHitRegion>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -5017,7 +5014,7 @@ impl ChatState {
             highlighted_entry: None,
             mouse_down_entry: None,
             entry_rects: Vec::new(),
-            copy_hit_regions: Vec::new(),
+            copy_action_hit_regions: Vec::new(),
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -5083,22 +5080,35 @@ impl ChatState {
         self.browse_cursor.is_some() || !self.browse_multi.is_empty()
     }
 
-    /// Yank a single entry's body text — used by the auto-copy-on-click
-    /// feature when the user clicks a chat entry.
-    fn yank_single_entry(&self, idx: usize) -> String {
-        self.entries
-            .get(idx)
-            .map(clipboard_text)
-            .unwrap_or_default()
-    }
-
     /// Copy a single entry to clipboard silently (no browse mode, just OSC 52).
     fn copy_entry_silently(state: &mut ChatState, idx: usize) {
-        let text = state.yank_single_entry(idx);
-        if !text.is_empty() {
-            crate::mouse::copy_osc52(&text);
-            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        state.copy_entry(idx, CopyFormat::Raw);
+    }
+
+    fn copy_action_hit_at(&self, col: u16, row: u16) -> Option<CopyActionHitRegion> {
+        self.copy_action_hit_regions
+            .iter()
+            .find(|hit| mouse::in_rect(col, row, hit.rect))
+            .cloned()
+    }
+
+    fn copy_entry(&mut self, idx: usize, format: CopyFormat) {
+        let text = self.entry_clipboard_text(idx, format);
+        if text.is_empty() {
+            return;
         }
+        crate::mouse::copy_osc52(&text);
+        self.set_info_notice(copy_notice(format));
+    }
+
+    fn entry_clipboard_text(&self, idx: usize, format: CopyFormat) -> String {
+        self.entries
+            .get(idx)
+            .map(|entry| match format {
+                CopyFormat::Raw => clipboard_text(entry),
+                CopyFormat::Markdown => markdown_clipboard_text(entry),
+            })
+            .unwrap_or_default()
     }
 
     /// Build the clipboard string. Single = body. Multi = role-prefixed.
@@ -5358,32 +5368,6 @@ impl ChatState {
         (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
     }
 
-    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
-        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
-            return (self.cached_lines.clone(), 0);
-        }
-        let view_end = scroll.saturating_add(height);
-        let mut first: Option<usize> = None;
-        let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
-            if screen_hi > scroll && screen_lo < view_end {
-                if first.is_none() {
-                    first = Some(i);
-                }
-                last = i;
-            }
-        }
-        let Some(first) = first else {
-            return (self.cached_lines.clone(), 0);
-        };
-        let line_lo = self.cached_line_ranges[first].1;
-        let line_hi = self.cached_line_ranges[last].2;
-        (
-            self.cached_lines[line_lo..line_hi].to_vec(),
-            self.cached_screen_ranges[first].1,
-        )
-    }
-
     /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
     /// each entry's `Line`s individually, so screen row positions reflect
     /// markdown wrapping (code blocks, tables, etc.). Called after every
@@ -5418,52 +5402,6 @@ impl ChatState {
             self.cached_screen_ranges
                 .push((entry_idx, screen_lo, screen_cursor, content_width));
         }
-    }
-
-    fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
-        let copy_lbl = " [Copy] ";
-        let mut regions: Vec<CopyHitRegion> = Vec::new();
-        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
-        let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
-        for line in &lines {
-            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-            if first.starts_with('\u{250c}') {
-                let lang = header_fence_lang(line);
-                pending = label_cells(line, copy_lbl)
-                    .map(|(col, cells)| (screen_cursor, col, cells, lang, String::new()));
-            } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, lang, acc)) = pending.take() {
-                    let text = fenced_text(lang.as_deref(), &acc);
-                    if let Some(r) =
-                        copy_region(header_row, header_col, header_cells, scroll, body, &text)
-                    {
-                        regions.push(r);
-                    }
-                    if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
-                        && let Some(r) = copy_region(
-                            screen_cursor,
-                            footer_col,
-                            footer_cells,
-                            scroll,
-                            body,
-                            &text,
-                        )
-                    {
-                        regions.push(r);
-                    }
-                }
-            } else if let Some((_, _, _, _, acc)) = pending.as_mut() {
-                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
-                if !acc.is_empty() {
-                    acc.push('\n');
-                }
-                acc.push_str(&body_text);
-            }
-
-            screen_cursor += wrapped_rows(line, width);
-        }
-        self.copy_hit_regions = regions;
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -6228,6 +6166,13 @@ impl ChatState {
     }
 }
 
+fn copy_notice(format: CopyFormat) -> String {
+    match format {
+        CopyFormat::Raw => crate::i18n::t("zc-chat-copied-clipboard"),
+        CopyFormat::Markdown => crate::i18n::t("zc-chat-copied-markdown"),
+    }
+}
+
 /// Body-only clipboard text.
 fn clipboard_text(entry: &ChatEntry) -> String {
     match entry {
@@ -6244,7 +6189,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
                 format!("{base} [{label}]")
             }
         }
-        ChatEntry::AgentMessage(t) => t.to_string(),
+        ChatEntry::AgentMessage(t) => markdown_plain_text(t),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::SystemMessage(t) => t.to_string(),
         ChatEntry::Tool {
@@ -6257,6 +6202,42 @@ fn clipboard_text(entry: &ChatEntry) -> String {
             None => format!("[tool: {name}] {input_json}"),
         },
     }
+}
+
+fn markdown_clipboard_text(entry: &ChatEntry) -> String {
+    match entry {
+        ChatEntry::AgentMessage(text) => text.to_string(),
+        ChatEntry::Tool {
+            name,
+            input_json,
+            result,
+            ..
+        } => {
+            let mut text = format!("**Tool: {name}**\n\n```json\n{input_json}\n```");
+            if let Some(result) = result {
+                text.push_str("\n\n```\n");
+                text.push_str(result);
+                text.push_str("\n```");
+            }
+            text
+        }
+        _ => clipboard_text(entry),
+    }
+}
+
+fn markdown_plain_text(markdown: &str) -> String {
+    let mut output = String::new();
+    for event in MdParser::new_ext(markdown, MdOptions::all()) {
+        match event {
+            MdEvent::Text(text) | MdEvent::Code(text) => output.push_str(&text),
+            MdEvent::SoftBreak | MdEvent::HardBreak => output.push('\n'),
+            MdEvent::End(TagEnd::Paragraph | TagEnd::Heading(_)) if !output.ends_with('\n') => {
+                output.push('\n');
+            }
+            _ => {}
+        }
+    }
+    output.trim().to_string()
 }
 
 /// Role-prefixed clipboard text. Used when ≥2 entries are yanked.
@@ -6416,6 +6397,36 @@ mod tests {
         );
     }
 
+    fn rendered_entry(entry: &ChatEntry, width: u16) -> String {
+        let mut lines = Vec::new();
+        render_entry_into(entry, false, true, width, &mut lines);
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn chat_entries_render_compact_colored_boundaries() {
+        let user = ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from("hello")),
+            attachments: vec![],
+        };
+        let agent = ChatEntry::AgentMessage(Arc::<str>::from("world"));
+
+        assert_eq!(rendered_entry(&user, 80), "  copy  cpmd  You:\n  hello\n");
+        assert_eq!(
+            rendered_entry(&agent, 80),
+            "  copy  cpmd  Agent:\n  world\n"
+        );
+    }
+
     #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
@@ -6451,6 +6462,39 @@ mod tests {
         assert!(
             local_scroll < height,
             "local scroll ({local_scroll}) must land inside the first visible entry, below viewport height ({height})"
+        );
+    }
+
+    #[test]
+    fn conversation_scrollbar_renders_only_thumb() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        for i in 0..50 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 12);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut s, area);
+            })
+            .expect("draw conversation");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            rendered.contains('█'),
+            "missing scrollbar thumb: {rendered}"
+        );
+        assert!(
+            !rendered.contains('║'),
+            "scrollbar track must stay hidden: {rendered}"
         );
     }
 
@@ -8122,47 +8166,39 @@ mod tests {
     }
 
     #[test]
-    fn md_code_block_bars_span_full_width() {
-        let width: u16 = 50;
-        let out = rendered("```rust\nlet x = 1;\n```\n", width);
-        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
-        let footer = out.lines().find(|l| l.starts_with('\u{2514}')).unwrap();
-        assert_eq!(header.chars().count(), width as usize, "header: {header:?}");
-        assert_eq!(
-            header.chars().count(),
-            footer.chars().count(),
-            "header and footer must match width"
+    fn md_code_block_uses_compact_header() {
+        let out = rendered("```rust\nlet x = 1;\n```\n", 50);
+        assert!(out.lines().any(|line| line == "  rust"));
+        assert!(
+            !out.contains('\u{250c}'),
+            "code block must not draw a top border: {out}"
         );
-        let copy_col = |l: &str| l.chars().take_while(|c| *c != '[').count();
-        assert_eq!(
-            copy_col(header),
-            copy_col(footer),
-            "[Copy] must start at the same column on header and footer\nheader: {header:?}\nfooter: {footer:?}"
+        assert!(
+            !out.contains('\u{2514}'),
+            "code block must not draw a bottom border: {out}"
+        );
+        assert!(
+            !out.contains("[Copy]"),
+            "code block must not render copy chrome: {out}"
         );
     }
 
     #[test]
     fn md_code_block_header_shows_language() {
         let out = rendered("```python\nx = 1\n```\n", 50);
-        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
+        let header = out.lines().find(|line| line.trim() == "python").unwrap();
+        assert_eq!(header, "  python");
         assert!(
-            header.contains(" python "),
-            "header must show the fence language: {header:?}"
-        );
-        assert!(
-            !header.contains(" code "),
-            "labeled fence must not fall back to ` code `: {header:?}"
+            !out.lines().any(|line| line.trim() == "code"),
+            "labeled fence must not fall back to `code`: {out:?}"
         );
     }
 
     #[test]
     fn md_code_block_header_strips_info_extras() {
         let out = rendered("```python title=\"x\"\nx = 1\n```\n", 50);
-        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
-        assert!(
-            header.contains(" python "),
-            "only the language token is used as the label: {header:?}"
-        );
+        let header = out.lines().find(|line| line.trim() == "python").unwrap();
+        assert_eq!(header, "  python");
         assert!(
             !header.contains("title"),
             "info-string extras must not leak into the label: {header:?}"
@@ -8172,11 +8208,8 @@ mod tests {
     #[test]
     fn md_code_block_unlabeled_fence_falls_back() {
         let out = rendered("```\nx = 1\n```\n", 50);
-        let header = out.lines().find(|l| l.starts_with('\u{250c}')).unwrap();
-        assert!(
-            header.contains(" code "),
-            "unlabeled fence keeps the ` code ` fallback: {header:?}"
-        );
+        let header = out.lines().find(|line| line.trim() == "code").unwrap();
+        assert_eq!(header, "  code");
     }
 
     #[test]
@@ -8244,114 +8277,6 @@ mod tests {
             Some("foo bar"),
             "unknown language keeps the flat two-space-indented body: {text:?}"
         );
-    }
-
-    #[test]
-    fn copy_label_cells_locate_copy_on_header_bar() {
-        let lines = markdown_to_lines("```rust\nlet x = 1;\n```\n", 50);
-        let header = lines
-            .iter()
-            .find(|l| {
-                l.spans
-                    .first()
-                    .map(|s| s.content.starts_with('\u{250c}'))
-                    .unwrap_or(false)
-            })
-            .expect("header bar");
-        let (col, cells) = label_cells(header, " [Copy] ").expect("copy label present");
-        assert_eq!(cells, "[Copy]".chars().count() as u16);
-        // The cell at `col` on the rendered header must be the '[' of [Copy].
-        let rendered: String = header
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert_eq!(
-            rendered.chars().nth(col as usize),
-            Some('['),
-            "label_cells column must point at '[' of [Copy]: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn copy_region_recovers_full_highlighted_body() {
-        let _g = theme::set_active_for_test(
-            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
-        );
-        let mut state = ChatState::new(
-            "sess".to_string(),
-            "agent".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
-        state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
-        let body = Rect::new(0, 0, 60, 20);
-        state.rebuild_copy_regions(60, 0, body);
-        assert!(
-            !state.copy_hit_regions.is_empty(),
-            "a highlighted fence must still register copy regions"
-        );
-        assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
-            "copy text contains only the code body without markdown fences"
-        );
-    }
-
-    #[test]
-    fn copy_region_unlabeled_fence_omits_language() {
-        let mut state = ChatState::new(
-            "sess".to_string(),
-            "agent".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
-        state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
-        let body = Rect::new(0, 0, 60, 20);
-        state.rebuild_copy_regions(60, 0, body);
-        assert_eq!(
-            state.copy_hit_regions[0].text, "plain text",
-            "copy text contains only the code body without fences"
-        );
-    }
-
-    #[test]
-    fn copy_regions_track_scroll_with_history_above_viewport() {
-        let _g = theme::set_active_for_test(
-            theme::theme_by_name("icy_blue").expect("icy_blue registered"),
-        );
-        let mut state = ChatState::new(
-            "sess".to_string(),
-            "agent".to_string(),
-            crate::todo_tracker::TodoTrackerSettings::default(),
-        );
-        let pad = "filler line\n".repeat(200);
-        state
-            .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from(pad.as_str())));
-        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
-            "```rust\nfn main() {}\n```\n",
-        )));
-        state.dirty = LinesDirty::Full;
-        state.rebuild_lines(60);
-
-        let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
-        let body = Rect::new(0, 0, 60, 20);
-
-        state.rebuild_copy_regions(60, fence_entry.1, body);
-        assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}",
-            "scrolled-to fence registers a copy region with body only"
-        );
-
-        state.rebuild_copy_regions(60, 0, body);
-        assert!(
-            state.copy_hit_regions.is_empty(),
-            "fence far below the viewport registers nothing"
-        );
-    }
-
-    #[test]
-    fn fenced_text_returns_body_without_markdown_fences() {
-        assert_eq!(fenced_text(Some("python"), "x = 1"), "x = 1");
-        assert_eq!(fenced_text(None, "x = 1"), "x = 1");
     }
 
     #[test]

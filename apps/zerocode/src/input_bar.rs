@@ -1177,7 +1177,7 @@ impl InputBarState {
             return false;
         }
 
-        let inner_x = mouse.column.saturating_sub(self.last_input_area.x + 1);
+        let inner_x = mouse.column.saturating_sub(self.last_input_area.x);
         let inner_y = mouse.row.saturating_sub(self.last_input_area.y + 1);
         let width = self.last_inner_width;
 
@@ -1498,7 +1498,7 @@ impl InputBarState {
         let has_attachments = !self.pending_attachments.is_empty();
 
         // Compute dynamic input height.
-        let inner_width = area.width.saturating_sub(2);
+        let inner_width = area.width;
         self.last_inner_width = inner_width;
         let content_rows = if self.input.is_empty() {
             1
@@ -1506,7 +1506,7 @@ impl InputBarState {
             wrapped_line_count(&self.input, inner_width)
         };
         let visible_rows = content_rows.min(MAX_INPUT_ROWS);
-        let input_height = visible_rows + 2; // +2 for top/bottom border
+        let input_height = visible_rows + 1;
 
         // Clamp scroll to the valid range unconditionally so the paragraph
         // offset and the overflow arrows always reflect the same true state,
@@ -1553,10 +1553,9 @@ impl InputBarState {
         let label_owned = turn_status.label(turn_started_at);
         let label: &str = &label_owned;
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP)
             .border_style(theme::dim_style())
-            .title(Span::styled(label, theme::title_style()))
-            .title_bottom(Span::styled("?=help", theme::dim_style()));
+            .title(Span::styled(label, theme::title_style()));
 
         if self.input.is_empty() && !turn_in_flight {
             // A paused queue takes the empty input line as ghost text in the
@@ -1601,7 +1600,7 @@ impl InputBarState {
             }
 
             let screen_row = cursor_row - self.scroll_offset;
-            let cx = input_area.x + 1 + cursor_col;
+            let cx = input_area.x + cursor_col;
             let cy = input_area.y + 1 + screen_row;
             f.set_cursor_position((cx, cy));
         }
@@ -1647,7 +1646,7 @@ impl InputBarState {
             + 4; // padding
 
         let popup_y = self.last_input_area.y.saturating_sub(popup_height);
-        let popup_x = self.last_input_area.x + 1;
+        let popup_x = self.last_input_area.x;
 
         let popup_rect = Rect::new(
             popup_x,
@@ -1853,6 +1852,37 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.pop_input_char();
         assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn compact_input_renders_text_below_top_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello");
+        let area = Rect::new(0, 0, 40, 6);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    true,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+            })
+            .expect("draw input bar");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("hello"), "input text missing: {rendered}");
+        assert!(
+            !rendered.contains("?=help"),
+            "bottom title overlaps compact input: {rendered}"
+        );
     }
 
     #[test]

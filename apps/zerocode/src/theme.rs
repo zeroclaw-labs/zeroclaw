@@ -442,7 +442,7 @@ pub(crate) fn list_highlight_style() -> Style {
 /// drift back to the terminal default.
 pub(crate) fn panel_block(title: &str) -> ratatui::widgets::Block<'static> {
     let mut block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
+        .borders(ratatui::widgets::Borders::TOP)
         .border_style(dim_style());
     if !title.is_empty() {
         block = block.title(ratatui::text::Span::styled(
