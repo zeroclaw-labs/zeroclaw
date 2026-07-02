@@ -67,7 +67,7 @@ Key properties:
 
 ## Tool receipts
 
-Every tool invocation produces an HMAC-SHA256 receipt that is appended to the tool-result text and passed back to the model in the conversation, proving the tool actually ran. The HMAC is keyed by a per-daemon-process key and computed over `tool_name || args || result || timestamp`. Receipts are not written to a separate on-disk log and are not chained; the model can echo them but cannot forge a new valid one without the key. See [Tool receipts](../security/tool-receipts.md).
+Successful tool executions can receive an HMAC-SHA256 receipt that is appended to the tool-result text and passed back to the model in the conversation, proving the signed result came from the runtime. The HMAC is keyed by an ephemeral in-memory key and computed over `tool_name || args || result || timestamp`. Receipts are not written to a separate on-disk log and are not chained; the model can echo them but cannot forge a new valid one without the key. See [Tool receipts](../security/tool-receipts.md).
 
 ## Outbound
 
