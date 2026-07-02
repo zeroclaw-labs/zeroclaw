@@ -911,10 +911,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
              - Be concise and direct\n\
+             - Use Markdown formatting for readable answers\n\
+             - If a tool can answer the task, use your tools instead of stopping at a plain chat reply\n\
+             - Use tool results silently: answer with the outcome and do not narrate internal tool execution bookkeeping\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu media markers.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers, tool output, or protocol markup in code fences.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -20404,6 +20407,40 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(block),
             "the compatibility alias should use the same WhatsApp Web guidance"
         );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_lark_and_feishu_encourage_tool_use() {
+        for channel_name in ["lark", "feishu"] {
+            let block = channel_delivery_instructions(channel_name)
+                .expect("lark and feishu must have a delivery-instructions block");
+            assert!(
+                block.contains("When responding on Lark/Feishu:"),
+                "{channel_name} block must identify itself"
+            );
+            assert!(
+                block.contains("use your tools"),
+                "{channel_name} block must steer the model toward the agent tool path"
+            );
+            assert!(
+                block.contains("Use tool results silently"),
+                "{channel_name} block must keep internal tool bookkeeping out of replies"
+            );
+
+            let prompt = build_channel_system_prompt("base prompt", channel_name, None);
+            assert!(
+                prompt.contains("base prompt"),
+                "{channel_name} system prompt must retain the base prompt"
+            );
+            assert!(
+                prompt.contains("When responding on Lark/Feishu:"),
+                "{channel_name} system prompt must include channel instructions"
+            );
+            assert!(
+                prompt.contains("Use tool results silently"),
+                "{channel_name} system prompt must include the tool-use guidance"
+            );
+        }
     }
 
     // Regression guard for #6646: web_search_tool / web_fetch never fired via
