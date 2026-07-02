@@ -38,6 +38,7 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
+const SCROLLBAR_VISIBLE_AFTER: Duration = Duration::from_millis(1200);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -2420,6 +2421,7 @@ impl Chat {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
+                        state.mark_scrollbar_active();
                         state.scrollbar_drag = Some(ScrollbarDrag {
                             start_scroll: state.scroll_offset,
                             start_row: row,
@@ -2510,6 +2512,7 @@ impl Chat {
                         let scroll_delta = dy * max as i32 / track_h as i32;
                         let new_off =
                             (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
+                        state.mark_scrollbar_active();
                         state.scroll_offset = new_off as u16;
                         state.pinned_to_bottom = state.scroll_offset >= max;
                     } else if let Some(start) = state.mouse_down_entry {
@@ -3481,9 +3484,11 @@ fn render_tool_entry(
     };
     let parsed: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
     let title = tool_title(name, parsed.as_ref());
+    let rail_style = theme::tool_label_style().add_modifier(sel_mod);
     lines.push(action_header_line(
         &title,
         theme::tool_label_style().add_modifier(sel_mod),
+        rail_style,
         sel_mod,
     ));
 
@@ -3527,7 +3532,7 @@ fn render_tool_entry(
                 input_json.to_string()
             };
             lines.push(Line::from(Span::styled(
-                format!("  {truncated}"),
+                truncated,
                 theme::dim_style().add_modifier(sel_mod),
             )));
         }
@@ -3540,10 +3545,12 @@ fn render_tool_entry(
             res.to_string()
         };
         lines.push(Line::from(Span::styled(
-            format!("  → {truncated}"),
+            format!("→ {truncated}"),
             theme::dim_style().add_modifier(sel_mod),
         )));
     }
+
+    prepend_rail_to_lines(&mut lines[body_start..], rail_style);
 
     // Apply REVERSED to body lines from diff_lines/write_lines too.
     if is_selected {
@@ -3574,15 +3581,17 @@ fn render_entry_into(
     };
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
+            let rail_style = theme::user_label_style().add_modifier(sel_mod);
             lines.push(action_header_line(
                 &crate::i18n::t("zc-chat-label-you"),
                 theme::user_label_style().add_modifier(sel_mod),
+                rail_style,
                 sel_mod,
             ));
             let body_style = theme::body_style().add_modifier(sel_mod);
             let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
             for line_text in text_lines {
-                lines.push(plain_indented_line(line_text, body_style));
+                lines.push(plain_indented_line(line_text, body_style, rail_style));
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -3593,14 +3602,17 @@ fn render_entry_into(
                 lines.push(plain_indented_line(
                     &format!("[{label}]"),
                     theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
+                    rail_style,
                 ));
             }
             lines.push(Line::default());
         }
         ChatEntry::AgentMessage(text) => {
+            let rail_style = theme::agent_label_style().add_modifier(sel_mod);
             lines.push(action_header_line(
                 &crate::i18n::t("zc-chat-label-agent"),
                 theme::agent_label_style().add_modifier(sel_mod),
+                rail_style,
                 sel_mod,
             ));
             let body_style = theme::body_style().add_modifier(sel_mod);
@@ -3617,7 +3629,7 @@ fn render_entry_into(
                     )
                     .style(line.style);
                 }
-                lines.push(indented_line(line, body_style));
+                lines.push(indented_line(line, body_style, rail_style));
             }
             lines.push(Line::default());
         }
@@ -3675,11 +3687,16 @@ fn copy_action_rects(body_x: u16, row: u16) -> [(CopyFormat, Rect); 2] {
     ]
 }
 
-fn action_header_line(label: &str, label_style: Style, selection: Modifier) -> Line<'static> {
+fn action_header_line(
+    label: &str,
+    label_style: Style,
+    rail_style: Style,
+    selection: Modifier,
+) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action = theme::accent_style().add_modifier(selection | Modifier::BOLD);
     Line::from(vec![
-        Span::styled("  ", muted),
+        Span::styled("▌ ", rail_style),
         Span::styled(crate::i18n::t("zc-chat-action-copy"), action),
         Span::styled("  ", muted),
         Span::styled(crate::i18n::t("zc-chat-action-copy-md"), action),
@@ -3724,14 +3741,24 @@ fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn indented_line(mut line: Line<'static>, style: Style) -> Line<'static> {
-    let mut spans = vec![Span::styled("  ".to_string(), style)];
+fn indented_line(mut line: Line<'static>, style: Style, rail_style: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled("▌ ".to_string(), rail_style)];
     spans.append(&mut line.spans);
-    Line::from(spans)
+    Line::from(spans).style(style)
 }
 
-fn plain_indented_line(text: &str, style: Style) -> Line<'static> {
-    Line::from(Span::styled(format!("  {text}"), style))
+fn plain_indented_line(text: &str, style: Style, rail_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("▌ ", rail_style),
+        Span::styled(text.to_string(), style),
+    ])
+}
+
+fn prepend_rail_to_lines(lines: &mut [Line<'static>], rail_style: Style) {
+    for line in lines {
+        line.spans
+            .insert(0, Span::styled("▌ ".to_string(), rail_style));
+    }
 }
 
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
@@ -3802,14 +3829,15 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let transient_lines: Vec<Line<'static>> = if transient {
         let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
         if has_stream_text {
-            lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-chat-label-agent"),
-                theme::agent_label_style(),
-            )));
+            let rail_style = theme::agent_label_style();
+            lines.push(Line::from(vec![
+                Span::styled("▌ ", rail_style),
+                Span::styled(crate::i18n::t("zc-chat-label-agent"), rail_style),
+            ]));
             lines.extend(
                 markdown_to_lines(&state.streaming_text, inner_width)
                     .into_iter()
-                    .map(|line| indented_line(line, theme::body_style())),
+                    .map(|line| indented_line(line, theme::body_style(), rail_style)),
             );
         }
         if has_stream_thought {
@@ -3897,17 +3925,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         }
     }
 
-    let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
-        .position(scroll as usize)
-        .viewport_content_length(inner_height as usize);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None),
-        body_area,
-        &mut scrollbar_state,
-    );
+    if state.should_show_scrollbar_thumb() {
+        let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
+            .position(scroll as usize)
+            .viewport_content_length(inner_height as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(None),
+            body_area,
+            &mut scrollbar_state,
+        );
+    }
     state.scrollbar_track_rect = scrollbar_hit_rect(body_area);
 }
 
@@ -4938,6 +4968,7 @@ pub struct ChatState {
     scrollbar_track_rect: Option<ratatui::layout::Rect>,
     /// Active scrollbar drag anchor.
     scrollbar_drag: Option<ScrollbarDrag>,
+    scrollbar_last_active_at: Option<Instant>,
     session_overlay: SessionOverlay,
     scroll_offset: u16,
     pinned_to_bottom: bool,
@@ -5041,6 +5072,7 @@ impl ChatState {
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
+            scrollbar_last_active_at: None,
             session_overlay: SessionOverlay::None,
             scroll_offset: 0,
             pinned_to_bottom: true,
@@ -5439,11 +5471,13 @@ impl ChatState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
+        self.mark_scrollbar_active();
         self.pinned_to_bottom = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
+        self.mark_scrollbar_active();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
         if self.scroll_offset >= max {
@@ -5468,6 +5502,17 @@ impl ChatState {
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
+    }
+
+    fn mark_scrollbar_active(&mut self) {
+        self.scrollbar_last_active_at = Some(Instant::now());
+    }
+
+    fn should_show_scrollbar_thumb(&self) -> bool {
+        self.scrollbar_drag.is_some()
+            || self
+                .scrollbar_last_active_at
+                .is_some_and(|active_at| active_at.elapsed() < SCROLLBAR_VISIBLE_AFTER)
     }
 
     pub fn title(&self) -> String {
@@ -6467,8 +6512,8 @@ mod tests {
         };
         let agent = ChatEntry::AgentMessage(Arc::<str>::from("world"));
 
-        assert_eq!(rendered_entry(&user, 80), "  copy  md  You:\n  hello\n");
-        assert_eq!(rendered_entry(&agent, 80), "  copy  md  Agent:\n  world\n");
+        assert_eq!(rendered_entry(&user, 80), "▌ copy  md  You:\n▌ hello\n");
+        assert_eq!(rendered_entry(&agent, 80), "▌ copy  md  Agent:\n▌ world\n");
     }
 
     #[test]
@@ -6553,24 +6598,56 @@ mod tests {
     }
 
     #[test]
-    fn conversation_scrollbar_renders_only_thumb() {
+    fn conversation_scrollbar_hides_thumb_when_idle() {
         use ratatui::{Terminal, backend::TestBackend};
 
-        let mut s = state();
-        for i in 0..50 {
-            s.entries
+        let mut state = state();
+        for entry_index in 0..50 {
+            state
+                .entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
-                    "entry {i}"
+                    "entry {entry_index}"
                 ))));
         }
-        s.mark_dirty_full();
+        state.mark_dirty_full();
 
         let area = Rect::new(0, 0, 80, 12);
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render_conversation(frame, &mut s, area);
+                render_conversation(frame, &mut state, area);
+            })
+            .expect("draw conversation");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(
+            !rendered.contains('█'),
+            "idle scrollbar visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn conversation_scrollbar_renders_only_thumb_when_active() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        for entry_index in 0..50 {
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {entry_index}"
+                ))));
+        }
+        state.mark_dirty_full();
+        state.mark_scrollbar_active();
+
+        let area = Rect::new(0, 0, 80, 12);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
             })
             .expect("draw conversation");
 
