@@ -326,6 +326,8 @@ impl Channel for AmqpChannel {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
 
             if tx.send(channel_msg).await.is_err() {
@@ -352,6 +354,16 @@ impl Channel for AmqpChannel {
 
     fn self_handle(&self) -> Option<String> {
         Some(self.sender_label.clone())
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in AMQP.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in AMQP.
+        Ok(())
     }
 }
 

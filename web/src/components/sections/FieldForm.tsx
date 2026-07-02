@@ -48,6 +48,7 @@ import {
   fetchConfigSchema,
   getAgentOptions,
   getCatalogModels,
+  getChannels,
   listProps,
   mcpRequiredByTransport,
   objectArrayElementProps,
@@ -856,6 +857,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
     const [filter, setFilter] = useState("");
 
+    // When this form edits a channel block (`channels.<type>.<alias>`), its
+    // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
+    // (built-ins + its `mcp_bundles` MCP), not the default agent's. The owner
+    // is the agent whose `channels` list contains `<type>.<alias>` (a reverse
+    // lookup the gateway already does and returns as `owning_agent`), so it
+    // is NOT the alias in the path. `undefined` for non-channel sections
+    // (risk profiles are shared across agents; pipeline/claude_code are
+    // global) leaves the picker on the default-agent catalog.
+    const [toolAgent, setToolAgent] = useState<string | undefined>(undefined);
+    useEffect(() => {
+      if (!prefix.startsWith("channels.")) {
+        setToolAgent(undefined);
+        return;
+      }
+      const channelName = prefix.slice("channels.".length);
+      let cancelled = false;
+      void getChannels()
+        .then((channels) => {
+          if (cancelled) return;
+          const owner = channels.find((c) => c.name === channelName)?.owning_agent;
+          setToolAgent(owner ?? undefined);
+        })
+        .catch(() => {
+          if (!cancelled) setToolAgent(undefined);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [prefix]);
+
     // Schema is whole-Config and ETag-cached server-side; fetch once per
     // session so every form row can resolve its `///` doc-comment helper
     // text via descriptionForPath without per-field round trips.
@@ -1239,6 +1270,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <FieldRow
                 key={f.path}
                 entry={f}
+                toolAgent={toolAgent}
                 mcpTransport={resolveMcpTransport(f.path, entries, draft)}
                 requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
@@ -1371,6 +1403,10 @@ interface FieldRowProps {
   tombstoned?: boolean;
   /** Pulls the row out of tombstoned state. */
   onUndoTombstone?: () => void;
+  /** Owning agent for an `allowed_tools`/`excluded_tools` ToolPicker in this
+   *  section (e.g. a channel's `owning_agent`), so the picker lists that
+   *  agent's scoped tools. `undefined` keeps the default-agent catalog. */
+  toolAgent?: string;
   /** Live transport draft value for the enclosing `mcp.servers.<name>` group
    *  (null when this row isn't an MCP server field). Drives the
    *  transport-conditional required badge/hint on `command` and `url`. */
@@ -1393,6 +1429,7 @@ function FieldRow({
   drift,
   tombstoned,
   onUndoTombstone,
+  toolAgent,
   mcpTransport,
   requiredByTransport,
 }: FieldRowProps) {
@@ -1847,6 +1884,7 @@ function FieldRow({
           // (parseInput → parseStringArrayValue) never sees a difference.
           <ToolPicker
             id={entry.path}
+            agent={toolAgent}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
           />

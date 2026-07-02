@@ -1638,7 +1638,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
@@ -1710,7 +1711,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
@@ -1791,6 +1793,15 @@ impl Channel for QQChannel {
 
     async fn health_check(&self) -> bool {
         self.fetch_access_token_with_retry().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the QQ Bot Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

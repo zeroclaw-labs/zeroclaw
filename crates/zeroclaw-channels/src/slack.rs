@@ -3432,6 +3432,8 @@ impl SlackChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -3758,6 +3760,8 @@ impl SlackChannel {
                                         interruption_scope_id: scope_id,
                                         attachments: vec![],
                                         subject: None,
+
+                                        ..Default::default()
                                     };
                                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"cancel_emoji": cancel_emoji, "user": user, "item_channel": item_channel, "item_ts": item_ts})), ":: reaction from on / — sending /stop");
                                     if tx.send(cancel_msg).await.is_err() {
@@ -3882,6 +3886,8 @@ impl SlackChannel {
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
                     subject: None,
+
+                    ..Default::default()
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -5067,6 +5073,8 @@ impl Channel for SlackChannel {
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -5168,6 +5176,8 @@ impl Channel for SlackChannel {
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -6708,6 +6718,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let msg1 = make_msg("100.000");
@@ -6736,6 +6748,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let msg1 = make_msg("100.000");

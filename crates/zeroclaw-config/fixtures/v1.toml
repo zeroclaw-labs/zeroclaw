@@ -534,6 +534,7 @@ allowed_domains = ["*"]
 backend = "agent_browser"
 native_headless = true
 native_webdriver_url = "http://127.0.0.1:9515"
+allowed_private_hosts = []
 
 [browser.computer_use]
 endpoint = "http://127.0.0.1:8787/v1/actions"

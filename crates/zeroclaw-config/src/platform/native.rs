@@ -3,8 +3,50 @@ use std::path::{Path, PathBuf};
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
+/// Command-line argument passed after `cmd.exe /C`.
+///
+/// The outer quotes make `cmd.exe` receive the whole configured command as one
+/// command string, while internal quotes remain verbatim for paths and args
+/// with spaces. This preserves the #7083 quoting contract for all Windows
+/// platform-shell call sites.
+pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
+    format!("\"{command}\"")
+}
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
+#[cfg(target_os = "windows")]
+const WINDOWS_COMMAND_EXECUTE_ARG: &str = "/C";
+
+#[cfg(target_os = "windows")]
+pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
+    process
+        .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
+        .raw_arg(windows_cmd_shell_raw_arg(command))
+        .creation_flags(CREATE_NO_WINDOW);
+    process
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut process = std::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
+    process
+        .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
+        .raw_arg(windows_cmd_shell_raw_arg(command))
+        .creation_flags(CREATE_NO_WINDOW);
+    process
+}
+
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
-pub struct NativeRuntime;
+pub struct NativeRuntime {
+    /// Shell binary to invoke for command execution (e.g. `"sh"`, `"bash"`).
+    shell: String,
+}
 
 impl Default for NativeRuntime {
     fn default() -> Self {
@@ -13,8 +55,17 @@ impl Default for NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Create a native runtime that uses the system default shell (`sh`).
     pub fn new() -> Self {
-        Self
+        Self { shell: "sh".into() }
+    }
+
+    /// Create a native runtime that uses a specific shell binary.
+    ///
+    /// `shell` should be a path or name resolvable via `PATH`,
+    /// e.g. `"bash"`, `"/bin/zsh"`, `"/usr/bin/fish"`.
+    pub fn with_shell(shell: String) -> Self {
+        Self { shell }
     }
 }
 
@@ -52,7 +103,12 @@ impl RuntimeAdapter for NativeRuntime {
             // Android keeps its shell at /system/bin/sh and it is not always
             // on PATH for spawned processes; use the absolute path when present
             // so the shell can launch (and reach platform tools).
-            let shell = if is_android() { "/system/bin/sh" } else { "sh" };
+            // User-configured shell is ignored on Android.
+            let shell = if is_android() {
+                "/system/bin/sh"
+            } else {
+                &self.shell
+            };
             let mut process = tokio::process::Command::new(shell);
             process.arg("-c").arg(command).current_dir(workspace_dir);
             Ok(process)
@@ -60,18 +116,8 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-            let mut process = tokio::process::Command::new("cmd.exe");
-            // Use raw_arg so the command string is passed verbatim to cmd.exe,
-            // bypassing Rust's CommandLineToArgvW escaping which would mangle
-            // embedded double quotes with backslash escapes that cmd doesn't
-            // understand (see #7083).
-            process
-                .raw_arg("/C")
-                .raw_arg(format!("\"{command}\""))
-                .current_dir(workspace_dir)
-                .creation_flags(CREATE_NO_WINDOW);
+            let mut process = windows_tokio_cmd_shell_command(command);
+            process.current_dir(workspace_dir);
             Ok(process)
         }
     }
@@ -158,6 +204,24 @@ mod tests {
                 "Windows: must not contain backslash-escaped quotes, got: {debug}"
             );
         }
+    }
+
+    #[test]
+    fn cmd_shell_raw_arg_wraps_command_for_verbatim_cmd_parsing() {
+        assert_eq!(
+            windows_cmd_shell_raw_arg(r#"dir "C:\Users\test\Desktop" /b"#),
+            r#""dir "C:\Users\test\Desktop" /b""#
+        );
+    }
+
+    #[test]
+    fn cmd_shell_raw_arg_preserves_internal_quotes_and_operators() {
+        assert_eq!(
+            windows_cmd_shell_raw_arg(
+                r#"dir "C:\path with spaces" /b 2>nul || echo "directory missing""#
+            ),
+            r#""dir "C:\path with spaces" /b 2>nul || echo "directory missing"""#
+        );
     }
 
     /// A command with mixed quoted and unquoted segments must pass
@@ -281,5 +345,123 @@ mod tests {
             stdout.contains(":\\"),
             "%%USERPROFILE%% should expand to a path, got: {stdout}"
         );
+    }
+
+    // ── Configurable shell tests ─────────────────────────────
+
+    #[test]
+    fn native_with_shell_defaults_to_sh() {
+        let runtime = NativeRuntime::new();
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("\"sh\""),
+            "default shell should be 'sh', got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_with_shell_bash() {
+        let runtime = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("\"bash\""),
+            "configured shell should appear in command debug, got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_with_shell_absolute_path() {
+        let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            format!("{cmd:?}").contains("/usr/bin/zsh"),
+            "absolute path should appear verbatim, got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn native_default_and_with_shell_are_different() {
+        let default = NativeRuntime::new();
+        let configured = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        #[cfg(not(target_os = "windows"))]
+        {
+            let default_debug = format!(
+                "{:?}",
+                default.build_shell_command("echo hi", &cwd).unwrap()
+            );
+            let configured_debug = format!(
+                "{:?}",
+                configured.build_shell_command("echo hi", &cwd).unwrap()
+            );
+            assert_ne!(
+                default_debug, configured_debug,
+                "default shell and configured shell should produce different commands"
+            );
+        }
+    }
+
+    #[test]
+    fn native_with_shell_passes_c_flag() {
+        let runtime = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        let cmd = runtime
+            .build_shell_command("echo test_command", &cwd)
+            .unwrap();
+        let debug = format!("{cmd:?}");
+
+        // The command string is preserved verbatim on every platform.
+        assert!(
+            debug.contains("echo test_command"),
+            "command should contain the passed string, got: {debug}"
+        );
+
+        // On Unix the shell is invoked as `<shell> -c "<command>"`. Android
+        // ignores the configured shell and pins `/system/bin/sh` (it is not on
+        // PATH for spawned processes), so mirror that runtime branch here.
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                debug.contains("-c"),
+                "shell command must use -c flag, got: {debug}"
+            );
+            if is_android() {
+                assert!(
+                    debug.contains("/system/bin/sh"),
+                    "Android should pin /system/bin/sh, got: {debug}"
+                );
+                assert!(
+                    !debug.contains("bash"),
+                    "Android must ignore the configured shell, got: {debug}"
+                );
+            } else {
+                assert!(
+                    debug.contains("bash"),
+                    "configured shell should be used, got: {debug}"
+                );
+            }
+        }
+
+        // On Windows the configured shell is ignored: commands run via
+        // `cmd.exe /C` (see the [runtime].shell docs), so there is no `-c`
+        // boundary and `bash` never appears.
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                debug.contains(WINDOWS_COMMAND_INTERPRETER)
+                    && debug.contains(WINDOWS_COMMAND_EXECUTE_ARG),
+                "Windows should use the cmd.exe /C boundary, got: {debug}"
+            );
+            assert!(
+                !debug.contains("bash"),
+                "Windows must ignore the configured shell, got: {debug}"
+            );
+        }
     }
 }

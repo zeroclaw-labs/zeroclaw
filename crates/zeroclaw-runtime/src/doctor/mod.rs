@@ -1249,6 +1249,33 @@ fn check_environment(items: &mut Vec<DiagItem>) {
 
     // Optional tools
     check_command_available("curl", &["--version"], cat, items);
+
+    if crate::service::linux_systemd_runtime_present() {
+        items.push(systemd_linger_diag_item(
+            crate::service::systemd_user_linger_status(),
+        ));
+    }
+}
+
+fn systemd_linger_diag_item(status: crate::service::SystemdUserLinger) -> DiagItem {
+    let cat = "environment";
+    match status {
+        crate::service::SystemdUserLinger::Enabled => DiagItem::ok(
+            cat,
+            crate::i18n::get_required_cli_string("cli-doctor-systemd-linger-enabled"),
+        ),
+        crate::service::SystemdUserLinger::Disabled { user } => DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-systemd-linger-disabled",
+                &[("user", user.as_str())],
+            ),
+        ),
+        crate::service::SystemdUserLinger::Unknown => DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string("cli-doctor-systemd-linger-unknown"),
+        ),
+    }
 }
 
 fn check_cli_tools(items: &mut Vec<DiagItem>) {
@@ -1701,6 +1728,33 @@ mod tests {
         // git should be available in any CI/dev environment
         assert!(git_item.is_some());
         assert_eq!(git_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn systemd_linger_diag_reports_disabled_user_service() {
+        let item = systemd_linger_diag_item(crate::service::SystemdUserLinger::Disabled {
+            user: "alice".to_string(),
+        });
+
+        assert_eq!(item.severity, Severity::Warn);
+        assert_eq!(item.category, "environment");
+        assert!(item.message.contains("may stop after logout"));
+        assert!(item.message.contains("loginctl enable-linger alice"));
+    }
+
+    #[test]
+    fn systemd_linger_diag_reports_enabled_and_unknown() {
+        let enabled = systemd_linger_diag_item(crate::service::SystemdUserLinger::Enabled);
+        assert_eq!(enabled.severity, Severity::Ok);
+        assert_eq!(enabled.message, "systemd user lingering enabled");
+
+        let unknown = systemd_linger_diag_item(crate::service::SystemdUserLinger::Unknown);
+        assert_eq!(unknown.severity, Severity::Warn);
+        assert!(
+            unknown
+                .message
+                .contains("could not be checked with loginctl")
+        );
     }
 
     #[test]
