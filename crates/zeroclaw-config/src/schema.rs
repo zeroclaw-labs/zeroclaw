@@ -4739,6 +4739,13 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Resource URIs to read once at agent startup and inject into the system
+    /// prompt as untrusted, server-origin context. Each is read via
+    /// `resources/read` on this server; pins on a server that does not advertise
+    /// resources, or that the agent's tool policy denies, are skipped with a
+    /// warning. Read once per run (not refreshed; no subscriptions).
+    #[serde(default)]
+    pub pinned_resources: Vec<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -7896,6 +7903,10 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+    /// Per-call WASM execution limits
+    #[serde(default)]
+    #[nested]
+    pub limits: PluginLimitsConfig,
     #[serde(default)]
     #[nested]
     #[natural_key = "name"]
@@ -7956,6 +7967,57 @@ impl Default for PluginSecurityConfig {
     }
 }
 
+/// Per-call WASM execution limits (`[plugins.limits]`).
+///
+/// Bounds a single plugin call so a runaway or malicious component traps
+/// instead of hanging the host or exhausting memory. `call_fuel` caps
+/// instructions per call; the memory, table, and instance ceilings bound a
+/// store's growth. Every value is operator-tunable and validated as non-zero.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plugins.limits"]
+pub struct PluginLimitsConfig {
+    /// Fuel budget per plugin call (wasmtime instruction units).
+    #[serde(default = "default_plugin_call_fuel")]
+    pub call_fuel: u64,
+    /// Maximum linear memory a plugin store may grow to, in megabytes.
+    #[serde(default = "default_plugin_max_memory_mb")]
+    pub max_memory_mb: usize,
+    /// Maximum table elements a plugin store may allocate.
+    #[serde(default = "default_plugin_max_table_elements")]
+    pub max_table_elements: usize,
+    /// Maximum component instances a plugin store may create.
+    #[serde(default = "default_plugin_max_instances")]
+    pub max_instances: usize,
+}
+
+fn default_plugin_call_fuel() -> u64 {
+    1_000_000_000
+}
+
+fn default_plugin_max_memory_mb() -> usize {
+    256
+}
+
+fn default_plugin_max_table_elements() -> usize {
+    100_000
+}
+
+fn default_plugin_max_instances() -> usize {
+    64
+}
+
+impl Default for PluginLimitsConfig {
+    fn default() -> Self {
+        Self {
+            call_fuel: default_plugin_call_fuel(),
+            max_memory_mb: default_plugin_max_memory_mb(),
+            max_table_elements: default_plugin_max_table_elements(),
+            max_instances: default_plugin_max_instances(),
+        }
+    }
+}
+
 fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
@@ -7972,6 +8034,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
         }
     }
@@ -11084,6 +11147,37 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
+    /// Shell binary the native runtime uses for command execution.
+    ///
+    /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
+    /// When unset or `null`, the system default `sh` is used. The shell is
+    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
+    /// shell binary.
+    ///
+    /// Accepted forms (Unix):
+    /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
+    /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// The value is validated when the native runtime is constructed, so a bad
+    /// value is reported up front rather than failing on the first shell
+    /// command. Rejected: empty/whitespace; a relative path with separators
+    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
+    /// instead); a bare name not found on `PATH`; and a path that does not
+    /// exist or is not executable.
+    ///
+    /// **Ignored on Windows and Android** (and not validated there): Windows
+    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
+    /// (its shell is not on `PATH` for spawned processes).
+    ///
+    /// **Examples:**
+    /// ```toml
+    /// [runtime]
+    /// shell = "bash"           # resolves via PATH
+    /// shell = "/bin/zsh"       # absolute path
+    /// ```
+    #[serde(default)]
+    pub shell: Option<String>,
+
     /// Global reasoning override for model_providers that expose explicit controls.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
@@ -12048,6 +12142,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub amqp: HashMap<String, AmqpConfig>,
+    /// Filesystem SOP listener instances (`[channels.filesystem.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub filesystem: HashMap<String, FilesystemConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -12298,6 +12396,12 @@ impl ChannelsConfig {
                 configured: !self.amqp.is_empty(),
             },
             ChannelInfo {
+                kind: "filesystem",
+                name: "Filesystem",
+                desc: "filesystem change SOP listener",
+                configured: !self.filesystem.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -12346,6 +12450,7 @@ impl ChannelsConfig {
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
+            || self.filesystem.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -12355,7 +12460,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12391,6 +12496,7 @@ impl ChannelsConfig {
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
+            ("filesystem", !self.filesystem.is_empty(), false),
         ]
     }
 
@@ -12475,6 +12581,7 @@ impl Default for ChannelsConfig {
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -13964,6 +14071,168 @@ fn default_mqtt_keep_alive_secs() -> u64 {
     30
 }
 
+/// Filesystem SOP listener configuration.
+///
+/// Watches configured paths and dispatches file create/modify/delete/rename
+/// events to the SOP engine. This is a fan-in listener, not a chat channel:
+/// its `Channel::send` has no outbound surface.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.filesystem"]
+pub struct FilesystemConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Root paths to watch. At least one is required.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Watch nested paths beneath each root.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub recursive: bool,
+    /// Glob patterns to include. Empty matches all paths under the roots.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Glob patterns to exclude. Applied after `include`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Event kinds to emit (`created`, `modified`, `deleted`, `renamed`).
+    #[tab(Behavior)]
+    #[serde(default = "default_filesystem_events")]
+    pub events: Vec<String>,
+    /// Collapse rapid repeated events per path/kind within this window.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Wait this long after the last event before reading metadata or content,
+    /// giving atomic writes and slow copies time to finish.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_settle_ms")]
+    pub settle_ms: u64,
+    /// Read file content into the event payload. Opt-in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub read_content: bool,
+    /// Follow symlinks when reading event-path metadata, hash, and content.
+    /// Off by default: a symlink under a watched root is rejected before any
+    /// metadata/hash/content handling so its target cannot escape the root. When
+    /// on, the canonical target must still resolve inside a configured root.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    /// Maximum file content bytes admitted into a payload when `read_content`,
+    /// and the size ceiling for hashing. `Some(n)` caps reads and hashing at
+    /// `n` bytes; oversize files are skipped rather than truncated. `None`
+    /// removes the ceiling entirely (unbounded reads). Defaults to
+    /// `Some(65536)` (64 KiB), so the cap applies by default whenever
+    /// `read_content` or hashing runs.
+    #[tab(Advanced)]
+    #[serde(default = "default_filesystem_max_content_bytes")]
+    pub max_content_bytes: Option<usize>,
+    /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
+    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
+    /// paths in SOP payloads and flood the watcher with events. Off unless
+    /// explicitly enabled.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allow_broad_roots: bool,
+    /// Tools excluded from this channel's tool spec.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: Vec::new(),
+            recursive: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            events: default_filesystem_events(),
+            debounce_ms: default_filesystem_debounce_ms(),
+            settle_ms: default_filesystem_settle_ms(),
+            read_content: false,
+            follow_symlinks: false,
+            max_content_bytes: default_filesystem_max_content_bytes(),
+            allow_broad_roots: false,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
+    "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
+];
+
+impl FilesystemConfig {
+    /// Validate the filesystem listener configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.paths.is_empty() {
+            anyhow::bail!("at least one path must be configured");
+        }
+        for path in &self.paths {
+            let trimmed = path.trim_end_matches('/');
+            let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+            if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
+                anyhow::bail!(
+                    "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+        }
+        for kind in &self.events {
+            if !matches!(
+                kind.as_str(),
+                "created" | "modified" | "deleted" | "renamed"
+            ) {
+                anyhow::bail!(
+                    "event '{kind}' is invalid; expected created, modified, deleted, or renamed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChannelConfig for FilesystemConfig {
+    fn name() -> &'static str {
+        "Filesystem"
+    }
+    fn desc() -> &'static str {
+        "Filesystem SOP Listener"
+    }
+}
+
+fn default_filesystem_events() -> Vec<String> {
+    vec![
+        "created".to_string(),
+        "modified".to_string(),
+        "deleted".to_string(),
+        "renamed".to_string(),
+    ]
+}
+
+fn default_filesystem_debounce_ms() -> u64 {
+    500
+}
+
+fn default_filesystem_settle_ms() -> u64 {
+    250
+}
+
+fn default_filesystem_max_content_bytes() -> Option<usize> {
+    Some(65536)
+}
+
 /// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
 ///
 /// Subscribes to an exchange via routing keys and lifts each delivery into an
@@ -13971,6 +14240,27 @@ fn default_mqtt_keep_alive_secs() -> u64 {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
+/// Where an AMQP delivery is routed once consumed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AmqpDispatch {
+    /// Drive a normal agent turn: the delivery becomes a `ChannelMessage`
+    /// shaped by `content_template`/`thread_id_field`. This is the default and
+    /// preserves the original AMQP consumer behavior.
+    #[default]
+    AgentLoop,
+    /// Dispatch the delivery to the SOP engine as an `amqp` `SopEvent`
+    /// (`topic` = routing key, `payload` = delivery body), matching SOPs whose
+    /// `amqp` trigger routing key matches. No agent turn is started.
+    Sop,
+    /// Do both: dispatch to the SOP engine and drive an agent turn from the
+    /// same delivery.
+    SopAndAgentLoop,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.amqp"]
@@ -13984,7 +14274,9 @@ pub struct AmqpConfig {
     pub enabled: bool,
     /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
     /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub amqp_url: String,
     /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
     #[tab(Advanced)]
@@ -14004,10 +14296,14 @@ pub struct AmqpConfig {
     pub ca_cert: Option<PathBuf>,
     /// Path to the client certificate for broker mutual-TLS auth
     /// (Fedora Messaging requires a client cert).
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_cert: Option<PathBuf>,
     /// Path to the client private key matching `client_cert`.
+    #[secret]
     #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_key: Option<PathBuf>,
     /// Value placed in `ChannelMessage.sender` for every delivery from this
     /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
@@ -14036,6 +14332,13 @@ pub struct AmqpConfig {
     #[tab(Behavior)]
     #[serde(default = "default_amqp_durable_ack")]
     pub durable_ack: bool,
+    /// Where consumed deliveries are routed: drive an agent turn
+    /// (`agent_loop`, default), dispatch to the SOP engine (`sop`), or both
+    /// (`sop_and_agent_loop`). The `sop` and `sop_and_agent_loop` modes match
+    /// the delivery against SOP `amqp` triggers by routing key.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub dispatch: AmqpDispatch,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -17142,6 +17445,7 @@ impl Config {
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
+        self.collect_memory_semantic_search_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -17161,6 +17465,100 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface sqlite semantic/hybrid search with no effective embedder. The
+    /// runtime treats `NoopEmbedding` as dimensions 0 and silently skips the
+    /// vector path, so derive this from the canonical memory settings instead
+    /// of storing another effective-mode field.
+    fn collect_memory_semantic_search_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !Self::memory_backend_is_sqlite(&self.memory.backend) {
+            return;
+        }
+        if !matches!(
+            &self.memory.search_mode,
+            SearchMode::Embedding | SearchMode::Hybrid
+        ) {
+            return;
+        }
+        if self.memory_has_effective_embedder() {
+            return;
+        }
+
+        let search_mode = match &self.memory.search_mode {
+            SearchMode::Bm25 => "bm25",
+            SearchMode::Embedding => "embedding",
+            SearchMode::Hybrid => "hybrid",
+        };
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "memory_semantic_search_without_embedder",
+            format!(
+                "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
+                 embedding provider is configured; vector search is skipped and \
+                 recall falls back to keyword-only behavior. Configure \
+                 memory.embedding_provider or a valid memory.embedding_model \
+                 hint route, or set memory.search_mode = \"bm25\"."
+            ),
+            "memory.search_mode",
+        ));
+    }
+
+    fn memory_backend_is_sqlite(backend: &str) -> bool {
+        let trimmed = backend.trim();
+        let family = trimmed
+            .split_once('.')
+            .map_or(trimmed, |(family, _)| family)
+            .trim();
+        family.eq_ignore_ascii_case("sqlite")
+    }
+
+    fn memory_has_effective_embedder(&self) -> bool {
+        let fallback = || Self::memory_embedding_settings_have_effective_embedder(&self.memory);
+        let Some(hint) = self
+            .memory
+            .embedding_model
+            .strip_prefix("hint:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return fallback();
+        };
+
+        let Some(route) = self
+            .embedding_routes
+            .iter()
+            .find(|route| route.hint.trim() == hint)
+        else {
+            return fallback();
+        };
+
+        if Self::embedding_route_has_effective_embedder(route, self.memory.embedding_dimensions) {
+            return true;
+        }
+        fallback()
+    }
+
+    fn memory_embedding_settings_have_effective_embedder(memory: &MemoryConfig) -> bool {
+        let provider = memory.embedding_provider.trim();
+        !provider.is_empty()
+            && !provider.eq_ignore_ascii_case("none")
+            && memory.embedding_dimensions > 0
+    }
+
+    fn embedding_route_has_effective_embedder(
+        route: &EmbeddingRouteConfig,
+        fallback_dimensions: usize,
+    ) -> bool {
+        let provider = route.model_provider.trim();
+        let model = route.model.trim();
+        let dimensions = route.dimensions.unwrap_or(fallback_dimensions);
+        !provider.is_empty()
+            && !provider.eq_ignore_ascii_case("none")
+            && !model.is_empty()
+            && dimensions > 0
     }
 
     /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
@@ -18857,6 +19255,35 @@ impl Config {
             }
         }
 
+        if self.plugins.limits.call_fuel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.call_fuel",
+                "plugins.limits.call_fuel must be greater than 0; a zero budget traps every plugin call before it runs"
+            );
+        }
+        if self.plugins.limits.max_memory_mb == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_memory_mb",
+                "plugins.limits.max_memory_mb must be greater than 0; a zero cap rejects every plugin at instantiation"
+            );
+        }
+        if self.plugins.limits.max_table_elements == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_table_elements",
+                "plugins.limits.max_table_elements must be greater than 0; a zero ceiling rejects every plugin that allocates a table"
+            );
+        }
+        if self.plugins.limits.max_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_instances",
+                "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
+            );
+        }
+
         Ok(())
     }
 
@@ -20296,6 +20723,20 @@ impl HasPropKind for serde_json::Value {
 mod tests {
 
     #[::core::prelude::v1::test]
+    fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
+        // Absent field defaults to empty.
+        let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
+        assert!(cfg.pinned_resources.is_empty());
+
+        // Present field round-trips.
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"s","command":"x","pinned_resources":["file:///a","file:///b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
+
+    #[::core::prelude::v1::test]
     fn skill_bundle_admits_skill_honors_include_and_exclude() {
         let mut bundle = super::SkillBundleConfig::default();
         assert!(bundle.admits_skill("anything"));
@@ -20409,6 +20850,84 @@ mod tests {
             ..base
         };
         assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    async fn amqp_dispatch_defaults_to_agent_loop() {
+        assert_eq!(AmqpConfig::default().dispatch, AmqpDispatch::AgentLoop);
+    }
+
+    #[test]
+    async fn filesystem_validate_requires_path() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("at least one path"));
+    }
+
+    #[test]
+    async fn filesystem_validate_rejects_broad_root_by_default() {
+        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+        }
+    }
+
+    #[test]
+    async fn filesystem_validate_allows_broad_root_with_escape_hatch() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/var".into()],
+            allow_broad_roots: true,
+            ..FilesystemConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn filesystem_validate_rejects_unknown_event() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/srv/inbox".into()],
+            events: vec!["created".into(), "exploded".into()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("exploded"));
+    }
+
+    #[test]
+    async fn filesystem_validate_accepts_scoped_path() {
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/srv/inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn filesystem_defaults_are_safe() {
+        let cfg = FilesystemConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.recursive);
+        assert!(!cfg.read_content);
+        assert!(!cfg.follow_symlinks);
+        assert!(!cfg.allow_broad_roots);
+        assert_eq!(cfg.debounce_ms, 500);
+        assert_eq!(cfg.settle_ms, 250);
+        assert_eq!(cfg.max_content_bytes, Some(65536));
+        assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
     #[cfg(unix)]
@@ -21090,6 +21609,59 @@ enabled = true
         assert!(
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_call_fuel() {
+        let mut config = Config::default();
+        config.plugins.limits.call_fuel = 0;
+        let err = config
+            .validate()
+            .expect_err("zero call_fuel must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_memory() {
+        let mut config = Config::default();
+        config.plugins.limits.max_memory_mb = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_memory_mb must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.max_memory_mb"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_table_elements() {
+        let mut config = Config::default();
+        config.plugins.limits.max_table_elements = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_table_elements must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.limits.max_table_elements"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_instances() {
+        let mut config = Config::default();
+        config.plugins.limits.max_instances = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_instances must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.max_instances"),
+            "error must name the offending path; got: {err}"
         );
     }
 
@@ -21911,6 +22483,7 @@ auto_save = true
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
+                filesystem: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -23446,6 +24019,7 @@ allowed_users = ["@u:matrix.org"]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -23966,6 +24540,7 @@ allowed_numbers = ["+1", "+2"]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
+            filesystem: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -26847,6 +27422,7 @@ group_policy = "disabled"
     #[test]
     async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         // mistral has a fixed wire protocol and ignores wire_api.
         config
             .providers
@@ -31102,6 +31678,127 @@ allowed_users = []
         );
     }
 
+    const SEMANTIC_MEMORY_WARNING: &str = "memory_semantic_search_without_embedder";
+
+    fn warnings_with_code(
+        config: &Config,
+        code: &str,
+    ) -> Vec<crate::validation_warnings::ValidationWarning> {
+        config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == code)
+            .collect()
+    }
+
+    fn suppress_semantic_memory_warning(config: &mut Config) {
+        config.memory.search_mode = SearchMode::Bm25;
+    }
+
+    #[test]
+    async fn collect_warnings_flags_sqlite_hybrid_without_embedder() {
+        let config = Config::default();
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert_eq!(warning.path, "memory.search_mode");
+        assert!(
+            warning.message.contains("sqlite"),
+            "warning should name sqlite memory: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("keyword-only"),
+            "warning should describe the runtime degradation: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_sqlite_embedding_without_embedder() {
+        let mut config = Config::default();
+        config.memory.search_mode = SearchMode::Embedding;
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].message.contains("\"embedding\""),
+            "warning should name embedding search mode: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_valid_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("k".to_string()),
+                    model: Some("gpt-4o".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            model_provider: "openai.default".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: Some(1536),
+            api_key: None,
+        });
+        config.validate().expect("hint route should validate");
+
+        assert!(
+            warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty(),
+            "valid hint route must count as an effective embedder"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_missing_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_invalid_hint_embedding_route() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".to_string();
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            model_provider: "none".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: Some(1536),
+            api_key: None,
+        });
+
+        let warnings = warnings_with_code(&config, SEMANTIC_MEMORY_WARNING);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_bm25_without_embedder() {
+        let mut config = Config::default();
+        config.memory.search_mode = SearchMode::Bm25;
+
+        assert!(warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty());
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_non_sqlite_without_embedder() {
+        let mut config = Config::default();
+        config.memory.backend = "markdown.default".to_string();
+
+        assert!(warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty());
+    }
+
     #[test]
     async fn config_validate_accepts_classifier_provider_pointing_at_existing_alias() {
         let toml = r#"
@@ -31186,6 +31883,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_on_dangling_ref() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "primary".to_string(),
             provider_entry_with_fallback(&["openai.ghost"]),
@@ -31203,6 +31901,7 @@ allowed_users = []
     #[test]
     async fn fallback_no_warning_when_ref_resolves() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "primary".to_string(),
             provider_entry_with_fallback(&["openai.backup"]),
@@ -31219,6 +31918,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_on_two_node_cycle() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config
             .providers
             .models
@@ -31244,6 +31944,7 @@ allowed_users = []
     #[test]
     async fn fallback_self_reference_is_a_cycle() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config.providers.models.openai.insert(
             "loop".to_string(),
             provider_entry_with_fallback(&["openai.loop"]),
@@ -31257,6 +31958,7 @@ allowed_users = []
     #[test]
     async fn fallback_empty_ref_is_skipped() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         config
             .providers
             .models
@@ -31269,6 +31971,7 @@ allowed_users = []
     #[test]
     async fn fallback_warns_when_chain_exceeds_max_depth() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
         for i in 0..n {
             let next = if i + 1 < n {
@@ -31298,6 +32001,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_warns_on_empty_entry() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["".to_string()];
         config
@@ -31314,6 +32018,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_warns_on_duplicate_of_primary() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["gpt-4o".to_string()];
         config
@@ -31330,6 +32035,7 @@ allowed_users = []
     #[test]
     async fn fallback_models_distinct_entries_do_not_warn() {
         let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
         let mut entry = provider_entry_with_fallback(&[]);
         entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
         config
@@ -31733,7 +32439,7 @@ model_provider = \"ollama.default\"
         undeliverable.sort_unstable();
         assert_eq!(
             undeliverable,
-            ["amqp", "mqtt", "voice_duplex", "voice_wake"],
+            ["amqp", "filesystem", "mqtt", "voice_duplex", "voice_wake"],
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }

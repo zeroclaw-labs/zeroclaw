@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::audit::SopAuditLogger;
 use super::engine::{SopEngine, now_iso8601};
-use super::types::{SopEvent, SopRun, SopRunAction, SopTriggerSource};
+use super::types::{SopEvent, SopExecutionMode, SopRun, SopRunAction, SopTriggerSource};
 use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
 
 // ── Dispatch result ─────────────────────────────────────────────
@@ -197,9 +197,34 @@ pub async fn dispatch_sop_event(
                 Ok(action) => {
                     // Extract run_id from the action (authoritative source)
                     let run_id = extract_run_id_from_action(&action).to_string();
-                    // Snapshot the run for audit (must be done under lock)
-                    if let Some(run) = eng.active_runs().get(&run_id) {
-                        started_runs.push(run.clone());
+
+                    // Headless deterministic runs have no agent loop to execute
+                    // steps. Left as-is, the run sits in active_runs as Running
+                    // forever and its max_concurrent slot never frees, so every
+                    // later event from the same SOP is skipped. Drive it to a
+                    // terminal state here so the slot frees and the SOP can fire
+                    // again on the next event.
+                    let is_deterministic = eng
+                        .get_sop(sop_name)
+                        .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
+                    let action = if is_deterministic {
+                        match eng.drive_headless_deterministic(&run_id, action) {
+                            Ok(terminal) => terminal,
+                            Err(e) => SopRunAction::Failed {
+                                run_id: run_id.clone(),
+                                sop_name: sop_name.clone(),
+                                reason: e.to_string(),
+                            },
+                        }
+                    } else {
+                        action
+                    };
+
+                    // Snapshot the run for audit (must be done under lock).
+                    // get_run resolves both active and finished runs, so a
+                    // terminal headless deterministic run is captured here.
+                    if let Some(run) = eng.get_run(&run_id).cloned() {
+                        started_runs.push(run);
                     }
                     ::zeroclaw_log::record!(
                         INFO,
@@ -341,15 +366,17 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                             .with_attrs(
                                 ::serde_json::json!({"run_id": run_id, "sop_name": sop_name})
                             ),
-                        "SOP headless dispatch: run  ('') completed immediately"
+                        &format!(
+                            "SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
+                        )
                     );
                 }
                 SopRunAction::Failed { reason, .. } => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name, "reason": reason.to_string()})), "SOP headless dispatch: run  ('') failed: ");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}"));
                 }
             },
             DispatchResult::Skipped { sop_name, reason } => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), "SOP headless dispatch: skipped '': ");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: skipped '{sop_name}': {reason}"));
             }
             DispatchResult::BlockedUnsafe { sop_name, reason } => {
                 ::zeroclaw_log::record!(
@@ -1191,6 +1218,72 @@ mod tests {
         assert!(
             (now - last_check).num_seconds() < 2,
             "last_check should be updated to now"
+        );
+    }
+
+    fn det_fs_sop(name: &str, path: &str) -> Sop {
+        let mut sop = test_sop(
+            name,
+            vec![SopTrigger::Filesystem {
+                path: path.into(),
+                events: vec![],
+                condition: None,
+            }],
+        );
+        sop.execution_mode = SopExecutionMode::Deterministic;
+        sop.deterministic = true;
+        sop.max_concurrent = 1;
+        sop
+    }
+
+    fn fs_event(path: &str, kind: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Filesystem,
+            topic: Some(path.into()),
+            payload: Some(format!(r#"{{"event":"{kind}","path":"{path}"}}"#)),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_deterministic_sop_refires_on_repeated_events() {
+        // Regression: a headless deterministic run must drain to terminal so its
+        // max_concurrent slot frees. Before the fix, the first event started a
+        // run that sat Running forever, and every later event was Skipped.
+        let engine = test_engine(vec![det_fs_sop("fs-det", "/watch")]);
+        let audit = test_audit();
+
+        let first = dispatch_sop_event(&engine, &audit, fs_event("/watch/a", "created")).await;
+        assert!(
+            first.iter().any(
+                |r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "fs-det")
+            ),
+            "first event must start the SOP"
+        );
+
+        let second = dispatch_sop_event(&engine, &audit, fs_event("/watch/b", "created")).await;
+        assert!(
+            second.iter().any(
+                |r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "fs-det")
+            ),
+            "second event must ALSO start the SOP (slot freed after first run)"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Skipped { .. })),
+            "second event must not be skipped on concurrency"
+        );
+
+        // The run must have been evicted from active_runs (terminal), not stuck.
+        let eng = engine.lock().unwrap();
+        assert_eq!(
+            eng.active_runs()
+                .values()
+                .filter(|r| r.sop_name == "fs-det")
+                .count(),
+            0,
+            "no fs-det run should remain active after headless completion"
         );
     }
 }

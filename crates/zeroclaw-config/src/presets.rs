@@ -211,6 +211,14 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
         values: tight_runtime,
     },
     RuntimePreset {
+        preset_name: "local_small",
+        label: "Local Small",
+        help: "Compact no-text-fallback profile for smaller local models. \
+               Keeps context and tool results small, disables parallel tool \
+               fan-out, and requires native or structured tool calls.",
+        values: local_small_runtime,
+    },
+    RuntimePreset {
         preset_name: "balanced",
         label: "Balanced",
         help: "Middle-of-the-road operational defaults. Suits most users \
@@ -256,6 +264,31 @@ fn tight_runtime() -> RuntimeProfileConfig {
         max_tool_result_chars: Some(8_000),
         keep_tool_context_turns: Some(2),
         memory_recall_limit: Some(3),
+        ..RuntimeProfileConfig::default()
+    }
+}
+
+fn local_small_runtime() -> RuntimeProfileConfig {
+    RuntimeProfileConfig {
+        agentic: true,
+        max_tool_iterations: 4,
+        max_actions_per_hour: 10,
+        max_cost_per_day_cents: 100,
+        shell_timeout_secs: 30,
+        max_delegation_depth: 1,
+        delegation_timeout_secs: Some(60),
+        agentic_timeout_secs: Some(120),
+        max_history_messages: Some(20),
+        max_context_tokens: Some(8_000),
+        compact_context: Some(true),
+        parallel_tools: Some(false),
+        tool_dispatcher: None,
+        tool_call_dedup_exempt: vec![],
+        max_system_prompt_chars: Some(4_000),
+        max_tool_result_chars: Some(4_000),
+        keep_tool_context_turns: Some(1),
+        memory_recall_limit: Some(3),
+        strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
 }
@@ -625,6 +658,61 @@ mod tests {
         let preset_values = (preset.values)();
         let schema_default = RuntimeProfileConfig::default();
         assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+    }
+
+    #[test]
+    fn local_small_runtime_matches_documented_small_model_shape() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let values = (preset.values)();
+
+        assert!(values.agentic);
+        assert_eq!(values.max_tool_iterations, 4);
+        assert_eq!(values.max_actions_per_hour, 10);
+        assert_eq!(values.max_cost_per_day_cents, 100);
+        assert_eq!(values.shell_timeout_secs, 30);
+        assert_eq!(values.max_delegation_depth, 1);
+        assert_eq!(values.delegation_timeout_secs, Some(60));
+        assert_eq!(values.agentic_timeout_secs, Some(120));
+        assert_eq!(values.max_history_messages, Some(20));
+        assert_eq!(values.max_context_tokens, Some(8_000));
+        assert_eq!(values.compact_context, Some(true));
+        assert_eq!(values.parallel_tools, Some(false));
+        assert_eq!(values.max_system_prompt_chars, Some(4_000));
+        assert_eq!(values.max_tool_result_chars, Some(4_000));
+        assert_eq!(values.keep_tool_context_turns, Some(1));
+        assert_eq!(values.memory_recall_limit, Some(3));
+        assert!(values.strict_tool_parsing);
+    }
+
+    #[test]
+    fn local_small_runtime_resolves_to_strict_compact_agent_policy() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let mut config = crate::schema::Config::default();
+        config
+            .runtime_profiles
+            .insert("local_small".into(), (preset.values)());
+        config.agents.insert(
+            "local_agent".into(),
+            crate::schema::AliasedAgentConfig {
+                runtime_profile: crate::providers::RuntimeProfileRef::new("local_small"),
+                ..crate::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let resolved = config
+            .resolved_agent_config("local_agent")
+            .expect("agent should resolve");
+
+        assert!(resolved.resolved.strict_tool_parsing);
+        assert_eq!(resolved.resolved.max_tool_iterations, 4);
+        assert_eq!(resolved.resolved.max_history_messages, 20);
+        assert_eq!(resolved.resolved.max_context_tokens, 8_000);
+        assert!(resolved.resolved.compact_context);
+        assert!(!resolved.resolved.parallel_tools);
+        assert_eq!(resolved.resolved.max_system_prompt_chars, 4_000);
+        assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);
+        assert_eq!(resolved.resolved.keep_tool_context_turns, 1);
+        assert_eq!(config.effective_memory_recall_limit("local_agent"), 3);
     }
 
     /// Regression: the `unbounded` preset must NOT zero out the action

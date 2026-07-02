@@ -113,6 +113,12 @@
           - "src/channels/lark.rs"
           - "crates/zeroclaw-channels/src/lark.rs"
 
+"channel:line":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-channels/src/line.rs"
+          - "docs/book/src/channels/line.md"
+
 "channel:linq":
   - changed-files:
       - any-glob-to-any-file:
@@ -280,6 +286,18 @@
           - "src/memory/**"
           - "crates/zeroclaw-memory/src/**"
 
+"memory:backend":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/memory/cli.rs"
+          - "crates/zeroclaw-memory/src/backend.rs"
+          - "crates/zeroclaw-memory/src/lucid.rs"
+          - "crates/zeroclaw-memory/src/markdown.rs"
+          - "crates/zeroclaw-memory/src/none.rs"
+          - "crates/zeroclaw-memory/src/postgres.rs"
+          - "crates/zeroclaw-memory/src/qdrant.rs"
+          - "crates/zeroclaw-memory/src/sqlite.rs"
+
 "security":
   - changed-files:
       - any-glob-to-any-file:
@@ -301,7 +319,6 @@
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/security/pairing.rs"
           - "crates/zeroclaw-gateway/src/api_pairing.rs"
-          - "apps/tauri/src/commands/pairing.rs"
           - "web/src/pages/Pairing.tsx"
 
 "security:policy":
@@ -492,6 +509,11 @@
           - "crates/zeroclaw-runtime/src/tools/cron_runs.rs"
           - "crates/zeroclaw-runtime/src/tools/cron_update.rs"
 
+"tool:delegate":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/tools/delegate.rs"
+
 "tool:file":
   - changed-files:
       - any-glob-to-any-file:
@@ -611,6 +633,18 @@
       - any-glob-to-any-file:
           - "src/observability/**"
           - "crates/zeroclaw-runtime/src/observability/**"
+
+"observability:log":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-log/src/**"
+          - "crates/zeroclaw-runtime/src/observability/log.rs"
+
+"observability:otel":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/observability/otel.rs"
+          - "tests/component/otel_dependency_feature_regression.rs"
 
 "observability:prometheus":
   - changed-files:
