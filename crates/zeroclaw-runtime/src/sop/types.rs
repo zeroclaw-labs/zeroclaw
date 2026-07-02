@@ -117,7 +117,7 @@ pub enum SopTrigger {
         /// Request path matched exactly against the event path.
         path: String,
     },
-    /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    /// Time-based firing. Live: dispatched by the daemon SOP maintenance tick.
     Cron {
         /// Cron expression evaluated over the run window.
         expression: String,
