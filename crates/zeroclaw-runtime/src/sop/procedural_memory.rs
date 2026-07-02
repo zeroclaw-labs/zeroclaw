@@ -48,6 +48,9 @@ pub fn create_proposal(engine: &SopEngine, draft: ProposalDraft) -> Result<Propo
         Some(toml) if !toml.trim().is_empty() => toml,
         _ => default_manifest_toml(sop_name, description),
     };
+    if let Some(reason) = scan_candidate(&manifest_toml, procedure_markdown) {
+        bail!("proposal rejected: {reason}");
+    }
     validate_candidate(sop_name, &manifest_toml, procedure_markdown)?;
     let now = now_iso8601();
     let id = format!(
@@ -726,5 +729,38 @@ mod tests {
         assert_eq!(proposal.source_run_id.as_deref(), Some(run_id.as_str()));
         assert!(proposal.procedure_markdown.contains("Captured Run Notes"));
         assert!(!proposal.procedure_markdown.contains(&redaction_fixture));
+    }
+
+    #[test]
+    fn create_proposal_rejects_credential_content_before_storing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_with_workspace(tmp.path());
+        // Use the same token= pattern as the redaction test; 20+ char value triggers generic-secret detection.
+        let credential = ["tok", "en=", "neutralplaceholder1234567890"].concat();
+        let md = format!("## Steps\n\n1. **Auth** - Use {credential} to authenticate.\n");
+
+        let result = create_proposal(
+            &engine,
+            ProposalDraft {
+                sop_name: "cred-test".into(),
+                description: "Credential test".into(),
+                manifest_toml: None,
+                procedure_markdown: md.clone(),
+                source_run_id: None,
+                requested_by: None,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "create_proposal must reject credential-like content"
+        );
+        // No pending or quarantined record should exist in the store.
+        let all = engine.list_proposals(None).unwrap_or_default();
+        assert!(
+            all.iter()
+                .all(|p| !p.procedure_markdown.contains(&credential)),
+            "raw credential must not be stored in any proposal record"
+        );
     }
 }
