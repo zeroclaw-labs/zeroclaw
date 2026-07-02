@@ -42,8 +42,8 @@ There are two kinds of ignored advisory:
 
 These ignores mark advisories with an exploitable bug. They are
 **temporary** and must be removed when a fix lands. The remaining live
-example is the wasmtime-wasi CVE bundle in **#8519** —
-`RUSTSEC-2026-0149`, `-0182`, `-0188` — which is cleared by the
+example is the wasmtime-wasi CVE bundle in **#8519**:
+`RUSTSEC-2026-0149`, `-0182`, `-0188`, which is cleared by the
 wasmtime `43` → `45.0.3` bump in `crates/zeroclaw-plugins/Cargo.toml`
 (see PR #8542, awaiting maintainer re-approval after the latest
 `upstream/master` merge).
@@ -63,14 +63,14 @@ wasmtime `43` → `45.0.3` bump in `crates/zeroclaw-plugins/Cargo.toml`
 
 These advisories are informational. The crate has no maintained
 successor on the dependency lines we use. They are
-**semi-permanent** — the entry stays until the underlying dependency
+**semi-permanent**; the entry stays until the underlying dependency
 is replaced (e.g. GTK3 → GTK4, rumqttc upgrade that pulls
 `rustls-webpki 0.103.x`).
 
 Live groups:
 
 - **`unic-*` (5 entries, `RUSTSEC-2025-0075`, `-0080`, `-0081`,
-  `-0098`, `-0100`)** — Unicode data tables. Transitive via
+  `-0098`, `-0100`)**: Unicode data tables. Transitive via
   `pulldown-cmark` and `mime_guess`. Both crates still depend on
   `unicase` in their latest releases; replacing either requires
   rewriting downstream code (`apps/zerocode/src/chat.rs` for
@@ -78,7 +78,7 @@ Live groups:
   waiting for upstream releases that drop the dependency. Tracking
   #8519.
 - **macro / font helpers (3 entries, `RUSTSEC-2026-0173`,
-  `-2024-0388`, `-2026-0192`)** — `proc-macro-error2`, `derivative`,
+  `-2024-0388`, `-2026-0192`)**: `proc-macro-error2`, `derivative`,
   `ttf-parser`. Transitive derive / macro helpers; replacing each
   requires coordinated upstream migration.
   - `proc-macro-error` (`RUSTSEC-2024-0370`) was cleared when
@@ -89,7 +89,7 @@ Live groups:
 
 Resolved groups:
 
-- **GTK3 stack (10 entries, `RUSTSEC-2024-0411..-0420`)** — pulled in
+- **GTK3 stack (10 entries, `RUSTSEC-2024-0411..-0420`)**: pulled in
   transitively by the now-removed `zeroclaw-desktop` (Tauri →
   webkit2gtk → gtk-rs bindings). These ignore entries were dropped in
   PR #8544 along with the desktop app. No GTK3 code remains in the
@@ -109,11 +109,11 @@ Resolved groups:
 
 ## Tracking issues
 
-- **#8519** — *Reconcile cargo-audit ignores and remediate wasmtime-wasi
+- **#8519**: *Reconcile cargo-audit ignores and remediate wasmtime-wasi
   CVEs.* Master issue for the audit/deny drift and the unmaintained
   GTK3 / unic-* / macro entries. Updates belong in the comments of
   the affected entries, not in this file.
-- **#8059** — *Policy cleanup: deny.toml ignored-advisory tracking,
+- **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
   higher-level policy view; the in-file comments are the per-entry
@@ -135,7 +135,7 @@ cargo fmt --all -- --check
 
 If `cargo audit` reports an advisory that is not on the ignore list,
 either add it (with rationale and tracking issue) or fix the
-underlying dep — there is no third option.
+underlying dep; there is no third option.
 
 If `cargo deny` reports an advisory that `cargo audit` does not, the
 two tools have drifted again. Open or update the tracking issue.
