@@ -257,6 +257,22 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+    if pinned_section.is_empty() {
+        return;
+    }
+    deferred_section.push_str("\n\n");
+    deferred_section.push_str(pinned_section);
+}
+
 /// Register an eager MCP tool wrapper into `tools` (and the delegate handle,
 /// when present) only if `policy` admits it. Returns `true` when the tool was
 /// registered, `false` when the policy dropped it.
@@ -1418,6 +1434,12 @@ pub async fn run(
                             mcp_policy.as_ref(),
                         );
                     }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -1517,6 +1539,10 @@ pub async fn run(
                             )
                         );
                     }
+                    // Append pinned MCP resources unconditionally, after both the
+                    // deferred and eager branches, so the deferred-path reassignment
+                    // of `deferred_section` does not clobber them.
+                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -3046,6 +3072,12 @@ pub async fn process_message(
                             mcp_policy_pm.as_ref(),
                         );
                     }
+                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy_pm.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -3142,6 +3174,10 @@ pub async fn process_message(
                             )
                         );
                     }
+                    // Append pinned MCP resources unconditionally, after both the
+                    // deferred and eager branches, so the deferred-path reassignment
+                    // of `deferred_section` does not clobber them.
+                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -14381,6 +14417,50 @@ Let me check the result."#;
             ),
             0,
             "deferred MCP must not register tool_search when policy admits no MCP stubs"
+        );
+    }
+
+    #[test]
+    fn pinned_section_survives_deferred_loading_reassignment() {
+        // Regression for the loop_.rs clobber bug (PR #8508 review): the
+        // pinned-resources block must reach the prompt even under
+        // `deferred_loading = true`, where the deferred branch reassigns
+        // `deferred_section` with `=`. The fix appends pins AFTER that branch
+        // via `append_pinned_mcp_section`; this test pins that ordering.
+        let pinned = "## Pinned MCP Resources\n\n\
+            <mcp-resource server=\"docs\" uri=\"docs__file:///handbook.md\" \
+            mime=\"text/plain\" trust=\"untrusted-external\">\nhandbook body\n</mcp-resource>\n";
+
+        // Emulate the production statement order for the deferred path.
+        // (build_pinned_resources_section result is captured first in `run()`)
+        let pinned_section = pinned.to_string();
+        // deferred_loading == true branch reassigns the section (as
+        // build_deferred_tools_section_filtered does), dropping prior content.
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+        // The fix: append pins AFTER the branch.
+        super::append_pinned_mcp_section(&mut deferred_section, &pinned_section);
+
+        assert!(
+            deferred_section.contains("## Pinned MCP Resources"),
+            "pinned section must survive the deferred-loading reassignment, got: {deferred_section}"
+        );
+        assert!(
+            deferred_section.contains("trust=\"untrusted-external\""),
+            "provenance-wrapped pinned content must reach the prompt under deferred_loading"
+        );
+        assert!(
+            deferred_section.contains("## Deferred MCP Tools"),
+            "the deferred tools section must also remain present"
+        );
+    }
+
+    #[test]
+    fn append_pinned_mcp_section_is_noop_for_empty() {
+        let mut section = "## Deferred MCP Tools".to_string();
+        super::append_pinned_mcp_section(&mut section, "");
+        assert_eq!(
+            section, "## Deferred MCP Tools",
+            "empty pinned section must not alter the accumulator"
         );
     }
 

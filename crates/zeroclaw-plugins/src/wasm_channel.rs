@@ -4,6 +4,8 @@
 //! Warm lifecycle: the store and bindings are created once and held in an async
 //! mutex. `listen` runs a poll-to-push bridge with exponential backoff.
 
+use crate::PluginPermission;
+use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ApprovalRequest as WitApprovalRequest, ApprovalResponse as WitApprovalResponse,
@@ -13,6 +15,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
 use crate::component::{PluginState, call_plugin, engine, load_component, wt};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +34,7 @@ pub struct WasmChannel {
     alias: String,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
+    inbound: InboundQueue,
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
@@ -57,9 +61,27 @@ impl Attributable for WasmChannel {
     }
 }
 
-fn linker() -> Result<Linker<PluginState>> {
+/// Resolve the JSON config section handed to a channel plugin's `configure`.
+/// Withheld (an empty object) unless the manifest grants `ConfigRead`, so a
+/// plugin without the permission can never be configured with another channel's
+/// secrets. Mirrors the tool-plugin `__config` rule.
+fn resolve_configure_json(
+    config: &HashMap<String, String>,
+    permissions: &[PluginPermission],
+) -> String {
+    if permissions.contains(&PluginPermission::ConfigRead) {
+        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        "{}".to_string()
+    }
+}
+
+fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
+    if http {
+        crate::component::add_wasi_http(&mut linker)?;
+    }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
     wt(
@@ -75,21 +97,45 @@ fn linker() -> Result<Linker<PluginState>> {
 
 impl WasmChannel {
     /// Compile and instantiate a channel plugin, caching its capabilities and
-    /// the static-identity exports needed by the sync trait methods.
+    /// the static-identity exports needed by the sync trait methods. The
+    /// permission set decides whether the store and linker expose outbound
+    /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
+    /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
+    /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
+    /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
+    /// and the memory/table/instance ceilings.
     pub async fn from_wasm(
         alias: impl Into<String>,
         wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
         let component = load_component(wasm_path)?;
-        let linker = linker()?;
-        let mut store = crate::component::new_store(limits);
+        let inbound = InboundQueue::default();
+        let mut store =
+            crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
+        let http = store.data().http_enabled();
+        let linker = build_linker(http)?;
+        crate::component::ensure_http_coherent(&store, http)?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",
         )?;
 
         let channel = bindings.zeroclaw_plugin_channel();
+
+        // Hand the plugin its resolved config once, before any other call. The
+        // section is withheld unless the manifest granted `ConfigRead`, matching
+        // the tool-plugin `__config` rule, so a plugin without the permission is
+        // configured with an empty object rather than another channel's secrets.
+        let config_json = resolve_configure_json(config, permissions);
+        wt(
+            channel.call_configure(&mut store, &config_json).await,
+            "channel.configure trapped",
+        )?
+        .map_err(anyhow::Error::msg)?;
+
         let capabilities = wt(
             channel.call_get_channel_capabilities(&mut store).await,
             "channel.get-channel-capabilities failed",
@@ -126,11 +172,19 @@ impl WasmChannel {
             alias: alias.into(),
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
+            inbound,
             cached_self_handle,
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Handle to this channel's inbound queue. A host-run listener clones it and
+    /// calls [`InboundQueue::enqueue`] for each received message; the plugin
+    /// drains them through its imported `inbound` interface.
+    pub fn inbound(&self) -> InboundQueue {
+        self.inbound.clone()
     }
 }
 
@@ -232,6 +286,7 @@ impl Channel for WasmChannel {
                 let polled = {
                     let mut guard = state.lock().await;
                     let (ref mut store, ref mut bindings) = *guard;
+                    crate::component::refuel(store);
                     bindings
                         .zeroclaw_plugin_channel()
                         .call_poll_message(store)
@@ -733,5 +788,59 @@ mod tests {
         // A subsequent successful poll clears the condition.
         mark_poll_healthy(&flag, true);
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
+    }
+
+    #[test]
+    fn configure_withholds_section_without_config_read() {
+        let mut config = HashMap::new();
+        config.insert("api_key".to_string(), "secret".to_string());
+        let json = resolve_configure_json(&config, &[PluginPermission::HttpClient]);
+        assert_eq!(json, "{}", "no ConfigRead means an empty config object");
+    }
+
+    #[test]
+    fn configure_passes_section_with_config_read() {
+        let mut config = HashMap::new();
+        config.insert("identity".to_string(), "on-call".to_string());
+        let json = resolve_configure_json(&config, &[PluginPermission::ConfigRead]);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["identity"], "on-call", "granted section round-trips");
+    }
+
+    #[test]
+    fn host_enqueued_inbound_reaches_the_drain_handle() {
+        // The inbound contract is host-fed: a listener the orchestrator owns
+        // (vendor tunnel, webhook) enqueues through the handle from
+        // `WasmChannel::inbound()`, and the plugin drains the same queue. Prove
+        // the producer side here so the transport is not just asserted at the
+        // queue type but at the handle a host listener actually holds.
+        let queue = crate::component::InboundQueue::default();
+        let listener_handle = queue.clone();
+        assert_eq!(queue.pending(), 0, "starts empty");
+
+        listener_handle.enqueue(crate::component::HostInboundMessage {
+            id: "evt-1".into(),
+            sender: "+15550100".into(),
+            reply_target: "+15550100".into(),
+            content: "inbound sms".into(),
+            channel: "inkbox".into(),
+            channel_alias: Some("on-call".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            subject: None,
+        });
+
+        assert_eq!(
+            queue.pending(),
+            1,
+            "host enqueue is visible on the drain side"
+        );
+        let drained = queue
+            .poll()
+            .expect("the plugin-side drain sees the message");
+        assert_eq!(drained.id, "evt-1");
+        assert_eq!(drained.content, "inbound sms");
+        assert_eq!(queue.pending(), 0, "draining empties the shared queue");
     }
 }
