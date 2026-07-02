@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use tokio::sync::Mutex;
 use zeroclaw_config::schema::Config;
+use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::{PluginCapability, PluginPermission};
@@ -104,9 +105,18 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     );
 
     let permissions = manifest.permissions.clone();
-    let mut plugin = runtime::create_plugin(wasm_path, &permissions)
-        .await
-        .expect("instantiate discovered plugin");
+    let mut plugin = runtime::create_plugin(
+        wasm_path,
+        &permissions,
+        PluginLimits {
+            call_fuel: 1_000_000_000,
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 64,
+        },
+    )
+    .await
+    .expect("instantiate discovered plugin");
 
     let meta = runtime::call_tool_metadata(&mut plugin)
         .await

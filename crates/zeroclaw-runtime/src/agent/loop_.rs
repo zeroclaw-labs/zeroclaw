@@ -1915,9 +1915,12 @@ pub async fn run(
                 thinking_params.system_prompt_prefix.as_deref(),
             )?;
 
+            let excluded_tool_names: HashSet<&str> =
+                excluded_tools.iter().map(String::as_str).collect();
             let runtime_capability_names = tools_registry
                 .iter()
                 .map(|tool| tool.name())
+                .filter(|name| !excluded_tool_names.contains(*name))
                 .collect::<Vec<_>>();
             if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                 &effective_msg,
@@ -2386,9 +2389,12 @@ pub async fn run(
                     &effective_input,
                 );
 
+                let excluded_tool_names: HashSet<&str> =
+                    excluded_tools.iter().map(String::as_str).collect();
                 let runtime_capability_names = tools_registry
                     .iter()
                     .map(|tool| tool.name())
+                    .filter(|name| !excluded_tool_names.contains(*name))
                     .collect::<Vec<_>>();
                 if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                     &effective_input,
