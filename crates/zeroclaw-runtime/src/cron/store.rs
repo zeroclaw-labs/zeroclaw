@@ -1080,6 +1080,10 @@ pub fn sync_declarative_jobs(
             let allowed_tools_json = encode_allowed_tools(decl.allowed_tools.as_ref())?;
             let command = decl.command.as_deref().unwrap_or("");
             let delete_after_run = matches!(decl.schedule, CronScheduleDecl::At { .. });
+            let shell_output_format_str = match decl.shell_output_format {
+                zeroclaw_config::schema::CronShellOutputFormat::Wrapped => "wrapped",
+                zeroclaw_config::schema::CronShellOutputFormat::Raw => "raw",
+            };
 
             // Check if job already exists.
             let exists: bool = conn
@@ -1107,8 +1111,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14
-                         WHERE id = ?15",
+                             uses_memory = ?14, shell_output_format = ?15
+                         WHERE id = ?16",
                         params![
                             expression,
                             command,
@@ -1124,6 +1128,7 @@ pub fn sync_declarative_jobs(
                             allowed_tools_json,
                             next_run.to_rfc3339(),
                             i32::from(decl.uses_memory),
+                            shell_output_format_str,
                             id,
                         ],
                     )
@@ -1135,8 +1140,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13
-                         WHERE id = ?14",
+                             uses_memory = ?13, shell_output_format = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -1151,6 +1156,7 @@ pub fn sync_declarative_jobs(
                             i32::from(delete_after_run),
                             allowed_tools_json,
                             i32::from(decl.uses_memory),
+                            shell_output_format_str,
                             id,
                         ],
                     )
@@ -1183,8 +1189,9 @@ pub fn sync_declarative_jobs(
                     "INSERT INTO cron_jobs (
                         id, expression, command, schedule, job_type, prompt, name,
                         session_target, model, enabled, delivery, delete_after_run,
-                        allowed_tools, source, uses_memory, agent_alias, created_at, next_run
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16, ?17)",
+                        allowed_tools, source, uses_memory, agent_alias, created_at, next_run,
+                        shell_output_format
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16, ?17, ?18)",
                     params![
                         id,
                         expression,
@@ -1203,6 +1210,7 @@ pub fn sync_declarative_jobs(
                         agent_alias,
                         now.to_rfc3339(),
                         next_run.to_rfc3339(),
+                        shell_output_format_str,
                     ],
                 )
                 .with_context(|| {
@@ -2860,6 +2868,57 @@ schedule = { kind = "every", every_ms = 300000 }
         assert!(
             err.to_string().contains("No cron job found"),
             "another agent's job must be unresolvable by name; got: {err}"
+        );
+    }
+
+    /// Regression: a declarative shell job with `shell_output_format = raw`
+    /// must report `shell_output_format = raw` through `get_job()`/`list_jobs()`,
+    /// matching the execution source of truth (config).
+    #[test]
+    fn sync_declarative_raw_shell_job_lists_with_raw_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["raw-decl"]);
+
+        let decls = decls_map(vec![(
+            "raw-decl".to_string(),
+            zeroclaw_config::schema::CronJobDecl {
+                name: Some("raw-decl".to_string()),
+                job_type: "shell".to_string(),
+                schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                    expr: "0 2 * * *".to_string(),
+                    tz: None,
+                },
+                command: Some("echo raw-decl-output".to_string()),
+                prompt: None,
+                enabled: true,
+                model: None,
+                allowed_tools: None,
+                uses_memory: true,
+                session_target: None,
+                delivery: None,
+                shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            },
+        )]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "raw-decl").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must return raw format for a declarative raw shell job"
+        );
+        assert_eq!(job.source, "declarative");
+
+        let jobs = list_jobs(&config).unwrap();
+        let listed = jobs
+            .iter()
+            .find(|j| j.id == "raw-decl")
+            .expect("job in list");
+        assert_eq!(
+            listed.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "list_jobs must return raw format for a declarative raw shell job"
         );
     }
 }
