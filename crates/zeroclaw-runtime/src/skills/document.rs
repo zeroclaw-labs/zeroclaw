@@ -286,6 +286,7 @@ mod tests {
                 version: Some("0.2.0".into()),
                 category: Some("coding".into()),
                 tags: vec!["slash".into(), "ops".into()],
+                always: false,
             },
             body: "# Code Review\n\nReviews diffs.\n".into(),
         };

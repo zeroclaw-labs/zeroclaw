@@ -6109,6 +6109,7 @@ mod tests {
                 .collect(),
             prompts: vec![],
             location: None,
+            always: false,
         }
     }
 
@@ -6197,6 +6198,7 @@ mod tests {
             }],
             prompts: vec![],
             location: None,
+            always: false,
         };
         tools::register_skill_tools_with_context(
             &mut tools,

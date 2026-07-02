@@ -251,6 +251,7 @@ mod tests {
                 tools: vec![],
                 prompts: vec![],
                 location: None,
+                always: false,
             }]
         };
 
