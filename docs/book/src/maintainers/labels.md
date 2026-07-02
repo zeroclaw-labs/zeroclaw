@@ -127,7 +127,7 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `runtime:wasm` | runtime WASM platform and first-party WASM plugin host files |
 | `security:bubblewrap` | `bubblewrap.rs` |
 | `security:docker` | `docker.rs` |
-| `security:pairing` | pairing security, gateway pairing API, Tauri pairing command, and web pairing page |
+| `security:pairing` | pairing security, gateway pairing API, and web pairing page |
 | `security:policy` | runtime security policy, IAM policy, and config policy files |
 | `security:secrets` | runtime and config secrets handling |
 
