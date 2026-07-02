@@ -13,10 +13,12 @@ plugin, getting more technical as you go down.
   platform integration with the full capability-flag surface.
 - [Writing a memory plugin](./writing-a-memory-plugin.md): a storage backend
   implementing agent-attributed recall.
-- [Writing a skill bundle](./writing-a-skill-bundle.md): a markdown-only
-  plugin that ships no WASM at all.
 - [Distributing plugins](./distributing-plugins.md): signing, registries, and
   install security.
+
+Markdown-only [skill bundles](../tools/skill-bundles.md) are not plugins,
+but they travel through the same manifest, signing, and install machinery;
+that page lives with the Skills documentation.
 
 For the operator's view of discovery, signature policy, and configuration, see
 [How plugins work](../developing/how-plugins-work.md). For the normative
@@ -60,8 +62,7 @@ matches at once:
 
 ## The pieces
 
-A plugin on disk is a directory holding a manifest and (for all but skill
-bundles) a compiled component:
+A plugin on disk is a directory holding a manifest and a compiled component:
 
 ```text
 ~/.zeroclaw/plugins/
@@ -75,7 +76,9 @@ The manifest declares two orthogonal things:
 - **Capabilities**: what the plugin *is*. One or more of `tool`, `channel`,
   `memory`, `observer`, `skill` (the `PluginCapability` enum in
   `crates/zeroclaw-plugins/src/lib.rs`). Each WASM capability selects the WIT
-  world the component must export.
+  world the component must export. The `skill` capability is the odd one out:
+  it marks a markdown [skill bundle](../tools/skill-bundles.md) riding the
+  install machinery, not code, and needs no component.
 - **Permissions**: what host services the plugin's code may *reach*. The
   `PluginPermission` enum in the same file. Today `config_read` (the plugin
   receives its own resolved config section) and `http_client` (outbound

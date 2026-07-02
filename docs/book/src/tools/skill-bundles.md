@@ -115,6 +115,6 @@ to use one to confirm end to end.
 
 ## Next
 
-- [Distributing plugins](./distributing-plugins.md): a skill bundle is the
-  simplest thing to publish, and the signing story is identical to WASM
-  plugins.
+- [Distributing plugins](../plugins/distributing-plugins.md): a skill bundle
+  is the simplest thing to publish, and the signing story is identical to
+  WASM plugins.

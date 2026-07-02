@@ -178,6 +178,6 @@ remote store.
 
 ## Next
 
-- [Writing a skill bundle](./writing-a-skill-bundle.md): the no-WASM plugin
-  kind.
+- [Skill bundles](../tools/skill-bundles.md): markdown-only skill
+  distribution through the same install machinery.
 - [Distributing plugins](./distributing-plugins.md).
