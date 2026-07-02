@@ -1,6 +1,6 @@
 use super::traits::{LlmMessageSnapshot, Observer, ObserverEvent, ObserverMetric};
 use crate::agent::loop_::scrub_for_export;
-use crate::observability::otel_config::otel_content_config;
+use crate::observability::otel_config::OtelContentConfig;
 use crate::util::{truncate_field, truncate_json_leaves};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
@@ -23,6 +23,11 @@ struct ActiveAgentSpan {
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
+    /// Per-observer OTel content policy, derived once from
+    /// `ObservabilityConfig` at construction. Owned by this instance so the
+    /// export boundary (`record_event` + attribute builders) consults a stable
+    /// privacy policy that no other observer can overwrite.
+    content_config: OtelContentConfig,
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
 
@@ -55,10 +60,11 @@ impl OtelObserver {
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(
+    pub(crate) fn new(
         endpoint: Option<&str>,
         service_name: Option<&str>,
         headers: Option<HashMap<String, String>>,
+        content_config: OtelContentConfig,
     ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
@@ -218,6 +224,7 @@ impl OtelObserver {
             .build();
 
         Ok(Self {
+            content_config,
             tracer_provider,
             meter_provider: meter_provider_clone,
             agent_starts,
@@ -347,9 +354,6 @@ impl Observer for OtelObserver {
                 agent_alias,
                 turn_id,
             } => {
-                let config = otel_content_config();
-                let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
-
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
                     KeyValue::new("tool.name", tool.clone()),
@@ -361,27 +365,12 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
                 }
 
-                // OTel-only content processing: scrub + truncate based on policy
-                if policy != OtelContentPolicy::Off
-                    && let Some(args) = arguments
-                {
-                    let scrubbed = scrub_for_export(args);
-                    let processed = if policy == OtelContentPolicy::Redacted {
-                        // Try JSON leaf truncation first, fall back to string truncation
-                        match serde_json::from_str::<serde_json::Value>(&scrubbed) {
-                            Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
-                                .and_then(|v| serde_json::to_string(&v).ok())
-                                .unwrap_or_else(|| {
-                                    truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
-                                }),
-                            Err(_) => truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed),
-                        }
-                    } else {
-                        scrubbed
-                    };
-                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", processed.clone()));
-                    span_attrs.push(KeyValue::new("input.value", processed));
-                }
+                // OTel-only content processing: scrub + truncate based on this
+                // observer's instance-owned tool I/O policy.
+                span_attrs.extend(tool_start_content_attrs(
+                    arguments.as_deref(),
+                    self.content_config,
+                ));
 
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -586,9 +575,9 @@ impl Observer for OtelObserver {
                 if let Some(output) = output_tokens {
                     span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
                 }
-                span_attrs.extend(message_attrs(messages));
+                span_attrs.extend(message_attrs(messages, self.content_config));
 
-                // Update agent span aggregation for turn-level input.value / output.value
+                // Update agent span aggregation for turn-level gen_ai.input.messages / gen_ai.output.messages
                 if let Some(tid) = turn_id
                     && let Ok(mut spans) = self.active_agent_spans.lock()
                     && let Some(agent_span) = spans.get_mut(tid)
@@ -669,38 +658,35 @@ impl Observer for OtelObserver {
                             agent_span.span.set_attribute(KeyValue::new("cost_usd", *c));
                         }
 
-                        // Set agent span aggregation attributes based on genai policy
-                        let config = otel_content_config();
+                        // Set agent span aggregation attributes based on this
+                        // observer's instance-owned genai policy. Emit the
+                        // GenAI semconv `gen_ai.input.messages` /
+                        // `gen_ai.output.messages` (JSON-string encoded).
+                        let config = self.content_config;
                         if config.genai_policy != OtelContentPolicy::Off {
-                            if let Some(input) = agent_span.first_user_input {
-                                // Clean metadata for display before truncation
-                                let cleaned = clean_for_display(&input);
-                                let processed =
-                                    if config.genai_policy == OtelContentPolicy::Redacted {
-                                        truncate_field(&cleaned, config.genai_max_chars)
-                                    } else {
-                                        Some(cleaned)
-                                    };
-                                if let Some(val) = processed {
-                                    agent_span
-                                        .span
-                                        .set_attribute(KeyValue::new("input.value", val));
-                                }
+                            if let Some(input) = agent_span.first_user_input
+                                && let Some(val) = process_agent_message(
+                                    &input,
+                                    "user",
+                                    config.genai_policy,
+                                    config.genai_max_chars,
+                                )
+                            {
+                                agent_span
+                                    .span
+                                    .set_attribute(KeyValue::new("gen_ai.input.messages", val));
                             }
-                            if let Some(output) = agent_span.last_output_text {
-                                // Clean metadata for display before truncation
-                                let cleaned = clean_for_display(&output);
-                                let processed =
-                                    if config.genai_policy == OtelContentPolicy::Redacted {
-                                        truncate_field(&cleaned, config.genai_max_chars)
-                                    } else {
-                                        Some(cleaned)
-                                    };
-                                if let Some(val) = processed {
-                                    agent_span
-                                        .span
-                                        .set_attribute(KeyValue::new("output.value", val));
-                                }
+                            if let Some(output) = agent_span.last_output_text
+                                && let Some(val) = process_agent_message(
+                                    &output,
+                                    "assistant",
+                                    config.genai_policy,
+                                    config.genai_max_chars,
+                                )
+                            {
+                                agent_span
+                                    .span
+                                    .set_attribute(KeyValue::new("gen_ai.output.messages", val));
                             }
                         }
 
@@ -737,9 +723,6 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
-                let config = otel_content_config();
-                let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
-
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
                     KeyValue::new("tool.name", tool.clone()),
@@ -753,36 +736,13 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
                 }
 
-                // OTel-only content processing: scrub + truncate based on policy
-                if policy != OtelContentPolicy::Off {
-                    if let Some(args) = arguments {
-                        let scrubbed = scrub_for_export(args);
-                        let processed = if policy == OtelContentPolicy::Redacted {
-                            match serde_json::from_str::<serde_json::Value>(&scrubbed) {
-                                Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
-                                    .and_then(|v| serde_json::to_string(&v).ok())
-                                    .unwrap_or_else(|| {
-                                        truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
-                                    }),
-                                Err(_) => truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed),
-                            }
-                        } else {
-                            scrubbed
-                        };
-                        span_attrs.push(KeyValue::new("gen_ai.tool.arguments", processed.clone()));
-                        span_attrs.push(KeyValue::new("input.value", processed));
-                    }
-                    if let Some(res) = result {
-                        let scrubbed = scrub_for_export(res);
-                        let processed = if policy == OtelContentPolicy::Redacted {
-                            truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
-                        } else {
-                            scrubbed
-                        };
-                        span_attrs.push(KeyValue::new("gen_ai.tool.result", processed.clone()));
-                        span_attrs.push(KeyValue::new("output.value", processed));
-                    }
-                }
+                // OTel-only content processing: scrub + truncate based on this
+                // observer's instance-owned tool I/O policy.
+                span_attrs.extend(tool_result_content_attrs(
+                    arguments.as_deref(),
+                    result.as_deref(),
+                    self.content_config,
+                ));
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("tool_call.result")
@@ -906,8 +866,8 @@ impl Observer for OtelObserver {
 /// Clean content for display in agent-level OTel traces by removing metadata
 /// that obscures the actual user input or model output.
 ///
-/// Only used for agent-level input.value / output.value in gen_ai.agent.invoke,
-/// NOT for individual llm.response spans.
+/// Only used for agent-level gen_ai.input.messages / gen_ai.output.messages in
+/// gen_ai.agent.invoke, NOT for individual llm.response spans.
 ///
 /// Removes (only when both start and end tags are present):
 /// - Memory context blocks (`[Memory context]`...`[/Memory context]`)
@@ -981,16 +941,118 @@ fn clean_for_display(content: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// Process one aggregated agent-span message (the turn's first user input or
+/// last assistant output) into a GenAI semconv `gen_ai.input.messages` /
+/// `gen_ai.output.messages` entry: strip runtime enrichment via
+/// [`clean_for_display`], truncate under `Redacted`, then JSON-encode as
+/// `[{"role": <role>, "content": <text>}]`. Returns `None` when truncation
+/// drops the content entirely.
+fn process_agent_message(
+    content: &str,
+    role: &str,
+    policy: OtelContentPolicy,
+    max_chars: usize,
+) -> Option<String> {
+    let cleaned = clean_for_display(content);
+    let processed = if policy == OtelContentPolicy::Redacted {
+        truncate_field(&cleaned, max_chars)
+    } else {
+        Some(cleaned)
+    }?;
+    let messages = vec![serde_json::json!({ "role": role, "content": processed })];
+    serde_json::to_string(&messages).ok()
+}
+
+/// Scrub + (under `Redacted`) JSON-leaf-truncate tool arguments. Shared by
+/// `tool_start_content_attrs` and `tool_result_content_attrs` so the JSON
+/// truncation / scrubbing logic lives in one place.
+fn process_tool_arguments(raw: &str, policy: OtelContentPolicy, max_chars: usize) -> String {
+    let scrubbed = scrub_for_export(raw);
+    if policy == OtelContentPolicy::Redacted {
+        // Try JSON leaf truncation first, fall back to string truncation.
+        match serde_json::from_str::<serde_json::Value>(&scrubbed) {
+            Ok(parsed) => truncate_json_leaves(&parsed, max_chars)
+                .and_then(|v| serde_json::to_string(&v).ok())
+                .unwrap_or_else(|| truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)),
+            Err(_) => truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed),
+        }
+    } else {
+        scrubbed
+    }
+}
+
+/// Scrub + (under `Redacted`) string-truncate tool result text. Result text is
+/// not assumed to be JSON, so it does not go through JSON-leaf truncation.
+fn process_tool_result(raw: &str, policy: OtelContentPolicy, max_chars: usize) -> String {
+    let scrubbed = scrub_for_export(raw);
+    if policy == OtelContentPolicy::Redacted {
+        truncate_field(&scrubbed, max_chars).unwrap_or(scrubbed)
+    } else {
+        scrubbed
+    }
+}
+
+/// Build the `gen_ai.tool.arguments` / `input.value` attributes for a
+/// `ToolCallStart` event under the given observer-owned content policy.
+/// Returns an empty vec when the policy is `Off` or no arguments were supplied.
+fn tool_start_content_attrs(arguments: Option<&str>, config: OtelContentConfig) -> Vec<KeyValue> {
+    let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
+    if policy == OtelContentPolicy::Off {
+        return Vec::new();
+    }
+    let Some(args) = arguments else {
+        return Vec::new();
+    };
+    let processed = process_tool_arguments(args, policy, max_chars);
+    vec![
+        KeyValue::new("gen_ai.tool.arguments", processed.clone()),
+        KeyValue::new("input.value", processed),
+    ]
+}
+
+/// Build the `gen_ai.tool.arguments` / `input.value` and `gen_ai.tool.result` /
+/// `output.value` attributes for a `ToolCall` event under the given
+/// observer-owned content policy. Returns an empty vec when the policy is `Off`;
+/// otherwise emits whichever of arguments / result are present.
+fn tool_result_content_attrs(
+    arguments: Option<&str>,
+    result: Option<&str>,
+    config: OtelContentConfig,
+) -> Vec<KeyValue> {
+    let (policy, max_chars) = (config.tool_io_policy, config.tool_io_max_chars);
+    if policy == OtelContentPolicy::Off {
+        return Vec::new();
+    }
+    let mut attrs = Vec::new();
+    if let Some(args) = arguments {
+        let processed = process_tool_arguments(args, policy, max_chars);
+        attrs.push(KeyValue::new("gen_ai.tool.arguments", processed.clone()));
+        attrs.push(KeyValue::new("input.value", processed));
+    }
+    if let Some(res) = result {
+        let processed = process_tool_result(res, policy, max_chars);
+        attrs.push(KeyValue::new("gen_ai.tool.result", processed.clone()));
+        attrs.push(KeyValue::new("output.value", processed));
+    }
+    attrs
+}
+
 /// Build the OTel GenAI message-content attributes from a captured snapshot.
 /// Returns an empty vec when there is nothing to emit. Encoding matches the
 /// Langfuse-validated shape: system carried separately, system filtered out of
 /// `input.messages`, output as a single assistant message (text + tool calls).
-fn message_attrs(messages: &Option<LlmMessageSnapshot>) -> Vec<KeyValue> {
+///
+/// `config` is the owning `OtelObserver`'s instance content policy; whether
+/// (and how) content is emitted is decided here, at the OTel export boundary,
+/// from that immutable per-observer config.
+fn message_attrs(
+    messages: &Option<LlmMessageSnapshot>,
+    config: OtelContentConfig,
+) -> Vec<KeyValue> {
     let Some(snap) = messages else {
         return Vec::new();
     };
 
-    let config = otel_content_config();
     let (policy, max_chars) = (config.genai_policy, config.genai_max_chars);
 
     if policy == OtelContentPolicy::Off {
@@ -1087,25 +1149,36 @@ mod tests {
             .map(|kv| kv.value.as_str().to_string())
     }
 
-    /// Install a non-`off` GenAI content policy so `message_attrs` emits content.
-    /// `message_attrs` reads the process-wide `otel_content_config()`; without this
-    /// the default `Off` policy short-circuits to an empty vec and the content
-    /// assertions below would fail. Uses `Full` so truncation is a no-op and the
-    /// exact captured strings are asserted verbatim.
-    fn set_genai_full() {
-        use crate::observability::otel_config::{OtelContentConfig, set_otel_content_config};
-        set_otel_content_config(OtelContentConfig {
+    /// `Full` GenAI policy with a generous char cap so truncation is a no-op
+    /// and the exact captured strings can be asserted verbatim. Tool I/O is
+    /// `Off` so GenAI-only tests don't accidentally exercise tool helpers.
+    fn genai_full_config() -> OtelContentConfig {
+        OtelContentConfig {
             genai_policy: OtelContentPolicy::Full,
             genai_max_chars: 10_000,
             tool_io_policy: OtelContentPolicy::Off,
             tool_io_max_chars: 0,
-        });
+        }
     }
 
-    #[test]
-    fn message_attrs_emits_genai_semconv() {
-        set_genai_full();
-        let snap = LlmMessageSnapshot {
+    /// `Full` tool I/O policy with a generous char cap. GenAI is `Off`.
+    fn tool_io_full_config() -> OtelContentConfig {
+        OtelContentConfig {
+            genai_policy: OtelContentPolicy::Off,
+            genai_max_chars: 0,
+            tool_io_policy: OtelContentPolicy::Full,
+            tool_io_max_chars: 10_000,
+        }
+    }
+
+    /// All-off policy — no content attributes emitted.
+    fn all_off_config() -> OtelContentConfig {
+        OtelContentConfig::off()
+    }
+
+    /// A populated snapshot reused by the GenAI policy-isolation tests.
+    fn sample_llm_snapshot() -> LlmMessageSnapshot {
+        LlmMessageSnapshot {
             input: vec![MessageSnapshot {
                 role: "user".into(),
                 content: "hi".into(),
@@ -1117,8 +1190,13 @@ mod tests {
                 arguments_json: r#"{"cmd":"ls"}"#.into(),
             }],
             system_instructions: Some("You are helpful.".into()),
-        };
-        let attrs = message_attrs(&Some(snap));
+        }
+    }
+
+    #[test]
+    fn message_attrs_emits_genai_semconv() {
+        let snap = sample_llm_snapshot();
+        let attrs = message_attrs(&Some(snap), genai_full_config());
 
         assert_eq!(
             attr_value(&attrs, "gen_ai.system_instructions").as_deref(),
@@ -1140,7 +1218,6 @@ mod tests {
 
     #[test]
     fn message_attrs_omits_empty_and_handles_none() {
-        set_genai_full();
         // Only system set: input/output omitted.
         let snap = LlmMessageSnapshot {
             input: vec![],
@@ -1148,19 +1225,18 @@ mod tests {
             output_tool_calls: vec![],
             system_instructions: Some("sys".into()),
         };
-        let attrs = message_attrs(&Some(snap));
+        let attrs = message_attrs(&Some(snap), genai_full_config());
         let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
         assert!(keys.contains(&"gen_ai.system_instructions"));
         assert!(!keys.contains(&"gen_ai.input.messages"));
         assert!(!keys.contains(&"gen_ai.output.messages"));
 
         // None → no attrs.
-        assert!(message_attrs(&None).is_empty());
+        assert!(message_attrs(&None, genai_full_config()).is_empty());
     }
 
     #[test]
     fn message_attrs_malformed_tool_arguments_falls_back_to_string() {
-        set_genai_full();
         let snap = LlmMessageSnapshot {
             input: vec![],
             output_text: None,
@@ -1171,11 +1247,18 @@ mod tests {
             }],
             system_instructions: None,
         };
-        let attrs = message_attrs(&Some(snap));
+        let attrs = message_attrs(&Some(snap), genai_full_config());
         let output: serde_json::Value =
             serde_json::from_str(&attr_value(&attrs, "gen_ai.output.messages").unwrap()).unwrap();
         // Malformed arguments fall back to the raw string, not null / dropped.
         assert_eq!(output[0]["tool_calls"][0]["arguments"], "not valid json");
+    }
+
+    #[test]
+    fn message_attrs_returns_empty_when_genai_policy_off() {
+        let snap = sample_llm_snapshot();
+        let attrs = message_attrs(&Some(snap), all_off_config());
+        assert!(attrs.is_empty());
     }
 
     // Note: OtelObserver::new() requires an OTLP endpoint.
@@ -1186,9 +1269,16 @@ mod tests {
 
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
-        // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"), None)
-            .expect("observer creation should not fail with valid endpoint format")
+        // but the observer itself works fine for recording. Content policy is
+        // all-off; smoke tests don't assert exported content, only that the
+        // recording path doesn't panic.
+        OtelObserver::new(
+            Some("http://127.0.0.1:19999"),
+            Some("zeroclaw-test"),
+            None,
+            all_off_config(),
+        )
+        .expect("observer creation should not fail with valid endpoint format")
     }
 
     #[test]
@@ -1543,7 +1633,12 @@ mod tests {
     #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"), None);
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("zeroclaw-test"),
+            None,
+            all_off_config(),
+        );
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"
@@ -1555,7 +1650,12 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
         headers.insert("X-Custom".to_string(), "value".to_string());
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("test"), Some(headers));
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("test"),
+            Some(headers),
+            all_off_config(),
+        );
         assert!(
             result.is_ok(),
             "observer creation with headers must succeed"
@@ -1566,8 +1666,13 @@ mod tests {
     fn otel_observer_with_headers_records_events() {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
-        let obs = OtelObserver::new(Some("http://127.0.0.1:19999"), Some("test"), Some(headers))
-            .expect("creation should succeed");
+        let obs = OtelObserver::new(
+            Some("http://127.0.0.1:19999"),
+            Some("test"),
+            Some(headers),
+            all_off_config(),
+        )
+        .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
             model: "claude-sonnet".into(),
@@ -1600,11 +1705,137 @@ mod tests {
             Some("http://127.0.0.1:12345"),
             Some("test"),
             Some(HashMap::new()),
+            all_off_config(),
         );
         assert!(
             result.is_ok(),
             "observer creation with empty headers must succeed"
         );
+    }
+
+    // ── per-observer policy isolation regression tests ────────────────
+    //
+    // With the old process-global mutable policy, a later observer's config
+    // could override an earlier observer's privacy policy (last-writer-wins).
+    // Now that `OtelContentConfig` is an immutable, instance-owned value,
+    // each observer's policy is stable regardless of what other configs
+    // are constructed around it. The tests exercise the export-boundary
+    // helpers directly so they don't depend on a real OTLP exporter.
+
+    #[test]
+    fn genai_policy_off_is_not_changed_by_later_full_config() {
+        let snap = sample_llm_snapshot();
+        let off = all_off_config();
+        let full = genai_full_config();
+
+        assert!(message_attrs(&Some(snap.clone()), off).is_empty());
+        assert!(!message_attrs(&Some(snap.clone()), full).is_empty());
+        // The later `full` config must not have mutated the earlier `off`.
+        assert!(message_attrs(&Some(snap), off).is_empty());
+    }
+
+    #[test]
+    fn genai_policy_full_is_not_changed_by_later_off_config() {
+        let snap = sample_llm_snapshot();
+        let full = genai_full_config();
+        let off = all_off_config();
+
+        assert!(!message_attrs(&Some(snap.clone()), full).is_empty());
+        assert!(message_attrs(&Some(snap.clone()), off).is_empty());
+        // The later `off` config must not have silenced the earlier `full`.
+        assert!(!message_attrs(&Some(snap), full).is_empty());
+    }
+
+    #[test]
+    fn tool_io_policy_is_instance_owned() {
+        let off = all_off_config();
+        let full = tool_io_full_config();
+
+        let off_attrs = tool_result_content_attrs(Some(r#"{"cmd":"ls"}"#), Some("ok"), off);
+        assert!(off_attrs.is_empty());
+
+        let full_attrs = tool_result_content_attrs(Some(r#"{"cmd":"ls"}"#), Some("ok"), full);
+        assert!(attr_value(&full_attrs, "gen_ai.tool.arguments").is_some());
+        assert!(attr_value(&full_attrs, "gen_ai.tool.result").is_some());
+        assert!(attr_value(&full_attrs, "input.value").is_some());
+        assert!(attr_value(&full_attrs, "output.value").is_some());
+
+        // The earlier `off` config is unaffected by the `full` config used above.
+        let off_attrs_again = tool_result_content_attrs(Some(r#"{"cmd":"ls"}"#), Some("ok"), off);
+        assert!(off_attrs_again.is_empty());
+    }
+
+    #[test]
+    fn tool_start_content_attrs_off_returns_empty() {
+        let attrs = tool_start_content_attrs(Some(r#"{"cmd":"ls"}"#), all_off_config());
+        assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn tool_start_content_attrs_full_emits_arguments() {
+        let attrs = tool_start_content_attrs(Some(r#"{"cmd":"ls"}"#), tool_io_full_config());
+        assert!(attr_value(&attrs, "gen_ai.tool.arguments").is_some());
+        assert!(attr_value(&attrs, "input.value").is_some());
+        assert!(attr_value(&attrs, "gen_ai.tool.result").is_none());
+        assert!(attr_value(&attrs, "output.value").is_none());
+    }
+
+    #[test]
+    fn process_agent_message_emits_genai_messages_json() {
+        // Full policy: clean_for_display strips the memory-context block, no
+        // truncation; output is a single-message GenAI JSON array.
+        let val = process_agent_message(
+            "hi [Memory context]old[/Memory context]",
+            "user",
+            OtelContentPolicy::Full,
+            10_000,
+        )
+        .expect("Some under non-off policy");
+        let parsed: serde_json::Value = serde_json::from_str(&val).unwrap();
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(parsed[0]["content"], "hi");
+    }
+
+    #[test]
+    fn process_agent_message_redacted_truncates() {
+        // Truncation drops the content entirely → None.
+        assert!(process_agent_message("abcdef", "user", OtelContentPolicy::Redacted, 0,).is_none());
+    }
+
+    #[test]
+    fn content_config_normalizes_zero_max_chars_to_off() {
+        use zeroclaw_config::schema::{ObservabilityConfig, OtelContentPolicy};
+
+        let cfg = ObservabilityConfig {
+            otel_genai_content: OtelContentPolicy::Full,
+            otel_genai_content_max_chars: 0,
+            otel_tool_io: OtelContentPolicy::Full,
+            otel_tool_io_max_chars: 0,
+            ..ObservabilityConfig::default()
+        };
+
+        let content = OtelContentConfig::from_observability_config(&cfg);
+        assert_eq!(content.genai_policy, OtelContentPolicy::Off);
+        assert_eq!(content.tool_io_policy, OtelContentPolicy::Off);
+    }
+
+    #[test]
+    fn content_config_preserves_nonzero_max_chars_policy() {
+        use zeroclaw_config::schema::{ObservabilityConfig, OtelContentPolicy};
+
+        let cfg = ObservabilityConfig {
+            otel_genai_content: OtelContentPolicy::Redacted,
+            otel_genai_content_max_chars: 500,
+            otel_tool_io: OtelContentPolicy::Full,
+            otel_tool_io_max_chars: 800,
+            ..ObservabilityConfig::default()
+        };
+
+        let content = OtelContentConfig::from_observability_config(&cfg);
+        assert_eq!(content.genai_policy, OtelContentPolicy::Redacted);
+        assert_eq!(content.genai_max_chars, 500);
+        assert_eq!(content.tool_io_policy, OtelContentPolicy::Full);
+        assert_eq!(content.tool_io_max_chars, 800);
     }
 
     // ── clean_for_display tests ───────────────────────────────────────
