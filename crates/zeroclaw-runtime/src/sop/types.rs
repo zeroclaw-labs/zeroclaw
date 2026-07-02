@@ -151,6 +151,19 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// A channel-sourced fan-in event, produced by a channel that routes forge
+    /// or platform events into SOP ingress (the Git forge channel is the first
+    /// producer). Live: emitted by the channel's event router and consumed by
+    /// the orchestrator's channel-SOP dispatch.
+    Channel {
+        /// Exact channel-SOP topic to match, for example
+        /// `git.<alias>:pull_request.opened`.
+        topic: String,
+        /// Optional expression evaluated against the event payload; when set,
+        /// the SOP only fires if it evaluates truthy.
+        #[serde(default)]
+        condition: Option<String>,
+    },
     /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
     /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
@@ -175,6 +188,7 @@ impl fmt::Display for SopTrigger {
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { topic, .. } => write!(f, "channel:{topic}"),
             Self::Manual => write!(f, "manual"),
             Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
         }
@@ -360,6 +374,7 @@ pub enum SopTriggerSource {
     Peripheral,
     Filesystem,
     Calendar,
+    Channel,
     Manual,
     Amqp,
 }
@@ -373,6 +388,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Peripheral => write!(f, "peripheral"),
             Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
+            Self::Channel => write!(f, "channel"),
             Self::Manual => write!(f, "manual"),
             Self::Amqp => write!(f, "amqp"),
         }
@@ -711,6 +727,19 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"octo/repo\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Channel { ref topic, .. } if topic == "git.main:pull_request.opened")
+        );
+    }
+
+    #[test]
     fn filesystem_event_kind_display_and_serde() {
         assert_eq!(FilesystemEventKind::Created.to_string(), "created");
         assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
@@ -848,6 +877,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 

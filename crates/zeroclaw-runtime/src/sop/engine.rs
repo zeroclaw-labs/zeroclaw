@@ -2103,6 +2103,17 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             SopTriggerSource::Calendar,
         ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
 
+        (SopTrigger::Channel { topic, condition }, SopTriggerSource::Channel) => {
+            let topic_match = event.topic.as_deref().is_some_and(|t| t == topic);
+            if !topic_match {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
 
         _ => false,
@@ -2899,6 +2910,42 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_matches_exact_topic_and_condition() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                topic: "git.main:pull_request.opened".into(),
+                condition: Some("$.repo == \"octo/repo\"".into()),
+            }],
+            ..test_sop("git-pr-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo","number":12}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        let wrong_topic = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_topic).is_empty());
+
+        let wrong_payload = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"other/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_payload).is_empty());
     }
 
     // ── Cron trigger matching ─────────────────────────
