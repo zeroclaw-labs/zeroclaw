@@ -28,7 +28,7 @@ pub struct Plugin {
     state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
 }
 
-fn linker() -> Result<Linker<PluginState>> {
+fn base_linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     let mut options = crate::component::bindings::tool::LinkOptions::default();
@@ -44,21 +44,44 @@ fn linker() -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
+/// Cached linker for plugins without `HttpClient`: base WASI plus the tool
+/// world, no network.
 fn tool_linker() -> &'static Linker<PluginState> {
     static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| linker().expect("tool linker"))
+    LINKER.get_or_init(|| base_linker().expect("tool linker"))
 }
 
-/// Compile and instantiate a tool plugin. Permissions gate config at call time.
+/// Cached linker for `HttpClient` plugins: the base surface plus `wasi:http`.
+/// Built only once, on first use by an HTTP-granted plugin.
+fn tool_linker_http() -> &'static Linker<PluginState> {
+    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
+    LINKER.get_or_init(|| {
+        let mut linker = base_linker().expect("tool linker");
+        crate::component::add_wasi_http(&mut linker).expect("tool http linker");
+        linker
+    })
+}
+
+/// Compile and instantiate a tool plugin under `limits`. The permission set
+/// decides whether the store carries an outbound-HTTP context and whether the
+/// linker exposes `wasi:http`; the two must agree, so both are derived from
+/// `permissions` here.
 pub async fn create_plugin(
     wasm_path: &Path,
-    _permissions: &[PluginPermission],
+    permissions: &[PluginPermission],
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
     let component = load_component(wasm_path)?;
-    let mut store = crate::component::new_store(limits);
+    let mut store = crate::component::new_store(permissions, limits);
+    let http = store.data().http_enabled();
+    let linker = if http {
+        tool_linker_http()
+    } else {
+        tool_linker()
+    };
+    crate::component::ensure_http_coherent(&store, http)?;
     let bindings = wt(
-        ToolPlugin::instantiate_async(&mut store, &component, tool_linker()).await,
+        ToolPlugin::instantiate_async(&mut store, &component, linker).await,
         "failed to instantiate tool plugin",
     )?;
     Ok(Plugin {
