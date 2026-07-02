@@ -37,9 +37,7 @@ pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap)
 }
 
 /// GET /api/sops/trigger-sources - the trigger-source registry the authoring
-/// surfaces render. Walks the backend channel registry (never a hardcoded UI
-/// list) and pairs each inbound-capable channel kind with its configured
-/// aliases from live config, plus a setup deep-link for unconfigured kinds.
+/// surfaces render. Thin skin over `zeroclaw_runtime::sop::registry_from_config`.
 pub async fn handle_sop_trigger_sources(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -47,21 +45,10 @@ pub async fn handle_sop_trigger_sources(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let configured: Vec<zeroclaw_runtime::sop::ConfiguredChannel> = {
+    let registry = {
         let config = state.config.read();
-        config
-            .channels_by_alias()
-            .into_iter()
-            .map(|info| zeroclaw_runtime::sop::ConfiguredChannel {
-                // Schema emits kebab channel types; ChannelKind is snake_case.
-                channel_type: info.channel_type.replace('-', "_"),
-                alias: info.alias,
-                enabled: info.enabled,
-                owning_agent: info.owning_agent,
-            })
-            .collect()
+        zeroclaw_runtime::sop::registry_from_config(&config)
     };
-    let registry = zeroclaw_runtime::sop::build_registry(&configured);
     Json(registry).into_response()
 }
 
@@ -115,27 +102,17 @@ pub async fn handle_sop_run_overlay(
         )
             .into_response();
     };
-    let guard = match engine.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "SOP engine lock poisoned" })),
-            )
-                .into_response();
+    match zeroclaw_runtime::sop::run_overlay_for(&sop, engine, &run_id) {
+        Ok(overlay) => Json(overlay).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
         }
-    };
-    match guard.get_run(&run_id) {
-        Some(run) => {
-            let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&sop);
-            let overlay = zeroclaw_runtime::sop::RunOverlay::project(&graph, run);
-            Json(overlay).into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("run '{run_id}' not found") })),
-        )
-            .into_response(),
     }
 }
 
@@ -161,8 +138,8 @@ pub async fn handle_sop_full(
     }
 }
 
-/// POST /api/sops - create a new SOP. Rejects an overwrite: the target name
-/// must not already exist on disk. Body is the canonical `Sop` JSON.
+/// POST /api/sops - create a new SOP. Rejects an overwrite via the runtime's
+/// `create_sop` guard. Body is the canonical `Sop` JSON.
 pub async fn handle_sop_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -172,20 +149,17 @@ pub async fn handle_sop_create(
         return e.into_response();
     }
     let (dir, _mode) = sops_dir_and_mode(&state);
-    if dir.join(&sop.name).exists() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": format!("SOP '{}' already exists", sop.name) })),
-        )
-            .into_response();
-    }
-    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+    match zeroclaw_runtime::sop::create_sop(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "created": sop.name })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("already exists") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
     }
 }
 

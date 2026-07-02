@@ -3908,9 +3908,9 @@ impl RpcDispatcher {
         to_result(crate::sop::SopGraph::from_sop(&sop))
     }
 
-    /// Project a run's live state onto its SOP graph for a watch view. Loads the
-    /// SOP by name, fetches the run by id from the shared engine, and returns the
-    /// inferred overlay. Errors if the SOP subsystem is not enabled or the run is
+    /// Project a run's live state onto its SOP graph for a watch view. Loads
+    /// the SOP by name and delegates to the shared `run_overlay_for`
+    /// orchestration. Errors if the SOP subsystem is not enabled or the run is
     /// unknown.
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
         let req: SopRunOverlayRequest = parse_params(params)?;
@@ -3922,14 +3922,16 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let guard = engine
-            .lock()
-            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-        let run = guard
-            .get_run(&req.run_id)
-            .ok_or_else(|| rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id)))?;
-        let graph = crate::sop::SopGraph::from_sop(&sop);
-        to_result(crate::sop::RunOverlay::project(&graph, run))
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
     }
 
     /// Validate either a named on-disk SOP (`{ "name": ... }`) or an unsaved
@@ -3961,18 +3963,12 @@ impl RpcDispatcher {
         to_result(serde_json::json!({ "saved": sop.name }))
     }
 
-    /// Create rejects an overwrite: the target must not already exist.
+    /// Create rejects an overwrite via the runtime's `create_sop` guard.
     fn handle_sops_create(&self, params: &Value) -> RpcResult {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
         let (dir, _mode) = self.sops_dir_and_mode();
-        if dir.join(&sop.name).exists() {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                format!("SOP '{}' already exists", sop.name),
-            ));
-        }
-        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        crate::sop::create_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "created": sop.name }))
     }
 
@@ -4017,25 +4013,14 @@ impl RpcDispatcher {
         to_result(crate::sop::SopGraph::from_sop(&sop))
     }
 
-    /// Return the trigger-source registry the authoring surfaces render. Walks
-    /// the backend channel registry (never a hardcoded list) and pairs each
-    /// inbound-capable channel kind with its configured aliases from live
-    /// config, plus a setup deep-link for unconfigured kinds.
+    /// Return the trigger-source registry the authoring surfaces render.
+    /// Thin skin over `crate::sop::registry_from_config`.
     fn handle_sops_trigger_sources(&self) -> RpcResult {
-        let configured: Vec<crate::sop::ConfiguredChannel> = {
+        let registry = {
             let config = self.ctx.config.read();
-            config
-                .channels_by_alias()
-                .into_iter()
-                .map(|info| crate::sop::ConfiguredChannel {
-                    channel_type: info.channel_type.replace('-', "_"),
-                    alias: info.alias,
-                    enabled: info.enabled,
-                    owning_agent: info.owning_agent,
-                })
-                .collect()
+            crate::sop::registry_from_config(&config)
         };
-        to_result(crate::sop::build_registry(&configured))
+        to_result(registry)
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {

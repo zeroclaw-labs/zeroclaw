@@ -32,8 +32,8 @@ pub use store::{
     SqliteRunStore, StoreError, build_run_store,
 };
 pub use trigger_registry::{
-    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerSourceRegistry,
-    build_registry,
+    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerField,
+    TriggerFieldKind, TriggerSourceRegistry, build_registry, registry_from_config,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -148,6 +148,79 @@ pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
     }
     std::fs::remove_dir_all(&dir)?;
     Ok(())
+}
+
+/// Create a new SOP: `save_sop` plus an overwrite guard. Single owner of the
+/// "SOP name is its on-disk directory" invariant; both authoring surfaces
+/// route creation through here.
+pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    if sops_dir.join(&sop.name).exists() {
+        anyhow::bail!("SOP '{}' already exists", sop.name);
+    }
+    save_sop(sops_dir, sop)
+}
+
+/// Project a run's live state onto its SOP graph. Shared watch-view
+/// orchestration for the gateway route and the RPC method: locks the engine,
+/// resolves the run, and returns the overlay. Errors are surface-agnostic
+/// strings; callers map them onto their status codes.
+pub fn run_overlay_for(
+    sop: &Sop,
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+) -> Result<RunOverlay> {
+    let guard = engine
+        .lock()
+        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let run = guard
+        .get_run(run_id)
+        .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))?;
+    let graph = SopGraph::from_sop(sop);
+    Ok(RunOverlay::project(&graph, run))
+}
+
+/// Compact steps to contiguous 1-based numbers and remap every routing
+/// reference (`next`, `depends_on`, `switch[].goto`, `on_failure: goto`)
+/// through the old-to-new map. References to dropped steps are removed
+/// (`on_failure` falls back to `Fail`). No-op when step numbers are not
+/// unique: duplicates are ambiguous to remap and must instead be rejected by
+/// strict validation. The single owner of renumber semantics: surfaces send
+/// drafts as-is and never remap client-side.
+pub fn normalize_step_numbers(sop: &mut Sop) {
+    let mut seen = std::collections::HashSet::new();
+    if !sop.steps.iter().all(|s| seen.insert(s.number)) {
+        return;
+    }
+    let remap: std::collections::HashMap<u32, u32> = sop
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            (
+                s.number,
+                u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1),
+            )
+        })
+        .collect();
+    for (i, step) in sop.steps.iter_mut().enumerate() {
+        step.number = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+        step.routing.next = step.routing.next.and_then(|n| remap.get(&n).copied());
+        step.routing.depends_on = step
+            .routing
+            .depends_on
+            .iter()
+            .filter_map(|d| remap.get(d).copied())
+            .collect();
+        for rule in &mut step.routing.switch {
+            rule.goto = rule.goto.and_then(|g| remap.get(&g).copied());
+        }
+        if let StepFailure::Goto { step: target } = step.on_failure {
+            step.on_failure = remap
+                .get(&target)
+                .map(|s| StepFailure::Goto { step: *s })
+                .unwrap_or(StepFailure::Fail);
+        }
+    }
 }
 
 /// Load SOPs from a specific directory. Each subdirectory may contain
@@ -640,7 +713,12 @@ pub fn render_steps(steps: &[SopStep]) -> String {
 ///
 /// STRICT: validates first and writes NOTHING if any blocking violation is
 /// present. Warnings do not block. Returns the blocking list on rejection.
+/// Step numbers are normalized (contiguous 1-based, routing refs remapped)
+/// before validation, so surfaces never renumber client-side.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    let mut sop = sop.clone();
+    normalize_step_numbers(&mut sop);
+    let sop = &sop;
     let validation = validate_sop_strict(sop);
     if !validation.is_ok() {
         anyhow::bail!("SOP rejected: {}", validation.blocking.join("; "));
@@ -999,6 +1077,84 @@ mod tests {
             location: None,
             deterministic: false,
         }
+    }
+
+    #[test]
+    fn normalize_remaps_routing_after_step_removal() {
+        // Steps 2 and 3 survive after step 1 was removed; refs point at old
+        // numbers. Normalization compacts to 1..=2 and remaps refs; the ref to
+        // the dropped step vanishes and its goto falls back to Fail.
+        let mut sop = minimal_sop(
+            "remap",
+            vec![
+                SopStep {
+                    number: 2,
+                    title: "a".to_string(),
+                    routing: StepRouting {
+                        next: Some(3),
+                        depends_on: vec![1],
+                        switch: vec![SwitchRule {
+                            name: "r".to_string(),
+                            when: None,
+                            goto: Some(3),
+                        }],
+                        ..StepRouting::default()
+                    },
+                    on_failure: StepFailure::Goto { step: 1 },
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 3,
+                    title: "b".to_string(),
+                    ..SopStep::default()
+                },
+            ],
+        );
+        normalize_step_numbers(&mut sop);
+        assert_eq!(sop.steps[0].number, 1);
+        assert_eq!(sop.steps[1].number, 2);
+        assert_eq!(sop.steps[0].routing.next, Some(2));
+        assert!(sop.steps[0].routing.depends_on.is_empty());
+        assert_eq!(sop.steps[0].routing.switch[0].goto, Some(2));
+        assert_eq!(sop.steps[0].on_failure, StepFailure::Fail);
+    }
+
+    #[test]
+    fn normalize_is_noop_on_duplicate_numbers() {
+        let mut sop = minimal_sop(
+            "dupes",
+            vec![
+                SopStep {
+                    number: 1,
+                    title: "a".to_string(),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 1,
+                    title: "b".to_string(),
+                    ..SopStep::default()
+                },
+            ],
+        );
+        normalize_step_numbers(&mut sop);
+        assert_eq!(sop.steps[0].number, 1);
+        assert_eq!(sop.steps[1].number, 1);
+    }
+
+    #[test]
+    fn create_sop_rejects_existing_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sop = minimal_sop(
+            "once",
+            vec![SopStep {
+                number: 1,
+                title: "a".to_string(),
+                ..SopStep::default()
+            }],
+        );
+        assert!(create_sop(tmp.path(), &sop).is_ok());
+        let err = create_sop(tmp.path(), &sop).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
