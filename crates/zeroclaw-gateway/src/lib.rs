@@ -1011,6 +1011,7 @@ pub async fn run_gateway(
                 None,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                None,
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -1145,6 +1146,7 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
         );
         let mut agent_tools = agent_tools_result.tools;
         let agent_delegate = agent_tools_result.delegate_handle;

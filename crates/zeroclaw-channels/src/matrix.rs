@@ -3699,7 +3699,13 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
@@ -4743,6 +4749,7 @@ mod tests {
                     &room_id,
                     &second,
                     &format!("zeroclaw draft lifecycle smoke {stamp} second final"),
+                    false,
                 )
                 .await
                 .expect("finalize second draft by id");
