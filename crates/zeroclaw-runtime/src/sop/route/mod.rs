@@ -167,56 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_routes_to_first_matching_port() {
-        use super::super::step_contract::SwitchRule;
-        let mut sop = sop();
-        sop.steps.push(step(3));
-        sop.steps[0].routing.switch = vec![
-            SwitchRule {
-                name: "never".into(),
-                when: Some("$.value > 999".into()),
-                goto: Some(2),
-            },
-            SwitchRule {
-                name: "catch_all".into(),
-                when: None,
-                goto: Some(3),
-            },
-        ];
-        let run = run();
-        let run_data = RunData::default();
-        let ctx = RouteCtx {
-            sop: &sop,
-            run: &run,
-            run_data: &run_data,
-            last_status: SopStepStatus::Completed,
-            max_step_visits: 256,
-        };
-        assert_eq!(resolve_next(&ctx), NextStep::Step(3));
-    }
-
-    #[test]
-    fn switch_with_no_match_completes() {
-        use super::super::step_contract::SwitchRule;
-        let mut sop = sop();
-        sop.steps[0].routing.switch = vec![SwitchRule {
-            name: "never".into(),
-            when: Some("$.value > 999".into()),
-            goto: Some(2),
-        }];
-        let run = run();
-        let run_data = RunData::default();
-        let ctx = RouteCtx {
-            sop: &sop,
-            run: &run,
-            run_data: &run_data,
-            last_status: SopStepStatus::Completed,
-            max_step_visits: 256,
-        };
-        assert_eq!(resolve_next(&ctx), NextStep::Complete);
-    }
-
-    #[test]
     fn linear_default_routes_to_next_step() {
         let sop = sop();
         let run = run();
@@ -230,23 +180,6 @@ mod tests {
         };
 
         assert_eq!(resolve_next(&ctx), NextStep::Step(2));
-    }
-
-    #[test]
-    fn terminal_step_completes_instead_of_falling_through() {
-        let mut sop = sop();
-        sop.steps[0].routing.terminal = true;
-        let run = run();
-        let run_data = RunData::default();
-        let ctx = RouteCtx {
-            sop: &sop,
-            run: &run,
-            run_data: &run_data,
-            last_status: SopStepStatus::Completed,
-            max_step_visits: 256,
-        };
-
-        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
     #[test]

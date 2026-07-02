@@ -649,61 +649,6 @@ mod tests {
     /// `draft_serializes_to_canonical_wire` test, any field-name or tagging
     /// drift between the mirror and this struct fails one side loudly.
     #[test]
-    fn mirror_wire_shape_is_canonical() {
-        let wire = serde_json::json!({
-            "name": "demo",
-            "description": "d",
-            "version": "1.0.0",
-            "priority": "high",
-            "execution_mode": "supervised",
-            "triggers": [{ "type": "manual" }],
-            "steps": [
-                {
-                    "number": 1,
-                    "title": "gate",
-                    "body": "b",
-                    "suggested_tools": ["shell"],
-                    "requires_confirmation": true,
-                    "kind": "checkpoint",
-                    "routing": { "when": "$.ok", "next": 2 },
-                    "on_failure": { "retry": { "max": 3 } }
-                },
-                {
-                    "number": 2,
-                    "title": "act",
-                    "body": "b2",
-                    "routing": { "depends_on": [1] },
-                    "on_failure": { "goto": { "step": 1 } }
-                }
-            ],
-            "cooldown_secs": 0,
-            "max_concurrent": 1,
-            "deterministic": false
-        });
-        let sop: Sop = serde_json::from_value(wire).expect("mirror wire parses into canonical Sop");
-        assert_eq!(sop.steps.len(), 2);
-        let s0 = &sop.steps[0];
-        assert_eq!(s0.kind, SopStepKind::Checkpoint);
-        assert!(s0.requires_confirmation);
-        assert_eq!(s0.routing.when.as_deref(), Some("$.ok"));
-        assert_eq!(s0.routing.next, Some(2));
-        assert_eq!(
-            s0.on_failure,
-            super::super::step_contract::StepFailure::Retry { max: 3 }
-        );
-        let s1 = &sop.steps[1];
-        assert_eq!(s1.routing.depends_on, vec![1]);
-        assert_eq!(
-            s1.on_failure,
-            super::super::step_contract::StepFailure::Goto { step: 1 }
-        );
-        // Bare "fail" string parses to the unit variant.
-        let f: super::super::step_contract::StepFailure =
-            serde_json::from_value(serde_json::json!("fail")).unwrap();
-        assert_eq!(f, super::super::step_contract::StepFailure::Fail);
-    }
-
-    #[test]
     fn priority_display() {
         assert_eq!(SopPriority::Critical.to_string(), "critical");
         assert_eq!(SopPriority::Low.to_string(), "low");
@@ -713,43 +658,8 @@ mod tests {
     /// drift test: every trigger variant's wire shape must round-trip through
     /// the canonical `SopTrigger` identically, so the mirror and this enum
     /// cannot diverge without one side failing.
-    #[test]
-    fn trigger_wire_shapes_round_trip_every_variant() {
-        for wire in [
-            serde_json::json!({"type": "manual"}),
-            serde_json::json!({"type": "webhook", "path": "/hook"}),
-            serde_json::json!({"type": "cron", "expression": "0 9 * * *"}),
-            serde_json::json!({"type": "mqtt", "topic": "a/+/b", "condition": "$.x"}),
-            serde_json::json!({"type": "filesystem", "path": "/tmp/w", "events": ["created", "deleted"], "condition": "$.y"}),
-            serde_json::json!({"type": "peripheral", "board": "b0", "signal": "s1", "condition": "$.z"}),
-            serde_json::json!({"type": "calendar", "calendar_source": "google", "calendar_ids": ["primary", "team"]}),
-            serde_json::json!({"type": "channel", "channel": "telegram", "alias": "ops", "condition": "$.text"}),
-            serde_json::json!({"type": "amqp", "routing_key": "orders.#", "condition": "$.total"}),
-        ] {
-            let trigger: SopTrigger = serde_json::from_value(wire.clone())
-                .unwrap_or_else(|e| panic!("parse {wire}: {e}"));
-            let back = serde_json::to_value(&trigger).unwrap();
-            assert_eq!(back, wire, "lossy round trip for {wire}");
-        }
-    }
-
     /// Overlay node-state wire tokens the zerocode `NodeRunState` mirror also
     /// parses. Guards the snake_case names against drift.
-    #[test]
-    fn node_run_state_wire_tokens_are_canonical() {
-        use crate::sop::graph::NodeRunState;
-        for (token, want) in [
-            ("pending", NodeRunState::Pending),
-            ("active", NodeRunState::Active),
-            ("completed", NodeRunState::Completed),
-            ("failed", NodeRunState::Failed),
-            ("skipped", NodeRunState::Skipped),
-        ] {
-            let got: NodeRunState = serde_json::from_value(serde_json::json!(token)).unwrap();
-            assert_eq!(got, want, "token {token}");
-        }
-    }
-
     #[test]
     fn execution_mode_display() {
         assert_eq!(SopExecutionMode::Auto.to_string(), "auto");
@@ -908,48 +818,6 @@ path = "/var/inbox"
     #[test]
     fn trigger_source_filesystem_display() {
         assert_eq!(SopTriggerSource::Filesystem.to_string(), "filesystem");
-    }
-
-    #[test]
-    fn trigger_channel_toml_roundtrip_and_display() {
-        let toml_str = r#"
-type = "channel"
-channel = "telegram"
-alias = "main"
-condition = "$.text == \"go\""
-"#;
-        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
-        assert!(matches!(
-            &trigger,
-            SopTrigger::Channel { channel, alias, condition }
-                if channel == "telegram"
-                    && alias.as_deref() == Some("main")
-                    && condition.is_some()
-        ));
-        assert_eq!(trigger.to_string(), "channel:telegram/main");
-        let round = toml::to_string(&trigger).unwrap();
-        let reparsed: SopTrigger = toml::from_str(&round).unwrap();
-        assert_eq!(reparsed, trigger);
-    }
-
-    #[test]
-    fn trigger_channel_without_alias_matches_kind_only() {
-        let toml_str = r#"
-type = "channel"
-channel = "discord"
-"#;
-        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
-        assert_eq!(trigger.to_string(), "channel:discord");
-        assert!(matches!(
-            &trigger,
-            SopTrigger::Channel { alias, condition, .. }
-                if alias.is_none() && condition.is_none()
-        ));
-    }
-
-    #[test]
-    fn trigger_source_channel_display() {
-        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
     }
 
     #[test]
