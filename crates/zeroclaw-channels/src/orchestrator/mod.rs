@@ -5147,14 +5147,8 @@ async fn process_channel_message_body(
                     activated_tools: ctx.activated_tools.as_ref(),
                     model_switch_callback: Some(model_switch_callback.clone()),
                     pacing: &ctx.pacing,
-                    strict_tool_parsing: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                    parallel_tools: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.parallel_tools),
+                    strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                    parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                     max_tool_result_chars: ctx.max_tool_result_chars,
                     context_token_budget: ctx.context_token_budget,
                     receipt_generator: ctx.receipt_generator.as_ref(),
