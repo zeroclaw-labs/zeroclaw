@@ -73,6 +73,7 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `type:dependencies` | Dependency or lockfile maintenance |
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
+| `type:test` | Test-only or test-primary work |
 
 ## Path labels
 
