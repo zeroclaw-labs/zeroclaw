@@ -1349,12 +1349,20 @@ impl Agent {
         if let Err(e) = tokio::fs::create_dir_all(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to create per-agent workspace dir (continuing): ");
         }
-        // Seed the agent's bootstrap files (AGENTS.md / SOUL.md /
-        // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
-        // run. Idempotent — never overwrites existing files; only
-        // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // Seed the agent's personality files (SOUL.md / IDENTITY.md /
+        // USER.md / AGENTS.md / TOOLS.md / HEARTBEAT.md / MEMORY.md) from
+        // the default preset on first run. Idempotent — only missing or
+        // blank files are written, so existing user edits are preserved.
+        // Without this a freshly-created agent loads with empty operating
+        // files, which silently breaks tool use for prompt-guided models
+        // that rely on AGENTS.md/TOOLS.md instead of native tool schemas.
+        if let Err(e) = crate::agent::personality::seed_default_personality(
+            config,
+            agent_alias,
+            &agent_workspace,
+        )
+        .await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
