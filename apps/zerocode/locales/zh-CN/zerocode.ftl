@@ -370,9 +370,14 @@ zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-action-copy = copy
 zc-chat-action-copy-md = md
+zc-chat-action-retry = retry
+zc-chat-action-edit = edit
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = 已复制到剪贴板
 zc-chat-copied-markdown = 已复制 Markdown 到剪贴板
+zc-chat-retry-queued = 已将消息重试加入队列
+zc-chat-edit-loaded = 已将消息载入输入框
+zc-chat-edit-input-busy = 编辑消息前请先清空输入框
 zc-config-breadcrumb-root = 配置
 zc-config-section-detail-hint = { $open } 或 { $into } 打开此部分
 zc-config-breadcrumb-new = 新建

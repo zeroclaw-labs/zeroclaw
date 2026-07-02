@@ -370,9 +370,14 @@ zc-chat-clipboard-you = あなた: { $text }
 zc-chat-clipboard-agent = エージェント: { $text }
 zc-chat-action-copy = copy
 zc-chat-action-copy-md = md
+zc-chat-action-retry = retry
+zc-chat-action-edit = edit
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = クリップボードにコピーしました
 zc-chat-copied-markdown = Markdown をクリップボードにコピーしました
+zc-chat-retry-queued = メッセージの再試行をキューに追加しました
+zc-chat-edit-loaded = メッセージを入力欄に読み込みました
+zc-chat-edit-input-busy = メッセージを編集する前に入力欄を空にしてください
 zc-config-breadcrumb-root = 設定
 zc-config-section-detail-hint = { $open } または { $into } でこのセクションを開く
 zc-config-breadcrumb-new = 新規

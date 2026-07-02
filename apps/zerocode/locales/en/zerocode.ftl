@@ -426,9 +426,14 @@ zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-action-copy = copy
 zc-chat-action-copy-md = md
+zc-chat-action-retry = retry
+zc-chat-action-edit = edit
 zc-chat-status-help = ?=help
 zc-chat-copied-clipboard = Copied raw text to clipboard
 zc-chat-copied-markdown = Copied markdown to clipboard
+zc-chat-retry-queued = Queued message retry
+zc-chat-edit-loaded = Loaded message into input
+zc-chat-edit-input-busy = Clear input before editing a message
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
