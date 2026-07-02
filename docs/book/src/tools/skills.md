@@ -49,7 +49,22 @@ tags: [release, docs]
 Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready.
 ```
 
-Supported frontmatter fields are `name`, `description`, `version`, `author`, and `tags`.
+Supported frontmatter fields are `name`, `description`, `version`, `author`, `tags`, and `always`.
+
+The `always: true` flag controls whether the skill's instructions are injected into the prompt when using compact prompt mode. By default, compact mode only includes skill tool definitions but omits their instructions. Setting `always: true` ensures the skill's instructions are always included, even in compact mode. This is useful for critical skills that must be followed in all contexts.
+
+Example:
+```markdown
+---
+name: security-review
+description: Security review checklist
+always: true
+---
+
+# Security Review
+
+Always check for SQL injection, XSS vulnerabilities, and proper authentication before deploying.
+```
 
 ## Create a TOML skill
 
