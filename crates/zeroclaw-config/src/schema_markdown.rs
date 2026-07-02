@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 /// Build the channel streaming-capability table by walking the `channels`
 /// section of the `Config` schema. Capability is derived from each channel
 /// struct's fields, never hand-listed:
-///   - has `stream_mode` (the off/partial/multi_message enum) -> draft updates
+///   - has `stream_mode` (channel-specific streaming enum) -> draft updates
 ///     and multi-message streaming are both supported.
 ///   - has `stream_drafts` (a partial-only boolean) -> draft updates only.
 ///   - neither -> no streaming.

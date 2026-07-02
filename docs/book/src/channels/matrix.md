@@ -423,7 +423,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 {{#streaming channel="Matrix" mode="stream_mode" path="channels.matrix.<alias>.stream_mode"}}
 
-Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
+Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline as answer text. In `single_message` mode, tool/progress status updates are edited into one sliding draft while the final answer is sent as a separate Matrix message; `stream_draft_lines` controls how many progress entries remain visible (`0` keeps all), and `message_max_bytes` still caps the rendered draft body by dropping older progress entries before editing Matrix. `stream_draft_delete` controls whether durable progress transcripts are deleted before the final answer is posted. Placeholder-only drafts are removed before the final answer even when transcript retention is enabled. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
 
 ## 8. Auto-recovery from corrupted local state
 

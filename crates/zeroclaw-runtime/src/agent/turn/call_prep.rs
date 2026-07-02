@@ -6,6 +6,7 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
+use super::progress::render_tool_start_progress;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -247,25 +248,7 @@ pub(crate) async fn prepare_tool_calls(
 
         // ── Progress: tool start ────────────────────────────
         if let Some(tx) = ctx.on_delta {
-            let hint = {
-                let raw = match tool_name.as_str() {
-                    "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-                    "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
-                    _ => tool_args
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| tool_args.get("query").and_then(|v| v.as_str())),
-                };
-                match raw {
-                    Some(s) => truncate_with_ellipsis(s, 60),
-                    None => String::new(),
-                }
-            };
-            let progress = if hint.is_empty() {
-                format!("\u{23f3} {}\n", tool_name)
-            } else {
-                format!("\u{23f3} {}: {hint}\n", tool_name)
-            };
+            let progress = render_tool_start_progress(&tool_name, &tool_args);
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

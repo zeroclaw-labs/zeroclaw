@@ -6,7 +6,7 @@
 //! - `allowlist`: filter inbound by sender + room
 //! - `approval`: 8-char token gen + reply parser
 //! - `context`: thread-root preamble fetcher + delivered-set
-//! - `streaming`: Partial + MultiMessage state machines
+//! - `streaming`: Partial, SingleMessage, and MultiMessage state machines
 //! - `session`: `session.json` blob persistence next to the SQLite store
 //! - `client`: SDK build, login/restore, recovery, cross-signing bootstrap, alias resolve
 //! - `inbound`: event handlers + sync loop
@@ -371,14 +371,14 @@ mod context {
 // ─── streaming ─────────────────────────────────────────────────────────────
 mod streaming {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         time::{Duration, Instant},
     };
 
     use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 
-    use super::markers;
+    use super::{StreamMode, markers};
 
     const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
 
@@ -421,6 +421,24 @@ mod streaming {
         EmptyError,
     }
 
+    /// Matrix-only progress draft for `stream_mode = "single_message"`.
+    /// It owns only live Matrix event state; the canonical config values stay
+    /// on `MatrixConfig`. Lines are stored as a deque so enforcing
+    /// `stream_draft_lines` is an O(1) pop from the front instead of repeatedly
+    /// re-splitting the rendered draft.
+    #[derive(Debug, Clone)]
+    pub(super) struct SingleDraft {
+        pub event_id: OwnedEventId,
+        pub thread_anchor: Option<OwnedEventId>,
+        /// Source of truth for the current visible progress window.
+        pub lines: VecDeque<String>,
+        /// Last body confirmed by a successful Matrix edit, used to decide
+        /// whether retained drafts need a final flush.
+        pub last_text: String,
+        /// Last edit attempt timestamp, used only for Matrix edit throttling.
+        pub last_edit: Instant,
+    }
+
     /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
     /// with the accumulated agent output; we send each `\n\n`-bounded paragraph
     /// as its own room message, threaded under `thread_anchor` when present.
@@ -432,32 +450,139 @@ mod streaming {
         pub sent_so_far: usize,
     }
 
+    /// Live draft storage for the Matrix stream mode selected at channel
+    /// construction. A channel handle has an immutable `MatrixConfig`, so
+    /// keeping only the active draft map prevents impossible cross-mode state
+    /// while preserving concurrent draft isolation within that mode.
     #[derive(Default, Debug)]
-    pub(super) struct State {
-        pub partial: HashMap<DraftKey, PartialDraft>,
-        pub multi: HashMap<DraftKey, MultiDraft>,
+    pub(super) enum State {
+        #[default]
+        Off,
+        Partial(HashMap<DraftKey, PartialDraft>),
+        Single(HashMap<DraftKey, SingleDraft>),
+        Multi(HashMap<DraftKey, MultiDraft>),
+    }
+
+    impl State {
+        /// Create the draft store matching the immutable Matrix stream mode.
+        pub(super) fn for_stream_mode(mode: StreamMode) -> Self {
+            match mode {
+                StreamMode::Off => Self::Off,
+                StreamMode::Partial => Self::Partial(HashMap::new()),
+                StreamMode::SingleMessage => Self::Single(HashMap::new()),
+                StreamMode::MultiMessage => Self::Multi(HashMap::new()),
+            }
+        }
+    }
+
+    pub(super) fn insert_partial(
+        state: &mut State,
+        key: DraftKey,
+        draft: PartialDraft,
+    ) -> Result<()> {
+        let State::Partial(drafts) = state else {
+            bail!("matrix: partial draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
     }
 
     pub(super) fn partial_for_update<'a>(
         state: &'a mut State,
         key: &DraftKey,
     ) -> Option<&'a mut PartialDraft> {
-        state.partial.get_mut(key)
+        match state {
+            State::Partial(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
     }
 
     pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
-        state.partial.remove(key)
+        match state {
+            State::Partial(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Partial(drafts) if drafts.contains_key(key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_len(state: &State) -> usize {
+        match state {
+            State::Partial(drafts) => drafts.len(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn insert_single(
+        state: &mut State,
+        key: DraftKey,
+        draft: SingleDraft,
+    ) -> Result<()> {
+        let State::Single(drafts) = state else {
+            bail!("matrix: single-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    /// Return the editable `single_message` draft for this room+draft id, if it
+    /// is still active.
+    pub(super) fn single_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    /// Remove the `single_message` draft from live state at finalize/cancel so
+    /// a late progress update cannot keep editing a completed response.
+    pub(super) fn take_single(state: &mut State, key: &DraftKey) -> Option<SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn single_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Single(drafts) if drafts.contains_key(key))
+    }
+
+    pub(super) fn insert_multi(state: &mut State, key: DraftKey, draft: MultiDraft) -> Result<()> {
+        let State::Multi(drafts) = state else {
+            bail!("matrix: multi-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
     }
 
     pub(super) fn multi_for_update<'a>(
         state: &'a mut State,
         key: &DraftKey,
     ) -> Option<&'a mut MultiDraft> {
-        state.multi.get_mut(key)
+        match state {
+            State::Multi(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
     }
 
     pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
-        state.multi.remove(key)
+        match state {
+            State::Multi(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Multi(drafts) if drafts.contains_key(key))
     }
 
     pub(super) fn partial_should_edit(
@@ -480,6 +605,218 @@ mod streaming {
         } else {
             Some(cleaned.to_string())
         }
+    }
+
+    /// Append one progress update to a single-message draft, dropping the
+    /// oldest entries once the configured window is full. A zero limit
+    /// intentionally means "unlimited".
+    pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
+        let text = normalize_matrix_progress_line(text);
+        if text.is_empty() {
+            return;
+        }
+        draft.lines.push_back(text);
+        if max_lines > 0 {
+            while draft.lines.len() > max_lines {
+                draft.lines.pop_front();
+            }
+        }
+    }
+
+    /// Keep multiline tool/status details and Markdown punctuation from
+    /// becoming accidental Matrix formatting inside the editable draft. This
+    /// is a Matrix presentation shim only; if upstream tool-progress
+    /// normalization ever provides the same guarantee, reconsider this
+    /// channel-local step.
+    pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
+        let mut normalized = String::with_capacity(text.len());
+        for ch in text.trim_end_matches(&['\r', '\n'][..]).chars() {
+            match ch {
+                '\n' => normalized.push('␊'),
+                '\r' => normalized.push('␍'),
+                '\u{000b}' => normalized.push('␋'),
+                '\u{000c}' => normalized.push('␌'),
+                '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.'
+                | '!' | '>' | '|' => {
+                    normalized.push('\\');
+                    normalized.push(ch);
+                }
+                _ => normalized.push(ch),
+            }
+        }
+        normalized
+    }
+
+    /// Render the newest progress entries that fit within the Matrix text-body
+    /// budget. Line-count limiting and byte-budget limiting deliberately share
+    /// the same deque: line limits drop old entries at insertion time, while
+    /// byte limits drop old entries at render time so `stream_draft_lines = 0`
+    /// can still stay below Matrix's event-size ceiling.
+    pub(super) fn single_visible_text_with_budget(draft: &SingleDraft, max_bytes: usize) -> String {
+        if max_bytes == 0 {
+            return String::new();
+        }
+        let mut selected_count = 0usize;
+        let mut bytes = 0usize;
+        for line in draft.lines.iter().rev() {
+            let separator = usize::from(selected_count > 0);
+            let next_bytes = line.len().saturating_add(separator);
+            if bytes.saturating_add(next_bytes) <= max_bytes {
+                selected_count += 1;
+                bytes += next_bytes;
+                continue;
+            }
+            if selected_count == 0 {
+                return truncate_utf8_bytes(line, max_bytes);
+            }
+            break;
+        }
+        let start = draft.lines.len().saturating_sub(selected_count);
+        let mut text = String::with_capacity(bytes);
+        for line in draft.lines.iter().skip(start) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(line);
+        }
+        text
+    }
+
+    /// Truncate a string to a byte budget without splitting a UTF-8 scalar.
+    /// Matrix limits are byte-oriented, while Rust string slicing requires a
+    /// char boundary.
+    fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            return text.to_string();
+        }
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
+    }
+
+    /// Check the Matrix edit-attempt interval before rendering the draft body.
+    /// Progress lines are still recorded first, so retained drafts can flush
+    /// the latest transcript during finalization without paying render cost on
+    /// every debounced tick.
+    pub(super) fn single_edit_interval_elapsed(
+        existing: &SingleDraft,
+        now: Instant,
+        min_interval: Duration,
+    ) -> bool {
+        now.saturating_duration_since(existing.last_edit) >= min_interval
+    }
+
+    /// Only thinking/reasoning entries use the Matrix edit debounce. Tool
+    /// progress, denials, replacements, and other durable entries edit the
+    /// existing draft immediately so fast operations do not look buffered.
+    pub(super) fn single_progress_uses_edit_interval(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        trimmed.starts_with("\u{1f914} ") // thinking status, U+1F914
+            || trimmed.starts_with("\u{1f9e0} ") // reasoning/full thinking, U+1F9E0
+            || trimmed.starts_with("\u{1f4ad} ") // thought bubble reasoning, U+1F4AD
+    }
+
+    /// Avoid duplicate Matrix edits after rendering confirms that the visible
+    /// transcript is unchanged.
+    pub(super) fn single_render_changed(existing: &SingleDraft, new_text: &str) -> bool {
+        existing.last_text != new_text
+    }
+
+    /// Mark a rendered single-message draft body as Matrix-visible only after
+    /// the edit request succeeds. Keeping `last_text` as a delivery checkpoint
+    /// lets retained drafts flush again during finalization after a failed edit.
+    pub(super) fn mark_single_edit_delivered(
+        existing: &mut SingleDraft,
+        event_id: &OwnedEventId,
+        visible_text: String,
+        delivered_at: Instant,
+    ) -> bool {
+        if existing.event_id.as_str() != event_id.as_str() {
+            return false;
+        }
+        existing.last_text = visible_text;
+        existing.last_edit = delivered_at;
+        true
+    }
+
+    /// Finalization sequence for Matrix `single_message` mode. Encoding the
+    /// delete/send ordering here keeps the user-visible timeline rule testable
+    /// without mocking Matrix network calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SingleFinalizePlan {
+        DeleteDraftThenSendFinal,
+        KeepDraftThenSendFinal,
+        SendFinalOnly,
+        Noop,
+    }
+
+    /// Cleanup needed for a retained single-message draft before the final
+    /// answer can be posted. Retention applies to durable progress transcripts,
+    /// not to the initial placeholder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum SingleRetainedDraftAction {
+        DeletePlaceholder,
+        Flush(String),
+        KeepCurrent,
+    }
+
+    impl SingleFinalizePlan {
+        pub(super) fn deletes_draft_first(self) -> bool {
+            matches!(self, Self::DeleteDraftThenSendFinal)
+        }
+
+        pub(super) fn keeps_draft(self) -> bool {
+            matches!(self, Self::KeepDraftThenSendFinal)
+        }
+
+        pub(super) fn sends_final(self) -> bool {
+            !matches!(self, Self::Noop)
+        }
+    }
+
+    /// Choose the single-message finalization sequence from durable state and
+    /// operator config. A missing draft only suppresses empty final text; when a
+    /// draft existed, final delivery is attempted even if the text is empty so
+    /// the normal Matrix send path reports any invalid final body.
+    pub(super) fn single_finalize_plan(
+        has_draft: bool,
+        delete_draft: bool,
+        final_has_text: bool,
+    ) -> SingleFinalizePlan {
+        match (has_draft, delete_draft, final_has_text) {
+            (true, true, _) => SingleFinalizePlan::DeleteDraftThenSendFinal,
+            (true, false, _) => SingleFinalizePlan::KeepDraftThenSendFinal,
+            (false, _, true) => SingleFinalizePlan::SendFinalOnly,
+            (false, _, false) => SingleFinalizePlan::Noop,
+        }
+    }
+
+    /// Decide how to make a retained draft coherent before the final answer is
+    /// sent. This bypasses edit debounce at finalize time so a kept progress
+    /// transcript cannot lag behind the in-memory sliding buffer.
+    pub(super) fn single_retained_draft_action(
+        draft: &SingleDraft,
+        max_bytes: usize,
+    ) -> SingleRetainedDraftAction {
+        if draft.lines.is_empty() {
+            return SingleRetainedDraftAction::DeletePlaceholder;
+        }
+        let visible_text = single_visible_text_with_budget(draft, max_bytes);
+        if visible_text.is_empty() || visible_text == draft.last_text {
+            SingleRetainedDraftAction::KeepCurrent
+        } else {
+            SingleRetainedDraftAction::Flush(visible_text)
+        }
+    }
+
+    /// Cancel removes drafts when the operator requested deletion or when
+    /// Matrix still only shows the initial placeholder. The line buffer may
+    /// contain undelivered progress after a failed edit, so the delivery
+    /// checkpoint is the correct source for the user-visible state.
+    pub(super) fn single_cancel_deletes_draft(draft: &SingleDraft, delete_draft: bool) -> bool {
+        delete_draft || draft.last_text == "..."
     }
 
     pub(super) fn decide_partial_finalize_action(
@@ -3373,6 +3710,7 @@ impl MatrixChannel {
         // `.with_ack_reactions(...)` after construction to thread the
         // actual `[channels].ack_reactions` global through.
         let ack_reactions = config.ack_reactions.unwrap_or(true);
+        let streaming_state = streaming::State::for_stream_mode(config.stream_mode);
         Ok(Self {
             config: Arc::new(config),
             alias: alias.into(),
@@ -3382,7 +3720,7 @@ impl MatrixChannel {
             transcription: None,
             client: tokio::sync::OnceCell::new(),
             pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
-            streaming_state: Arc::new(TokioRwLock::new(streaming::State::default())),
+            streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
             reaction_log: Arc::new(TokioMutex::new(HashMap::new())),
@@ -3473,6 +3811,50 @@ impl MatrixChannel {
             event_id
         };
         outbound::edit(client, recipient, &event_id, &visible_text).await
+    }
+
+    /// Update the sliding progress transcript for `single_message` mode.
+    /// Unlike Partial mode, assistant answer text is intentionally ignored
+    /// elsewhere; this draft is only for durable status/progress entries.
+    async fn single_update_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.message_max_bytes.max(1);
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+
+            let now = Instant::now();
+            let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
+            if streaming::single_progress_uses_edit_interval(text)
+                && !streaming::single_edit_interval_elapsed(draft, now, interval)
+            {
+                return Ok(());
+            }
+
+            let visible_text = streaming::single_visible_text_with_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = now;
+            (draft.event_id.clone(), visible_text, now)
+        };
+        let client = self.ensure_client().await?;
+        outbound::edit(client, recipient, &update.0, &update.1).await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, update.1, update.2);
+            }
+        }
+        Ok(())
     }
 
     /// MultiMessage paragraph emitter. Loops emitting one paragraph per
@@ -3615,9 +3997,9 @@ impl Channel for MatrixChannel {
 
     fn supports_draft_updates(&self) -> bool {
         // The orchestrator's streaming pipeline is gated on this returning
-        // true. Both Partial and MultiMessage need it on so update_draft is
-        // driven with accumulated text; the channel decides internally
-        // whether to edit a single message or emit paragraphs.
+        // true. Partial, SingleMessage, and MultiMessage all need streaming
+        // setup; the channel decides internally whether to edit answer text,
+        // edit progress only, or emit paragraphs.
         !matches!(self.config.stream_mode, StreamMode::Off)
     }
 
@@ -3642,7 +4024,8 @@ impl Channel for MatrixChannel {
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
                 let key = streaming::draft_key(room_id, event_id.as_ref())?;
                 let mut state = self.streaming_state.write().await;
-                state.partial.insert(
+                streaming::insert_partial(
+                    &mut state,
                     key,
                     streaming::PartialDraft {
                         event_id: event_id.clone(),
@@ -3650,7 +4033,34 @@ impl Channel for MatrixChannel {
                         last_text: message.content.clone(),
                         last_edit: Instant::now(),
                     },
-                );
+                )?;
+                Ok(Some(event_id.to_string()))
+            }
+            StreamMode::SingleMessage => {
+                // Single-message mode starts with one editable progress draft.
+                // Final answer text is never copied here; finalize_draft sends
+                // the answer as a separate Matrix message.
+                let event_id = outbound::send(&self.outbox(client), message).await?;
+                let thread_anchor =
+                    outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
+                let first_edit_ready = Instant::now()
+                    .checked_sub(Duration::from_millis(
+                        self.config.draft_update_interval_ms.max(50),
+                    ))
+                    .unwrap_or_else(Instant::now);
+                let mut state = self.streaming_state.write().await;
+                streaming::insert_single(
+                    &mut state,
+                    key,
+                    streaming::SingleDraft {
+                        event_id: event_id.clone(),
+                        thread_anchor,
+                        lines: Default::default(),
+                        last_text: message.content.clone(),
+                        last_edit: first_edit_ready,
+                    },
+                )?;
                 Ok(Some(event_id.to_string()))
             }
             StreamMode::MultiMessage => {
@@ -3665,13 +4075,14 @@ impl Channel for MatrixChannel {
                 let draft_id = streaming::new_multi_message_draft_id();
                 let key = streaming::draft_key(room_id, &draft_id)?;
                 let mut state = self.streaming_state.write().await;
-                state.multi.insert(
+                streaming::insert_multi(
+                    &mut state,
                     key,
                     streaming::MultiDraft {
                         thread_anchor,
                         sent_so_far: 0,
                     },
-                );
+                )?;
                 Ok(Some(draft_id))
             }
         }
@@ -3681,6 +4092,7 @@ impl Channel for MatrixChannel {
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            StreamMode::SingleMessage => Ok(()),
             StreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
@@ -3691,12 +4103,16 @@ impl Channel for MatrixChannel {
         message_id: &str,
         text: &str,
     ) -> Result<()> {
-        // Tool-status updates only show in Partial (edit-in-place) mode.
-        // MultiMessage doesn't have an in-flight draft to update.
-        if matches!(self.config.stream_mode, StreamMode::Partial) {
-            return self.update_draft(recipient, message_id, text).await;
+        match self.config.stream_mode {
+            StreamMode::Partial => self.update_draft(recipient, message_id, text).await,
+            StreamMode::SingleMessage => {
+                self.single_update_progress(recipient, message_id, text)
+                    .await
+            }
+            // MultiMessage doesn't have an in-flight draft to update, and Off
+            // means the orchestrator should not have created one.
+            StreamMode::Off | StreamMode::MultiMessage => Ok(()),
         }
-        Ok(())
     }
 
     async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
@@ -3814,6 +4230,92 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
+            StreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                let plan = streaming::single_finalize_plan(
+                    draft.is_some(),
+                    self.config.stream_draft_delete,
+                    !text.trim().is_empty(),
+                );
+
+                if plan.deletes_draft_first()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    // Matrix implements message deletion through redaction.
+                    // Delete before the final send so the user's timeline
+                    // lands on the final answer rather than a trailing
+                    // "message deleted" event after it.
+                    outbound::redact(
+                        client,
+                        recipient,
+                        &draft.event_id,
+                        Some("streaming draft replaced by final response".to_string()),
+                    )
+                    .await
+                    .context("matrix: single-message draft delete failed before final send")?;
+                }
+
+                if plan.keeps_draft()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    match streaming::single_retained_draft_action(
+                        draft,
+                        self.config.message_max_bytes.max(1),
+                    ) {
+                        streaming::SingleRetainedDraftAction::DeletePlaceholder => {
+                            outbound::redact(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                Some(
+                                    "empty streaming draft removed before final response"
+                                        .to_string(),
+                                ),
+                            )
+                            .await
+                            .context(
+                                "matrix: empty single-message draft delete failed before final send",
+                            )?;
+                        }
+                        streaming::SingleRetainedDraftAction::Flush(visible_text) => {
+                            if let Err(edit_err) =
+                                outbound::edit(client, recipient, &draft.event_id, &visible_text)
+                                    .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": edit_err.to_string()})),
+                                    "matrix: single-message retained draft flush failed before final send"
+                                );
+                                // Retention mode makes the durable progress
+                                // transcript best-effort once it already
+                                // exists. A stale retained draft is less
+                                // harmful than suppressing the separate final
+                                // Matrix answer, so final delivery proceeds.
+                            }
+                        }
+                        streaming::SingleRetainedDraftAction::KeepCurrent => {}
+                    }
+                }
+
+                if plan.sends_final() {
+                    let mut msg = SendMessage::new(text, recipient);
+                    msg.thread_ts = draft
+                        .as_ref()
+                        .and_then(|draft| draft.thread_anchor.as_ref())
+                        .map(|e| e.to_string());
+                    outbound::send(&self.outbox(client), &msg).await?;
+                }
+                Ok(())
+            }
             StreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
@@ -3854,6 +4356,27 @@ impl Channel for MatrixChannel {
                         client,
                         recipient,
                         &d.event_id,
+                        Some("cancelled".to_string()),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            StreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                if let Some(draft) = draft
+                    && streaming::single_cancel_deletes_draft(
+                        &draft,
+                        self.config.stream_draft_delete,
+                    )
+                {
+                    let _ = outbound::redact(
+                        client,
+                        recipient,
+                        &draft.event_id,
                         Some("cancelled".to_string()),
                     )
                     .await;
@@ -4373,13 +4896,30 @@ mod tests {
     }
 
     mod streaming {
+        use super::super::MatrixChannel;
         use super::super::streaming;
         use super::super::streaming::{
-            MultiDraft, PartialDraft, PartialFinalizeAction, State, decide_partial_finalize_action,
-            partial_should_edit, partial_visible_text,
+            MultiDraft, PartialDraft, PartialFinalizeAction, SingleDraft,
+            SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
+            insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
+            normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
+            partial_visible_text, push_single_progress_line, single_cancel_deletes_draft,
+            single_contains, single_edit_interval_elapsed, single_finalize_plan,
+            single_progress_uses_edit_interval, single_render_changed,
+            single_retained_draft_action, single_visible_text_with_budget,
         };
+        use matrix_sdk::config::SyncSettings;
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
+        use std::collections::VecDeque;
+        use std::sync::Arc;
         use std::time::{Duration, Instant};
+        use tempfile::TempDir;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method, path_regex},
+        };
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
             PartialDraft {
@@ -4395,6 +4935,16 @@ mod tests {
                 event_id,
                 thread_anchor: None,
                 last_text: text.to_string(),
+                last_edit: Instant::now(),
+            }
+        }
+
+        fn single_draft(event_id: OwnedEventId) -> SingleDraft {
+            SingleDraft {
+                event_id,
+                thread_anchor: None,
+                lines: VecDeque::new(),
+                last_text: "...".to_string(),
                 last_edit: Instant::now(),
             }
         }
@@ -4449,6 +4999,491 @@ mod tests {
         }
 
         #[test]
+        fn single_progress_slides_oldest_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 2);
+            push_single_progress_line(&mut draft, "two", 2);
+            push_single_progress_line(&mut draft, "three", 2);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_zero_limit_keeps_all_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "one\ntwo\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_byte_budget_drops_oldest_entries_after_line_limit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, "two\nthree".len()),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_byte_budget_truncates_oversized_utf8_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "😀😀😀", 0);
+
+            let visible = single_visible_text_with_budget(&draft, 5);
+
+            assert_eq!(visible, "😀");
+            assert!(visible.len() <= 5);
+            assert!(visible.is_char_boundary(visible.len()));
+        }
+
+        #[test]
+        fn single_progress_normalizes_vertical_whitespace_for_matrix_only() {
+            assert_eq!(
+                normalize_matrix_progress_line("shell: printf 'a\\nb'\nnext\r\n"),
+                "shell: printf 'a\\nb'␊next"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line("delegate: prompt=Check **service**\nthen _report_"),
+                "delegate: prompt=Check \\*\\*service\\*\\*␊then \\_report\\_"
+            );
+        }
+
+        #[test]
+        fn single_edit_interval_can_skip_render_until_debounce_elapses() {
+            let now = Instant::now();
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_edit = now - Duration::from_millis(100);
+
+            assert!(!single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+
+            draft.last_edit = now - Duration::from_millis(600);
+            assert!(single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn single_only_thinking_progress_uses_edit_debounce() {
+            for line in [
+                "\u{1f914} Thinking...\n",
+                "\u{1f914} Thinking (round 2)...\n",
+                "\u{1f9e0} considering options\n",
+                "\u{1f4ad} considering options\n",
+            ] {
+                assert!(
+                    single_progress_uses_edit_interval(line),
+                    "expected debounced thinking/reasoning progress for {line:?}"
+                );
+            }
+
+            for line in [
+                "\u{1f4ac} Got 2 tool call(s) (1s)\n",
+                "\u{23f3} shell: command=uname -a\n",
+                "\u{2705} shell: command=uname -a (0s)\n",
+                "\u{274c} shell: command=false (0s): failed\n",
+                "\u{270f} shell: replaced by user\n",
+                "plain durable progress\n",
+            ] {
+                assert!(
+                    !single_progress_uses_edit_interval(line),
+                    "expected immediate durable progress edit for {line:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn single_render_changed_skips_duplicate_matrix_edits() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one\ntwo".to_string();
+
+            assert!(!single_render_changed(&draft, "one\ntwo"));
+            assert!(single_render_changed(&draft, "two\nthree"));
+        }
+
+        #[test]
+        fn failed_single_edit_leaves_retained_draft_flushable() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+
+            // Simulate a rendered edit body whose Matrix request fails: the
+            // line buffer advanced, but the delivery checkpoint must not.
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one".to_string())
+            );
+
+            assert!(mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$single:server"),
+                "one".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_edit_delivery_ignores_replaced_draft_event() {
+            let mut draft = single_draft(owned_event_id!("$current:server"));
+
+            assert!(!mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$old:server"),
+                "old progress".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(draft.last_text, "...");
+        }
+
+        #[test]
+        fn single_finalize_plan_deletes_draft_before_sending_final_when_enabled() {
+            assert_eq!(
+                single_finalize_plan(true, true, true),
+                streaming::SingleFinalizePlan::DeleteDraftThenSendFinal
+            );
+        }
+
+        #[test]
+        fn single_finalize_plan_keeps_draft_but_still_sends_final_when_disabled() {
+            assert_eq!(
+                single_finalize_plan(true, false, true),
+                streaming::SingleFinalizePlan::KeepDraftThenSendFinal
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, true),
+                streaming::SingleFinalizePlan::SendFinalOnly
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, false),
+                streaming::SingleFinalizePlan::Noop
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_flushes_latest_unflushed_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one".to_string();
+            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "two", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one\ntwo".to_string())
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_keeps_current_visible_text() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+            draft.last_text = "one".to_string();
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_deletes_placeholder_without_progress() {
+            let draft = single_draft(owned_event_id!("$single:server"));
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
+        fn single_cancel_deletes_placeholder_but_retains_durable_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            push_single_progress_line(&mut draft, "one", 10);
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            draft.last_text = "one".to_string();
+            assert!(!single_cancel_deletes_draft(&draft, false));
+            assert!(single_cancel_deletes_draft(&draft, true));
+        }
+
+        #[tokio::test]
+        async fn single_message_update_draft_ignores_answer_text() {
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: "https://matrix.invalid".to_string(),
+                    access_token: Some("test-token".to_string()),
+                    stream_mode: StreamMode::SingleMessage,
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+            let key =
+                super::super::streaming_key("!room:server", "$draft:server").expect("draft key");
+
+            {
+                let mut state = channel.streaming_state.write().await;
+                insert_single(
+                    &mut state,
+                    key.clone(),
+                    single_draft(owned_event_id!("$draft:server")),
+                )
+                .expect("single-message state accepts draft");
+            }
+
+            Channel::update_draft(&channel, "!room:server", "$draft:server", "final prose")
+                .await
+                .expect("single_message answer deltas are ignored without Matrix I/O");
+
+            let mut state = channel.streaming_state.write().await;
+            let draft =
+                streaming::single_for_update(&mut state, &key).expect("draft remains active");
+            assert!(draft.lines.is_empty());
+            assert_eq!(draft.last_text, "...");
+        }
+
+        #[tokio::test]
+        async fn retained_single_draft_flush_failure_still_sends_final() {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": "old progress"
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/event/.*$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@bot:server",
+                    "event_id": draft_id.as_str(),
+                    "origin_server_ts": 1,
+                    "room_id": room_id,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": "old progress"
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": draft_id.as_str()
+                    }
+                })))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "errcode": "M_BAD_JSON",
+                    "error": "edit failed"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "final answer"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: StreamMode::SingleMessage,
+                    stream_draft_delete: false,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            if let Err(err) = client.sync_once(SyncSettings::default()).await {
+                let paths = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|request| request.url.path().to_string())
+                    .collect::<Vec<_>>();
+                panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+            }
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let mut draft = single_draft(draft_id.clone());
+                draft.last_text = "old progress".to_string();
+                push_single_progress_line(&mut draft, "new progress", 10);
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer"),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "retained draft flush failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("retained draft finalize timed out; received paths: {paths:?}");
+                }
+            }
+        }
+
+        #[test]
         fn marker_only_partial_finalize_redacts_placeholder_after_upload() {
             assert_eq!(
                 decide_partial_finalize_action(true, true),
@@ -4488,8 +5523,9 @@ mod tests {
 
             assert_ne!(first, second);
 
-            let mut state = streaming::State::default();
-            state.partial.insert(
+            let mut state = streaming::State::for_stream_mode(StreamMode::Partial);
+            insert_partial(
+                &mut state,
                 first.clone(),
                 PartialDraft {
                     event_id: owned_event_id!("$draft-a:server"),
@@ -4497,8 +5533,10 @@ mod tests {
                     last_text: "first".to_string(),
                     last_edit: Instant::now(),
                 },
-            );
-            state.partial.insert(
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
                 second.clone(),
                 PartialDraft {
                     event_id: owned_event_id!("$draft-b:server"),
@@ -4506,14 +5544,15 @@ mod tests {
                     last_text: "second".to_string(),
                     last_edit: Instant::now(),
                 },
-            );
+            )
+            .expect("partial state accepts second draft");
 
-            assert_eq!(state.partial.len(), 2);
+            assert_eq!(partial_len(&state), 2);
             assert_eq!(
-                state.partial.remove(&second).map(|draft| draft.event_id),
+                streaming::take_partial(&mut state, &second).map(|draft| draft.event_id),
                 Some(owned_event_id!("$draft-b:server"))
             );
-            assert!(state.partial.contains_key(&first));
+            assert!(partial_contains(&state, &first));
         }
 
         #[test]
@@ -4523,15 +5562,19 @@ mod tests {
             let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
             let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
 
-            let mut state = State::default();
-            state.partial.insert(
+            let mut state = State::for_stream_mode(StreamMode::Partial);
+            insert_partial(
+                &mut state,
                 first.clone(),
                 partial_draft(owned_event_id!("$draft-a:server"), "first"),
-            );
-            state.partial.insert(
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
                 second.clone(),
                 partial_draft(owned_event_id!("$draft-b:server"), "second"),
-            );
+            )
+            .expect("partial state accepts second draft");
 
             streaming::partial_for_update(&mut state, &second)
                 .expect("second draft remains addressable")
@@ -4547,18 +5590,75 @@ mod tests {
             let finalized = streaming::take_partial(&mut state, &second)
                 .expect("finalize removes only the addressed draft");
             assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
-            assert!(state.partial.contains_key(&first));
-            assert!(!state.partial.contains_key(&second));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &second));
 
-            state.partial.insert(
+            insert_partial(
+                &mut state,
                 canceled.clone(),
                 partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
-            );
+            )
+            .expect("partial state accepts canceled draft");
             let canceled_draft = streaming::take_partial(&mut state, &canceled)
                 .expect("cancel removes only the addressed draft");
             assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
-            assert!(state.partial.contains_key(&first));
-            assert!(!state.partial.contains_key(&canceled));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn single_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::for_stream_mode(StreamMode::SingleMessage);
+            insert_single(
+                &mut state,
+                first.clone(),
+                single_draft(owned_event_id!("$draft-a:server")),
+            )
+            .expect("single state accepts first draft");
+            insert_single(
+                &mut state,
+                second.clone(),
+                single_draft(owned_event_id!("$draft-b:server")),
+            )
+            .expect("single state accepts second draft");
+
+            push_single_progress_line(
+                streaming::single_for_update(&mut state, &second)
+                    .expect("second draft remains addressable"),
+                "second updated",
+                10,
+            );
+
+            assert_eq!(
+                streaming::single_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .lines
+                    .len(),
+                0
+            );
+
+            let finalized = streaming::take_single(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &second));
+
+            insert_single(
+                &mut state,
+                canceled.clone(),
+                single_draft(owned_event_id!("$draft-c:server")),
+            )
+            .expect("single state accepts canceled draft");
+            let canceled_draft = streaming::take_single(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &canceled));
         }
 
         #[test]
@@ -4571,21 +5671,25 @@ mod tests {
             let canceled =
                 super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
 
-            let mut state = State::default();
-            state.multi.insert(
+            let mut state = State::for_stream_mode(StreamMode::MultiMessage);
+            insert_multi(
+                &mut state,
                 first.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 5,
                 },
-            );
-            state.multi.insert(
+            )
+            .expect("multi state accepts first draft");
+            insert_multi(
+                &mut state,
                 second.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 0,
                 },
-            );
+            )
+            .expect("multi state accepts second draft");
 
             streaming::multi_for_update(&mut state, &second)
                 .expect("second multi-message draft remains addressable")
@@ -4601,21 +5705,23 @@ mod tests {
             let finalized = streaming::take_multi(&mut state, &second)
                 .expect("finalize removes only the addressed multi-message draft");
             assert_eq!(finalized.sent_so_far, 12);
-            assert!(state.multi.contains_key(&first));
-            assert!(!state.multi.contains_key(&second));
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &second));
 
-            state.multi.insert(
+            insert_multi(
+                &mut state,
                 canceled.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 3,
                 },
-            );
+            )
+            .expect("multi state accepts canceled draft");
             let canceled_draft = streaming::take_multi(&mut state, &canceled)
                 .expect("cancel removes only the addressed multi-message draft");
             assert_eq!(canceled_draft.sent_so_far, 3);
-            assert!(state.multi.contains_key(&first));
-            assert!(!state.multi.contains_key(&canceled));
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &canceled));
         }
 
         #[test]
@@ -4641,7 +5747,9 @@ mod tests {
         use zeroclaw_api::channel::{Channel, SendMessage};
         use zeroclaw_config::schema::{MatrixConfig, StreamMode};
 
-        use super::super::{MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming_key};
+        use super::super::{
+            MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming, streaming_key,
+        };
 
         fn env_first(primary: &str, fallback: &str) -> String {
             env::var(primary)
@@ -4674,6 +5782,9 @@ mod tests {
                 stream_mode: StreamMode::Partial,
                 draft_update_interval_ms: 50,
                 multi_message_delay_ms: 0,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
                 reply_in_thread: false,
                 ack_reactions: Some(false),
                 approval_timeout_secs: 1,
@@ -4716,8 +5827,8 @@ mod tests {
             let second_key = streaming_key(&room_id, &second).expect("second draft key");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.contains_key(&first_key));
-                assert!(state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(streaming::partial_contains(&state, &second_key));
             }
 
             tokio::time::sleep(Duration::from_millis(60)).await;
@@ -4727,15 +5838,13 @@ mod tests {
                 .await
                 .expect("update first draft by id");
             {
-                let state = channel.streaming_state.read().await;
+                let mut state = channel.streaming_state.write().await;
                 assert_eq!(
-                    state
-                        .partial
-                        .get(&first_key)
+                    streaming::partial_for_update(&mut state, &first_key)
                         .map(|draft| draft.last_text.as_str()),
                     Some(first_update.as_str())
                 );
-                assert!(state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &second_key));
             }
 
             channel
@@ -4748,8 +5857,8 @@ mod tests {
                 .expect("finalize second draft by id");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.contains_key(&first_key));
-                assert!(!state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(!streaming::partial_contains(&state, &second_key));
             }
 
             channel
@@ -4758,7 +5867,7 @@ mod tests {
                 .expect("cancel first draft by id");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.is_empty());
+                assert_eq!(streaming::partial_len(&state), 0);
             }
         }
 
@@ -5015,6 +6124,9 @@ mod tests {
                 stream_mode: Default::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
                 mention_only: false,
                 recovery_key: None,
                 password: password.map(String::from),

@@ -313,7 +313,17 @@ impl DiscordChannel {
         draft_update_interval_ms: u64,
         multi_message_delay_ms: u64,
     ) -> Self {
-        self.stream_mode = stream_mode;
+        self.stream_mode = match stream_mode {
+            zeroclaw_config::schema::StreamMode::SingleMessage => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "discord: stream_mode=single_message is not supported; falling back to off"
+                );
+                zeroclaw_config::schema::StreamMode::Off
+            }
+            other => other,
+        };
         self.draft_update_interval_ms = draft_update_interval_ms;
         self.multi_message_delay_ms = multi_message_delay_ms;
         self
@@ -3528,7 +3538,11 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != zeroclaw_config::schema::StreamMode::Off
+        matches!(
+            self.stream_mode,
+            zeroclaw_config::schema::StreamMode::Partial
+                | zeroclaw_config::schema::StreamMode::MultiMessage
+        )
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -3548,7 +3562,7 @@ impl Channel for DiscordChannel {
             return Ok(None);
         }
         match self.stream_mode {
-            StreamMode::Off => Ok(None),
+            StreamMode::Off | StreamMode::SingleMessage => Ok(None),
             StreamMode::Partial => {
                 let initial_text = if message.content.is_empty() {
                     "...".to_string()
@@ -3595,7 +3609,7 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
         match self.stream_mode {
-            StreamMode::Off => Ok(()),
+            StreamMode::Off | StreamMode::SingleMessage => Ok(()),
             StreamMode::Partial => {
                 // Rate-limit edits per channel.
                 {

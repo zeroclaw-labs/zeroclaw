@@ -711,7 +711,17 @@ impl TelegramChannel {
         stream_mode: StreamMode,
         draft_update_interval_ms: u64,
     ) -> Self {
-        self.stream_mode = stream_mode;
+        self.stream_mode = match stream_mode {
+            StreamMode::SingleMessage => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "telegram: stream_mode=single_message is not supported; falling back to off"
+                );
+                StreamMode::Off
+            }
+            other => other,
+        };
         self.draft_update_interval_ms = if draft_update_interval_ms == 0 {
             TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
         } else {
@@ -3308,11 +3318,11 @@ impl Channel for TelegramChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != StreamMode::Off
+        self.stream_mode != StreamMode::Off && self.stream_mode != StreamMode::SingleMessage
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if self.stream_mode == StreamMode::Off {
+        if self.stream_mode == StreamMode::Off || self.stream_mode == StreamMode::SingleMessage {
             return Ok(None);
         }
 

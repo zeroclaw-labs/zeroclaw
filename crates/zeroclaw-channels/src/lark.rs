@@ -1010,6 +1010,14 @@ impl LarkChannel {
                 );
                 StreamMode::Off
             }
+            StreamMode::SingleMessage => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,),
+                    "lark: stream_mode=single_message is not supported by Feishu's editable-card surface; falling back to off"
+                );
+                StreamMode::Off
+            }
             other => other,
         };
         self.stream_mode = effective_stream_mode;
@@ -3078,7 +3086,7 @@ impl Channel for LarkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        !matches!(self.stream_mode, StreamMode::Off)
+        matches!(self.stream_mode, StreamMode::Partial)
     }
 
     /// Open a streaming draft card. Returns `Ok(None)` (caller must
@@ -3087,7 +3095,7 @@ impl Channel for LarkChannel {
     /// `String` is the Feishu `message_id` used by subsequent
     /// `update_draft` / `finalize_draft` PATCH calls.
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if matches!(self.stream_mode, StreamMode::Off) {
+        if !matches!(self.stream_mode, StreamMode::Partial) {
             return Ok(None);
         }
 

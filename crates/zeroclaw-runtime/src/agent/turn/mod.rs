@@ -61,6 +61,7 @@ pub(crate) mod max_iter;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
+pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
