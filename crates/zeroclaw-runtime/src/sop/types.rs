@@ -164,10 +164,16 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// Inbound message on a configured agent-loop channel (telegram, discord,
+    /// slack, ...). Live: delivered by the channel orchestrator when the
+    /// channel's SOP dispatch mode is enabled.
     Channel {
+        /// `ChannelKind` snake_case value naming the channel type.
         channel: String,
+        /// Optional configured-instance alias; unset matches every instance.
         #[serde(default)]
         alias: Option<String>,
+        /// Optional expression evaluated against the message payload.
         #[serde(default)]
         condition: Option<String>,
     },

@@ -20,9 +20,9 @@ pub mod wire;
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
-    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity,
-    GraphWire, NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay,
-    SopGraph, TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
+    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
+    NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph,
+    TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
@@ -300,7 +300,6 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
 // ── Markdown step parser ────────────────────────────────────────
 
 /// Parse procedure steps from SOP.md content.
-///
 /// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
 /// Sub-bullets parse execution hints and dark per-step contract metadata.
@@ -679,7 +678,6 @@ pub fn render_steps(steps: &[SopStep]) -> String {
     out
 }
 
-///
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     let mut sop = sop.clone();
     normalize_step_numbers(&mut sop);
@@ -748,7 +746,6 @@ impl SopValidation {
     }
 }
 
-///
 pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     let mut blocking = Vec::new();
 
