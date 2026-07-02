@@ -32,8 +32,9 @@ ignore = [
     "RUSTSEC-2025-0081",  # unic-char-property unmaintained; tracking #8519
     "RUSTSEC-2025-0098",  # unic-ucd-version unmaintained; tracking #8519
     "RUSTSEC-2025-0100",  # unic-ucd-ident unmaintained; tracking #8519
-    # macro/font helpers unmaintained (transitive); tracking #8519
-    "RUSTSEC-2024-0370",  # proc-macro-error unmaintained; transitive macro helper; tracking #8519
+    # macro/font helpers unmaintained (transitive); tracking #8519.
+    # RUSTSEC-2024-0370 (proc-macro-error) was dropped when zeroclaw-desktop
+    # (Tauri) was removed in PR #8544.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; transitive macro helper; tracking #8519
     "RUSTSEC-2024-0388",  # derivative unmaintained; transitive derive helper; tracking #8519
     "RUSTSEC-2026-0192",  # ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519
