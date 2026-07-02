@@ -70,9 +70,10 @@ pub struct LineChannel {
     client: reqwest::Client,
     /// Base URL for the LINE Messaging API. Overrideable in tests.
     api_base_url: String,
-    /// Sender display name injected into every outgoing message ("AI <botName>", max 20 chars).
-    /// Set once in `listen()` after fetching `/v2/bot/info`.
-    sender_name: Arc<parking_lot::RwLock<String>>,
+    /// Resolves the operator-configured sender display name at send-time.
+    /// Returns `None` (or empty string) when unset; the send path falls back to `"AI"`.
+    /// No cache — reads canonical config state on demand (AGENTS.md SSOT rule).
+    sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     /// Bot profile image URL from `/v2/bot/info`; injected as `sender.iconUrl`.
     sender_icon: Arc<parking_lot::RwLock<Option<String>>>,
     /// Base URL for the LINE Content API (audio/file downloads). Overrideable in tests.
@@ -127,19 +128,31 @@ async fn send_loading_indicator(
     chat_id: &str,
 ) {
     let body = serde_json::json!({"chatId": chat_id});
-    if let Err(e) = client
+    match client
         .post(format!("{api_base_url}/v2/bot/chat/loading/start"))
         .bearer_auth(channel_access_token)
         .json(&body)
         .send()
         .await
     {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            &format!("loading indicator failed: {e}")
-        );
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("loading indicator failed: {e}")
+            );
+        }
+        Ok(resp) if !resp.status().is_success() => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"status": resp.status().as_u16()})),
+                "loading indicator returned non-2xx from LINE"
+            );
+        }
+        Ok(_) => {}
     }
 }
 
@@ -738,7 +751,7 @@ impl LineChannel {
             client: zeroclaw_config::schema::build_channel_proxy_client("channel.line", None),
             api_base_url: "https://api.line.me".to_string(),
             content_api_base_url: "https://api-data.line.me".to_string(),
-            sender_name: Arc::new(parking_lot::RwLock::new(String::new())),
+            sender_name_resolver: Arc::new(|| None),
             sender_icon: Arc::new(parking_lot::RwLock::new(None)),
             transcription_manager: None,
         }
@@ -757,12 +770,17 @@ impl LineChannel {
     ///
     /// Mirrors [`LarkChannel::from_config`] — keeps construction logic inside the
     /// channel crate rather than duplicating it across orchestrator call sites.
+    ///
+    /// `sender_name_resolver` is called at send-time to read the canonical
+    /// display-name from the live config (SSOT). Callers should close over
+    /// `Arc<RwLock<Config>>` so hot-reloads are reflected without restart.
     pub fn from_config(
         config: &zeroclaw_config::schema::LineConfig,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> Self {
-        let ch = Self::new(
+        Self::new(
             config.channel_access_token.clone(),
             config.channel_secret.clone(),
             config.dm_policy.clone(),
@@ -771,11 +789,18 @@ impl LineChannel {
             peer_resolver,
             config.webhook_port,
         )
-        .with_proxy_url(config.proxy_url.clone());
-        if let Some(name) = config.sender_name.as_deref().filter(|s| !s.is_empty()) {
-            *ch.sender_name.write() = name.to_string();
-        }
-        ch
+        .with_proxy_url(config.proxy_url.clone())
+        .with_sender_name_resolver(sender_name_resolver)
+    }
+
+    /// Override the sender display name resolver. The closure is called at
+    /// send-time; return `None` or an empty string to use the `"AI"` fallback.
+    pub fn with_sender_name_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.sender_name_resolver = resolver;
+        self
     }
 
     /// Override the proxy URL for outbound HTTP calls.
@@ -999,7 +1024,9 @@ impl LineChannel {
     /// Send text via the Reply API (consumes `reply_token`).
     async fn send_reply(&self, reply_token: &str, text: &str) -> anyhow::Result<()> {
         let url = format!("{}/v2/bot/message/reply", self.api_base_url);
-        let sender_name = self.sender_name.read().clone();
+        let sender_name = (self.sender_name_resolver)()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "AI".to_string());
         let sender_icon = self.sender_icon.read().clone();
         let messages: Vec<serde_json::Value> = Self::split_message(text)
             .into_iter()
@@ -1038,7 +1065,9 @@ impl LineChannel {
     /// Send text via the Push API (requires a paid LINE plan for high volume).
     async fn send_push(&self, to: &str, text: &str) -> anyhow::Result<()> {
         let url = format!("{}/v2/bot/message/push", self.api_base_url);
-        let sender_name = self.sender_name.read().clone();
+        let sender_name = (self.sender_name_resolver)()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "AI".to_string());
         let sender_icon = self.sender_icon.read().clone();
         let messages: Vec<serde_json::Value> = Self::split_message(text)
             .into_iter()
@@ -1168,9 +1197,6 @@ impl Channel for LineChannel {
     /// via `message.mention.mentionees`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_info = self.fetch_bot_info().await?;
-        if self.sender_name.read().is_empty() {
-            *self.sender_name.write() = "AI".to_string();
-        }
         *self.sender_icon.write() = bot_info.picture_url;
         ::zeroclaw_log::record!(
             INFO,
@@ -2283,9 +2309,8 @@ mod tests {
             empty_resolver(),
             0,
         )
-        .with_api_base_url(&server.uri());
-
-        *ch.sender_name.write() = "AI".to_string();
+        .with_api_base_url(&server.uri())
+        .with_sender_name_resolver(Arc::new(|| Some("AI".to_string())));
         ch.pending_tokens
             .write()
             .insert("Urecipient".to_string(), "reply-token".to_string());
@@ -2321,9 +2346,8 @@ mod tests {
             empty_resolver(),
             0,
         )
-        .with_api_base_url(&server.uri());
-
-        *ch.sender_name.write() = "AI".to_string();
+        .with_api_base_url(&server.uri())
+        .with_sender_name_resolver(Arc::new(|| Some("AI".to_string())));
         *ch.sender_icon.write() = Some("https://profile.line-scdn.net/bot-icon.png".to_string());
         ch.pending_tokens
             .write()
@@ -2343,7 +2367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_reply_omits_sender_when_name_empty() {
+    async fn send_reply_uses_ai_fallback_when_no_resolver() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2354,6 +2378,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        // No sender_name_resolver configured — must fall back to "AI".
         let ch = LineChannel::new(
             "tok".into(),
             "sec".into(),
@@ -2365,7 +2390,6 @@ mod tests {
         )
         .with_api_base_url(&server.uri());
 
-        // sender_name stays "" (not yet initialized)
         ch.pending_tokens
             .write()
             .insert("Urecipient".to_string(), "reply-token".to_string());
@@ -2376,9 +2400,10 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
-        assert!(
-            body["messages"][0].get("sender").is_none(),
-            "sender must be absent when name is empty"
+        assert_eq!(
+            body["messages"][0]["sender"]["name"],
+            "AI",
+            "sender name must fall back to AI when no resolver is configured"
         );
     }
 
@@ -2403,9 +2428,8 @@ mod tests {
             empty_resolver(),
             0,
         )
-        .with_api_base_url(&server.uri());
-
-        *ch.sender_name.write() = "AI".to_string();
+        .with_api_base_url(&server.uri())
+        .with_sender_name_resolver(Arc::new(|| Some("AI".to_string())));
         // No pending token → falls through to Push API
         ch.send(&SendMessage::new("hi", "Urecipient"))
             .await
@@ -2672,7 +2696,7 @@ mod tests {
     // ---- listen() sets sender identity from bot info -----------------------
 
     #[tokio::test]
-    async fn listen_sets_sender_name_to_ai() {
+    async fn listen_sets_sender_icon_from_bot_info() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2699,7 +2723,6 @@ mod tests {
         .with_api_base_url(&server.uri());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let sender_name = Arc::clone(&ch.sender_name);
         let sender_icon = Arc::clone(&ch.sender_icon);
 
         let abort = zeroclaw_spawn::spawn!(async move {
@@ -2709,7 +2732,6 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        assert_eq!(*sender_name.read(), "AI");
         assert_eq!(
             *sender_icon.read(),
             Some("https://profile.line-scdn.net/popcorn.png".to_string())

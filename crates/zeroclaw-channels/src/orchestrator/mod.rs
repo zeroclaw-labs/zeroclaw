@@ -6427,8 +6427,21 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
                 };
+                let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .line
+                            .get(&alias)
+                            .and_then(|ln| ln.sender_name.clone())
+                            .filter(|s| !s.is_empty())
+                    })
+                };
                 Ok(Arc::new(
-                    LineChannel::from_config(ln, alias, peer_resolver)
+                    LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
                         .with_persistence(config_arc.clone()),
                 ))
             }
@@ -7618,11 +7631,24 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
         };
+        let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .line
+                    .get(&alias)
+                    .and_then(|ln| ln.sender_name.clone())
+                    .filter(|s| !s.is_empty())
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "LINE",
             alias: Some(alias.clone()),
             channel: Arc::new(
-                LineChannel::from_config(ln, alias.clone(), peer_resolver)
+                LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
                     .with_persistence(config_arc.clone())
                     .with_transcription(config.transcription.clone()),
             ),
