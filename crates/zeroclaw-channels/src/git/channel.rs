@@ -508,6 +508,7 @@ impl Channel for GitChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let result = self.edit_comment(recipient, message_id, text, false).await;
         self.draft_edits.lock().remove(message_id);
