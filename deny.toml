@@ -47,7 +47,6 @@ ignore = [
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; transitive macro helper; tracking #8519" },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper; tracking #8519" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive derive helper; tracking #8519" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519" },
 ]
 
 [licenses]

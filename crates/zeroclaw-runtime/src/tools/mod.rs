@@ -103,8 +103,6 @@ pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
 pub use zeroclaw_tools::notion_tool::NotionTool;
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
-#[cfg(feature = "rag-pdf")]
-pub use zeroclaw_tools::pdf_read::PdfReadTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
@@ -1100,13 +1098,6 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
     }
-
-    // PDF extraction (feature-gated at compile time via rag-pdf)
-    #[cfg(feature = "rag-pdf")]
-    tool_arcs.push(Arc::new(RateLimitedTool::new(
-        PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
-        security.clone(),
-    )));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
