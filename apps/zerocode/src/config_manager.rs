@@ -419,42 +419,6 @@ impl App {
         Ok(())
     }
 
-    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
-        self.section = ConfigSection::Zeroclaw;
-        self.zeroclaw_pane = ZeroclawPane::Detail;
-        self.deactivate_filter();
-
-        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
-            return Ok(());
-        };
-
-        self.section_cursor = section_idx;
-        self.loaded_section = Some(section_idx);
-        self.load_aliases("agents").await?;
-
-        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
-            self.alias_cursor = 0;
-            self.screen = Screen::AliasList {
-                section_idx,
-                map_path: "agents".to_string(),
-                breadcrumb: vec!["agents".to_string()],
-            };
-            self.status_msg = None;
-            return Ok(());
-        };
-
-        self.alias_cursor = alias_idx;
-        let prefix = format!("agents.{alias}");
-        self.load_fields(&prefix).await?;
-        self.screen = Screen::FieldList {
-            section_idx,
-            prefix,
-            breadcrumb: vec!["agents".to_string(), alias.to_string()],
-        };
-        self.status_msg = None;
-        Ok(())
-    }
-
     /// Draw the current screen into the given area, beneath the Config
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
