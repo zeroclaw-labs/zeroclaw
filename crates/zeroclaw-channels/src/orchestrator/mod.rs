@@ -4781,37 +4781,111 @@ async fn process_channel_message_body(
         .as_ref()
         .map(|c| c.is_direct_message(&msg))
         .unwrap_or(false);
-    let classifier_intent = if explicit_channel_address || direct_message {
-        AssistantChannelOutcome::Reply(String::new())
-    } else {
-        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
-            Arc<dyn ModelProvider>,
-            String,
-            Option<f64>,
-        ) = resolve_classifier_route(
-            ctx.as_ref(),
-            &ctx.agent_cfg.classifier_provider,
-            &runtime_defaults,
-        )
-        .await
-        .unwrap_or_else(|| {
-            (
-                Arc::clone(&active_model_provider),
-                route.model.clone(),
-                None,
-            )
-        });
+    let precheck = &ctx.agent_cfg.precheck;
+    let classifier_intent = ::zeroclaw_log::scope!(
+        category: "channel",
+        model_provider: route.model_provider.as_str(),
+        model: route.model.as_str(),
+        => async {
+            if explicit_channel_address || direct_message {
+                AssistantChannelOutcome::Reply(String::new())
+            } else if !precheck.enabled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip).with_attrs(
+                        ::serde_json::json!({
+                            "phase": "precheck",
+                            "reason": "disabled",
+                        })
+                    ),
+                    "reply-intent precheck skipped"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            } else {
+                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+                    Arc<dyn ModelProvider>,
+                    String,
+                    Option<f64>,
+                ) = resolve_classifier_route(
+                    ctx.as_ref(),
+                    &ctx.agent_cfg.classifier_provider,
+                    &runtime_defaults,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    (
+                        Arc::clone(&active_model_provider),
+                        route.model.clone(),
+                        None,
+                    )
+                });
 
-        classify_channel_reply_intent(
-            classifier_provider_arc.as_ref(),
-            history[0].content.as_str(),
-            &history,
-            classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.defaults.temperature),
-        )
-        .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
-    };
+                let started = Instant::now();
+                let precheck_future = classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                );
+                match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
+                    .await
+                {
+                    Ok(Ok(outcome)) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck completed"
+                        );
+                        outcome
+                    }
+                    Ok(Err(e)) => {
+                        let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "error": safe_err,
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck failed open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                    "timeout_secs": precheck.timeout_secs,
+                                })),
+                            "reply-intent precheck timed out; failing open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                }
+            }
+        }
+    )
+    .await;
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -13783,6 +13857,7 @@ BTC is currently around $65,000 based on latest tool output."#
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        precheck_delay: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -13801,6 +13876,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
             if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.precheck_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
@@ -15465,6 +15543,190 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent_messages.is_empty(),
             "provider returns NO_REPLY from precheck, so no visible reply should be sent"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl;
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.primary",
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-log".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-log".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut precheck_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "reply-intent precheck completed")
+                    {
+                        precheck_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = precheck_event.expect("reply-intent precheck log should be emitted");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "test-agent",
+            "precheck record must inherit agent_alias from the channel turn span, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model"], "test-model",
+            "precheck record must preserve primary model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["classifier_model"], "test-model",
+            "classifier model must use a non-attribution attr key, got: {value}"
+        );
+        assert!(
+            value["attributes"].get("agent").is_none(),
+            "agent alias belongs in zeroclaw.agent_alias, not attributes.agent: {value}"
+        );
+        assert!(
+            value["attributes"].get("model").is_none(),
+            "classifier model must not shadow zeroclaw.model via attributes.model: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-disabled".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-disabled".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-disabled:visible reply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider {
+            precheck_delay: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-timeout".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-timeout:visible reply"]
         );
     }
 
