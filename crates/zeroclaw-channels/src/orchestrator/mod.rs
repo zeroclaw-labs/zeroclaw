@@ -905,6 +905,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
@@ -20559,6 +20560,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("When responding on WhatsApp Web:"),
             "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[LOCATION:"),
+            "whatsapp block must include location pin instructions"
         );
         assert!(
             block.contains("[IMAGE:<path>]"),
