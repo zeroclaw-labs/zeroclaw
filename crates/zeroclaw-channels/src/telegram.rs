@@ -26,6 +26,18 @@ struct MultiDraftKey {
 struct MultiDraftState {
     sent_so_far: usize,
     thread_id: Option<String>,
+    /// Latest visible narration from orchestrator `update_draft` (not sent until flush).
+    latest_visible: String,
+}
+
+/// Strip think blocks and orphan tag fragments before multi-message delivery.
+fn sanitize_multi_message_visible_text(text: &str) -> String {
+    let stripped = zeroclaw_tool_call_parser::strip_think_tags(text);
+    stripped
+        .replace("</think>", "")
+        .replace("<think>", "")
+        .trim()
+        .to_string()
 }
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
@@ -800,12 +812,12 @@ impl TelegramChannel {
             (unsent, thread_id, delay)
         };
 
-        let content = unsent.trim();
+        let content = sanitize_multi_message_visible_text(unsent.trim());
         if content.is_empty() {
             return Ok(());
         }
 
-        let cleaned = strip_tool_call_tags(content);
+        let cleaned = strip_tool_call_tags(&content);
         if let Err(e) = self
             .send_text_chunks(&cleaned, &chat_id, thread_id.as_deref())
             .await
@@ -833,6 +845,32 @@ impl TelegramChannel {
         Ok(())
     }
 
+    /// Flush all in-flight multi-message drafts for `recipient` using buffered narration.
+    async fn flush_pending_multi_message_drafts_for_recipient(
+        &self,
+        recipient: &str,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode != StreamMode::MultiMessage {
+            return Ok(());
+        }
+
+        let pending: Vec<(String, String)> = {
+            let drafts = self.multi_message_drafts.lock();
+            drafts
+                .iter()
+                .filter(|(key, _)| key.recipient == recipient)
+                .map(|(key, state)| (key.draft_id.clone(), state.latest_visible.clone()))
+                .collect()
+        };
+
+        for (draft_id, latest_visible) in pending {
+            self.flush_unsent(recipient, &draft_id, &latest_visible)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     async fn finalize_multi_message_draft(
         &self,
         recipient: &str,
@@ -845,21 +883,20 @@ impl TelegramChannel {
         self.try_queue_voice_reply(recipient, &text, true);
 
         let key = Self::multi_draft_key(recipient, message_id);
-        let (sent_so_far, thread_id) = {
+        let thread_id = {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 return Ok(());
             };
-            (draft.sent_so_far, draft.thread_id.or(parsed_thread))
+            draft.thread_id.or(parsed_thread)
         };
         self.last_draft_edit.lock().remove(&chat_id);
 
         let (text_without_markers, attachments) = parse_attachment_markers(&text);
-        let remainder = if text_without_markers.len() > sent_so_far {
-            text_without_markers[sent_so_far..].trim().to_string()
-        } else {
-            String::new()
-        };
+        // `finalize_draft` receives the final agent-turn text (`delivered_response`),
+        // not the draft updater's accumulated multi-turn buffer. Intermediate turns
+        // are emitted via `flush_draft_turn`; send the final turn in full.
+        let remainder = text_without_markers.trim().to_string();
 
         if !remainder.is_empty() {
             self.send_text_chunks(&remainder, &chat_id, thread_id.as_deref())
@@ -3465,6 +3502,7 @@ impl Channel for TelegramChannel {
                     MultiDraftState {
                         sent_so_far: 0,
                         thread_id,
+                        latest_visible: String::new(),
                     },
                 );
                 Ok(Some(draft_id))
@@ -3552,7 +3590,14 @@ impl Channel for TelegramChannel {
                 Ok(())
             }
             StreamMode::MultiMessage => {
-                let _ = (recipient, message_id, text);
+                if !Self::is_multi_message_synthetic_draft(message_id) {
+                    return Ok(());
+                }
+                let key = Self::multi_draft_key(recipient, message_id);
+                let mut drafts = self.multi_message_drafts.lock();
+                if let Some(draft) = drafts.get_mut(&key) {
+                    draft.latest_visible = text.to_string();
+                }
                 Ok(())
             }
         }
@@ -4284,6 +4329,11 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
+        // Deliver buffered narration before the approval prompt so users see
+        // the agent's pre-tool message first (multi_message turn-boundary mode).
+        self.flush_pending_multi_message_drafts_for_recipient(recipient)
+            .await?;
+
         // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
         let (chat_id, thread_id) = recipient
             .split_once(':')
@@ -4799,6 +4849,7 @@ mod tests {
                 MultiDraftState {
                     sent_so_far: 5,
                     thread_id: None,
+                    latest_visible: String::new(),
                 },
             );
             drafts.insert(
@@ -4806,6 +4857,7 @@ mod tests {
                 MultiDraftState {
                     sent_so_far: 0,
                     thread_id: None,
+                    latest_visible: String::new(),
                 },
             );
 
@@ -4818,6 +4870,16 @@ mod tests {
             assert_eq!(
                 drafts.get(&second_key).expect("second draft").sent_so_far,
                 12
+            );
+        }
+
+        #[test]
+        fn sanitize_multi_message_visible_text_strips_orphan_close_tag() {
+            assert_eq!(
+                super::super::sanitize_multi_message_visible_text(
+                    "</think>Понял, продолжаем мультитурн!"
+                ),
+                "Понял, продолжаем мультитурн!"
             );
         }
     }
@@ -4862,6 +4924,7 @@ mod tests {
             MultiDraftState {
                 sent_so_far: 42,
                 thread_id: Some("99".to_string()),
+                latest_visible: String::new(),
             },
         );
         ch.multi_message_drafts.lock().insert(
@@ -4869,6 +4932,7 @@ mod tests {
             MultiDraftState {
                 sent_so_far: 7,
                 thread_id: None,
+                latest_visible: String::new(),
             },
         );
 
@@ -4982,6 +5046,179 @@ mod tests {
                 .sent_so_far,
             0,
             "sent_so_far must not advance when both HTML and plain send fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_sends_full_final_answer_after_successful_intermediate_flush() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Searching the docs...",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Here is the answer.",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 2 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.flush_draft_turn("123", &draft_id, "Searching the docs...")
+            .await
+            .unwrap();
+
+        ch.finalize_draft("123", &draft_id, "Here is the answer.")
+            .await
+            .expect("finalize must send the full final turn, not slice by flushed offset");
+    }
+
+    #[tokio::test]
+    async fn flush_draft_turn_strips_orphan_redacted_thinking_close_tag() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Понял, продолжаем мультитурн!",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.flush_draft_turn(
+            "123",
+            &draft_id,
+            "</think>Понял, продолжаем мультитурн!",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_approval_flushes_narration_before_approval_prompt() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("Понял, вызовем калькулятор"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("Tool approval required"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 2 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(0);
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.update_draft(
+            "123",
+            &draft_id,
+            "Понял, вызовем калькулятор:",
+        )
+        .await
+        .unwrap();
+
+        let request = ChannelApprovalRequest {
+            tool_name: "calculator".to_string(),
+            arguments_summary: "expr=1+1".to_string(),
+            raw_arguments: None,
+        };
+
+        let result = ch.request_approval("123", &request).await.unwrap();
+        assert_eq!(
+            result,
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
         );
     }
 
