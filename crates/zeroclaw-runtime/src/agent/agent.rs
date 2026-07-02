@@ -1753,7 +1753,7 @@ impl Agent {
             .route_model_by_hint(route_model_by_hint)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
-            .skills_prompt_mode(config.skills.prompt_injection_mode)
+            .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
             .auto_save(config.memory.auto_save)
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
