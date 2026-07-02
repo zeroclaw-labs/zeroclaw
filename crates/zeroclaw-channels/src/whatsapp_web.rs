@@ -908,6 +908,7 @@ impl WhatsAppWebChannel {
                 interruption_scope_id: None,
                 attachments,
                 subject: None,
+                internal_sop_event: None,
                 passive_context,
                 conversation_scope,
             })
