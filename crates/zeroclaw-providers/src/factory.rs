@@ -953,6 +953,9 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         if let Some(extra) = opts.provider_extra.clone() {
             p = p.with_extra_body(extra);
         }
+        if !opts.fallback_models.is_empty() {
+            p = p.with_fallback_models(opts.fallback_models.clone());
+        }
         Ok(Box::new(p))
     }
 }

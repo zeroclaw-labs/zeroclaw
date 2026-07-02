@@ -21,6 +21,11 @@ pub struct OpenRouterModelProvider {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    /// Models to pass in OpenRouter's native `models` array for automatic
+    /// failover.  When non-empty the request body includes
+    /// `models: ["primary", ...fallbacks]` so OpenRouter retries on the next
+    /// model when the primary is down, rate-limited, or moderated.
+    fallback_models: Vec<String>,
 }
 
 /// OpenRouter's public aggregator endpoint.
@@ -96,7 +101,12 @@ struct ResponseMessage {
 
 #[derive(Debug, Serialize)]
 struct NativeChatRequest {
+    /// OpenRouter native model fallback list. When set, includes the primary
+    /// model followed by any fallback models, enabling automatic failover.
+    #[serde(rename = "model")]
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<String>>,
     messages: Vec<NativeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -206,6 +216,7 @@ impl OpenRouterModelProvider {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             max_tokens: None,
             extra_body: None,
+            fallback_models: Vec::new(),
         }
     }
     /// Override the HTTP request timeout for LLM API calls.
@@ -226,6 +237,36 @@ impl OpenRouterModelProvider {
     pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
         self.extra_body = Some(extra);
         self
+    }
+
+    /// Set models to pass in OpenRouter's native `models` array for automatic
+    /// failover.  When non-empty the request body includes
+    /// `models: ["primary", ...fallbacks]` so OpenRouter retries on the next
+    /// model when the primary is down, rate-limited, or moderated.
+    pub fn with_fallback_models(mut self, fallback_models: Vec<String>) -> Self {
+        self.fallback_models = fallback_models;
+        self
+    }
+
+    /// Build the OpenRouter `models` array for native failover.
+    ///
+    /// Returns `None` when there are no fallback models configured, which
+    /// keeps the request body compact and avoids sending redundant data.
+    /// When `fallback_models` is non-empty returns `Some(vec![primary,
+    /// ...fallbacks])` — OpenRouter uses this ordered list to try the next
+    /// model on any error (rate-limit, downtime, moderation block, etc.).
+    fn build_models_array(&self, primary: &str) -> Option<Vec<String>> {
+        if self.fallback_models.is_empty() {
+            return None;
+        }
+        let mut models = Vec::with_capacity(1 + self.fallback_models.len());
+        models.push(primary.to_string());
+        for m in &self.fallback_models {
+            if m != primary {
+                models.push(m.clone());
+            }
+        }
+        Some(models)
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -726,6 +767,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models: self.build_models_array(model),
             messages: Self::convert_messages(request.messages),
             temperature,
             tool_choice: tools
@@ -823,6 +865,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models: self.build_models_array(model),
             messages: Self::convert_messages(request.messages),
             temperature,
             tool_choice: tools
@@ -956,6 +999,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let native_request = NativeChatRequest {
             model: model.to_string(),
+            models: self.build_models_array(model),
             messages: native_messages,
             temperature,
             tool_choice: native_tools
@@ -1143,6 +1187,7 @@ mod tests {
     fn native_chat_request_serializes_stream_true() {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.0),
             tools: None,
@@ -1158,6 +1203,7 @@ mod tests {
     fn native_chat_request_omits_stream_when_none() {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.0),
             tools: None,
@@ -2071,6 +2117,7 @@ mod tests {
         );
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
+            models: None,
             messages: vec![],
             temperature: Some(0.7),
             tools: None,
@@ -2130,5 +2177,64 @@ mod tests {
             !finished.load(Ordering::SeqCst),
             "cancelled task must not have run its completion side effect"
         );
+    }
+
+    #[test]
+    fn build_models_array_empty_fallbacks_returns_none() {
+        let provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        assert!(provider.build_models_array("gpt-4o").is_none());
+    }
+
+    #[test]
+    fn build_models_array_with_fallbacks() {
+        let provider = OpenRouterModelProvider::new("test", Some("key"), None)
+            .with_fallback_models(vec![
+                "claude-sonnet".to_string(),
+                "gemini-flash".to_string(),
+            ]);
+        let models = provider.build_models_array("gpt-4o").unwrap();
+        assert_eq!(models, vec!["gpt-4o", "claude-sonnet", "gemini-flash"]);
+    }
+
+    #[test]
+    fn build_models_array_deduplicates_primary() {
+        let provider = OpenRouterModelProvider::new("test", Some("key"), None)
+            .with_fallback_models(vec!["gpt-4o".to_string(), "claude-sonnet".to_string()]);
+        let models = provider.build_models_array("gpt-4o").unwrap();
+        // Primary should appear only once (at index 0), not duplicated
+        assert_eq!(models, vec!["gpt-4o", "claude-sonnet"]);
+    }
+
+    #[test]
+    fn native_request_serializes_models_when_set() {
+        let req = NativeChatRequest {
+            model: "gpt-4o".into(),
+            models: Some(vec!["gpt-4o".into(), "claude-sonnet".into()]),
+            messages: vec![],
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"model\":\"gpt-4o\""));
+        assert!(json.contains("\"models\":[\"gpt-4o\",\"claude-sonnet\"]"));
+    }
+
+    #[test]
+    fn native_request_omits_models_when_none() {
+        let req = NativeChatRequest {
+            model: "gpt-4o".into(),
+            models: None,
+            messages: vec![],
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("models"));
     }
 }

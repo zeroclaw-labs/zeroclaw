@@ -640,6 +640,10 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// Models to pass in OpenRouter's native `models` array for automatic
+    /// failover. When non-empty, OpenRouter retries on the next model when
+    /// the primary is down, rate-limited, or moderated.
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -664,6 +668,7 @@ impl Default for ModelProviderRuntimeOptions {
             think: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            fallback_models: Vec::new(),
         }
     }
 }
@@ -734,6 +739,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        fallback_models: entry.map(|e| e.fallback_models.clone()).unwrap_or_default(),
     }
 }
 
