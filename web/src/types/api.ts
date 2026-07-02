@@ -170,6 +170,20 @@ export interface CliTool {
   category: string;
 }
 
+export interface McpServer {
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string | null;
+  args: string[];
+  tool_timeout_secs: number | null;
+}
+
+export interface ToolsResponse {
+  tools: ToolSpec[];
+  mcp_servers: McpServer[];
+}
+
 export interface Session {
   /** Display form: `gw_` stripped for gateway sessions, full composite for
    * channel-driven sessions. */

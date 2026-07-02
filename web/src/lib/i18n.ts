@@ -116,7 +116,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.path': '路径',
     'tools.version': '版本',
     'tools.category': '类别',
-    'tools.load_error': '加载工具失败',
+    'tools.mcp_servers': 'MCP 服务器',
+    'tools.mcp_transport': '传输方式',
+    'tools.mcp_endpoint': '端点',
 
     // Cron
     'cron.title': '定时任务',
@@ -1241,6 +1243,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.path': 'Path',
     'tools.version': 'Version',
     'tools.category': 'Category',
+    'tools.mcp_servers': 'MCP Servers',
+    'tools.mcp_transport': 'Transport',
+    'tools.mcp_endpoint': 'Endpoint',
     'tools.load_error': 'Failed to load tools',
 
     // Cron

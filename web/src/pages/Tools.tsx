@@ -11,8 +11,9 @@ import {
   ShieldCheck,
   ShieldX,
   ExternalLink,
+  Server,
 } from 'lucide-react';
-import type { ToolSpec, CliTool } from '@/types/api';
+import type { ToolSpec, CliTool, McpServer } from '@/types/api';
 import {
   getTools,
   getCliTools,
@@ -70,10 +71,12 @@ function accessReason(tool: string, a: ProfileAccess): string {
 
 export default function Tools() {
   const [tools, setTools] = useState<ToolSpec[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [cliTools, setCliTools] = useState<CliTool[]>([]);
   const [search, setSearch] = useState('');
   const [expandedTool, setExpandedTool] = useState<string | null>(null);
   const [agentSectionOpen, setAgentSectionOpen] = useState(true);
+  const [mcpSectionOpen, setMcpSectionOpen] = useState(true);
   const [cliSectionOpen, setCliSectionOpen] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -104,12 +107,17 @@ export default function Tools() {
       .catch((err) => setError(err.message));
   }, []);
 
-  // Agent tools re-fetch whenever the selected agent changes.
+  // Agent tools and MCP servers re-fetch whenever the selected agent changes.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     getTools(selectedAgent || undefined)
-      .then((toolList) => { if (!cancelled) setTools(toolList); })
+      .then((resp) => {
+        if (!cancelled) {
+          setTools(resp.tools);
+          setMcpServers(resp.mcp_servers);
+        }
+      })
       .catch((err) => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -197,6 +205,10 @@ export default function Tools() {
   const filteredCli = cliTools.filter((t) =>
     t.name.toLowerCase().includes(search.toLowerCase()) ||
     t.category.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  const filteredMcp = mcpServers.filter((s) =>
+    s.name.toLowerCase().includes(search.toLowerCase()),
   );
 
   if (error) {
@@ -348,6 +360,62 @@ export default function Tools() {
           ))}
         </div>
       </section>
+
+      {/* MCP Servers Section */}
+      {filteredMcp.length > 0 && (
+        <section>
+          <button
+            onClick={() => setMcpSectionOpen((v) => !v)}
+            type="button"
+            className="flex items-center gap-2 mb-4 w-full text-left group cursor-pointer"
+            aria-expanded={mcpSectionOpen}
+            aria-controls="mcp-servers-section"
+          >
+            <Server className="h-4 w-4 text-pc-text-muted" />
+            <span className="text-xs font-semibold uppercase tracking-wider flex-1 text-pc-text-secondary" role="heading" aria-level={2}>
+              {t('tools.mcp_servers')}
+            </span>
+            <Badge tone="neutral">{filteredMcp.length}</Badge>
+            <ChevronDown
+              className="h-4 w-4 text-pc-text-muted transition-transform"
+              style={{ transform: mcpSectionOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }}
+            />
+          </button>
+
+          <div id="mcp-servers-section">
+            {mcpSectionOpen && (
+              <Card padded={false} className="overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm border-collapse">
+                    <thead>
+                      <tr className="border-b border-pc-border text-left text-[11px] font-medium uppercase tracking-wider text-pc-text-faint">
+                        <th className="px-4 py-2.5 font-medium">{t('tools.name')}</th>
+                        <th className="px-4 py-2.5 font-medium">{t('tools.mcp_transport')}</th>
+                        <th className="px-4 py-2.5 font-medium">{t('tools.mcp_endpoint')}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredMcp.map((server) => (
+                        <tr key={server.name} className="border-b border-pc-border/60 last:border-0">
+                          <td className="px-4 py-2.5 font-medium text-pc-text">
+                            {server.name}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <Badge tone="neutral" className="capitalize">{server.transport}</Badge>
+                          </td>
+                          <td className="px-4 py-2.5 font-mono text-xs truncate max-w-[300px] text-pc-text-muted">
+                            {server.url ?? server.command ?? '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* CLI Tools Section */}
       {filteredCli.length > 0 && (

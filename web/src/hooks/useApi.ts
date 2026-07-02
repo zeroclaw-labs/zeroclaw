@@ -11,7 +11,7 @@ import {
 } from '../lib/api';
 import type {
   StatusResponse,
-  ToolSpec,
+  ToolsResponse,
   CronJob,
   Integration,
   MemoryEntry,
@@ -87,7 +87,7 @@ export function useStatus(): UseApiResult<StatusResponse> {
 }
 
 /** Fetch registered tools from /api/tools. */
-export function useTools(): UseApiResult<ToolSpec[]> {
+export function useTools(): UseApiResult<ToolsResponse> {
   return useApiCall(getTools);
 }
 

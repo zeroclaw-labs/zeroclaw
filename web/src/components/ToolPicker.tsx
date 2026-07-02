@@ -69,7 +69,8 @@ function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
   const inflight = catalogInflight.get(key);
   if (inflight) return inflight;
   const promise = Promise.all([getTools(agent), getCliTools()])
-    .then(([tools, cliTools]) => {
+    .then(([resp, cliTools]) => {
+      const tools = resp.tools;
       const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
         name: tnt.name,
         description: tnt.description,

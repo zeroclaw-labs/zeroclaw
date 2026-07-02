@@ -1,6 +1,5 @@
 import type {
   StatusResponse,
-  ToolSpec,
   CronJob,
   CronRun,
   Integration,
@@ -13,6 +12,7 @@ import type {
   ChannelDetail,
   SessionMessagesResponse,
   TuiEntry,
+  ToolsResponse,
 } from "../types/api";
 import type { components } from "./api-generated";
 import { clearToken, getToken, setToken } from "./auth";
@@ -1695,14 +1695,12 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(agent?: string): Promise<ToolSpec[]> {
+export function getTools(agent?: string): Promise<ToolsResponse> {
   const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
-    (data) => {
-      const result = unwrapField(data, "tools");
-      return Array.isArray(result) ? result : [];
-    },
-  );
+  return apiFetch<ToolsResponse>(`/api/tools${qs}`).then((data) => ({
+    tools: Array.isArray(data.tools) ? data.tools : [],
+    mcp_servers: Array.isArray(data.mcp_servers) ? data.mcp_servers : [],
+  }));
 }
 
 // ---------------------------------------------------------------------------

@@ -317,7 +317,8 @@ pub struct ToolsQuery {
     pub agent: Option<String>,
 }
 
-/// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
+/// GET /api/tools — list registered tool specs, configured MCP servers, and
+/// the agent-scoped tool set when `?agent=<alias>` is provided.
 pub async fn handle_api_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -346,7 +347,29 @@ pub async fn handle_api_tools(
         })
         .collect();
 
-    Json(serde_json::json!({"tools": tools})).into_response()
+    let mcp_servers: Vec<serde_json::Value> = {
+        let cfg = state.config.read();
+        if cfg.mcp.enabled {
+            cfg.mcp
+                .servers
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "transport": s.transport,
+                        "url": s.url,
+                        "command": s.command,
+                        "args": s.args,
+                        "tool_timeout_secs": s.tool_timeout_secs,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    Json(serde_json::json!({"tools": tools, "mcp_servers": mcp_servers})).into_response()
 }
 
 /// GET /api/cron — list cron jobs
@@ -4189,6 +4212,90 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_returns_tools_and_mcp_servers() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.mcp.enabled = true;
+        config
+            .mcp
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: "test-fs".into(),
+                transport: zeroclaw_config::schema::McpTransport::Stdio,
+                url: None,
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                ],
+                tool_timeout_secs: Some(30),
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            });
+
+        let tools = vec![zeroclaw_api::tool::ToolSpec {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+        }];
+
+        let state = AppState {
+            tools_registry: Arc::new(tools),
+            config: Arc::new(RwLock::new(config)),
+            ..test_state(zeroclaw_config::schema::Config::default())
+        };
+
+        let response = handle_api_tools(
+            State(state),
+            HeaderMap::new(),
+            Query(ToolsQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+
+        let tools_arr = json["tools"].as_array().expect("tools array");
+        assert_eq!(tools_arr.len(), 1);
+        assert_eq!(tools_arr[0]["name"], "shell");
+
+        let mcp_arr = json["mcp_servers"].as_array().expect("mcp_servers array");
+        assert_eq!(mcp_arr.len(), 1);
+        assert_eq!(mcp_arr[0]["name"], "test-fs");
+        assert_eq!(mcp_arr[0]["transport"], "stdio");
+        assert_eq!(mcp_arr[0]["command"], "npx");
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_returns_empty_mcp_servers_when_disabled() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            ..test_state(zeroclaw_config::schema::Config::default())
+        };
+
+        let response = handle_api_tools(
+            State(state),
+            HeaderMap::new(),
+            Query(ToolsQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+
+        assert!(json["tools"].as_array().unwrap().is_empty());
+        assert!(json["mcp_servers"].as_array().unwrap().is_empty());
     }
 
     #[cfg(feature = "a2a")]
