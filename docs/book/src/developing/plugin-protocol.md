@@ -118,7 +118,11 @@ jail, and host-fed `inbound` queue) is complete and unit-covered, and
 to register. Wiring those into the live orchestrator (the discovery-to-channel
 loop in the runtime, plus a per-vendor host listener that drains its transport
 into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice.
+runtime channel-registration change, not this host slice. The memory bridge
+(`WasmMemory`) is in the same position one step earlier: the adapter implements
+the full `Memory` trait against the `memory-plugin` world, but the host does not
+yet expose a memory counterpart to `channel_plugin_details()` and the runtime
+does not yet construct a `WasmMemory` as a configurable backend.
 
 ## Plugin structure
 
@@ -486,7 +490,10 @@ fails its policy rather than aborting the whole host; install returns the error.
 
 A plugin is a `cdylib` crate that targets the component model. Generate the
 guest bindings from the same `wit/v0` package the host uses, implement the
-exported world, and compile to `wasm32-wasip2`.
+exported world, and compile to `wasm32-wasip2`. For the full worked
+walkthroughs from empty crate to installed plugin, see the
+[plugin guides](../plugins/index.md); the notes below cover the
+build and install mechanics.
 
 ### Building
 
