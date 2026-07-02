@@ -2755,6 +2755,15 @@ pub async fn run(
                                     continue;
                                 }
                                 history = result.history;
+                                // When the system prompt + inlined tool
+                                // definitions alone meet or exceed the budget,
+                                // the single remaining turn can never fit;
+                                // surface the actionable root cause + remedy
+                                // rather than a generic "cannot trim" warning
+                                // (#5808).
+                                let system_floor =
+                                    crate::agent::history::estimate_system_floor_tokens(&history);
+                                let floor_exceeds_budget = system_floor >= eff_max_context_tokens;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2763,16 +2772,48 @@ pub async fn run(
                                         model_provider = %provider_name,
                                     );
                                     let _zc_trim_guard = __zc_trim_span.entered();
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
+                                    if floor_exceeds_budget {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "system_floor": system_floor,
+                                                "budget": eff_max_context_tokens,
+                                                "error_key": "context_floor_exceeds_budget",
+                                            })),
+                                            crate::agent::history::context_floor_remediation(
+                                                system_floor,
+                                                eff_max_context_tokens,
+                                            )
+                                        );
+                                    } else {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                            "Context overflow but only one turn remains; cannot trim further"
+                                        );
+                                    }
+                                }
+
+                                if floor_exceeds_budget {
+                                    eprintln!(
+                                        "\nError: {e}\n{}\n",
+                                        crate::agent::history::context_floor_remediation(
+                                            system_floor,
+                                            eff_max_context_tokens,
                                         )
-                                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                        "Context overflow but only one turn remains; cannot trim further"
                                     );
+                                    break String::new();
                                 }
                             }
 
