@@ -171,6 +171,14 @@ pub(crate) async fn interpret_chat_response(
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
     // this ensures we support both native and prompt-guided models.
+    //
+    // Native calls are NOT filtered here against `known_tool_names`. Tools
+    // outside the request scope are rejected at the execution layer
+    // (`tool_execution.rs`: `find_tool` returns None → "Unknown tool";
+    // `is_excluded_tool` → "Tool not available"). This preserves the
+    // runtime's feedback contract (verified by `turn_handles_unknown_tool_
+    // gracefully` and `run_tool_call_loop_enforces_sop_step_tool_scope`)
+    // while still failing closed — the call never executes.
     let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
         Vec::new()
     } else {

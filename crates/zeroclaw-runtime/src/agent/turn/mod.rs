@@ -121,6 +121,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::TOOL_SPECS_OVERRIDE;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -480,12 +481,20 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let mut iteration_tool_specs = build_iteration_tool_specs(
-            model_provider,
-            tools_registry,
-            excluded_tools,
-            activated_tools,
-        )?;
+        let mut iteration_tool_specs =
+            match TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten() {
+                Some(override_specs) => IterationToolSpecs::from_override(
+                    model_provider,
+                    &override_specs,
+                    excluded_tools,
+                ),
+                None => build_iteration_tool_specs(
+                    model_provider,
+                    tools_registry,
+                    excluded_tools,
+                    activated_tools,
+                )?,
+            };
 
         let (vision_model_provider_box, degrade_strip_images) =
             resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
