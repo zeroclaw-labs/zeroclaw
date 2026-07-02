@@ -36,6 +36,7 @@
 | 2 | 2026-04-09 | Added §4.4.1 Versioning Policy (unified workspace inheritance, stability tiers, product-level breaking change definition); added §4.4.2 Release Artifacts (feature flag fate, canonical release binary profile, release artifact matrix); added Discussion Questions for versioning strategy and observability defaults |
 | 3 | 2026-04-10 | Terminology correction per implementation feedback from PR #5559: "kernel" → "runtime" for the agent orchestration layer throughout; "kernel" now refers specifically to the irreducible foundation (`--no-default-features` build); §4.1 updated to describe the explicit two-layer architecture (foundation + runtime); §4.2–§4.3 dependency diagram and component map updated to show `zeroclaw-runtime`; Phase 2 renamed from "The Kernel" to "The Runtime"; binary size targets reframed as aspirational north stars with measured progress tracking rather than hard gates; §7 updated with actual Phase 1 measurement (6.6 MB foundation build) and explicit note that architectural decomposition enables optimization but optimization is a dedicated second pass |
 | 4 | 2026-06-02 | Updated §5.2 to target `wasm32-wasip2` to enable WIT files. Updated Phase 2 §D2 to replace Extism with wasmtime to enable ARM32 targets and WIT files |
+| 5 | 2026-06-29 | Amended §4.4.2 to replace the single always-on `plugins-wasm` row with the three-flag execution-backend taxonomy (`plugins-wasm` host plus `plugins-wasm-cranelift` / `plugins-wasm-pulley` backends), completing the RFC #6943 deconfliction |
 
 ---
 
@@ -156,7 +157,7 @@ For an AI agent runtime, the mapping reveals **two distinct internal layers** th
 | IPC | Local socket / IPC API between the runtime and external components |
 | Device drivers | Channel plugins (Telegram, Discord, etc.) |
 | Filesystem drivers | Memory backend plugins (SQLite, Markdown) |
-| User processes | Gateway binary, Tauri desktop app |
+| User processes | Gateway binary |
 
 The distinction matters: the **foundation** is the minimum that must exist for any ZeroClaw binary to function. The **runtime** is the minimum that must exist for it to function *as an agent*. Everything else is composed in.
 
@@ -224,12 +225,6 @@ If `zeroclaw-runtime` ever imports `TelegramChannel`, the architecture has been 
 │   │  REST API    │  │  ...            │  │  ...                │    │
 │   └──────┬───────┘  └─────────────────┘  └─────────────────────┘    │
 │          │                                                          │
-│          ▼                                                          │
-│   ┌─────────────────┐                                               │
-│   │ zeroclaw-desktop│   ← Tauri app (already exists in apps/tauri)  │
-│   │ System tray app │     bundles zeroclaw-gw as a sidecar          │
-│   │ Native GUI      │                                               │
-│   └─────────────────┘                                               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -242,8 +237,7 @@ The architecture enables a clean distribution story that requires no Rust toolch
 | CLI only | `zeroclaw` runtime binary | Configure provider, done |
 | CLI + Discord | `zeroclaw` runtime binary | Download + install `channel-discord.wasm` |
 | Local web UI | `zeroclaw` + `zeroclaw-gw` | Configure both, open browser |
-| Desktop app | `zeroclaw-desktop` installer | Bundles runtime + gateway + UI |
-| Everything | `zeroclaw-desktop` or `zeroclaw --profile full` | Downloads all plugins |
+| Everything | `zeroclaw --profile full` | Downloads all plugins |
 
 The `zeroclaw plugin install` command (backed by `PluginHost`, which already exists) becomes the package manager. The `zeroclaw onboard` wizard integrates it so non-technical users never see `cargo`.
 
@@ -328,6 +322,16 @@ The 20+ feature flags in the current `Cargo.toml` fall into three buckets as the
 | **Always-on** | `plugins-wasm`, `skill-creation` | Compiled into every kernel binary unconditionally. `plugins-wasm` is the kernel's core mechanism; `skill-creation` is a zero-overhead code path. Neither belongs behind a flag. |
 | **Stay → platform/infrastructure flag** | `peripheral-rpi`, `hardware`, `sandbox-landlock`, `sandbox-bubblewrap`, `voice-wake`, `probe` | Remain as compile-time flags because they require native library linking or OS-level access that cannot be provided by a WASM plugin. `peripheral-rpi` and `hardware` appear only in platform-specific release targets. |
 
+`plugins-wasm` is always-on, but it is not a single flag: it is a three-flag taxonomy. The host machinery is unconditional; the execution backend is a platform-level decision made at build time. `plugins-wasm` without a backend sub-flag does not produce a usable plugin runtime, because wasmtime needs either a compiler or an interpreter to execute a component.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `plugins-wasm` | Always-on | Enables the WASM component host; loads and executes `.wasm` component files |
+| `plugins-wasm-cranelift` | On (where supported) | Cranelift JIT compilation; used on x86_64, aarch64, and other Cranelift-supported targets |
+| `plugins-wasm-pulley` | On (where Cranelift unavailable) | Pulley interpreter; used on 32-bit ARM and any other target where Cranelift cannot be used |
+
+Every release target enables exactly one backend: `cranelift` where it is supported, `pulley` where it is not. The always-on intent holds: every binary carries the plugin host and can execute plugins on its platform.
+
 Two flags require a deliberate team decision before the v0.8.0 release and are surfaced here rather than resolved unilaterally:
 
 - **`observability-prometheus`**: currently in `default`. Prometheus metrics add measurable binary size overhead. The question is whether a production runtime should ship observability on by default, or whether operators opt in. Recommendation: keep in `default` for the standard release; operators on severely size-constrained targets can build with `--no-default-features`.
@@ -366,7 +370,6 @@ Each GitHub Release publishes the following artifacts:
 | `zeroclaw` kernel binary (hardware) | `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | Same targets, compiled with `peripheral-rpi` and `hardware` flags for Raspberry Pi deployments |
 | `zeroclaw-gw` gateway binary | Same platform matrix as kernel | Published alongside the kernel; users install separately |
 | WASM plugin files | `wasm32-wasip2` | Published to the plugin registry (not GitHub Releases); installable via `zeroclaw plugin install` |
-| `zeroclaw-desktop` installer | `x86_64` and `aarch64` for macOS, Windows, Linux (AppImage/deb) | Bundles kernel + gateway + full plugin set; built by the Tauri workflow |
 
 The `wasm32-wasip2` plugin builds run in a separate CI job and are published to the plugin registry on their own cadence. A plugin release does not require a kernel release.
 
@@ -660,7 +663,7 @@ The kernel includes exactly the tools a user needs for a useful agent with no pl
 
 ##### D1: Define the kernel IPC API
 
-Before extracting the gateway, define the OpenAPI 3.1 spec for the local API the kernel exposes on a Unix socket or loopback port. This API is what the gateway, the Tauri app, and any future client connects to. It is the stable contract between the kernel and the outside world.
+Before extracting the gateway, define the OpenAPI 3.1 spec for the local API the kernel exposes on a Unix socket or loopback port. This API is what the gateway and any future client connects to. It is the stable contract between the kernel and the outside world.
 
 Endpoints include: send a message, receive a streaming response, list active sessions, list installed plugins, get agent status, manage memory, trigger cron jobs. This is a design document first: the spec should be reviewed and agreed upon before a line of implementation is written.
 
@@ -676,17 +679,12 @@ Move `src/gateway/` to a new `crates/zeroclaw-gw/` crate with its own binary. It
 
 The WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail webhook handlers currently in `gateway/mod.rs` move to their respective channel plugins. The gateway provides a generic webhook registration API: a channel plugin, when loaded, registers its webhook path prefix and its handler function. The gateway routes incoming webhooks to the registered handler. The gateway no longer knows about WhatsApp.
 
-##### D5: Formalize the Tauri sidecar relationship
-
-Update `apps/tauri/` to bundle `zeroclaw-gw` as a Tauri sidecar binary. The Tauri app becomes the "full experience" distribution: it starts the kernel and gateway automatically and opens the web UI. Users who download the Tauri app get everything working without touching a terminal.
-
 #### Success Metrics for v0.9.0
 
 - Kernel binary (release) does not contain any web assets or HTTP server code
 - `zeroclaw-gw` starts, connects to the kernel via IPC, and serves the web dashboard
 - Removing `zeroclaw-gw` does not break the kernel or any channel plugins
 - WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail channel code has moved to plugin crates
-- Tauri desktop app bundles and starts both binaries correctly
 
 ---
 
@@ -773,7 +771,6 @@ The project's vision is expressed in runtime terms: **<5 MB RAM** on $10 hardwar
 | Runtime binary (foundation + `agent-runtime`) | N/A | tracked → | aspiration: ≤ 5 MB RAM at runtime |
 | Runtime + gateway | N/A | tracked → | ~5–7 MB on disk |
 | Runtime + gateway + top 5 channels | N/A | tracked → | ~8–10 MB (plugins are separate files) |
-| Tauri desktop app (bundles all) | N/A | tracked → | ~20–25 MB installer |
 
 The 6.6 MB Phase 1 foundation build represents real progress from the 8.8 MB monolith and proves the decomposition is working. Reaching the vision target requires a dedicated dependency-audit and optimization pass through each crate after the structural decomposition is complete: reviewing each crate's `Cargo.toml` for unnecessary or over-featured dependencies, validating LTO and strip profiles, and auditing which tokio/serde feature flags are actually needed.
 
