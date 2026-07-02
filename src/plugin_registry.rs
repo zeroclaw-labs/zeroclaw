@@ -1,44 +1,21 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use zeroclaw::plugins::PluginManifest;
+pub(crate) use zeroclaw::plugins::registry::search_entries;
+use zeroclaw::plugins::registry::{
+    PluginRegistryEntry, PluginRegistryIndex, parse_plugin_spec, resolve_entry,
+    write_cached_registry_index,
+};
 
 pub(crate) const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json";
 pub(crate) const MAX_PLUGIN_ZIP_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 50 * 1024 * 1024;
 const REGISTRY_URL_ENV: &str = "ZEROCLAW_PLUGIN_REGISTRY_URL";
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub(crate) struct PluginRegistryEntry {
-    pub(crate) name: String,
-    pub(crate) version: String,
-    #[serde(default)]
-    pub(crate) description: Option<String>,
-    #[serde(default)]
-    pub(crate) author: Option<String>,
-    #[serde(default)]
-    pub(crate) capabilities: Vec<String>,
-    pub(crate) url: String,
-    #[serde(default)]
-    pub(crate) sha256: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PluginRegistryIndex {
-    #[serde(default)]
-    pub(crate) plugins: Vec<PluginRegistryEntry>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PluginSpec {
-    name: String,
-    version: Option<String>,
-}
 
 pub(crate) struct DownloadedPlugin {
     _temp_dir: TempDir,
@@ -97,69 +74,15 @@ pub(crate) async fn fetch_registry_index(registry_url: &str) -> Result<PluginReg
         .context("parsing plugin registry JSON")
 }
 
-pub(crate) fn search_entries<'a>(
-    index: &'a PluginRegistryIndex,
-    query: &str,
-) -> Vec<&'a PluginRegistryEntry> {
-    let query = query.to_lowercase();
-    index
-        .plugins
-        .iter()
-        .filter(|entry| {
-            entry.name.to_lowercase().contains(&query)
-                || entry
-                    .description
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&query)
-        })
-        .collect()
-}
-
-pub(crate) fn parse_plugin_spec(source: &str) -> Result<PluginSpec> {
-    let source = source.trim();
-    if source.is_empty() {
-        bail!("plugin name must not be empty");
-    }
-    let Some((name, version)) = source.rsplit_once('@') else {
-        return Ok(PluginSpec {
-            name: source.to_string(),
-            version: None,
-        });
-    };
-    if name.is_empty() || version.is_empty() {
-        bail!("plugin registry source must be name or name@version");
-    }
-    Ok(PluginSpec {
-        name: name.to_string(),
-        version: Some(version.to_string()),
-    })
-}
-
-pub(crate) fn resolve_entry<'a>(
-    index: &'a PluginRegistryIndex,
-    spec: &PluginSpec,
-) -> Result<&'a PluginRegistryEntry> {
-    let mut matches = index
-        .plugins
-        .iter()
-        .filter(|entry| entry.name == spec.name)
-        .filter(|entry| {
-            spec.version
-                .as_ref()
-                .is_none_or(|version| &entry.version == version)
-        });
-    matches
-        .next_back()
-        .ok_or_else(|| anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name)))
-}
-
 pub(crate) async fn download_registry_plugin(
     registry_url: &str,
     source: &str,
+    cache_data_dir: Option<&Path>,
 ) -> Result<DownloadedPlugin> {
     let index = fetch_registry_index(registry_url).await?;
+    if let Some(data_dir) = cache_data_dir {
+        write_cached_registry_index(data_dir, registry_url, &index)?;
+    }
     let spec = parse_plugin_spec(source)?;
     let entry = resolve_entry(&index, &spec)?.clone();
     let bytes = download_archive_bytes(&entry.url).await?;
@@ -489,62 +412,6 @@ capabilities = ["tool"]
     }
 
     #[test]
-    fn parses_name_and_optional_version() {
-        assert_eq!(
-            parse_plugin_spec("team-calendar").unwrap(),
-            PluginSpec {
-                name: "team-calendar".to_string(),
-                version: None,
-            }
-        );
-        assert_eq!(
-            parse_plugin_spec("team-calendar@0.2.0").unwrap(),
-            PluginSpec {
-                name: "team-calendar".to_string(),
-                version: Some("0.2.0".to_string()),
-            }
-        );
-        assert!(parse_plugin_spec("@0.2.0").is_err());
-        assert!(parse_plugin_spec("team-calendar@").is_err());
-    }
-
-    #[test]
-    fn search_matches_name_or_description() {
-        let index = sample_index();
-
-        let matches = search_entries(&index, "calendar");
-
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].name, "team-calendar");
-        assert_eq!(matches[1].version, "0.2.0");
-    }
-
-    #[test]
-    fn resolve_uses_pinned_version_or_latest_listed_match() {
-        let index = sample_index();
-
-        let latest = resolve_entry(
-            &index,
-            &PluginSpec {
-                name: "team-calendar".to_string(),
-                version: None,
-            },
-        )
-        .unwrap();
-        let pinned = resolve_entry(
-            &index,
-            &PluginSpec {
-                name: "team-calendar".to_string(),
-                version: Some("0.1.0".to_string()),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(latest.version, "0.2.0");
-        assert_eq!(pinned.version, "0.1.0");
-    }
-
-    #[test]
     fn verifies_optional_sha256_digest() {
         let bytes = b"plugin archive";
         let digest = hex::encode(Sha256::digest(bytes));
@@ -591,40 +458,6 @@ capabilities = ["tool"]
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("manifest.toml"), "").unwrap();
         assert_eq!(find_manifest_dir(nested_root.path()).unwrap(), nested);
-    }
-
-    fn sample_index() -> PluginRegistryIndex {
-        PluginRegistryIndex {
-            plugins: vec![
-                PluginRegistryEntry {
-                    name: "team-calendar".to_string(),
-                    version: "0.1.0".to_string(),
-                    description: Some("Schedule meetings".to_string()),
-                    author: None,
-                    capabilities: vec!["tool".to_string()],
-                    url: "https://example.invalid/team-calendar-0.1.0.zip".to_string(),
-                    sha256: None,
-                },
-                PluginRegistryEntry {
-                    name: "web-research".to_string(),
-                    version: "0.1.0".to_string(),
-                    description: Some("Research web pages".to_string()),
-                    author: None,
-                    capabilities: vec!["tool".to_string()],
-                    url: "https://example.invalid/web-research-0.1.0.zip".to_string(),
-                    sha256: None,
-                },
-                PluginRegistryEntry {
-                    name: "team-calendar".to_string(),
-                    version: "0.2.0".to_string(),
-                    description: Some("Team calendar scheduling".to_string()),
-                    author: None,
-                    capabilities: vec!["tool".to_string()],
-                    url: "https://example.invalid/team-calendar-0.2.0.zip".to_string(),
-                    sha256: None,
-                },
-            ],
-        }
     }
 
     fn zip_with_entry(name: &str, body: &[u8]) -> Vec<u8> {

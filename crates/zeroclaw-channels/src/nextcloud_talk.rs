@@ -332,6 +332,8 @@ impl NextcloudTalkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -476,6 +478,8 @@ impl NextcloudTalkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages

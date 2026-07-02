@@ -73,183 +73,6 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
-/// Interactive secret prompt with pre-submit feedback.
-///
-/// Replaces `dialoguer::Password::interact()` for `agent-runtime` builds.
-/// Uses `crossterm` raw mode to read keystrokes one at a time. When the
-/// input buffer transitions from empty to non-empty, a fixed-length
-/// indicator line ("● Value captured — press Enter to save") appears
-/// immediately — giving the user visible feedback *before* pressing Enter.
-/// The indicator is removed if the buffer becomes empty again (e.g. after
-/// backspace). No secret length is disclosed at any point.
-///
-/// When `allow_empty` is false, submitting an empty/whitespace-only value
-/// re-prompts (matching `dialoguer::Password` interactive behavior) instead
-/// of bailing. Ctrl+C and Esc remain the explicit cancellation paths.
-///
-/// Returns the raw buffer — callers that historically trimmed (e.g.
-/// `config set secret`, `read_auth_input`) must trim themselves. This
-/// avoids silently rewriting secrets/tokens/OTP codes that may contain
-/// significant leading or trailing whitespace.
-///
-/// For non-`agent-runtime` builds, callers fall through to `dialoguer::Password`,
-/// which provides no pre-submit feedback (the pre-existing behavior).
-#[cfg(feature = "agent-runtime")]
-fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-        execute,
-        style::Print,
-        terminal::{disable_raw_mode, enable_raw_mode},
-    };
-    use std::io::{self, Write as IoWrite};
-
-    enable_raw_mode()?;
-
-    // RAII guard ensures raw mode is disabled even if the closure panics.
-    // Without this, a panic would leave the terminal in raw mode (no echo),
-    // requiring the user to manually run `stty sane` or `reset`.
-    struct RawModeGuard;
-    impl Drop for RawModeGuard {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-        }
-    }
-    let _raw_guard = RawModeGuard;
-
-    let result: Result<String> = (|| {
-        // Outer loop: re-prompts on empty submit when allow_empty is false,
-        // matching dialoguer::Password's interactive behavior.
-        loop {
-            eprintln!("{prompt_text}");
-            io::stderr().flush()?;
-
-            let mut buffer = String::new();
-            let mut feedback_shown = false;
-
-            // Inner loop: raw-mode keystroke reading.
-            loop {
-                if event::poll(std::time::Duration::from_millis(200))? {
-                    if let Event::Key(KeyEvent {
-                        code,
-                        modifiers,
-                        kind,
-                        ..
-                    }) = event::read()?
-                    {
-                        // Only respond to key press / repeat; ignore release events
-                        // (crossterm sends Press, Repeat, Release under kitty keyboard protocol).
-                        if kind != crossterm::event::KeyEventKind::Press
-                            && kind != crossterm::event::KeyEventKind::Repeat
-                        {
-                            continue;
-                        }
-
-                        match code {
-                            KeyCode::Enter => {
-                                // Clear the feedback line before submitting so it doesn't
-                                // linger in the terminal scrollback.
-                                if feedback_shown {
-                                    // Move cursor up one line, clear it, then move back down
-                                    // so the cursor ends up on the correct line for any
-                                    // subsequent output from the caller.
-                                    execute!(
-                                        io::stderr(),
-                                        crossterm::cursor::MoveUp(1),
-                                        crossterm::terminal::Clear(
-                                            crossterm::terminal::ClearType::CurrentLine
-                                        ),
-                                        crossterm::cursor::MoveToColumn(0),
-                                        crossterm::cursor::MoveDown(1)
-                                    )?;
-                                }
-                                break;
-                            }
-                            KeyCode::Char(c) => {
-                                if c == 'c' && modifiers.contains(KeyModifiers::CONTROL) {
-                                    // Ctrl+C — clear feedback, then return an Interrupted-style
-                                    // error so callers that map Interrupted → Ok(None) / bail
-                                    // continue to work.
-                                    if feedback_shown {
-                                        execute!(
-                                            io::stderr(),
-                                            crossterm::cursor::MoveUp(1),
-                                            crossterm::terminal::Clear(
-                                                crossterm::terminal::ClearType::CurrentLine
-                                            ),
-                                            crossterm::cursor::MoveToColumn(0)
-                                        )?;
-                                    }
-                                    bail!("Interrupted");
-                                }
-                                buffer.push(c);
-                                if !feedback_shown && !buffer.is_empty() {
-                                    feedback_shown = true;
-                                    // Show fixed-length indicator — no {$count} to avoid
-                                    // disclosing secret length (issue #7808 requirement).
-                                    let indicator = ta(
-                                        "cli-secret-captured",
-                                        &[], // i18n-exempt: no args; length not disclosed
-                                        "  ● Value captured — press Enter to save",
-                                    );
-                                    execute!(io::stderr(), Print(format!("{indicator}\r\n")))?;
-                                    io::stderr().flush()?;
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                buffer.pop();
-                                if buffer.is_empty() && feedback_shown {
-                                    feedback_shown = false;
-                                    // Remove the indicator line: move up, clear, return cursor.
-                                    execute!(
-                                        io::stderr(),
-                                        crossterm::cursor::MoveUp(1),
-                                        crossterm::terminal::Clear(
-                                            crossterm::terminal::ClearType::CurrentLine
-                                        ),
-                                        crossterm::cursor::MoveToColumn(0)
-                                    )?;
-                                    io::stderr().flush()?;
-                                }
-                            }
-                            KeyCode::Esc => {
-                                // Treat Esc the same as Ctrl+C for consistency with
-                                // the existing Password Ctrl+C-as-back-out mapping.
-                                if feedback_shown {
-                                    execute!(
-                                        io::stderr(),
-                                        crossterm::cursor::MoveUp(1),
-                                        crossterm::terminal::Clear(
-                                            crossterm::terminal::ClearType::CurrentLine
-                                        ),
-                                        crossterm::cursor::MoveToColumn(0)
-                                    )?;
-                                }
-                                bail!("Interrupted");
-                            }
-                            _ => {} // Ignore other keys (arrows, Home, etc.)
-                        }
-                    }
-                    // Ignore mouse / resize events
-                }
-            }
-
-            if !allow_empty && buffer.trim().is_empty() {
-                // Re-prompt on empty submit for required fields,
-                // preserving dialoguer::Password interactive behavior.
-                continue;
-            }
-
-            // Return raw buffer — callers trim if they need to (matching the
-            // pre-PR behavior at each call site individually).
-            return Ok(buffer);
-        }
-    })();
-
-    // RawModeGuard's Drop impl calls disable_raw_mode() here (or on panic).
-    result
-}
-
 #[cfg(feature = "agent-runtime")]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
@@ -1168,26 +991,6 @@ Examples (Windows PowerShell):
     /// Print the config JSON Schema (used by the docs pipeline).
     #[command(hide = true)]
     MarkdownSchema,
-
-    /// Launch or install the companion desktop app
-    // i18n-exempt: clap derive help — framework requires a compile-time literal
-    #[command(long_about = "\
-Launch the ZeroClaw companion desktop app.
-
-The companion app is a lightweight menu bar / system tray application \
-that connects to the same gateway as the CLI. It provides quick access \
-to the dashboard, status monitoring, and device pairing.
-
-Use --install to download the pre-built companion app for your platform.
-
-Examples:
-  zeroclaw desktop              # launch the companion app
-  zeroclaw desktop --install    # download and install it")]
-    Desktop {
-        /// Download and install the companion app
-        #[arg(long)]
-        install: bool,
-    },
 
     /// Deprecated: use `zeroclaw config` instead
     #[command(hide = true)]
@@ -2618,52 +2421,22 @@ fn prompt_for_field(
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // Use crossterm-based secret_prompt for pre-submit feedback
-        // when agent-runtime is available; otherwise fall through to
-        // dialoguer::Password (no pre-submit feedback).
-        #[cfg(feature = "agent-runtime")]
+        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
+        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
+        // Map that to `Ok(None)` so the caller treats it as "user backed
+        // out" instead of bubbling a confusing IO-error message.
+        match Password::new()
+            .with_prompt(prompt.clone())
+            .allow_empty_password(true)
+            .interact()
         {
-            match secret_prompt(&prompt, true) {
-                Ok(pw) => {
-                    if !pw.is_empty() {
-                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
-                    }
-                    return Ok(Some(pw));
+            Ok(pw) => return Ok(Some(pw)),
+            Err(e) => {
+                let io: std::io::Error = e.into();
+                if io.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
                 }
-                Err(e) => {
-                    // secret_prompt returns "Interrupted" for Ctrl+C / Esc,
-                    // matching the existing Password Ctrl+C-as-back-out mapping.
-                    if e.to_string() == "Interrupted" {
-                        return Ok(None);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        #[cfg(not(feature = "agent-runtime"))]
-        {
-            // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-            // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-            // Map that to `Ok(None)` so the caller treats it as "user backed
-            // out" instead of bubbling a confusing IO-error message.
-            match Password::new()
-                .with_prompt(prompt.clone())
-                .allow_empty_password(true)
-                .interact()
-            {
-                Ok(pw) => {
-                    if !pw.is_empty() {
-                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
-                    }
-                    return Ok(Some(pw));
-                }
-                Err(e) => {
-                    let io: std::io::Error = e.into();
-                    if io.kind() == std::io::ErrorKind::Interrupted {
-                        return Ok(None);
-                    }
-                    return Err(io.into());
-                }
+                return Err(io.into());
             }
         }
     }
@@ -3394,7 +3167,7 @@ async fn main() -> Result<()> {
     // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
     match &cli.command {
         Commands::MarkdownHelp => {
-            print_markdown_help();
+            clap_markdown::print_help_markdown::<Cli>();
             return Ok(());
         }
         Commands::MarkdownSchema => {
@@ -4147,6 +3920,14 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // EPIC A1 + SOP cron: drive periodic maintenance and cron
+                // triggers against the shared engine for this daemon iteration.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
@@ -4268,7 +4049,11 @@ async fn main() -> Result<()> {
                     registry,
                     ephemeral,
                 ))
-                .await?;
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -4877,10 +4662,20 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None)
                 };
-                Box::pin(channels::start_channels(
+                // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
+                let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
-                .await
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                result
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -4931,188 +4726,6 @@ async fn main() -> Result<()> {
                 &config,
             ))
             .await
-        }
-
-        Commands::Desktop {
-            install: do_install,
-        } => {
-            let download_url = "https://www.zeroclawlabs.ai/download";
-
-            if do_install {
-                println!(
-                    "{}",
-                    t(
-                        "cli-desktop-download",
-                        "Download the ZeroClaw companion app:"
-                    )
-                );
-                println!();
-                #[cfg(target_os = "macos")]
-                {
-                    println!("  macOS:  {download_url}"); // i18n-exempt: literal command/identifier example
-                    println!();
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-homebrew",
-                            "Or install via Homebrew (coming soon):"
-                        )
-                    );
-                    println!("  brew install --cask zeroclaw"); // i18n-exempt: literal command/identifier example
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    println!("  Linux:  {download_url}"); // i18n-exempt: literal command/identifier example
-                    println!();
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-linux-pkg",
-                            "  Download the .deb or .AppImage for your architecture."
-                        )
-                    );
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                {
-                    println!("  {download_url}");
-                }
-                println!();
-
-                // On macOS, open the download page in the browser
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("open").arg(download_url).spawn();
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(download_url)
-                        .spawn();
-                }
-                return Ok(());
-            }
-
-            // Locate the companion app
-            let desktop_bin = {
-                let mut found = None;
-
-                // 1. macOS: check /Applications/ZeroClaw.app
-                #[cfg(target_os = "macos")]
-                {
-                    let app_paths = [
-                        PathBuf::from("/Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
-                        PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                            .join("Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
-                    ];
-                    for app in &app_paths {
-                        if app.is_file() {
-                            found = Some(app.clone());
-                            break;
-                        }
-                    }
-                }
-
-                // 2. Same directory as the current executable
-                if found.is_none() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
-                        if sibling.is_file() {
-                            found = Some(sibling);
-                        }
-                    }
-                }
-
-                // 3. Common cargo/local install locations under the user's home directory.
-                //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
-                //    are both resolved correctly. On Windows the binary is .exe — try
-                //    both names since which::which (step 4) only catches PATH entries.
-                if found.is_none() {
-                    if let Some(home) =
-                        directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                    {
-                        let bin_names: &[&str] = if cfg!(windows) {
-                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
-                        } else {
-                            &["zeroclaw-desktop"]
-                        };
-                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
-                        let dirs: &[&str] = if cfg!(windows) {
-                            &[".cargo/bin"]
-                        } else {
-                            &[".cargo/bin", ".local/bin"]
-                        };
-                        'outer: for dir in dirs {
-                            for name in bin_names {
-                                let candidate = home.join(dir).join(name);
-                                if candidate.is_file() {
-                                    found = Some(candidate);
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 4. Fallback to PATH lookup
-                if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
-                        found = Some(path);
-                    }
-                }
-
-                found
-            };
-
-            match desktop_bin {
-                Some(bin) => {
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-launching",
-                            "Launching ZeroClaw companion app..."
-                        )
-                    );
-                    let _child = std::process::Command::new(&bin)
-                        .spawn()
-                        .with_context(|| format!("Failed to launch {}", bin.display()))?;
-                    Ok(())
-                }
-                None => {
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-not-installed",
-                            "ZeroClaw companion app is not installed."
-                        )
-                    );
-                    println!();
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-desktop-download-at",
-                            &[("url", download_url)],
-                            "Download it at"
-                        )
-                    );
-                    println!("  Or run: zeroclaw desktop --install"); // i18n-exempt: literal command
-                    println!();
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-blurb1",
-                            "The companion app is a lightweight menu bar app that"
-                        )
-                    );
-                    println!(
-                        "{}",
-                        t(
-                            "cli-desktop-blurb2",
-                            "connects to the same gateway as the CLI."
-                        )
-                    );
-                    std::process::exit(1);
-                }
-            }
         }
 
         Commands::Locales { locales_command } => {
@@ -5372,25 +4985,10 @@ async fn main() -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    #[cfg(feature = "agent-runtime")]
-                    let secret_value = {
-                        let raw = secret_prompt(&format!("Enter value for {path}"), false)?;
-                        raw.trim().to_string()
-                    };
-                    #[cfg(not(feature = "agent-runtime"))]
-                    let secret_value = {
-                        let raw = dialoguer::Password::new()
-                            .with_prompt(format!("Enter value for {path}"))
-                            .interact()?;
-                        raw.trim().to_string()
-                    };
-                    if !secret_value.is_empty() {
-                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
-                    }
-                    // Safety net for the `not(agent-runtime)` dialoguer fallback path,
-                    // which does not enforce non-empty input at the prompt level.
-                    // Under agent-runtime, secret_prompt(_, false) re-prompts on empty
-                    // input, making this check unreachable for that path.
+                    let secret_value = dialoguer::Password::new()
+                        .with_prompt(format!("Enter value for {path}"))
+                        .interact()?;
+                    let secret_value = secret_value.trim().to_string();
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -6013,6 +5611,11 @@ async fn main() -> Result<()> {
             PluginCommands::Search { query, registry } => {
                 let registry_url = plugin_registry::registry_url(registry.as_deref());
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                zeroclaw::plugins::registry::write_cached_registry_index(
+                    &config.data_dir,
+                    &registry_url,
+                    &index,
+                )?;
                 let matches = plugin_registry::search_entries(&index, &query);
                 if matches.is_empty() {
                     println!(
@@ -6084,8 +5687,12 @@ async fn main() -> Result<()> {
                             "Resolving plugin from registry..."
                         )
                     );
-                    let downloaded =
-                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let downloaded = plugin_registry::download_registry_plugin(
+                        &registry_url,
+                        &source,
+                        Some(&config.data_dir),
+                    )
+                    .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     host.install(&plugin_dir)?;
                     println!(
@@ -6241,16 +5848,10 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
-                    #[cfg(feature = "agent-runtime")]
-                    let entered = secret_prompt("Enter OTP code", false)?;
-                    #[cfg(not(feature = "agent-runtime"))]
                     let entered = Password::new()
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
-                    if !entered.is_empty() {
-                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
-                    }
                     otp_code = Some(entered);
                 }
 
@@ -6481,117 +6082,6 @@ fi"#
 
     writer.flush()?;
     Ok(())
-}
-
-fn print_markdown_help() {
-    print!(
-        "{}",
-        escape_mdbook_placeholder_tags(&clap_markdown::help_markdown::<Cli>())
-    );
-}
-
-#[must_use]
-fn escape_mdbook_placeholder_tags(markdown: &str) -> String {
-    let mut escaped = String::with_capacity(markdown.len());
-    let mut in_fence = false;
-
-    for line in markdown.split_inclusive('\n') {
-        let (body, newline) = line
-            .strip_suffix('\n')
-            .map_or((line, ""), |body| (body, "\n"));
-        let starts_fence = is_markdown_fence_line(body);
-
-        if in_fence {
-            escaped.push_str(body);
-            escaped.push_str(newline);
-            if starts_fence {
-                in_fence = false;
-            }
-            continue;
-        }
-
-        if starts_fence {
-            in_fence = true;
-            escaped.push_str(body);
-        } else {
-            escaped.push_str(&escape_mdbook_placeholder_tags_in_line(body));
-        }
-        escaped.push_str(newline);
-    }
-
-    escaped
-}
-
-#[must_use]
-fn escape_mdbook_placeholder_tags_in_line(line: &str) -> String {
-    let mut escaped = String::with_capacity(line.len());
-    let mut index = 0;
-    let mut in_code_span = false;
-
-    while index < line.len() {
-        let Some(ch) = line[index..].chars().next() else {
-            break;
-        };
-
-        if ch == '`' {
-            in_code_span = !in_code_span;
-            escaped.push(ch);
-            index += ch.len_utf8();
-            continue;
-        }
-
-        if !in_code_span
-            && ch == '<'
-            && let Some(end_offset) = line[index + 1..].find('>')
-        {
-            let name_start = index + 1;
-            let name_end = name_start + end_offset;
-            let name = &line[name_start..name_end];
-
-            if is_cli_placeholder_name(name) {
-                escaped.push('`');
-                escaped.push_str(&line[index..=name_end]);
-                escaped.push('`');
-                index = name_end + 1;
-                continue;
-            }
-        }
-
-        escaped.push(ch);
-        index += ch.len_utf8();
-    }
-
-    escaped
-}
-
-#[must_use]
-fn is_markdown_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
-}
-
-#[must_use]
-fn is_cli_placeholder_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_alphabetic()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        && !is_common_html_tag(name)
-}
-
-#[must_use]
-fn is_common_html_tag(name: &str) -> bool {
-    const COMMON_HTML_TAGS: &[&str] = &[
-        "a", "abbr", "br", "code", "details", "div", "em", "img", "kbd", "li", "ol", "p", "samp",
-        "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr", "ul", "var",
-    ];
-
-    let normalized = name.to_ascii_lowercase();
-    COMMON_HTML_TAGS.contains(&normalized.as_str())
 }
 
 // ─── Gateway helper functions ───────────────────────────────────────────────
@@ -7089,11 +6579,11 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let raw = secret_prompt(prompt, false)?;
-    if !raw.is_empty() {
-        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
-    }
-    Ok(raw.trim().to_string())
+    let input = Password::new()
+        .with_prompt(prompt)
+        .allow_empty_password(false)
+        .interact()?;
+    Ok(input.trim().to_string())
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -7488,6 +6978,139 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    let audit = sop_audit.cloned();
+    let cron_cache = audit
+        .as_ref()
+        .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cron_check = chrono::Utc::now();
+        loop {
+            ticker.tick().await;
+            let Some(report) = run_sop_maintenance_tick(
+                &engine,
+                audit.as_ref(),
+                cron_cache.as_ref(),
+                &mut last_cron_check,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !report.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": report.maintenance.timed_out,
+                            "reaped_claims": report.maintenance.reaped_claims,
+                            "pruned_runs": report.maintenance.pruned_runs,
+                            "cron_started": report.cron_started,
+                            "cron_skipped": report.cron_skipped,
+                            "cron_no_match": report.cron_no_match,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Default)]
+struct SopMaintenanceTickReport {
+    maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
+    cron_started: usize,
+    cron_skipped: usize,
+    cron_blocked_unsafe: usize,
+    cron_no_match: usize,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenanceTickReport {
+    fn is_empty(&self) -> bool {
+        self.maintenance.is_empty()
+            && self.cron_started == 0
+            && self.cron_skipped == 0
+            && self.cron_blocked_unsafe == 0
+            && self.cron_no_match == 0
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_sop_maintenance_tick(
+    engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
+    last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<SopMaintenanceTickReport> {
+    let maintenance = match engine.lock() {
+        Ok(mut e) => e.run_maintenance_tick(),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP maintenance tick: engine lock poisoned; skipping this pass"
+            );
+            return None;
+        }
+    };
+
+    let mut report = SopMaintenanceTickReport {
+        maintenance,
+        ..SopMaintenanceTickReport::default()
+    };
+
+    if let (Some(audit), Some(cache)) = (audit, cron_cache) {
+        let results = zeroclaw_runtime::sop::dispatch::check_sop_cron_triggers(
+            engine,
+            audit,
+            cache,
+            last_cron_check,
+        )
+        .await;
+        for result in &results {
+            match result {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                    report.cron_started += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                    report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
+                    report.cron_blocked_unsafe += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
+                    report.cron_no_match += 1;
+                }
+            }
+        }
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    }
+
+    Some(report)
+}
+
 #[cfg(feature = "gateway")]
 async fn run_gateway_if_enabled(
     host: &str,
@@ -7861,41 +7484,6 @@ mod tests {
         assert!(
             !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
             "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
-        );
-    }
-
-    #[test]
-    fn markdown_help_escapes_plain_placeholders_for_mdbook() {
-        assert_eq!(
-            escape_mdbook_placeholder_tags("Send a note to <to> with <MESSAGE>.\n"),
-            "Send a note to `<to>` with `<MESSAGE>`.\n"
-        );
-    }
-
-    #[test]
-    fn markdown_help_preserves_existing_code_spans() {
-        let markdown = "Use `<to>` or `zeroclaw send <to>` from a shell.\n";
-
-        assert_eq!(escape_mdbook_placeholder_tags(markdown), markdown);
-    }
-
-    #[test]
-    fn markdown_help_preserves_fenced_code_blocks() {
-        let markdown = "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass <message>.\n";
-
-        assert_eq!(
-            escape_mdbook_placeholder_tags(markdown),
-            "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass `<message>`.\n"
-        );
-    }
-
-    #[test]
-    fn markdown_help_does_not_escape_common_html_or_autolinks() {
-        let markdown = "Use <br> for HTML, see <https://example.com>, then pass <arg-name>.\n";
-
-        assert_eq!(
-            escape_mdbook_placeholder_tags(markdown),
-            "Use <br> for HTML, see <https://example.com>, then pass `<arg-name>`.\n"
         );
     }
 
@@ -8680,6 +8268,63 @@ mod tests {
             !created,
             "auto-materialization must stay scoped to typed provider aliases"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_memory::traits::Memory;
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "cron-sop".into(),
+            description: "cron regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Supervised,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
+        let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report =
+            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
+                .await
+                .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
     }
 
     #[test]

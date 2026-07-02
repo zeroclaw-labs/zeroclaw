@@ -98,7 +98,11 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let contents = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let config: BridgeConfig = toml::from_str(&contents)
+    // Strip a leading UTF-8 BOM if present before parsing config.toml.
+    let contents = contents
+        .strip_prefix('\u{FEFF}')
+        .unwrap_or(contents.as_str());
+    let config: BridgeConfig = toml::from_str(contents)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
     let pair_code = pair_code_from_args(args)?.or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));

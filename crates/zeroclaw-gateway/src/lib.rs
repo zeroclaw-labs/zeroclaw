@@ -1972,7 +1972,9 @@ pub async fn run_gateway(
         );
 
     #[cfg(feature = "a2a")]
-    let inner = inner.merge(a2a::a2a_routes());
+    let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
+        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
+    )));
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
@@ -2337,6 +2339,18 @@ async fn handle_pair(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "new client paired successfully"
             );
+            // `try_pair` is not just validation: by the time we land
+            // here, the pairing code is consumed and the token's
+            // SHA-256 hash is already in `PairingGuard::paired_tokens`.
+            // Every step below MUST succeed atomically — if any of them
+            // fails, we MUST roll back via `revoke_token_hash` and
+            // return 500 WITHOUT the token in the body. The previous
+            // version of this code returned the plaintext token in the
+            // 500 body, so the caller received a bearer that
+            // authenticated until restart even though there was no
+            // device row and no persisted token record. That preserves
+            // the management gap this whole PR is trying to close.
+            let token_hash = PairingGuard::token_hash(&token);
             // Register the device so a token paired via the legacy `/pair`
             // route is listable and revocable from the management UI, exactly
             // like `/api/pair` (`submit_pairing_enhanced`). Without this the
@@ -2344,8 +2358,8 @@ async fn handle_pair(
             // see nor revoke it. The token itself is owned by `PairingGuard`
             // and persisted below; this row is metadata keyed by its hash.
             if let Some(ref registry) = state.device_registry {
-                registry.register(
-                    PairingGuard::token_hash(&token),
+                if let Err(e) = registry.register(
+                    token_hash.clone(),
                     api_pairing::DeviceInfo {
                         id: uuid::Uuid::new_v4().to_string(),
                         name: None,
@@ -2355,7 +2369,32 @@ async fn handle_pair(
                         ip_address: Some(rate_key.clone()),
                         capabilities: None,
                     },
-                );
+                ) {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "device registry insert failed after successful legacy /pair; rolling back in-process token"
+                    );
+                    // Compensating action: drop the just-accepted
+                    // hash so the failed pairing leaves no
+                    // authenticate-able state. The pairing code is
+                    // already consumed (one-shot), so the operator
+                    // must call `initiate_pairing` to issue a new
+                    // code. The orphaned registry row, if any, sits
+                    // until the operator removes it via the
+                    // management UI; the next `revoke_all` /
+                    // `reconcile` cycle cleans it up.
+                    state.pairing.revoke_token_hash(&token_hash);
+                    let body = serde_json::json!({
+                        "paired": false,
+                        "persisted": false,
+                        "error": format!("Device registry error: {e}"),
+                        "message": "Pairing failed; the in-process token was not retained.",
+                    });
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
+                }
             }
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
@@ -2365,15 +2404,22 @@ async fn handle_pair(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "pairing succeeded but token persistence failed"
+                    "pairing token persistence failed; rolling back in-process token"
                 );
+                // Same compensating action: persistence failed, so a
+                // restart would resurrect the in-memory token. Drop
+                // it now and do NOT return the plaintext token in the
+                // body — the previous behavior leaked a usable
+                // bearer on a 200, which is the very gap this PR
+                // closes.
+                state.pairing.revoke_token_hash(&token_hash);
                 let body = serde_json::json!({
-                    "paired": true,
+                    "paired": false,
                     "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                    "error": format!("Token persistence error: {err}"),
+                    "message": "Pairing failed; the in-process token was not retained.",
                 });
-                return (StatusCode::OK, Json(body));
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
             }
 
             let body = serde_json::json!({
@@ -2929,6 +2975,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -2966,6 +3013,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -4436,6 +4484,82 @@ mod tests {
         }
     }
 
+    /// Regression test for #7733 at the gateway MCP wiring site.
+    /// `append_scoped_mcp_tools` must early-return without mutating
+    /// `gw_tools` when the agent has no `mcp_bundles` grant, even if
+    /// `[[mcp.servers]]` is non-empty.
+    ///
+    /// Note: this is a behavior-pinning test, not a mutation-discriminating
+    /// one. The configured stdio server (`/usr/bin/mcp-fs`) is unlikely
+    /// to exist on the test host, so a hypothetical regression that
+    /// reverted to `&config.mcp.servers` would also produce zero
+    /// registered tools (the stdio connect fails non-fatally). The
+    /// stronger guard against that regression is
+    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` plus
+    /// the resolver-level pins in `zeroclaw-config`. This test still
+    /// adds value by exercising the `append_scoped_mcp_tools` call
+    /// surface and ensuring it does not hang or panic for an unscoped
+    /// agent.
+    #[tokio::test]
+    async fn append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles() {
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }];
+        // Critically: NO mcp_bundles configured and NO agent grants.
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "unscoped".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let security: Arc<SecurityPolicy> = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let initial_len = gw_tools.len();
+
+        // Bound the call with a short timeout: if the no-bundle branch
+        // ever stops being an early-return and tries to spawn an stdio
+        // MCP child, we'd rather see a timeout failure here than a
+        // hanging CI job.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::append_scoped_mcp_tools(&config, "unscoped", &security, &mut gw_tools, None),
+        )
+        .await
+        .expect("append_scoped_mcp_tools must not hang for an unscoped agent");
+
+        assert_eq!(
+            gw_tools.len(),
+            initial_len,
+            "append_scoped_mcp_tools must not push any tool when the \
+             agent has no mcp_bundles grant; gw_tools went from {} \
+             to {}",
+            initial_len,
+            gw_tools.len()
+        );
+    }
+
     /// Gateway parity with the channel path: the gateway now scopes MCP servers
     /// by `mcp_bundles` and gates registration through the same
     /// `register_eager_mcp_tool_if_allowed` helper, so an `excluded_tools`-denied
@@ -4734,18 +4858,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        state.device_registry.as_ref().unwrap().register(
-            PairingGuard::token_hash(&token),
-            api_pairing::DeviceInfo {
-                id: device_id.to_string(),
-                name: None,
-                device_type: None,
-                paired_at: chrono::Utc::now(),
-                last_seen: chrono::Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        state
+            .device_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                PairingGuard::token_hash(&token),
+                api_pairing::DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: chrono::Utc::now(),
+                    last_seen: chrono::Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
         token
     }
 
@@ -4814,7 +4943,13 @@ mod tests {
             "rotate=all must persist an empty token set"
         );
         assert!(
-            state.device_registry.as_ref().unwrap().list().is_empty(),
+            state
+                .device_registry
+                .as_ref()
+                .unwrap()
+                .list()
+                .expect("test device registry list")
+                .is_empty(),
             "rotate=all must clear the device registry"
         );
     }
@@ -5704,6 +5839,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -8221,6 +8358,139 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Regression tests for atomic /pair path (review feedback on #8466).
+    //
+    // `handle_pair` (`/pair`) and `submit_pairing_enhanced` (`/api/pair`)
+    // share the same atomicity invariant: once `try_pair` accepts the
+    // code, every subsequent step (device registry write, token
+    // persistence) MUST succeed atomically. If any step fails, the
+    // handler must roll back the in-process token via
+    // `revoke_token_hash` and return 5xx WITHOUT the plaintext bearer
+    // in the body. Otherwise the calling client receives a usable
+    // bearer token that authenticates until restart even though there
+    // is no device row and no persisted token record — exactly the
+    // management gap the PR is closing.
+    //
+    // The api_pairing.rs side of this guarantee is exercised by
+    // `submit_pairing_enhanced_rolls_back_*`. These two tests cover the
+    // legacy `/pair` path that previously leaked the bearer in its
+    // 500 body.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Build an `AppState` whose device registry points at a non-existent
+    /// path so every SQLite write fails. Mirrors `unwriteable_registry_state`
+    /// in `api_pairing::tests` so the regression set stays side-by-side.
+    fn unwriteable_registry_pair_state(tmp: &tempfile::TempDir) -> AppState {
+        let mut state = admin_paircode_state(tmp, true, false);
+        // No registry from `admin_paircode_state`; inject the broken one.
+        state.device_registry = Some(Arc::new(api_pairing::DeviceRegistry::with_db_path(
+            std::path::PathBuf::from("/this/path/does/not/exist/devices.db"),
+        )));
+        state
+    }
+
+    async fn legacy_pair_response_json(
+        result: impl IntoResponse,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("legacy /pair response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    /// If `registry.register(...)` fails after `try_pair` already
+    /// accepted the code, `handle_pair` must roll back the in-process
+    /// token (no accepted credential left behind) and must NOT return
+    /// the plaintext bearer in the 500 body — the previous behavior
+    /// did, so the calling client received a usable token that
+    /// authenticated until restart.
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_registry_register_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = unwriteable_registry_pair_state(&tmp);
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair registry.register failure must surface as 500"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             registry.register (compensating `revoke_token_hash`); instead have {:?}",
+            state.pairing.tokens()
+        );
+    }
+
+    /// If token persistence to `config.toml` fails after `try_pair`
+    /// already accepted the code, `handle_pair` must roll back the
+    /// in-process token and return 500 WITHOUT the bearer in the body.
+    /// The previous behavior leaked a usable bearer on a 200, which is
+    /// exactly the gap this whole PR closes.
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_persist_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        // No registry → registry branch is skipped, so persistence is the
+        // only failing step. Point config_path at an unwritable target.
+        state.config.write().config_path = std::path::PathBuf::from("/no/such/dir/config.toml");
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair persistence failure MUST surface as 500 (legacy leaked 200 + token)"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             persist; have {:?}",
+            state.pairing.tokens()
+        );
     }
 }
 

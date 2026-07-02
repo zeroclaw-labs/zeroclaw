@@ -4,7 +4,7 @@
 
 - SOP definitions are loaded from `<workspace>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
-- SOP runs are started by MQTT event fan-in or by the in-agent tool `sop_execute`. The webhook, cron, and peripheral trigger types are defined and matched but not yet wired to a live event source (see [Connectivity](./connectivity.md)).
+- SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP) or by the in-agent tool `sop_execute`. Other trigger types are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
 
@@ -53,4 +53,4 @@ graph LR
 
 4. Trigger runs via configured event sources, or manually from an agent turn with `sop_execute`.
 
-For trigger routing and auth details, see [Connectivity](./connectivity.md).
+For trigger routing and auth details, see [SOP Fan-In](./fan-in/overview.md).

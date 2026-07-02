@@ -27,8 +27,6 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
-cli-desktop-about = Launch the ZeroClaw companion desktop app
-
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
 cli-config-get-about = Get a config property value
@@ -320,6 +318,12 @@ cli-skills-install-suggestion =
     Matched capability: {$matched}
     Next: Run `{$install_command}` to install it.
 
+cli-plugin-install-suggestion =
+    It looks like this request needs the `{$name}` plugin, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.
 
@@ -329,17 +333,6 @@ cli-completions-long-about =
       source <(zeroclaw completions bash)
       zeroclaw completions zsh > ~/.zfunc/_zeroclaw
       zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
-
-cli-desktop-long-about =
-    Launch the ZeroClaw companion desktop app.
-
-    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
-
-    Use --install to download the pre-built companion app for your platform.
-
-    Examples:
-      zeroclaw desktop              # launch the companion app
-      zeroclaw desktop --install    # download and install it
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
@@ -667,11 +660,6 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
-cli-desktop-download = Download the ZeroClaw companion app:
-cli-desktop-homebrew = Or install via Homebrew (coming soon):
-cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
-cli-desktop-launching = Launching ZeroClaw companion app...
-
 # ── status fields ──
 cli-status-version = Version:     {$v}
 cli-status-workspace = Workspace:   {$v}
@@ -713,9 +701,6 @@ cli-status-word-not-configured = not configured
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
-cli-desktop-not-installed = ZeroClaw companion app is not installed.
-cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
-cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
@@ -744,7 +729,6 @@ cli-warn-crypto-provider = Warning: Failed to install default crypto provider: {
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ Could not load cost usage: {$err}
 cli-warn-cost-tracker = {"  "}⚠ Could not init cost tracker: {$err}
-cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
@@ -894,3 +878,12 @@ cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
 cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
+# Emitted by the daemon startup guard in src/main.rs when the configured gateway
+# address is already bound. The daemon supervises its own in-process gateway
+# (shared event bus / canvas / reload channel) and cannot adopt a separate
+# process, so it fails fast with an actionable message instead of degrading into
+# a supervisor retry loop. The two variants differ only by who holds the port.
+cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
