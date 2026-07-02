@@ -16037,6 +16037,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             }])
@@ -19906,6 +19909,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
                 }])
