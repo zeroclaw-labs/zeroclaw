@@ -17548,7 +17548,9 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_include_instructions_and_tools() {
+    fn prompt_skills_render_compact_with_tools() {
+        // The bare `build_system_prompt` path renders skills compactly:
+        // instructions load on demand via `read_skill`, only tools are inlined.
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -17578,16 +17580,17 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
-        assert!(prompt.contains("<instructions>"));
+        // Instructions are never inlined now — they load on demand.
+        assert!(prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("<instructions>"));
         assert!(
-            prompt.contains(
+            !prompt.contains(
                 "<instruction>Always run cargo test before final response.</instruction>"
             )
         );
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
-        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
@@ -17677,9 +17680,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        // Instructions are no longer inlined (loaded on demand), so the prompt
+        // body is not asserted here.
     }
 
     #[test]

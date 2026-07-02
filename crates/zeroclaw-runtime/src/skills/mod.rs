@@ -1545,20 +1545,31 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the "Available Skills" system prompt section (compact summaries).
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
         workspace_dir,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
     )
 }
 
-/// Build the "Available Skills" system prompt section with configurable verbosity.
+/// Build the "Available Skills" system prompt section.
+///
+/// Always renders compact summaries; per-skill instructions load on demand via
+/// `read_skill`. See `_mode` for the deprecation note.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
-    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    // DEPRECATED: the injection mode is ignored — skills now always render as
+    // compact summaries whose instructions load on demand via `read_skill`.
+    // `Full` was removed because inlining every skill body blows up the context
+    // window and diverges from the progressive-disclosure model used by Claude
+    // Code and OpenClaw. This parameter is retained only so existing call sites
+    // keep compiling during the deprecation window; removal (this param, the
+    // `prompt_injection_mode` config key, and `SkillsPromptInjectionMode`) is
+    // tracked in #8310.
+    _mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
 
@@ -1566,51 +1577,23 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
-            "## Available Skills\n\n\
-             Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-             <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
-            "## Available Skills\n\n\
-             Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
-             The `location` field is included for reference.\n\n\
-             <available_skills>\n",
-        ),
-    };
+    let mut prompt = String::from(
+        "## Available Skills\n\n\
+         Skill summaries are preloaded below to keep context compact.\n\
+         Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+         The `location` field is included for reference.\n\n\
+         <available_skills>\n",
+    );
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, true);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
-            let _ = writeln!(prompt, "    <instructions>");
-            for instruction in &skill.prompts {
-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-            }
-            let _ = writeln!(prompt, "    </instructions>");
-        }
-
+        // Skill instructions are always loaded on demand via `read_skill`; only
+        // tool metadata is inlined so the LLM knows which skill tools exist.
         if !skill.tools.is_empty() {
             // Tools with known kinds (shell, script, http) are registered as
             // callable tool specs and can be invoked directly via function calling.
