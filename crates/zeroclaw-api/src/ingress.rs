@@ -173,19 +173,13 @@ impl IngressContext {
         Self::phase1(TurnOrigin::SubTurn)
     }
 
-    /// The envelope for an internally driven, trusted turn (cron, SOP step,
-    /// subagent, or any phase-1 caller that has not yet stamped real identity).
-    ///
-    /// `source_class = Internal`, `trust = Trusted`, `transport = Internal`,
-    /// `sender = None`, `message_id = None`. Passing the layer with this
-    /// envelope dispositions to [`IngressDecision::Loop`] under the default
-    /// policy, so behavior is identical to a turn that never had an envelope.
-    ///
-    /// Transitional: callers are being migrated to the per-origin
-    /// constructors above; this is equivalent to [`Self::sub_turn`].
+    /// Envelope for a turn whose origin is threaded in from the entry
+    /// point (e.g. `agent::run` / `process_message`, whose one body serves
+    /// several distinct entries: CLI, cron, daemon, subagent spawn).
+    /// Equivalent to the per-origin constructors above.
     #[must_use]
-    pub fn internal() -> Self {
-        Self::sub_turn()
+    pub fn from_origin(origin: TurnOrigin) -> Self {
+        Self::phase1(origin)
     }
 }
 
@@ -212,14 +206,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn internal_envelope_is_internal_and_trusted() {
-        let ctx = IngressContext::internal();
+    fn sub_turn_envelope_is_internal_and_trusted() {
+        let ctx = IngressContext::sub_turn();
         assert_eq!(ctx.source_class, SourceClass::Internal);
         assert_eq!(ctx.trust, TrustClass::Trusted);
         assert_eq!(ctx.transport, Transport::Internal);
         assert!(ctx.sender.is_none());
         assert!(ctx.message_id.is_none());
         assert_eq!(ctx.origin, TurnOrigin::SubTurn);
+    }
+
+    #[test]
+    fn from_origin_matches_the_named_constructor() {
+        assert_eq!(
+            IngressContext::from_origin(TurnOrigin::Cron),
+            IngressContext::cron()
+        );
+        assert_eq!(
+            IngressContext::from_origin(TurnOrigin::SubTurn),
+            IngressContext::sub_turn()
+        );
     }
 
     #[test]

@@ -145,7 +145,7 @@ pub async fn maybe_run_skill_review(
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias,
                 turn_id: &turn_id,
             })

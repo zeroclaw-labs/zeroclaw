@@ -1032,6 +1032,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
@@ -1187,6 +1188,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {

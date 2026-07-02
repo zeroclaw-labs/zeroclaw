@@ -2355,9 +2355,9 @@ impl Agent {
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay phase-1 placeholders (RFC #6971 §4).
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
                         turn_id: &turn_id,
                     }),
@@ -2805,9 +2805,9 @@ impl Agent {
                             steering: None,
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
-                            // Phase 1: stamp Internal/Trusted. Real per-transport
-                            // stamping is PR C (RFC #6971 §4).
-                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay phase-1 placeholders (RFC #6971 §4).
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
                             turn_id: &turn_id,
                         }),

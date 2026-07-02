@@ -486,7 +486,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         image_cache: None,
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
-        ingress: IngressContext::internal(),
+        ingress: IngressContext::sub_turn(),
         agent_alias: None,
         turn_id: &turn_id,
     })
@@ -886,7 +886,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: IngressContext::internal(),
+                ingress: IngressContext::sub_turn(),
                 agent_alias: None,
                 turn_id: &turn_id,
             })

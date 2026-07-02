@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn default_policy_returns_loop_for_internal() {
-        let ctx = IngressContext::internal();
+        let ctx = IngressContext::sub_turn();
         let policy = IngressPolicy::default();
         assert_eq!(
             ingress_policy("hello", &ctx, &policy),
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn default_policy_returns_loop_for_empty_text() {
-        let ctx = IngressContext::internal();
+        let ctx = IngressContext::sub_turn();
         let policy = IngressPolicy::default();
         assert_eq!(ingress_policy("", &ctx, &policy), IngressDecision::Loop);
     }

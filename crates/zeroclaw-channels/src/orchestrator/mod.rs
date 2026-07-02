@@ -5178,9 +5178,10 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Channel-orchestrator dispatch; source/transport/trust stay
+                // phase-1 placeholders. Real channel transport identity is
+                // stamped at the edge in phase 2 (RFC #6971 §4, tracker #8583).
+                ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });

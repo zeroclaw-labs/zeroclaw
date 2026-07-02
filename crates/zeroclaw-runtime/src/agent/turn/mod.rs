@@ -1267,7 +1267,7 @@ async fn drive_live_sop_actions(
                         steering: None,
                         new_messages_out: new_messages_out.as_deref_mut(),
                         image_cache: image_cache.as_deref_mut(),
-                        ingress: IngressContext::internal(),
+                        ingress: IngressContext::sub_turn(),
                         agent_alias,
                         turn_id: &nested_turn_id,
                     }))

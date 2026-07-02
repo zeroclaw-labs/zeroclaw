@@ -261,6 +261,7 @@ impl Tool for SpawnSubagentTool {
                 false,
                 Some(session_path),
                 None,
+                zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
         ))
