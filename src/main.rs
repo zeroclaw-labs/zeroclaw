@@ -924,6 +924,9 @@ Examples:
         /// Target version (default: latest)
         #[arg(long)]
         version: Option<String>,
+        /// With --check, emit machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run diagnostic self-tests
@@ -3881,6 +3884,11 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Capture the launch command now, before any in-app upgrade can
+            // swap the binary on disk (after which `current_exe()` resolves to a
+            // "(deleted)" path on Linux). Used by the post-loop self-respawn.
+            zeroclaw_runtime::restart::record_launch();
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -4083,6 +4091,11 @@ async fn main() -> Result<()> {
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }
+            // Bare-process auto-restart: the daemon has now torn down (the
+            // gateway listener is released), so launch the upgraded binary as a
+            // detached child before we exit. No-op unless an in-app upgrade
+            // requested a self-respawn.
+            zeroclaw_runtime::restart::respawn_if_requested();
             Ok(())
         }
 
@@ -4738,10 +4751,25 @@ async fn main() -> Result<()> {
             check,
             force,
             version,
+            json,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
-                if info.is_newer {
+                if json {
+                    // Machine-readable shape consumed by the gateway's
+                    // `GET /api/version/check`. Keep field names stable.
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "current_version": info.current_version,
+                            "latest_version": info.latest_version,
+                            "is_newer": info.is_newer,
+                            "release_url": info.release_url,
+                            "release_notes": info.release_notes,
+                            "published_at": info.published_at,
+                        }))?
+                    );
+                } else if info.is_newer {
                     println!(
                         "{}",
                         ta(
@@ -7120,6 +7148,10 @@ async fn run_gateway_if_enabled(
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
+    // Capture the launch command before the gateway starts so in-app upgrade
+    // can self-respawn after the listener is released. Must mirror the same
+    // call in the Daemon branch.
+    zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
@@ -7128,6 +7160,10 @@ async fn run_gateway_if_enabled(
         host, port, config, tx, None, None, None, None, None,
     ))
     .await;
+    // Self-respawn after the listener is released, if an in-app upgrade
+    // requested it. No-op when no respawn was requested or on supervised
+    // restart modes.
+    zeroclaw_runtime::restart::respawn_if_requested();
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
             let restart_port = available_gateway_restart_hint_port(host, port);

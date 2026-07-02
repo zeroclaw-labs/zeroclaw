@@ -6493,6 +6493,19 @@ pub struct GatewayConfig {
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
+
+    /// Poll GitHub for newer releases and show an "update available" indicator
+    /// on the dashboard version tag. Read-only; does not install anything.
+    /// (default: true)
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+
+    /// Allow triggering a self-upgrade (binary swap via `zeroclaw update`) from
+    /// the dashboard. This is a remote-code-execution-adjacent surface: any
+    /// authenticated dashboard user could replace the running binary. Keep off
+    /// unless you trust every paired client. (default: false)
+    #[serde(default)]
+    pub allow_self_upgrade: bool,
 }
 
 fn default_gateway_port() -> u16 {
@@ -6570,6 +6583,8 @@ impl Default for GatewayConfig {
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
+            check_updates: true,
+            allow_self_upgrade: false,
         }
     }
 }
@@ -24641,6 +24656,8 @@ allowed_numbers = ["+1", "+2"]
             tls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
+            check_updates: true,
+            allow_self_upgrade: false,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -24656,6 +24673,8 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert!(parsed.check_updates);
+        assert!(!parsed.allow_self_upgrade);
     }
 
     #[test]

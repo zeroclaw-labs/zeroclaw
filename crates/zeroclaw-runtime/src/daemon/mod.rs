@@ -139,11 +139,19 @@ async fn wait_for_exit_signal(
 
     #[cfg(not(unix))]
     {
+        // In-process shutdown trigger (no SIGTERM on Windows): the gateway fires
+        // this to request a graceful exit, e.g. for post-upgrade self-respawn.
+        let respawn_shutdown = crate::restart::shutdown_notify().notified();
+        tokio::pin!(respawn_shutdown);
         loop {
             tokio::select! {
                 res = tokio::signal::ctrl_c() => {
                     res?;
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received Ctrl+C, shutting down...");
+                    return Ok(DaemonExit::Shutdown);
+                }
+                _ = &mut respawn_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "In-process shutdown requested, shutting down...");
                     return Ok(DaemonExit::Shutdown);
                 }
                 changed = reload_rx.changed() => {
