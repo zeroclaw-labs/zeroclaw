@@ -395,7 +395,18 @@ mod tests {
         impl AgentTurn for CapturingTurn {
             async fn run_single(&mut self, message: &str) -> TransportResult<String> {
                 self.seen.lock().unwrap().push(message.to_string());
-                Ok("ok".to_string())
+                Ok("ANSWER: ok".to_string())
+            }
+        }
+
+        struct NoOperator;
+        #[async_trait]
+        impl crate::agent_responder::OperatorIo for NoOperator {
+            async fn say(&mut self, _text: &str) -> TransportResult<()> {
+                Err(TransportError::Closed)
+            }
+            async fn hear(&mut self) -> TransportResult<String> {
+                Err(TransportError::Closed)
             }
         }
 
@@ -403,9 +414,12 @@ mod tests {
         let chosen = select_locale(&mut selector).await.unwrap();
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut responder = AgentResponder::new(CapturingTurn {
-            seen: Arc::clone(&seen),
-        })
+        let mut responder = AgentResponder::new(
+            CapturingTurn {
+                seen: Arc::clone(&seen),
+            },
+            NoOperator,
+        )
         .with_locale(chosen);
         responder
             .respond("Provide the homeserver URL")

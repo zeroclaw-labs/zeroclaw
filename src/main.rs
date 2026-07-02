@@ -1202,7 +1202,8 @@ async fn run_onboard_flow(
 ) -> anyhow::Result<()> {
     use zeroclaw_onboarding::{
         AgentPhraser, AgentResponder, CliTransport, FieldScope, FlowRequest, InProcessAgentTurn,
-        LlmTransport, TtyPasswordSource, TtySecretReader, build_spec_scoped, phrase_spec, run_flow,
+        LlmTransport, TtyOperatorIo, TtyPasswordSource, TtySecretReader, build_spec_scoped,
+        phrase_spec, run_flow,
     };
     use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
 
@@ -1293,7 +1294,7 @@ async fn run_onboard_flow(
             agent_alias,
         ))
         .await?;
-        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent))
+        let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent), TtyOperatorIo)
             .with_locale(selected_locale.clone());
         let mut transport = LlmTransport::new(responder, TtySecretReader);
         let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;

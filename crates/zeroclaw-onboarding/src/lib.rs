@@ -9,7 +9,9 @@ pub mod outcome_message;
 pub mod phrasing;
 pub mod spec_builder;
 
-pub use agent_responder::{AgentResponder, AgentTurn, InProcessAgentTurn};
+pub use agent_responder::{
+    AgentResponder, AgentTurn, InProcessAgentTurn, OperatorIo, TtyOperatorIo,
+};
 pub use cli_transport::{CliSecretSource, CliTransport, NoSecretSource, TtyPasswordSource};
 pub use driver::{DriverError, FlowRequest, run_flow};
 pub use llm_transport::{LlmResponder, LlmTransport, SecretReader, TtySecretReader};
