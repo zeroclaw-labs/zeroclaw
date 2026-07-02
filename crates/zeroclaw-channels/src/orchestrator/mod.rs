@@ -5098,6 +5098,12 @@ async fn process_channel_message_body(
             .with_attrs(::serde_json::json!({"elapsed_before_llm_ms": elapsed_before_llm_ms})),
         "starting LLM call"
     );
+    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
+    // the tool-call loop below. Allocating per turn (rather than clearing a shared
+    // handle) keeps concurrent same-agent turns from reading each other's routes.
+    let turn_routing: tools::TurnRoutingHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Per-turn collector. `tool_execution::execute_one_tool` pushes
     // `<tool_name>: <receipt>` here whenever a receipt is generated, so the
     // orchestrator can render the trailing `Tool receipts:` block after the
@@ -5184,6 +5190,10 @@ async fn process_channel_message_body(
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });
+            // Scope this turn's routing handle so concurrent same-agent turns,
+            // which share one SendViaTool, never read each other's routes.
+            let tool_loop =
+                tools::TURN_ROUTING.scope(Some(std::sync::Arc::clone(&turn_routing)), tool_loop);
             let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(thinking.params.native_thinking, tool_loop);
             let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
@@ -5560,55 +5570,130 @@ async fn process_channel_message_body(
                 None
             };
 
-            if let Some(channel) = target_channel.as_ref() {
-                let reply_delivered = if let Some(ref draft_id) = draft_message_id {
-                    match channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
-                        .await
+            // Read the last routing instruction set by `send_via` this turn from
+            // the per-turn handle scoped into TURN_ROUTING around the loop above.
+            let turn_route = turn_routing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned();
+
+            // Resolve the delivery channel and modality from the routing entry.
+            // `None` entry → default delivery (originating channel, no modality override).
+            let (
+                delivery_channel,
+                delivery_recipient,
+                suppress_voice_override,
+                force_voice_override,
+            ) = if let Some(ref route) = turn_route {
+                let ch: Option<Arc<dyn Channel>> = match route.channel.as_deref() {
+                    None | Some("") => target_channel.clone(),
+                    Some(key) => ctx.channels_by_name.get(key).map(Arc::clone),
+                };
+                let recipient = route
+                    .recipient
+                    .clone()
+                    .unwrap_or_else(|| msg.reply_target.clone());
+                let suppress = match route.modality {
+                    zeroclaw_config::multi_agent::OutputModality::Text => Some(true),
+                    zeroclaw_config::multi_agent::OutputModality::Voice => Some(false),
+                    zeroclaw_config::multi_agent::OutputModality::Mirror => None,
+                };
+                let force_voice = matches!(
+                    route.modality,
+                    zeroclaw_config::multi_agent::OutputModality::Voice
+                );
+                (ch, recipient, suppress, force_voice)
+            } else {
+                (
+                    target_channel.clone(),
+                    msg.reply_target.clone(),
+                    None,
+                    false,
+                )
+            };
+
+            if let Some(channel) = delivery_channel.as_ref() {
+                let is_redirect = turn_route
+                    .as_ref()
+                    .and_then(|r| r.channel.as_deref())
+                    .is_some();
+                // Whether the agent's reply reached a channel — gates the
+                // `fire_message_sent` observer hook below.
+                let reply_delivered = if is_redirect {
+                    // Routing redirects to a different channel: cancel any in-progress
+                    // draft on the originating channel before delivering elsewhere.
+                    if let (Some(orig_ch), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
                     {
-                        Ok(()) => true,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Failed to finalize draft; sending as new message"
-                            );
-                            match channel
-                                .send(&SendMessage::reply_to(&msg, &delivered_response))
-                                .await
-                            {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    ::zeroclaw_log::record!(
-                                        ERROR,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(
-                                            ::serde_json::json!({"error": format!("{}", e)}),
-                                        ),
-                                        "failed to reply"
-                                    );
-                                    false
+                        let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
+                    }
+                    let suppress = suppress_voice_override.unwrap_or(false);
+                    let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
+                        .in_thread(msg.thread_ts.clone());
+                    if suppress {
+                        send_msg = send_msg.suppress_voice();
+                    } else if force_voice_override {
+                        send_msg = send_msg.force_voice();
+                    }
+                    channel.send(&send_msg).await.is_ok()
+                } else if let Some(ref draft_id) = draft_message_id {
+                    // Same channel with draft. For force-voice routing: cancel the
+                    // draft placeholder and deliver via send() so force_voice()
+                    // reaches the channel's voice path (finalize_draft has no
+                    // force_voice concept).
+                    if force_voice_override {
+                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
+                        channel
+                            .send(
+                                &SendMessage::new(&delivered_response, &delivery_recipient)
+                                    .force_voice()
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await
+                            .is_ok()
+                    } else {
+                        let suppress = suppress_voice_override.unwrap_or(false);
+                        match channel
+                            .finalize_draft(
+                                &delivery_recipient,
+                                draft_id,
+                                &delivered_response,
+                                suppress,
+                            )
+                            .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Failed to finalize draft; sending as new message"
+                                );
+                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
+                                if suppress {
+                                    fallback = fallback.suppress_voice();
                                 }
+                                channel.send(&fallback).await.is_ok()
                             }
                         }
                     }
                 } else {
-                    match channel
-                        .send(
-                            &SendMessage::reply_to(&msg, &delivered_response)
-                                .with_cancellation(cancellation_token.clone()),
-                        )
-                        .await
-                    {
+                    // No draft — plain send.
+                    let suppress = suppress_voice_override.unwrap_or(false);
+                    let mut send_msg = SendMessage::reply_to(&msg, &delivered_response)
+                        .with_cancellation(cancellation_token.clone());
+                    if suppress {
+                        send_msg = send_msg.suppress_voice();
+                    } else if force_voice_override {
+                        send_msg = send_msg.force_voice();
+                    }
+                    match channel.send(&send_msg).await {
                         Ok(()) => true,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -5637,7 +5722,7 @@ async fn process_channel_message_body(
                 if let Some(ref block) = receipts_block
                     && let Err(e) = channel
                         .send(
-                            &SendMessage::new(block, &msg.reply_target)
+                            &SendMessage::new(block, &delivery_recipient)
                                 .in_thread(msg.thread_ts.clone()),
                         )
                         .await
@@ -5717,18 +5802,16 @@ async fn process_channel_message_body(
                     "channel_message_error"
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                    if let Some(draft_id) = draft_message_id.as_deref() {
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(error_text, &msg.reply_target)
+                                .suppress_voice()
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             } else {
                 eprintln!(
@@ -5789,7 +5872,9 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = format!("⚠️ Error: {safe_error}");
+                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -5839,21 +5924,22 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
+                // Localized error text (master) delivered with suppress_voice
+                // (RFC #6969 error-path fix): cancel the draft, then send as
+                // text so a timeout notice is never read aloud on a voice peer.
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
                     "channel-runtime-request-timeout",
                 );
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text.as_str())
-                        .await;
-                } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                if let Some(draft_id) = draft_message_id.as_deref() {
+                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
+                let _ = channel
+                    .send(
+                        &SendMessage::new(error_text, &msg.reply_target)
+                            .suppress_voice()
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
             }
         }
     }
@@ -9335,6 +9421,7 @@ pub async fn start_channels(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            Some(Arc::clone(&config_arc)),
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -12847,6 +12934,7 @@ api_key = "anthropic-key"
             recipient: &str,
             message_id: &str,
             text: &str,
+            _suppress_voice: bool,
         ) -> anyhow::Result<()> {
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
