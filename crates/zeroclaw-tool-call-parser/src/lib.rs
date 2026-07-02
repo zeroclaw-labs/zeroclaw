@@ -1034,6 +1034,265 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     values
 }
 
+fn skip_json_ws(input: &str, mut idx: usize) -> usize {
+    while let Some(ch) = input[idx..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn find_json_field_value_start(input: &str, field: &str, start: usize) -> Option<usize> {
+    let pattern = format!("\"{field}\"");
+    let mut search_start = start;
+    while let Some(relative) = input[search_start..].find(&pattern) {
+        let key_start = search_start + relative;
+        let after_key = key_start + pattern.len();
+        let colon = skip_json_ws(input, after_key);
+        if input[colon..].starts_with(':') {
+            return Some(colon + 1);
+        }
+        search_start = after_key;
+    }
+    None
+}
+
+fn find_json_string_end(input: &str, quote_start: usize) -> Option<usize> {
+    if !input[quote_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[quote_start + 1..].char_indices() {
+        let idx = quote_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_json_string_field_after(
+    input: &str,
+    field: &str,
+    start: usize,
+) -> Option<(String, usize)> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, field, start)?);
+    let value_end = find_json_string_end(input, value_start)?;
+    let value = serde_json::from_str::<String>(&input[value_start..=value_end]).ok()?;
+    Some((value, value_end + 1))
+}
+
+// Narrow recovery for malformed file_write calls whose content string contains
+// model-emitted unescaped quotes. This is deliberately not a general JSON
+// repair path: content must be the final argument field and the remaining tail
+// must only close the surrounding tool-call protocol envelope.
+fn decode_recovered_json_string_fragment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let mut value = 0u32;
+                let mut valid = true;
+                let mut consumed = String::with_capacity(4);
+                for _ in 0..4 {
+                    let Some(hex) = chars.next() else {
+                        valid = false;
+                        break;
+                    };
+                    consumed.push(hex);
+                    if let Some(digit) = hex.to_digit(16) {
+                        value = (value << 4) | digit;
+                    } else {
+                        valid = false;
+                    }
+                }
+                if valid && consumed.len() == 4 {
+                    if let Some(decoded) = char::from_u32(value) {
+                        out.push(decoded);
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&consumed);
+                    }
+                } else {
+                    out.push_str("\\u");
+                    out.push_str(&consumed);
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn file_write_content_tail_is_unambiguous(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with('}') {
+        return false;
+    }
+    idx += '}'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    while let Some(ch) = input[idx..].chars().next() {
+        match ch {
+            '}' | ']' => {
+                idx += ch.len_utf8();
+                idx = skip_json_ws(input, idx);
+            }
+            _ => break,
+        }
+    }
+
+    let tail = input[idx..].trim_start();
+    tail.is_empty()
+        || tail.starts_with("</tool_call>")
+        || tail.starts_with("</tool_calls>")
+        || tail.starts_with("</toolcall>")
+        || tail.starts_with("</tool-call>")
+        || tail.starts_with("</invoke>")
+        || tail.starts_with("</minimax:tool_call>")
+        || tail.starts_with("</minimax:toolcall>")
+        || tail.starts_with("```")
+}
+
+fn file_write_content_quote_starts_additional_final_field(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with(',') {
+        return false;
+    }
+
+    idx += ','.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let Some(field_end) = find_json_string_end(input, idx) else {
+        return false;
+    };
+
+    idx = skip_json_ws(input, field_end + 1);
+    if !input[idx..].starts_with(':') {
+        return false;
+    }
+
+    idx += ':'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let mut stream =
+        serde_json::Deserializer::from_str(&input[idx..]).into_iter::<serde_json::Value>();
+    let Some(Ok(_)) = stream.next() else {
+        return false;
+    };
+
+    let consumed = stream.byte_offset();
+    consumed > 0 && file_write_content_tail_is_unambiguous(input, idx + consumed)
+}
+
+fn parse_malformed_file_write_content_after(input: &str, start: usize) -> Option<String> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, "content", start)?);
+    if !input[value_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[value_start + 1..].char_indices() {
+        let idx = value_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' if file_write_content_tail_is_unambiguous(input, idx + 1) => {
+                let raw = &input[value_start + 1..idx];
+                return Some(decode_recovered_json_string_fragment(raw));
+            }
+            '"' if file_write_content_quote_starts_additional_final_field(input, idx + 1) => {
+                return None;
+            }
+            '"' => {}
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_malformed_file_write_arguments(input: &str) -> Option<serde_json::Value> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let object_start = skip_json_ws(trimmed, 0);
+    if !trimmed[object_start..].starts_with('{') {
+        return None;
+    }
+
+    let (path, path_end) = parse_json_string_field_after(trimmed, "path", object_start)?;
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    let content = parse_malformed_file_write_content_after(trimmed, path_end)?;
+    Some(serde_json::json!({
+        "path": path,
+        "content": content,
+    }))
+}
+
+fn parse_malformed_file_write_call(input: &str) -> Option<ParsedToolCall> {
+    let trimmed = input.trim();
+    let body = json_fence_body(trimmed).unwrap_or(trimmed).trim();
+    if body.is_empty() || !(body.starts_with('{') || body.starts_with('[')) {
+        return None;
+    }
+
+    let (name, name_end) = parse_json_string_field_after(body, "name", 0)?;
+    if map_tool_name_alias(name.trim()) != "file_write" {
+        return None;
+    }
+
+    let arguments_start = find_json_field_value_start(body, "arguments", name_end)
+        .or_else(|| find_json_field_value_start(body, "parameters", name_end))?;
+    let arguments = parse_malformed_file_write_arguments(&body[arguments_start..])?;
+
+    Some(ParsedToolCall {
+        name: "file_write".to_string(),
+        arguments,
+        tool_call_id: None,
+    })
+}
+
 /// Find the end position of a JSON object by tracking balanced braces.
 fn find_json_end(input: &str) -> Option<usize> {
     let trimmed = input.trim_start();
@@ -1604,6 +1863,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             return (text_parts.join("\n"), calls);
         }
     }
+    if let Some(call) = parse_malformed_file_write_call(response.trim()) {
+        return (String::new(), vec![call]);
+    }
 
     if let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response)
         && !minimax_calls.is_empty()
@@ -1647,6 +1909,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                calls.push(call);
+                parsed_any = true;
+            }
+
             // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any && let Some(xml_calls) = parse_xml_tool_calls(inner) {
                 calls.extend(xml_calls);
@@ -1688,6 +1955,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         parsed_any = true;
                         calls.extend(parsed_calls);
                     }
+                }
+
+                if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                    calls.push(call);
+                    parsed_any = true;
                 }
 
                 // Try XML
@@ -1735,6 +2007,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if let Some(call) = parse_malformed_file_write_call(after_open) {
+                calls.push(call);
+                remaining = "";
+                continue;
+            }
+
             // Last resort: try GLM shortened body on everything after the open tag.
             // The model may have emitted `<tool_call>shell>ls` with no close tag at all.
             let glm_input = after_open.trim();
@@ -1774,6 +2052,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
                 calls.extend(parsed_calls);
             }
+            if calls.is_empty()
+                && let Some(call) = parse_malformed_file_write_call(inner)
+            {
+                calls.push(call);
+            }
             last_end = full_match.end();
         }
 
@@ -1809,8 +2092,18 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             // Try to parse the inner content as JSON arguments
             let json_values = extract_json_values(inner);
             if json_values.is_empty() {
-                // Log a warning if we found a tool block but couldn't parse arguments
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                if map_tool_name_alias(tool_name) == "file_write"
+                    && let Some(arguments) = parse_malformed_file_write_arguments(inner)
+                {
+                    calls.push(ParsedToolCall {
+                        name: "file_write".to_string(),
+                        arguments,
+                        tool_call_id: None,
+                    });
+                } else {
+                    // Log a warning if we found a tool block but couldn't parse arguments
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                }
             } else {
                 for value in json_values {
                     let arguments = if value.is_object() {
@@ -2571,6 +2864,88 @@ Done."#;
         );
         assert!(text.contains("I'll write a test file."));
         assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_content_quotes() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero"><script>const msg = "ok";</script></section>"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "index.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero"><script>const msg = "ok";</script></section>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_tool_name_fence() {
+        let response = r#"```tool file_write
+{"path":"index.html","content":"<div data-kind="card">ok</div>"}
+```"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<div data-kind="card">ok</div>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_non_ascii_safely() {
+        let response = r#"说明:
+<tool_call>
+{"name":"file_write","arguments":{"path":"页面.html","content":"<p title="问候">你好，世界 🌏</p>"}}
+</tool_call>
+完成"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("说明"));
+        assert!(text.contains("完成"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "页面.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<p title="问候">你好，世界 🌏</p>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_ambiguous_malformed_file_write() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero">","mode":"append"}}
+</tool_call>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_valid_file_write_json_unchanged() {
+        let response = r#"{"name":"file_write","arguments":{"path":"index.html","content":"<section class=\"hero\">ok</section>"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero">ok</section>"#
+        );
     }
 
     #[test]

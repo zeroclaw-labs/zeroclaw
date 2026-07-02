@@ -9,7 +9,14 @@ fn main() {
 }
 
 fn build_web_dashboard() {
-    let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    // Use the runtime env var, not `env!`, so the path stays correct when
+    // cargo reuses a cached build-script binary built under a different
+    // CARGO_MANIFEST_DIR (e.g. GitLab CI's per-slot /builds/.../<slot> dir
+    // changing between pipelines). `env!` bakes the value at build-script
+    // compile time and goes stale across that cache reuse.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is always set by cargo for build scripts");
+    let web_dir = std::path::Path::new(&manifest_dir)
         .parent()
         .and_then(|p| p.parent())
         .map(|root| root.join("web"));
@@ -57,7 +64,10 @@ fn ensure_embedded_web_dist_when_enabled() {
         return;
     }
 
-    let web_dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    // See build_web_dashboard for why this reads the var at runtime.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is always set by cargo for build scripts");
+    let web_dist = std::path::Path::new(&manifest_dir)
         .parent()
         .and_then(|p| p.parent())
         .map(|root| root.join("web/dist"))

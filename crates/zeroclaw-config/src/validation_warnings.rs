@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
+/// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
+///   vector search on sqlite memory, but no effective embedder is configured.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
