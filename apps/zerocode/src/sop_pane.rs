@@ -1157,11 +1157,7 @@ impl SopPane {
         let title = self.right_title();
 
         if visual && self.error.is_none() {
-            if editing {
-                self.render_editor_canvas(f, cols[1], &title);
-            } else {
-                self.render_nodes(f, cols[1], &title);
-            }
+            self.render_canvas(f, cols[1], &title);
             return;
         }
         self.node_rects.clear();
@@ -1216,7 +1212,7 @@ impl SopPane {
         }
     }
 
-    fn render_nodes(&mut self, f: &mut Frame, area: Rect, title: &str) {
+    fn render_canvas(&mut self, f: &mut Frame, area: Rect, title: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title.to_string());
@@ -1227,111 +1223,69 @@ impl SopPane {
         self.add_rects.clear();
         self.wire_rects.clear();
 
-        if self.graph.nodes.is_empty() {
-            let para = Paragraph::new("(no nodes; press n to author, e to edit)")
-                .wrap(Wrap { trim: false });
-            f.render_widget(para, inner);
+        let editor = self.editor.as_ref();
+        let graph = if editor.is_some() {
+            &self.editor_graph
+        } else {
+            &self.graph
+        };
+
+        let empty = match editor {
+            Some(ed) => ed.draft.steps.is_empty(),
+            None => graph.nodes.is_empty(),
+        };
+        if empty {
+            let msg = if editor.is_some() {
+                "(no steps; Ctrl+n to add, then click handles to wire)"
+            } else {
+                "(no nodes; press n to author, e to edit)"
+            };
+            f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), inner);
             return;
         }
 
         let phase =
             (self.animation_origin.elapsed().as_millis() / 200) % ACTIVE_SPINNER.len() as u128;
         let active_frame = ACTIVE_SPINNER[phase as usize];
+        let linking = self.link_from;
+        let selected_number =
+            editor.and_then(|ed| ed.draft.steps.get(ed.step_cursor).map(|s| s.number));
+        let switch_by_step: std::collections::HashMap<u32, Vec<String>> = editor
+            .map(|ed| {
+                ed.draft
+                    .steps
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.number,
+                            s.routing.switch.iter().map(|r| r.name.clone()).collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let slots = layout_slots(&self.graph.layout, inner, self.pan_x, self.pan_y);
+        let slots = layout_slots(&graph.layout, inner, self.pan_x, self.pan_y);
 
-        for wire in self
-            .graph
-            .wires
-            .iter()
-            .filter(|w| w.class == PinClass::Flow)
-        {
+        for wire in graph.wires.iter().filter(|w| w.class == PinClass::Flow) {
             let (Some(from), Some(to)) = (slots.get(&wire.from_step), slots.get(&wire.to_step))
             else {
                 continue;
             };
             draw_wire_2d(f, inner, *from, *to, wire_color(wire));
             let (mx, my) = wire_midpoint(*from, *to);
-            if my > inner.y && in_rect(mx, my.saturating_sub(1), inner) {
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        wire_label(wire),
-                        Style::default().fg(wire_color(wire)),
-                    )),
-                    Rect::new(mx, my.saturating_sub(1), inner.width.min(12), 1),
-                );
-            }
-        }
-
-        for node in &self.graph.nodes {
-            let Some(rect) = slots.get(&node.step).copied() else {
-                continue;
-            };
-            if !rects_overlap(rect, inner) {
+            if editor.is_none() {
+                if my > inner.y && in_rect(mx, my.saturating_sub(1), inner) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            wire_label(wire),
+                            Style::default().fg(wire_color(wire)),
+                        )),
+                        Rect::new(mx, my.saturating_sub(1), inner.width.min(12), 1),
+                    );
+                }
                 continue;
             }
-            let clipped = clip_rect(rect, inner);
-            let state = self
-                .overlay
-                .as_ref()
-                .and_then(|o| o.state_of(node.step as u64));
-            render_node_card(f, clipped, node, state, active_frame);
-            self.node_rects.push((node.step, clipped));
-        }
-    }
-
-    fn render_editor_canvas(&mut self, frame: &mut Frame, area: Rect, title: &str) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title.to_string());
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        self.node_rects.clear();
-        self.handle_rects.clear();
-        self.add_rects.clear();
-        self.wire_rects.clear();
-
-        let Some(editor) = self.editor.as_ref() else {
-            return;
-        };
-        if editor.draft.steps.is_empty() {
-            let empty = Paragraph::new("(no steps; Ctrl+n to add, then click handles to wire)")
-                .wrap(Wrap { trim: false });
-            frame.render_widget(empty, inner);
-            return;
-        }
-
-        let linking = self.link_from;
-        let selected_number = editor
-            .draft
-            .steps
-            .get(editor.step_cursor)
-            .map(|step| step.number);
-
-        let slots = layout_slots(&self.editor_graph.layout, inner, self.pan_x, self.pan_y);
-        let switch_by_step: std::collections::HashMap<u32, Vec<String>> = editor
-            .draft
-            .steps
-            .iter()
-            .map(|s| {
-                (
-                    s.number,
-                    s.routing.switch.iter().map(|r| r.name.clone()).collect(),
-                )
-            })
-            .collect();
-
-        for wire in self
-            .editor_graph
-            .wires
-            .iter()
-            .filter(|w| w.class == PinClass::Flow)
-        {
-            let (Some(from), Some(to)) = (slots.get(&wire.from_step), slots.get(&wire.to_step))
-            else {
-                continue;
-            };
-            draw_wire_2d(frame, inner, *from, *to, wire_color(wire));
             let Some(role) = wire.flow_role else { continue };
             if role == FlowRole::Trigger {
                 continue;
@@ -1344,10 +1298,9 @@ impl SopPane {
                 }),
                 _ => None,
             };
-            let (mx, my) = wire_midpoint(*from, *to);
             if in_rect(mx, my, inner) {
                 let rect = Rect::new(mx, my, 1, 1);
-                frame.render_widget(
+                f.render_widget(
                     Paragraph::new(Span::styled("✕", Style::default().fg(Color::DarkGray))),
                     rect,
                 );
@@ -1356,7 +1309,7 @@ impl SopPane {
             }
         }
 
-        for node in &self.editor_graph.nodes {
+        for node in &graph.nodes {
             let Some(rect) = slots.get(&node.step).copied() else {
                 continue;
             };
@@ -1364,16 +1317,24 @@ impl SopPane {
                 continue;
             }
             let clipped = clip_rect(rect, inner);
+            let Some(ed) = editor else {
+                let state = self
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| o.state_of(node.step as u64));
+                render_node_card(f, clipped, node, state, active_frame);
+                self.node_rects.push((node.step, clipped));
+                continue;
+            };
 
             if node.kind == NodeKind::Trigger {
-                render_trigger_card(frame, clipped, node);
+                render_trigger_card(f, clipped, node);
                 self.node_rects.push((node.step, clipped));
                 continue;
             }
 
-            let step = editor.draft.steps.iter().find(|s| s.number == node.step);
-            let selected = selected_number == Some(node.step);
-            render_editor_card(frame, clipped, node, step, selected);
+            let step = ed.draft.steps.iter().find(|s| s.number == node.step);
+            render_editor_card(f, clipped, node, step, selected_number == Some(node.step));
             self.node_rects.push((node.step, clipped));
 
             let handle_x = rect.x.saturating_add(rect.width.saturating_sub(1));
@@ -1395,7 +1356,7 @@ impl SopPane {
             for (role, port, color) in handles {
                 if in_rect(handle_x, hy, inner) {
                     let zone = Rect::new(handle_x, hy, 1, 1);
-                    frame.render_widget(
+                    f.render_widget(
                         Paragraph::new(Span::styled("○", Style::default().fg(color))),
                         zone,
                     );
@@ -1403,7 +1364,7 @@ impl SopPane {
                     let add_x = handle_x.saturating_add(1);
                     if in_rect(add_x, hy, inner) {
                         let add_zone = Rect::new(add_x, hy, 1, 1);
-                        frame.render_widget(
+                        f.render_widget(
                             Paragraph::new(Span::styled("+", Style::default().fg(Color::DarkGray))),
                             add_zone,
                         );
@@ -1418,7 +1379,7 @@ impl SopPane {
                 && rect.y > inner.y
             {
                 let hint = Rect::new(rect.x, rect.y.saturating_sub(1), inner.width, 1);
-                frame.render_widget(
+                f.render_widget(
                     Paragraph::new(Span::styled(
                         format!("wiring {role:?} → click target"),
                         Style::default()
