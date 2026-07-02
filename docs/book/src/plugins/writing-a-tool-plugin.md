@@ -257,9 +257,15 @@ Contract points, each anchored in the host source:
 - **Log through the imported `logging` interface, never `wasi:logging`.**
   `log-record` is fire-and-forget; the host absorbs all errors so a failed
   log write can never crash your call, and events land in every destination
-  `zeroclaw_log` writes to, correctly attributed. `PluginAction` and
-  `PluginOutcome` are closed enums mirroring the host taxonomies; there is no
-  free-form variant on purpose. Pick the closest.
+  `zeroclaw_log` writes to, carrying the
+  [`zeroclaw.*` attribution](../ops/observability.md#zeroclaw-attribution)
+  (`agent_alias`, `session_key`, provider, channel) of the host span your
+  call runs under. Note the `attrs` field on `plugin-event` is **not**
+  attribution: it is the free-form `attributes` payload of the log row.
+  Attribution is alias-bound, inherited from the ambient tracing span on the
+  host side, and nothing a plugin sends can set or clobber it.
+  `PluginAction` and `PluginOutcome` are closed enums mirroring the host
+  taxonomies; there is no free-form variant on purpose. Pick the closest.
 
 ## 4. The `__config` jail
 
@@ -332,8 +338,9 @@ Ask the agent to use the tool:
 
 The model sees `redact` in its catalog with your schema, calls it, and the
 host runs the component in a fresh store under the configured fuel and memory
-limits. Your `log-record` events appear in the structured log, attributed to
-the plugin.
+limits. Your `log-record` events appear in the structured log with the
+[span attribution](../ops/observability.md#zeroclaw-attribution) of the host
+call site.
 
 Two operational constraints worth repeating from the
 [plugins overview](./index.md):

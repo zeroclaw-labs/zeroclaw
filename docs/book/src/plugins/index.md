@@ -89,8 +89,10 @@ The manifest declares two orthogonal things:
 ## The worlds
 
 `wit/v0/` defines one world per WASM capability. Every world imports the host
-`logging` interface and exports `plugin-info` (self-reported name and version)
-plus its primary interface:
+`logging` interface, whose `log-record` events land in the structured log
+carrying the [span attribution](../ops/observability.md#zeroclaw-attribution)
+of the host call site, and exports `plugin-info` (self-reported name and
+version) plus its primary interface:
 
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
