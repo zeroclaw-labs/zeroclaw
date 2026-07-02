@@ -86,6 +86,7 @@ pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::McpRegistry;
+pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
     build_deferred_tools_section_filtered,
@@ -1444,6 +1445,16 @@ pub fn all_tools_with_runtime(
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
+                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
+                        call_fuel: config.plugins.limits.call_fuel,
+                        max_memory_bytes: config
+                            .plugins
+                            .limits
+                            .max_memory_mb
+                            .saturating_mul(1024 * 1024),
+                        max_table_elements: config.plugins.limits.max_table_elements,
+                        max_instances: config.plugins.limits.max_instances,
+                    };
                     for (manifest, wasm_path) in details {
                         // SSOT: `config` is the snapshot the whole tool set is
                         // built from, identical to every other tool here. A
@@ -1464,6 +1475,7 @@ pub fn all_tools_with_runtime(
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
+                            plugin_limits,
                         )));
                     }
                     ::zeroclaw_log::record!(
